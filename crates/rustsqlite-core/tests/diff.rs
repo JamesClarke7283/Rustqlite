@@ -330,3 +330,190 @@ fn scalar_functions() {
         assert_same(db.str(), q);
     }
 }
+
+#[test]
+fn string_functions() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = standard_fixture();
+    for q in [
+        // instr: 1-based, 0 when absent, chars for TEXT, bytes for BLOB-vs-BLOB, NULL→NULL.
+        "SELECT instr('abcabc','bc'), instr('abcabc','x'), instr('abc',''), instr('','');",
+        "SELECT instr('héllo','llo'), instr(12345,34), instr(3.14,'.1');",
+        "SELECT instr(NULL,'a'), instr('a',NULL), typeof(instr('a','a'));",
+        "SELECT instr(x'01020304', x'0203'), instr(x'010203', x'04');",
+        "SELECT instr('He', x'4865'), instr(x'4865', x'48'), typeof(instr(x'4865',x'48'));",
+        // NOTE: `replace(...)` is exercised via `call_scalar` unit tests below; the current
+        // parser reserves REPLACE as a keyword, so it cannot appear as a function in SQL yet.
+        // trim / ltrim / rtrim, 1-arg (spaces) and 2-arg (character set).
+        "SELECT '['||trim('  hi  ')||']', '['||ltrim('  hi  ')||']', '['||rtrim('  hi  ')||']';",
+        "SELECT trim('xxhixx','x'), ltrim('xxhixx','x'), rtrim('xxhixx','x');",
+        "SELECT trim('xyhixy','xy'), trim('xyzhiyx','xy'), trim('héllo','h');",
+        "SELECT trim(NULL), trim('abc',NULL), trim(123), '['||trim('   ')||']';",
+        // char: codepoints to string; 0 args; out-of-range → U+FFFD; multi-arg.
+        "SELECT char(72,73), '['||char()||']', char(233), hex(char(0));",
+        // Out-of-range codepoints fold to U+FFFD (EFBFBD). NOTE: lone surrogates like 0xD800
+        // are deliberately omitted — they encode to invalid UTF-8 (ED A0 80) that the current
+        // `Value::Text(String)` model cannot hold (see the known-limitation note in char_()).
+        "SELECT hex(char(-1)), hex(char(0x110000)), hex(char(0x10FFFF));",
+        "SELECT hex(char(128)), hex(char(0x7FF)), hex(char(0x800)), hex(char(0x10000));",
+        // unicode: first codepoint; empty/NULL → NULL.
+        "SELECT unicode('A'), unicode('abc'), unicode('é'), unicode(123);",
+        "SELECT unicode(''), unicode(NULL), typeof(unicode('A'));",
+        // hex: UPPERCASE; blob bytes vs text rendering bytes; NULL→NULL.
+        "SELECT hex('abc'), hex(x'0102ff'), hex(123), hex(1.5), hex('héllo');",
+        "SELECT hex(NULL), hex(''), typeof(hex('a'));",
+        // unhex: valid decode (1- and 2-arg ignore-set); round-trip.
+        "SELECT hex(unhex('414243')), typeof(unhex('414243')), hex(unhex('deadBEEF'));",
+        "SELECT hex(unhex('41-42-43','-')), hex(unhex('41 42 43',' ')), hex(unhex('414243',''));",
+        // Invalid input is NULL (not an error): odd length, non-hex digit, mid-byte pass char.
+        "SELECT unhex(NULL), unhex('zz41',NULL), unhex('zz'), unhex('4'), unhex('4 1',' ');",
+        // concat: NULL treated as empty; always TEXT.
+        "SELECT concat('a','b','c'), concat('a',NULL,'c'), concat(NULL,NULL);",
+        "SELECT concat(1,2.5,'x'), typeof(concat(1,2)), concat('a');",
+        // concat_ws: separator + skipped NULL data args; NULL separator → NULL.
+        "SELECT concat_ws('-','a','b','c'), concat_ws('-','a',NULL,'c'), concat_ws('-',NULL,NULL);",
+        "SELECT concat_ws(NULL,'a','b'), concat_ws(',',1,2,3), concat_ws('x','a');",
+        // quote: SQL literal for each storage class.
+        "SELECT quote('abc'), quote('it''s'), quote(123), quote(1.5), quote(NULL);",
+        "SELECT quote(x'0102FF'), quote(''), quote(x''), quote(1e300), quote(2.0);",
+        "SELECT quote(0.1), quote(9223372036854775807), quote(-0.0);",
+        // octet_length: byte length per type; NULL→NULL.
+        "SELECT octet_length('abc'), octet_length('héllo'), octet_length(x'010203');",
+        "SELECT octet_length(123), octet_length(1.5), octet_length(NULL), octet_length('');",
+        // exercised over the fixture columns.
+        "SELECT instr(b,'a'), hex(b), octet_length(b) FROM t ORDER BY id;",
+        "SELECT trim(b), upper(b), quote(b) FROM t ORDER BY id;",
+    ] {
+        assert_same(db.str(), q);
+    }
+}
+
+#[test]
+fn math_functions() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = standard_fixture();
+    for q in [
+        // sqrt / ceil / floor / trunc, with INT-vs-REAL return types and out-of-domain → NULL.
+        "SELECT sqrt(4), sqrt(2), sqrt(0), sqrt(-1), sqrt(NULL), typeof(sqrt(4));",
+        "SELECT ceil(2.1), ceil(2.0), ceil(-2.1), ceil(2), ceiling(2.9);",
+        "SELECT typeof(ceil(2)), typeof(ceil(2.0)), typeof(ceil(2.5));",
+        "SELECT floor(2.9), floor(-2.1), floor(2), typeof(floor(2)), typeof(floor(2.5));",
+        "SELECT trunc(2.9), trunc(-2.9), trunc(2), typeof(trunc(2)), typeof(trunc(2.5));",
+        // logs: ln natural, log/log10 base-10, log2, two-arg log(b,x); out-of-domain → NULL.
+        "SELECT ln(1), ln(2.718281828459045), ln(0), ln(-1), ln(NULL);",
+        "SELECT log(100), log(1000), log(0), log(-1), log10(100), log10(1000);",
+        "SELECT log2(8), log2(1024), log2(0);",
+        "SELECT log(2,8), log(10,1000), log(2,0), log(0,8), log(-2,8), log(1,8);",
+        "SELECT exp(0), exp(1), typeof(ln(1)), typeof(log(100)), typeof(exp(0));",
+        // pow / mod / sign.
+        "SELECT pow(2,10), power(2,0.5), pow(-1,0.5), pow(-2,3), pow(0,0);",
+        "SELECT mod(10,3), mod(10.5,3), mod(-10,3), mod(10,0), mod(10,-3);",
+        "SELECT typeof(mod(10,3)), typeof(pow(2,3));",
+        "SELECT sign(5), sign(-5), sign(0), sign(2.5), sign(-2.5), sign(0.0);",
+        "SELECT sign(NULL), sign('abc'), typeof(sign(5)), typeof(sign(2.5));",
+        // trig and inverse/hyperbolic, with out-of-domain → NULL.
+        "SELECT pi(), typeof(pi());",
+        "SELECT sin(0), cos(0), tan(0), asin(0), acos(1), atan(0);",
+        "SELECT asin(2), acos(2), asin(-2);",
+        "SELECT atan2(1,1), atan2(1,0), atan2(0,0);",
+        "SELECT sinh(0), cosh(0), tanh(0), asinh(0), acosh(1), atanh(0);",
+        "SELECT acosh(0), atanh(2), atanh(1);",
+        "SELECT radians(180), degrees(3.141592653589793);",
+        "SELECT sin(NULL), typeof(sin(0)), typeof(cos(1));",
+        // over the fixture's REAL column.
+        "SELECT abs(c), sqrt(abs(c)), floor(c), ceil(c) FROM t ORDER BY id;",
+    ] {
+        assert_same(db.str(), q);
+    }
+}
+
+#[test]
+fn misc_functions() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = standard_fixture();
+    for q in [
+        // iif (the `if` alias is a reserved word in the current parser; it is covered by the
+        // call_scalar unit tests instead).
+        "SELECT iif(1,'a','b'), iif(0,'a','b'), iif(NULL,'a','b'), iif(1>2,'yes','no');",
+        "SELECT iif('x','a','b'), iif('0','a','b'), iif(2.5,'a','b');",
+        // variadic min / max — mixed types, NULL→NULL, return type, BLOB ordering.
+        "SELECT min(3,1,2), max(3,1,2), min(1,'a',2.5), max(1,'a',2.5);",
+        "SELECT min(NULL,1), max(NULL,1), min('b','a','c'), typeof(min(1,2));",
+        "SELECT min(1,2.0), max(1,2.0), max(1,'1',1.0);",
+        // zeroblob.
+        "SELECT hex(zeroblob(3)), length(zeroblob(5)), typeof(zeroblob(0));",
+        "SELECT hex(zeroblob(0)), length(zeroblob(-1)), quote(zeroblob(2));",
+        // likely / unlikely / likelihood — identity passthrough.
+        "SELECT likely(5), unlikely('x'), likelihood(42,0.5), typeof(likely(5));",
+        "SELECT likely(NULL), likelihood('abc',0.9);",
+        // over the fixture.
+        "SELECT iif(a IS NULL,'?',a), max(a,0), min(a,c) FROM t ORDER BY id;",
+    ] {
+        assert_same(db.str(), q);
+    }
+}
+
+/// Volatile / connection-state functions. Their *shape* is deterministic (typeof, length, the
+/// fixed 0 counters, the version string), so `assert_same` is the right oracle for everything
+/// except the raw random value — that is covered structurally in `random_values_vary` below.
+#[test]
+fn volatile_functions_shape() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    for q in [
+        // random() is an integer.
+        "SELECT typeof(random());",
+        // randomblob: a BLOB of the requested length; N<1 and NULL clamp to a single byte.
+        "SELECT typeof(randomblob(8)), length(randomblob(8));",
+        "SELECT length(randomblob(0)), length(randomblob(-5)), length(randomblob(1));",
+        "SELECT typeof(randomblob(NULL)), length(randomblob(NULL));",
+        "SELECT length(randomblob(1000));",
+        // changes / total_changes / last_insert_rowid are 0 (no write path in M3b).
+        "SELECT changes(), total_changes(), last_insert_rowid();",
+        "SELECT typeof(changes()), typeof(last_insert_rowid());",
+        // sqlite_version() is a great deterministic parity check.
+        "SELECT sqlite_version();",
+        "SELECT typeof(sqlite_version());",
+    ] {
+        assert_same(db.str(), q);
+    }
+}
+
+/// `random()` must actually vary across rows of one statement (it would be a faithfulness bug to
+/// return a constant). Non-differential — the value is non-deterministic, so we check structure.
+#[test]
+fn random_values_vary() {
+    let db = TempDb::new();
+    let rows = rustsqlite_rows(
+        db.str(),
+        "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<20) \
+         SELECT random() FROM c;",
+    );
+    // If the recursive CTE path isn't compilable yet, fall back to a multi-column constant SELECT
+    // (still exercises distinct draws within one statement).
+    let rows = match rows {
+        Ok(r) if r.len() >= 2 => r,
+        _ => match rustsqlite_rows(db.str(), "SELECT random(), random(), random(), random();") {
+            Ok(r) => r.first().map(|s| s.split('|').map(str::to_string).collect()).unwrap_or_default(),
+            Err(e) => panic!("rustsqlite random() error: {e}"),
+        },
+    };
+    let distinct: std::collections::HashSet<&String> = rows.iter().collect();
+    assert!(
+        distinct.len() > 1,
+        "random() returned all-identical values across {} draws: {rows:?}",
+        rows.len()
+    );
+}

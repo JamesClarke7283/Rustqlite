@@ -155,6 +155,13 @@ fn cmd_mode(state: &mut ShellState, args: &[String]) {
         Some(name) => match parse_mode(name) {
             Some(mode) => {
                 state.mode = mode;
+                // `.mode insert <TABLE>` records the destination table; bare `.mode insert`
+                // keeps the default ("tab"), matching the sqlite3 shell.
+                if mode == OutputMode::Insert {
+                    if let Some(tab) = args.get(1) {
+                        state.insert_table = tab.clone();
+                    }
+                }
                 // The tabular modes turn headers on (the shell does this when the mode is set);
                 // an explicit `.headers off` afterwards still wins.
                 if matches!(

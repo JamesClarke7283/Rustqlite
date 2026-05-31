@@ -25,6 +25,99 @@ use super::opcode::Opcode;
 use super::program::{p5_to_aff, Instruction, Program, P4, P5_JUMPIFNULL, P5_NULLEQ, P5_STOREP2};
 use super::sorter::Sorter;
 
+/// `SQLITE_MAX_LENGTH` — the default cap on the size of a string or BLOB (`sqlite3.c`). A
+/// `randomblob(N)` request larger than this is rejected exactly as SQLite does (`SQLITE_TOOBIG`,
+/// reported as "string or blob too big").
+const SQLITE_MAX_LENGTH: i64 = 1_000_000_000;
+
+/// Per-statement runtime state for the volatile / connection-state scalar functions.
+///
+/// These functions (`random`, `randomblob`, `changes`, `total_changes`, `last_insert_rowid`)
+/// can't live in the pure, deterministic [`crate::func`] registry, so the executor special-cases
+/// them and reaches into this context. Keeping them here keeps `func/` unit-testable.
+///
+/// The PRNG is a splitmix64 (the same construction the fp-rendering fuzz test uses) so it needs
+/// no `rand` dependency and works under the crate's `overflow-checks = true` dev profile via
+/// `wrapping_*`. It is seeded once per construction from `std::process::id()` mixed with a
+/// process-global atomic counter, so successive statements — and successive calls within one
+/// statement — produce distinct values, while avoiding `std::time`. The values are not
+/// cryptographically strong, which matches SQLite's own non-cryptographic `random()`.
+pub struct RuntimeCtx {
+    /// splitmix64 state, advanced on each draw.
+    rng_state: u64,
+    /// `changes()` — rows changed by the last write. Always 0 in M3b (no write path yet).
+    pub changes: i64,
+    /// `total_changes()` — rows changed since the connection opened. Always 0 in M3b.
+    pub total_changes: i64,
+    /// `last_insert_rowid()` — rowid of the last successful insert. Always 0 in M3b.
+    pub last_insert_rowid: i64,
+}
+
+impl Default for RuntimeCtx {
+    fn default() -> RuntimeCtx {
+        RuntimeCtx::new()
+    }
+}
+
+impl RuntimeCtx {
+    /// A fresh context with a distinct PRNG seed.
+    pub fn new() -> RuntimeCtx {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // A process-global counter guarantees two `RuntimeCtx`es built in the same process (even
+        // back-to-back) get different seeds without consulting the clock.
+        static SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let bump = SEED_COUNTER.fetch_add(1, Ordering::Relaxed);
+        // Mix the pid and counter through splitmix64's finalizer so even adjacent seeds diverge.
+        let mut seed = (u64::from(std::process::id()) << 32) ^ bump.wrapping_mul(0x9e3779b97f4a7c15);
+        seed = (seed ^ (seed >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        seed = (seed ^ (seed >> 27)).wrapping_mul(0x94d049bb133111eb);
+        RuntimeCtx {
+            rng_state: seed ^ (seed >> 31),
+            changes: 0,
+            total_changes: 0,
+            last_insert_rowid: 0,
+        }
+    }
+
+    /// Advance the splitmix64 PRNG and return the next 64-bit draw.
+    fn next_u64(&mut self) -> u64 {
+        self.rng_state = self.rng_state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = self.rng_state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    }
+
+    /// `random()` — a signed 64-bit pseudo-random integer.
+    pub fn next_i64(&mut self) -> i64 {
+        self.next_u64() as i64
+    }
+
+    /// `n` pseudo-random bytes for `randomblob(n)`.
+    pub fn random_bytes(&mut self, n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            out.extend_from_slice(&self.next_u64().to_le_bytes());
+        }
+        out.truncate(n);
+        out
+    }
+}
+
+/// SQLite's `randomblob(N)` length rule: a NULL or `N < 1` argument yields a single byte, and a
+/// request larger than `SQLITE_MAX_LENGTH` is rejected (`SQLITE_TOOBIG`). Returns the clamped
+/// length, or an error mirroring the oracle's "string or blob too big".
+fn randomblob_len(arg: Option<&Value>) -> Result<usize> {
+    let n = match arg {
+        Some(v) if !v.is_null() => v.as_i64(),
+        _ => 1, // missing or NULL → 1 byte (matches the oracle)
+    };
+    if n > SQLITE_MAX_LENGTH {
+        return Err(Error::msg("string or blob too big"));
+    }
+    Ok(n.max(1) as usize)
+}
+
 /// The outcome of one [`Vdbe::step`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum StepResult {
@@ -50,6 +143,8 @@ pub struct Vdbe {
     /// Per-`(cursor, rowid)` decoded-record cache so successive `Column` reads of one row decode
     /// the payload once.
     decoded: Option<(usize, i64, Vec<Value>)>,
+    /// Runtime state for the volatile / connection-state functions (PRNG + change counters).
+    ctx: RuntimeCtx,
 }
 
 impl Vdbe {
@@ -70,10 +165,14 @@ impl Vdbe {
             result_count: 0,
             halted: false,
             decoded: None,
+            ctx: RuntimeCtx::new(),
         }
     }
 
     /// Reset to the start so the program can be re-run (`sqlite3_reset`).
+    ///
+    /// The PRNG state in `ctx` is deliberately NOT reset: SQLite's randomness is global, so
+    /// re-running a statement keeps advancing the sequence rather than repeating it.
     pub fn reset(&mut self) {
         self.pc = 0;
         for r in &mut self.regs {
@@ -355,7 +454,20 @@ impl Vdbe {
                     let nargs = p5 as usize;
                     let start = p2 as usize;
                     let args: Vec<Value> = self.regs[start..start + nargs].to_vec();
-                    let result = func::call_scalar(&name, &args)?;
+                    // The volatile / connection-state functions need runtime state, so they are
+                    // intercepted here before the pure `func::call_scalar` registry. Names are
+                    // case-insensitive (codegen stores the original case in p4).
+                    let result = match name.to_ascii_lowercase().as_str() {
+                        "random" => Value::Int(self.ctx.next_i64()),
+                        "randomblob" => {
+                            Value::Blob(self.ctx.random_bytes(randomblob_len(args.first())?))
+                        }
+                        "changes" => Value::Int(self.ctx.changes),
+                        "total_changes" => Value::Int(self.ctx.total_changes),
+                        "last_insert_rowid" => Value::Int(self.ctx.last_insert_rowid),
+                        "sqlite_version" => Value::Text(crate::SQLITE_VERSION.to_string()),
+                        _ => func::call_scalar(&name, &args)?,
+                    };
                     self.regs[p3 as usize] = result;
                     self.pc += 1;
                 }

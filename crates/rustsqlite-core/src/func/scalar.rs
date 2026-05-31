@@ -94,6 +94,74 @@ pub fn nullif(x: &Value, y: &Value) -> Value {
     }
 }
 
+/// `iif(C, A, B)` / `if(C, A, B)` — `A` when `C` is truthy, else `B`. A NULL or zero condition is
+/// falsy. SQLite implements this as the equivalent `CASE WHEN C THEN A ELSE B END`.
+pub fn iif(c: &Value, a: &Value, b: &Value) -> Value {
+    if truthy(c) {
+        a.clone()
+    } else {
+        b.clone()
+    }
+}
+
+/// SQLite truth value of a register: NULL is false, otherwise the numeric value is non-zero.
+fn truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Int(i) => *i != 0,
+        Value::Real(r) => *r != 0.0,
+        // TEXT/BLOB take NUMERIC affinity for a boolean test: their numeric value, else 0.
+        other => other.as_f64() != 0.0,
+    }
+}
+
+/// The scalar (variadic, ≥2-arg) `min(...)` / `max(...)`. These select the minimum / maximum
+/// argument under SQLite's value ordering (NULL sorts lowest). Per SQLite, if *any* argument is
+/// NULL the result is NULL. `want_max` picks `max`; otherwise `min`. Comparisons use the BINARY
+/// collation, matching the oracle for these scalar forms.
+pub fn min_max(args: &[Value], want_max: bool) -> Value {
+    if args.iter().any(Value::is_null) {
+        return Value::Null;
+    }
+    let mut best = &args[0];
+    for cand in &args[1..] {
+        let ord = mem_compare(cand, best, Collation::Binary);
+        let take = if want_max {
+            ord == Ordering::Greater
+        } else {
+            ord == Ordering::Less
+        };
+        if take {
+            best = cand;
+        }
+    }
+    best.clone()
+}
+
+/// `zeroblob(N)` — a BLOB of `N` zero bytes. A negative or NULL `N` produces an empty BLOB
+/// (SQLite clamps a negative length to 0). Mirrors `zeroblobFunc`.
+pub fn zeroblob(n: &Value) -> Result<Value> {
+    let len = n.as_i64();
+    if len <= 0 {
+        return Ok(Value::Blob(Vec::new()));
+    }
+    // Guard against absurd sizes the way SQLite's SQLITE_MAX_LENGTH check does.
+    if len > i64::from(i32::MAX) {
+        return Err(Error::msg("string or blob too big"));
+    }
+    Ok(Value::Blob(vec![0u8; len as usize]))
+}
+
+/// `likely(X)` / `unlikely(X)` — optimizer hints; semantically the identity (return `X`).
+pub fn likely(x: &Value) -> Value {
+    x.clone()
+}
+
+/// `likelihood(X, Y)` — optimizer hint; returns `X` unchanged (the probability `Y` is advisory).
+pub fn likelihood(x: &Value, _y: &Value) -> Value {
+    x.clone()
+}
+
 /// `round(X)` / `round(X, N)` — always REAL, half-away-from-zero. A NULL `X` or `N` yields NULL.
 pub fn round(x: &Value, n: Option<&Value>) -> Value {
     let mut n_digits: i64 = 0;

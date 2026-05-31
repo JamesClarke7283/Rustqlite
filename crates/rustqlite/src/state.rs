@@ -14,6 +14,8 @@ pub struct ShellState {
     pub colsep: String,
     pub rowsep: String,
     pub nullvalue: String,
+    /// Target table name for `insert` mode (set by `.mode insert <TABLE>`; default `"tab"`).
+    pub insert_table: String,
     pub echo: bool,
     pub bail: bool,
 }
@@ -29,6 +31,7 @@ impl ShellState {
             colsep: cli.separator.clone().unwrap_or_else(|| "|".to_string()),
             rowsep: cli.newline.clone().unwrap_or_else(|| "\n".to_string()),
             nullvalue: cli.nullvalue.clone().unwrap_or_default(),
+            insert_table: "tab".to_string(),
             echo: cli.echo,
             bail: cli.bail,
         }
