@@ -115,7 +115,7 @@ impl Sqlite3 {
     /// A clone of the database header, if the database has been opened with content. Used by
     /// the shell's `.dbinfo`. (Engine-internal convenience, not part of the C API.)
     pub fn db_header(&self) -> Option<crate::format::DbHeader> {
-        self.pager.as_ref().map(|p| p.header().clone())
+        self.pager.as_ref().map(|p| p.header())
     }
 
     /// The number of pages in the database file (0 if there is no content yet).
