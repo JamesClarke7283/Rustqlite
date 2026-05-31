@@ -387,29 +387,29 @@ dependencies = [
 
 [[package]]
 name = "rustqlite"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "rustqlite-parser",
- "tokio",
-]
-
-[[package]]
-name = "rustqlite-cli"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "clap",
- "rustqlite",
  "rustqlite-parser",
+ "rustsqlite-core",
  "rustyline",
 ]
 
 [[package]]
 name = "rustqlite-parser"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "pest",
  "pest_derive",
+]
+
+[[package]]
+name = "rustsqlite-core"
+version = "0.0.2"
+dependencies = [
+ "async-trait",
+ "rustqlite-parser",
+ "tokio",
 ]
 
 [[package]]

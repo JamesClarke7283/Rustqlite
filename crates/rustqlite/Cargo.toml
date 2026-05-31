@@ -6,12 +6,17 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "A faithful, file-format-compatible reimplementation of the SQLite3 engine in Rust. Public API mirrors the SQLite C API; I/O is async on tokio."
+description = "The rustsqlite shell — a clap-derive CLI mirroring the sqlite3 command-line tool."
+
+[[bin]]
+name = "rustsqlite"
+path = "src/main.rs"
 
 [dependencies]
+rustsqlite-core = { workspace = true }
 rustqlite-parser = { workspace = true }
-tokio = { workspace = true }
-async-trait = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+clap = { workspace = true }
+rustyline = { workspace = true }
+# Note: the async tokio runtime lives inside the `rustsqlite-core` engine (it owns a process-global
+# runtime and the C-API functions drive it via block_on), so the CLI itself stays synchronous
+# and does not depend on tokio directly.

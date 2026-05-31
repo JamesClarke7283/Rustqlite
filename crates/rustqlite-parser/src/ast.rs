@@ -164,6 +164,7 @@ pub enum BinaryOp {
     Mod,
     Concat,
     Is,
+    IsNot,
     Like,
     Glob,
 }

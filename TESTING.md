@@ -2,7 +2,7 @@
 
 Rustqlite's correctness bar is **behavioral and byte-level equivalence with C SQLite**. The test strategy is
 layered. Per project policy, **SQLite's own `.test` files are NOT vendored into this repository** — instead
-this document gives copy-paste instructions plus an in-tree Rust harness to run suites against rustqlite,
+this document gives copy-paste instructions plus an in-tree Rust harness to run suites against rustsqlite,
 out-of-tree.
 
 The reference oracle is the **system `sqlite3` binary** (and/or `libsqlite3`). On this machine that is
@@ -27,7 +27,7 @@ Per-module tests for the codecs and parsers — the file-format-critical layer i
 
 ```sh
 cargo test                                   # whole workspace
-cargo test -p rustqlite format::            # varint / serial_type / record / header codecs
+cargo test -p rustsqlite-core format::      # varint / serial_type / record / header codecs
 cargo test -p rustqlite-parser              # grammar + Pratt precedence golden tests
 ```
 
@@ -35,54 +35,54 @@ cargo test -p rustqlite-parser              # grammar + Pratt precedence golden 
 
 Guarantees byte-compatibility in both directions.
 
-- **C → rustqlite**: create/populate a DB with the system `sqlite3`, open and read it with rustqlite;
+- **C → rustsqlite**: create/populate a DB with the system `sqlite3`, open and read it with rustsqlite;
   assert identical schema and rows.
-- **rustqlite → C** (once the write path lands, M4): write with rustqlite, then in C SQLite run
+- **rustsqlite → C** (once the write path lands, M4): write with rustsqlite, then in C SQLite run
   `PRAGMA integrity_check;` (must report `ok`) and `SELECT` the rows back.
 
 ```sh
-cargo test -p rustqlite --test fileformat
+cargo test -p rustsqlite-core --test fileformat
 ```
 
 Manual proof:
 
 ```sh
 sqlite3 demo.db "create table t(a,b); insert into t values(1,'x'),(2,'y');"
-cargo run -p rustqlite-cli -- demo.db ".mode column" "select * from t;"   # (M3+) identical rows
-cargo run -p rustqlite-cli -- demo.db ".tables" ".schema"                 # (M1) works today
+cargo run -p rustqlite -- demo.db ".mode column" "select * from t;"   # (M3+) identical rows
+cargo run -p rustqlite -- demo.db ".tables" ".schema"                 # (M1) works today
 ```
 
 ## 3. Differential oracle (`tests/diff/`)
 
-Run identical SQL through rustqlite and the system `sqlite3`; assert identical result rows and error
+Run identical SQL through rustsqlite and the system `sqlite3`; assert identical result rows and error
 behavior. The fastest way to catch behavior drift.
 
 ```sh
-cargo test -p rustqlite --test diff
+cargo test -p rustsqlite-core --test diff
 ```
 
 ## 4. sqllogictest (`tests/slt/`)
 
-Implement the [`sqllogictest`](https://crates.io/crates/sqllogictest) crate's DB trait for rustqlite and
+Implement the [`sqllogictest`](https://crates.io/crates/sqllogictest) crate's DB trait for rustsqlite and
 run `.slt` corpora. Engine-agnostic, large coverage, no TCL needed. (Wired up from M3 once a query path
 exists.)
 
 ```sh
-cargo test -p rustqlite --test slt
+cargo test -p rustsqlite-core --test slt
 ```
 
 ## 5. Upstream TCL suite (out-of-tree, later phase)
 
 Faithful execution of SQLite's own `.test`/`testrunner.tcl` requires a thin **C-ABI shim** that exports the
-real `sqlite3_*` symbols backed by rustqlite (the optional `crates/rustqlite-capi` cdylib, loaded via
+real `sqlite3_*` symbols backed by rustsqlite (the optional `crates/rustsqlite-capi` cdylib, loaded via
 `LD_PRELOAD` or linked into `testfixture`). Until that shim exists, sqllogictest + the differential oracle
 are the conformance gate.
 
 ```sh
-# Sketch (later): clone upstream, build testfixture against the rustqlite C-ABI shim.
+# Sketch (later): clone upstream, build testfixture against the rustsqlite C-ABI shim.
 git clone https://github.com/sqlite/sqlite.git /tmp/sqlite-upstream
 git -C /tmp/sqlite-upstream checkout version-3.53.1
-# ... build crates/rustqlite-capi as a cdylib exporting sqlite3_* ...
+# ... build crates/rustsqlite-capi as a cdylib exporting sqlite3_* ...
 # ... point testfixture/testrunner.tcl at it; run the .test files out-of-tree ...
 ```
 

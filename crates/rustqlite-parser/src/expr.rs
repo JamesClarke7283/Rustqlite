@@ -25,6 +25,7 @@ fn pratt() -> &'static PrattParser<Rule> {
             .op(Op::infix(Rule::op_eq, Assoc::Left)
                 | Op::infix(Rule::op_ne, Assoc::Left)
                 | Op::infix(Rule::op_is, Assoc::Left)
+                | Op::infix(Rule::op_isnot, Assoc::Left)
                 | Op::infix(Rule::op_like, Assoc::Left)
                 | Op::infix(Rule::op_glob, Assoc::Left))
             .op(Op::infix(Rule::op_lt, Assoc::Left)
@@ -78,6 +79,7 @@ fn fold(pairs: Pairs<'_, Rule>) -> Expr {
                 Rule::op_mod => BinaryOp::Mod,
                 Rule::op_concat => BinaryOp::Concat,
                 Rule::op_is => BinaryOp::Is,
+                Rule::op_isnot => BinaryOp::IsNot,
                 Rule::op_like => BinaryOp::Like,
                 Rule::op_glob => BinaryOp::Glob,
                 other => unreachable!("unexpected infix operator {other:?}"),

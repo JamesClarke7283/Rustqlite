@@ -195,7 +195,7 @@ pos = { "+" }
 
 infix = _{
       op_or | op_and | op_concat | op_eq | op_ne | op_le | op_ge | op_lt | op_gt
-    | op_add | op_sub | op_mul | op_div | op_mod | op_is | op_like | op_glob
+    | op_add | op_sub | op_mul | op_div | op_mod | op_isnot | op_is | op_like | op_glob
 }
 op_or = { K_OR }
 op_and = { K_AND }
@@ -211,6 +211,8 @@ op_sub = { "-" }
 op_mul = { "*" }
 op_div = { "/" }
 op_mod = { "%" }
+// `IS NOT` must be tried before plain `IS` so it is not parsed as `IS (NOT …)`.
+op_isnot = { K_IS ~ K_NOT }
 op_is = { K_IS }
 op_like = { K_LIKE }
 op_glob = { K_GLOB }

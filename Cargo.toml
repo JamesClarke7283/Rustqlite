@@ -7,12 +7,12 @@
 resolver = "2"
 members = [
     "crates/rustqlite-parser",
+    "crates/rustsqlite-core",
     "crates/rustqlite",
-    "crates/rustqlite-cli",
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 rust-version = "1.96"
 license = "Apache-2.0"
@@ -22,8 +22,8 @@ description = "A faithful, file-format-compatible reimplementation of SQLite3 in
 
 [workspace.dependencies]
 # Internal crates.
-rustqlite = { path = "crates/rustqlite", version = "0.0.1" }
-rustqlite-parser = { path = "crates/rustqlite-parser", version = "0.0.1" }
+rustsqlite-core = { path = "crates/rustsqlite-core", version = "0.0.2" }
+rustqlite-parser = { path = "crates/rustqlite-parser", version = "0.0.2" }
 
 # Async runtime for the VFS/pager I/O layer (the engine is async on tokio).
 tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "sync", "macros"] }

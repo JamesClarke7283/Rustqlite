@@ -13,10 +13,10 @@ and correctly reads/writes `.db` files created by C SQLite.
 | Crate | Role |
 |---|---|
 | [`crates/rustqlite-parser`](crates/rustqlite-parser) | SQL text → AST. A **pest** PEG grammar ported from SQLite's `parse.y`; expression precedence via pest's `PrattParser`. No engine dependency. |
-| [`crates/rustqlite`](crates/rustqlite) | The core engine and the public **C-API-mirroring** library. Async on **tokio**. |
-| [`crates/rustqlite-cli`](crates/rustqlite-cli) | The shell (binary `rustqlite`). **clap derive** for flags; dot-commands dispatched in the REPL. |
+| [`crates/rustsqlite-core`](crates/rustsqlite-core) | The core engine and the public **C-API-mirroring** library. Async on **tokio**. |
+| [`crates/rustqlite`](crates/rustqlite) | The shell (binary `rustsqlite`). **clap derive** for flags; dot-commands dispatched in the REPL. |
 
-Dependency direction: `rustqlite-cli` → `rustqlite` → `rustqlite-parser`.
+Dependency direction: `rustqlite` (CLI) → `rustsqlite-core` → `rustqlite-parser`.
 
 ## Architecture parity (module → upstream C source)
 
@@ -26,19 +26,19 @@ upstream source file-by-file.
 | Layer | Upstream C | Rust location |
 |---|---|---|
 | Tokenizer + Parser | `tokenize.c`, `parse.y` | `rustqlite-parser` (`sqlite.pest`, `ast.rs`, `expr.rs`/Pratt, `lib.rs`) |
-| Interface / C-API | `main.c`, `vdbeapi.c`, `prepare.c`, `legacy.c` | `rustqlite::capi` |
-| Code generator + planner | `build.c`, `select.c`, `where*.c`, … | `rustqlite::codegen` |
-| VDBE (bytecode VM) | `vdbe.c`, `vdbeaux.c`, … | `rustqlite::vdbe` |
-| B-tree | `btree.c` | `rustqlite::btree` |
-| Pager + WAL | `pager.c`, `pcache.c`, `wal.c` | `rustqlite::pager` |
-| Record/format codecs | serial types, file format | `rustqlite::format` |
-| VFS / OS | `os_unix.c`, `os.c` | `rustqlite::vfs` |
-| Type system & affinity | `vdbemem.c`, `analyze.c` | `rustqlite::types` |
-| Built-in functions | `func.c`, `date.c`, `printf.c` | `rustqlite::func` |
-| PRAGMA | `pragma.c` | `rustqlite::pragma` |
-| Schema / catalog | `build.c`, `prepare.c` | `rustqlite::schema` |
-| Utilities | `util.c`, `hash.c`, `utf.c` | `rustqlite::util` |
-| Shell | `shell.c.in` | `rustqlite-cli` |
+| Interface / C-API | `main.c`, `vdbeapi.c`, `prepare.c`, `legacy.c` | `rustsqlite_core::capi` |
+| Code generator + planner | `build.c`, `select.c`, `where*.c`, … | `rustsqlite_core::codegen` |
+| VDBE (bytecode VM) | `vdbe.c`, `vdbeaux.c`, … | `rustsqlite_core::vdbe` |
+| B-tree | `btree.c` | `rustsqlite_core::btree` |
+| Pager + WAL | `pager.c`, `pcache.c`, `wal.c` | `rustsqlite_core::pager` |
+| Record/format codecs | serial types, file format | `rustsqlite_core::format` |
+| VFS / OS | `os_unix.c`, `os.c` | `rustsqlite_core::vfs` |
+| Type system & affinity | `vdbemem.c`, `analyze.c` | `rustsqlite_core::types` |
+| Built-in functions | `func.c`, `date.c`, `printf.c` | `rustsqlite_core::func` |
+| PRAGMA | `pragma.c` | `rustsqlite_core::pragma` |
+| Schema / catalog | `build.c`, `prepare.c` | `rustsqlite_core::schema` |
+| Utilities | `util.c`, `hash.c`, `utf.c` | `rustsqlite_core::util` |
+| Shell | `shell.c.in` | `rustqlite` (CLI) |
 
 ## Async model
 
@@ -52,13 +52,13 @@ public surface stays C-API-faithful while I/O is async underneath. Concurrency s
 ```sh
 cargo build
 
-# Create a database with the reference engine, then read it with rustqlite:
+# Create a database with the reference engine, then read it with rustsqlite:
 sqlite3 demo.db "create table t(a, b); insert into t values (1, 'x'), (2, 'y');"
-cargo run -p rustqlite-cli -- demo.db ".tables"
-cargo run -p rustqlite-cli -- demo.db ".schema"
+cargo run -p rustqlite -- demo.db ".tables"
+cargo run -p rustqlite -- demo.db ".schema"
 
 # Library version (mirrors the C API):
-cargo run -p rustqlite-cli -- -version
+cargo run -p rustqlite -- -version
 ```
 
 ## Roadmap (milestones)
@@ -75,7 +75,7 @@ Built bottom-up so each layer is verified against real SQLite before the next.
   · **M8 — WAL & durability** · **M9 — Conformance hardening**.
 
 See [`AGENTS.md`](AGENTS.md) for contributor guidance and [`TESTING.md`](TESTING.md) for how to run
-SQLite's own suite against rustqlite (out-of-tree; the `.test` files are **not** vendored).
+SQLite's own suite against rustsqlite (out-of-tree; the `.test` files are **not** vendored).
 
 ## License
 

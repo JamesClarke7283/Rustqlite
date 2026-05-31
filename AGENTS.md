@@ -9,12 +9,13 @@ Rustqlite is a **full, faithful reimplementation of SQLite3 in Rust**. It is not
 2. **Architecture parity**: modules map 1:1 to upstream C source (tokenizer/parser, code generator + query
    planner, VDBE register VM, B-tree, pager + WAL, VFS, utilities). See README for the mapping table.
 3. **File-format compatibility**: must open, read, and write `.db` files created by C SQLite, byte-for-byte
-   per https://www.sqlite.org/fileformat2.html. `PRAGMA integrity_check` on a rustqlite-written DB must pass
+   per https://www.sqlite.org/fileformat2.html. `PRAGMA integrity_check` on a rustsqlite-written DB must pass
    in C SQLite.
 4. **C-API parity**: the public library API mirrors the SQLite C API (`sqlite3_open`, `sqlite3_prepare_v2`,
    `sqlite3_step`, `sqlite3_column_*`, `sqlite3_bind_*`, `sqlite3_finalize`, result codes `SQLITE_*`, …),
    translated to Rust types. Keep names identical where possible.
-5. **CLI parity**: `rustqlite-cli` mirrors the `sqlite3` shell — same flags, dot-commands, and output modes.
+5. **CLI parity**: the `rustqlite` CLI crate (binary `rustsqlite`) mirrors the `sqlite3` shell — same flags,
+   dot-commands, and output modes.
 
 ## Compatibility target
 - SQLite **3.53.1** (see `VERSION`). `sqlite3_libversion()` reports `"3.53.1"`,
@@ -27,9 +28,10 @@ Rustqlite is a **full, faithful reimplementation of SQLite3 in Rust**. It is not
 ## Workspace
 - `crates/rustqlite-parser` — SQL text → AST. **pest** PEG grammar ported from upstream `parse.y`;
   expression precedence via pest `PrattParser`. No engine dependency.
-- `crates/rustqlite` — the core engine and the public C-API-mirroring library. **Async on tokio.**
-- `crates/rustqlite-cli` — the shell. **clap derive**; dot-commands dispatched in the REPL, not as clap
-  subcommands.
+- `crates/rustsqlite-core` — the core engine and the public C-API-mirroring library (imported as
+  `rustsqlite_core`). **Async on tokio.**
+- `crates/rustqlite` — the shell (binary **`rustsqlite`**). **clap derive**; dot-commands dispatched in
+  the REPL, not as clap subcommands.
 
 ## Async model
 VFS/pager I/O is async on a tokio multi-thread runtime. The `sqlite3_*` functions keep synchronous
@@ -45,22 +47,29 @@ runtime (e.g. a `#[tokio::test]`); engine-internal async fns are tested directly
 - Dependencies: small, vetted crates allowed; never one that compromises file-format faithfulness. Justify
   each non-trivial dependency below.
 
+## Versioning
+- **Increment the crate version as we go.** Bump `version` in the root `[workspace.package]` (and the
+  matching `workspace.dependencies` entries for the internal crates, which must stay in lockstep) whenever
+  a change lands — a patch bump (`0.0.1` → `0.0.2`) for an incremental feature/fix, a minor bump for a
+  milestone. All three crates inherit the workspace version (`version.workspace = true`), so one edit moves
+  the whole tree. This keeps `Cargo.lock` and any published artifact honest about what changed.
+
 ## Dependency rationale
 | Crate | Dep | Why |
 |---|---|---|
-| `rustqlite` | `tokio` | async runtime + async file I/O for the VFS/pager layer |
-| `rustqlite` | `async-trait` | object-safe (`dyn`) async methods on the `Vfs`/`VfsFile` traits |
+| `rustsqlite-core` | `tokio` | async runtime + async file I/O for the VFS/pager layer |
+| `rustsqlite-core` | `async-trait` | object-safe (`dyn`) async methods on the `Vfs`/`VfsFile` traits |
 | `rustqlite-parser` | `pest`, `pest_derive` | PEG grammar engine; the locked decision for the parser |
-| `rustqlite-cli` | `clap` (derive) | sqlite3-shell-compatible argument parsing |
-| `rustqlite-cli` | `rustyline` | line editing + history for interactive mode |
+| `rustqlite` (CLI) | `clap` (derive) | sqlite3-shell-compatible argument parsing |
+| `rustqlite` (CLI) | `rustyline` | line editing + history for interactive mode |
 
 Error types in the core are hand-rolled (no `thiserror`) to keep the dependency surface minimal.
 
 ## Build / run / test
 - Build: `cargo build`
-- Shell: `cargo run -p rustqlite-cli -- <file.db>`
+- Shell: `cargo run -p rustqlite -- <file.db>` (the binary is `rustsqlite`)
 - Tests: `cargo test`  (unit + differential + file-format round-trip + sqllogictest)
-- Running SQLite's own suite against rustqlite: see `TESTING.md` (run out-of-tree; do not vendor `.test`
+- Running SQLite's own suite against rustsqlite: see `TESTING.md` (run out-of-tree; do not vendor `.test`
   files into this repo).
 
 ## Definition of done for a feature
@@ -73,5 +82,14 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   async VFS (mem + tokio), read-only pager, table-b-tree read cursor with overflow, `sqlite_schema`
   reader. CLI `.tables`/`.schema` read real C-SQLite databases. Remaining: index b-tree read cursor,
   `WITHOUT ROWID`, ptrmap/auto-vacuum awareness.
-- **M2+ — Parser, query path, write path, …**: not yet started (parser crate has a working subset grammar
-  as a starting point; full `parse.y` port pending).
+- **M2 — Parser**: 🚧 a working subset grammar (`SELECT`/`CREATE TABLE`/`INSERT` + the full expression
+  atom/operator set, including `IS NOT`); full `parse.y` port pending. Known gap: a bare integer literal
+  larger than `i64` (e.g. the exact `-9223372036854775808`) is parsed as REAL rather than special-cased.
+- **M3a — Read query path (single-table SELECT)**: ✅ a faithful register VDBE (executor + opcode set),
+  code generator (projection, `WHERE` with 3-valued logic, `ORDER BY` via an in-memory sorter,
+  `LIMIT`/`OFFSET`, rowid-alias substitution), value comparison + type affinity, the byte-faithful REAL→text
+  formatter (`sqlite3FpDecode` port, fuzz-validated), ~10 scalar functions, and the C-API prepare/step/column
+  path. CLI runs `SELECT` in `list`/`csv`/`column` modes. Differential-tested against `sqlite3` 3.53.1.
+  Deferred to **M3b**: `EXPLAIN`/`EXPLAIN QUERY PLAN`, the full scalar-function set, the remaining output
+  modes, and the `sqllogictest` harness.
+- **M3b+ — write path, indexes, joins, aggregates, …**: pending.
