@@ -52,12 +52,38 @@ pub fn parse_one(sql: &str) -> Result<Option<Stmt>, ParseError> {
 }
 
 fn build_statement(pair: Pair<'_, Rule>) -> Stmt {
-    let inner = pair.into_inner().next().expect("statement has one child");
-    match inner.as_rule() {
-        Rule::select_stmt => Stmt::Select(build_select(inner)),
-        Rule::create_table_stmt => Stmt::CreateTable(build_create_table(inner)),
-        Rule::insert_stmt => Stmt::Insert(build_insert(inner)),
+    let mut inner = pair.into_inner();
+    let first = inner.next().expect("statement has at least one child");
+    if first.as_rule() == Rule::explain_prefix {
+        // An `explain_prefix` is followed by exactly one statement child (select/create/insert).
+        let kind = explain_kind(&first);
+        let body = inner.next().expect("explain_prefix precedes a statement");
+        return Stmt::Explain(Box::new(build_inner_stmt(body)), kind);
+    }
+    build_inner_stmt(first)
+}
+
+/// Build the select/create/insert statement from its grammar pair.
+fn build_inner_stmt(pair: Pair<'_, Rule>) -> Stmt {
+    match pair.as_rule() {
+        Rule::select_stmt => Stmt::Select(build_select(pair)),
+        Rule::create_table_stmt => Stmt::CreateTable(build_create_table(pair)),
+        Rule::insert_stmt => Stmt::Insert(build_insert(pair)),
         other => unreachable!("unexpected statement {other:?}"),
+    }
+}
+
+/// Classify an `explain_prefix` pair: a `query plan` descendant means [`ExplainKind::QueryPlan`],
+/// otherwise it is a plain bytecode [`ExplainKind::Bytecode`].
+fn explain_kind(prefix: &Pair<'_, Rule>) -> ExplainKind {
+    if prefix
+        .clone()
+        .into_inner()
+        .any(|p| p.as_rule() == Rule::explain_query_plan)
+    {
+        ExplainKind::QueryPlan
+    } else {
+        ExplainKind::Bytecode
     }
 }
 
@@ -528,6 +554,49 @@ mod tests {
         assert!(matches!(
             &s.columns[0],
             ResultColumn::Expr { expr: Expr::Column { name, .. }, .. } if name == "select_count"
+        ));
+    }
+
+    #[test]
+    fn explain_plain_wraps_select() {
+        let stmts = parse("EXPLAIN SELECT 1;").unwrap();
+        let Stmt::Explain(inner, kind) = &stmts[0] else {
+            panic!("expected EXPLAIN")
+        };
+        assert_eq!(*kind, ExplainKind::Bytecode);
+        assert!(matches!(inner.as_ref(), Stmt::Select(_)));
+    }
+
+    #[test]
+    fn explain_query_plan_wraps_select() {
+        let stmts = parse("EXPLAIN QUERY PLAN SELECT * FROM t;").unwrap();
+        let Stmt::Explain(inner, kind) = &stmts[0] else {
+            panic!("expected EXPLAIN QUERY PLAN")
+        };
+        assert_eq!(*kind, ExplainKind::QueryPlan);
+        assert!(matches!(inner.as_ref(), Stmt::Select(_)));
+    }
+
+    #[test]
+    fn plain_select_is_not_explain() {
+        // Regression: an ordinary SELECT must still parse to `Stmt::Select`, not `Explain`.
+        assert!(matches!(&parse("SELECT 1;").unwrap()[0], Stmt::Select(_)));
+    }
+
+    #[test]
+    fn query_and_plan_are_non_reserved_identifiers() {
+        // SQLite reserves EXPLAIN but NOT `query`/`plan`, so they remain valid column names
+        // (verified against the oracle). The grammar must match that.
+        let Stmt::Select(s) = &parse("SELECT plan, query FROM t;").unwrap()[0] else {
+            panic!("expected SELECT")
+        };
+        assert!(matches!(
+            &s.columns[0],
+            ResultColumn::Expr { expr: Expr::Column { name, .. }, .. } if name == "plan"
+        ));
+        assert!(matches!(
+            &s.columns[1],
+            ResultColumn::Expr { expr: Expr::Column { name, .. }, .. } if name == "query"
         ));
     }
 }

@@ -462,6 +462,76 @@ fn misc_functions() {
     }
 }
 
+/// LIKE / GLOB via the SQL **operator** form (`X LIKE Y`, `X GLOB Y`), which lowers to the same
+/// `like(Y, X)` / `glob(Y, X)` registered functions. The bare `like(...)` / `glob(...)` *call*
+/// syntax can't be reached from SQL because the parser reserves LIKE/GLOB as keywords (exactly
+/// like `replace`/`if`), so the function-call path is pinned by `call_scalar` unit tests in
+/// `func::registry` instead. Restricted to TEXT and number operands, which are byte-identical to
+/// the oracle; BLOB operands are deliberately excluded because the operator form's
+/// `SQLITE_LIKE_DOESNT_MATCH_BLOBS` behavior is a documented divergence (see the doc comment at
+/// the top of `func/like.rs`).
+#[test]
+fn like_glob_functions_and_operators() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = standard_fixture();
+    for q in [
+        // LIKE %, _ wildcards.
+        "SELECT 'abc' LIKE 'a%', 'abc' LIKE 'a_c', 'abc' LIKE '%b%';",
+        "SELECT 'abc' LIKE 'a_', 'abc' LIKE '_b_', 'abc' LIKE '%';",
+        // ASCII-only case fold: ASCII folds, non-ASCII stays case-sensitive.
+        "SELECT 'ABC' LIKE 'abc', 'abc' LIKE 'ABC', 'À' LIKE 'à', 'À' LIKE 'À';",
+        // NULL operands → NULL.
+        "SELECT 'abc' LIKE NULL, NULL LIKE 'a%', NULL LIKE NULL;",
+        // Number operands are text-coerced (agree with the oracle for both forms).
+        "SELECT 123 LIKE '1%', 123 LIKE '123', 12.5 LIKE '12%', 12.5 LIKE '12.5';",
+        // GLOB *, ?, and [...] classes.
+        "SELECT 'abc' GLOB 'a*', 'abc' GLOB 'a?c', 'abc' GLOB '*c', 'abc' GLOB 'a?';",
+        // GLOB case-sensitive range classes.
+        "SELECT 'B' GLOB '[A-Z]', 'b' GLOB '[A-Z]', 'x' GLOB '[a-z]', '5' GLOB '[0-9]';",
+        // GLOB bracket negation uses '^'; '!' is an ordinary literal class member.
+        "SELECT 'a' GLOB '[^b]', 'b' GLOB '[^b]', '^' GLOB '[^b]';",
+        "SELECT '!' GLOB '[!b]', 'a' GLOB '[!b]', 'b' GLOB '[!b]';",
+        // GLOB number operand and NULL operands.
+        "SELECT 123 GLOB '1*', 123 GLOB '12?', 'abc' GLOB NULL, NULL GLOB 'a*';",
+        // WHERE usage (the value form is wrapped in If/IfNot by compile_jump's fallback).
+        "SELECT a, b FROM t WHERE b LIKE '%a%' ORDER BY id;",
+        "SELECT a, b FROM t WHERE b GLOB '[A-Z]*' ORDER BY id;",
+        "SELECT 1 WHERE 'abc' LIKE '%b%';",
+        "SELECT 1 WHERE 'abc' GLOB 'a*';",
+        // NOT LIKE / NOT GLOB (value form), including NULL propagation (NOT NULL = NULL).
+        "SELECT 'abc' NOT LIKE 'xyz', 'abc' NOT LIKE 'abc';",
+        "SELECT 'abc' NOT GLOB 'abc', 'abc' NOT GLOB 'xyz';",
+        "SELECT NULL NOT LIKE 'a', 'a' NOT LIKE NULL, NULL NOT GLOB 'a';",
+        // NOT LIKE / NOT GLOB in a WHERE clause.
+        "SELECT a, b FROM t WHERE b NOT LIKE '%a%' ORDER BY id;",
+        "SELECT a, b FROM t WHERE b NOT GLOB '[A-Z]*' ORDER BY id;",
+        // LIKE … ESCAPE: a `\`-escaped wildcard matches literally; a mismatch is 0.
+        "SELECT 'a%c' LIKE 'a\\%c' ESCAPE '\\', 'abc' LIKE 'a\\%c' ESCAPE '\\';",
+        "SELECT 'a_c' LIKE 'a\\_c' ESCAPE '\\';",
+        // A custom (non-`\`) escape character.
+        "SELECT 'a%c' LIKE 'a@%c' ESCAPE '@';",
+        // NOT LIKE … ESCAPE.
+        "SELECT 'abc' NOT LIKE 'a\\%c' ESCAPE '\\';",
+        // ESCAPE NULL → NULL; a numeric escape uses its text ('5') as the single escape char.
+        "SELECT 'a' LIKE 'a' ESCAPE NULL;",
+        "SELECT '5%c' LIKE '5%%c' ESCAPE '5';",
+    ] {
+        assert_same(db.str(), q);
+    }
+
+    // A bad (multi-character) ESCAPE is a runtime error in both engines; the rustsqlite error text
+    // matches the oracle's message exactly.
+    let err = rustsqlite_rows(db.str(), "SELECT 'a' LIKE 'a' ESCAPE 'xy';")
+        .expect_err("multi-char ESCAPE must error");
+    assert!(
+        err.contains("ESCAPE expression must be a single character"),
+        "unexpected ESCAPE error text: {err}"
+    );
+}
+
 /// Volatile / connection-state functions. Their *shape* is deterministic (typeof, length, the
 /// fixed 0 counters, the version string), so `assert_same` is the right oracle for everything
 /// except the raw random value — that is covered structurally in `random_values_vary` below.
@@ -506,7 +576,10 @@ fn random_values_vary() {
     let rows = match rows {
         Ok(r) if r.len() >= 2 => r,
         _ => match rustsqlite_rows(db.str(), "SELECT random(), random(), random(), random();") {
-            Ok(r) => r.first().map(|s| s.split('|').map(str::to_string).collect()).unwrap_or_default(),
+            Ok(r) => r
+                .first()
+                .map(|s| s.split('|').map(str::to_string).collect())
+                .unwrap_or_default(),
             Err(e) => panic!("rustsqlite random() error: {e}"),
         },
     };

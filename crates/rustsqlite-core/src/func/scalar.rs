@@ -119,6 +119,13 @@ fn truthy(v: &Value) -> bool {
 /// argument under SQLite's value ordering (NULL sorts lowest). Per SQLite, if *any* argument is
 /// NULL the result is NULL. `want_max` picks `max`; otherwise `min`. Comparisons use the BINARY
 /// collation, matching the oracle for these scalar forms.
+///
+/// Tie-break, faithful to `minmaxFunc`: that loop replaces the running best `iBest` when
+/// `(sqlite3MemCompare(best, cand) ^ mask) >= 0` (mask 0 for min, all-ones for max). Working it
+/// through, on an *equal* compare (different storage classes that compare numerically equal, e.g.
+/// `1` and `1.0`) **min keeps the later** argument while **max keeps the earlier** — so
+/// `min(1, 1.0)` is `1.0` but `max(1, 1.0)` is `1`. We reproduce that by replacing on
+/// `cand <= best` for min and on `cand > best` (strict) for max.
 pub fn min_max(args: &[Value], want_max: bool) -> Value {
     if args.iter().any(Value::is_null) {
         return Value::Null;
@@ -127,9 +134,9 @@ pub fn min_max(args: &[Value], want_max: bool) -> Value {
     for cand in &args[1..] {
         let ord = mem_compare(cand, best, Collation::Binary);
         let take = if want_max {
-            ord == Ordering::Greater
+            ord == Ordering::Greater // strict: keep the earlier on a tie
         } else {
-            ord == Ordering::Less
+            ord != Ordering::Greater // Less or Equal: take the later on a tie
         };
         if take {
             best = cand;

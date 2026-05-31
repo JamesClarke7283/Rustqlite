@@ -8,7 +8,7 @@ use rustsqlite_core::{sqlite3_open_v2, sqlite3_prepare_v2, Value};
 
 use crate::cli::Cli;
 use crate::dot_cmd::{self, Flow};
-use crate::output::format_rows;
+use crate::output::{format_rows, render_eqp_tree, render_explain_bytecode};
 use crate::state::ShellState;
 
 /// Run the shell to completion, returning the process exit code.
@@ -111,6 +111,10 @@ fn handle_sql(state: &mut ShellState, sql: &str) -> bool {
     let columns: Vec<String> = (0..ncol)
         .map(|i| stmt.column_name(i).unwrap_or("").to_string())
         .collect();
+    // The shell renders EXPLAIN regardless of the active `.mode`: plain EXPLAIN as a fixed
+    // columnar table, EXPLAIN QUERY PLAN as the `QUERY PLAN` tree. 0 = normal, 1 = EXPLAIN,
+    // 2 = EXPLAIN QUERY PLAN (mirrors sqlite3_stmt_isexplain).
+    let explain_kind = stmt.explain_kind();
 
     let mut rows: Vec<Vec<Value>> = Vec::new();
     loop {
@@ -127,7 +131,14 @@ fn handle_sql(state: &mut ShellState, sql: &str) -> bool {
     }
 
     if ncol > 0 {
-        print!("{}", format_rows(mode, state, &columns, &rows));
+        match explain_kind {
+            // EXPLAIN QUERY PLAN: the tree, not a column table, regardless of `.mode`.
+            2 => print!("{}", render_eqp_tree(&rows)),
+            // Plain EXPLAIN: a fixed columnar table (addr|opcode|p1|p2|p3|p4|p5|comment),
+            // headers on, regardless of the user's `.mode`.
+            1 => print!("{}", render_explain_bytecode(&columns, &rows)),
+            _ => print!("{}", format_rows(mode, state, &columns, &rows)),
+        }
     }
     false
 }

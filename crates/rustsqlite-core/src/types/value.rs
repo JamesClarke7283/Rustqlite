@@ -47,25 +47,82 @@ impl Value {
         }
     }
 
-    /// Best-effort integer interpretation, as `sqlite3_value_int64`: INTEGER as itself, REAL
-    /// truncated toward zero, TEXT parsed (0 if not numeric), BLOB/NULL as 0.
+    /// Integer interpretation, faithful to `sqlite3_value_int64`: INTEGER as itself, REAL
+    /// truncated toward zero, TEXT/BLOB parsed via SQLite's **leading numeric prefix** (a BLOB is
+    /// interpreted as its bytes-as-text first), and `0` when there is no numeric prefix or for
+    /// NULL. (`'10x'` → 10, `'abc'` → 0, `x'2d35'` = `"-5"` → -5.)
     pub fn as_i64(&self) -> i64 {
         match self {
             Value::Int(i) => *i,
             Value::Real(r) => *r as i64,
-            Value::Text(s) => s.trim().parse().unwrap_or(0),
-            _ => 0,
+            Value::Text(s) => prefix_i64(s),
+            Value::Blob(b) => prefix_i64(&String::from_utf8_lossy(b)),
+            Value::Null => 0,
         }
     }
 
-    /// Best-effort floating-point interpretation, as `sqlite3_value_double`.
+    /// Floating-point interpretation, faithful to `sqlite3_value_double`: INTEGER/REAL directly,
+    /// TEXT/BLOB via SQLite's **leading numeric prefix** (`sqlite3AtoF`-style, a BLOB read as its
+    /// bytes-as-text), and `0.0` when there is no numeric prefix or for NULL. This is the
+    /// coercion the math functions and boolean truthiness use; it does NOT require the *whole*
+    /// string to be numeric (`'3.5x'` → 3.5, `'abc'` → 0.0).
     pub fn as_f64(&self) -> f64 {
         match self {
             Value::Int(i) => *i as f64,
             Value::Real(r) => *r,
-            Value::Text(s) => s.trim().parse().unwrap_or(0.0),
-            _ => 0.0,
+            Value::Text(s) => prefix_f64(s),
+            Value::Blob(b) => prefix_f64(&String::from_utf8_lossy(b)),
+            Value::Null => 0.0,
         }
+    }
+
+    /// The storage-class code from `sqlite3_value_numeric_type`: like [`storage_class`], but a
+    /// **TEXT** value whose *entire* content is a valid number reports `INTEGER`(1)/`FLOAT`(2)
+    /// instead of `TEXT`(3). A BLOB is never promoted (it stays `BLOB`=4), matching upstream
+    /// (`sqlite3_value_numeric_type` only applies numeric affinity to TEXT). The math functions
+    /// (`math1`/`math2`/`ceil`/`floor`/`trunc`/`sign`/`log`) use this to gate a non-numeric
+    /// argument to NULL — distinct from [`as_f64`], which parses a leading prefix.
+    ///
+    /// [`storage_class`]: Value::storage_class
+    /// [`as_f64`]: Value::as_f64
+    pub fn numeric_type(&self) -> i32 {
+        match self {
+            Value::Int(_) => 1,
+            Value::Real(_) => 2,
+            Value::Blob(_) => 4,
+            Value::Null => 5,
+            Value::Text(s) => match crate::util::numeric_prefix(s) {
+                (Some(Value::Int(_)), true) => 1,
+                (Some(Value::Real(_)), true) => 2,
+                _ => 3, // not fully numeric → stays TEXT
+            },
+        }
+    }
+
+    /// True when [`numeric_type`](Value::numeric_type) is INTEGER or FLOAT — the gate the math
+    /// functions apply (a non-numeric argument yields NULL).
+    pub fn is_numeric(&self) -> bool {
+        matches!(self.numeric_type(), 1 | 2)
+    }
+}
+
+/// `f64` value of the leading numeric prefix of `s` (`sqlite3_value_double` text path): the
+/// prefix value, or `0.0` if there is none.
+fn prefix_f64(s: &str) -> f64 {
+    match crate::util::numeric_prefix(s).0 {
+        Some(Value::Int(i)) => i as f64,
+        Some(Value::Real(r)) => r,
+        _ => 0.0,
+    }
+}
+
+/// `i64` value of the leading numeric prefix of `s` (`sqlite3_value_int64` text path): an integer
+/// prefix as itself, a real-valued prefix truncated toward zero, else `0`.
+fn prefix_i64(s: &str) -> i64 {
+    match crate::util::numeric_prefix(s).0 {
+        Some(Value::Int(i)) => i,
+        Some(Value::Real(r)) => r as i64,
+        _ => 0,
     }
 }
 

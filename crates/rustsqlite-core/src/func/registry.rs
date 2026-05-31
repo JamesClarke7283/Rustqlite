@@ -6,6 +6,7 @@
 use crate::error::{Error, Result};
 use crate::types::Value;
 
+use super::like;
 use super::math;
 use super::scalar;
 use super::string;
@@ -30,6 +31,8 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         ("nullif", 2) => Ok(scalar::nullif(&args[0], &args[1])),
 
         // ---- misc scalars (M3b) ----
+        // 2-arg `iif(X, Y)` is shorthand for `iif(X, Y, NULL)` (upstream accepts both arities).
+        ("iif" | "if", 2) => Ok(scalar::iif(&args[0], &args[1], &Value::Null)),
         ("iif" | "if", 3) => Ok(scalar::iif(&args[0], &args[1], &args[2])),
         ("min", n) if n >= 2 => Ok(scalar::min_max(args, false)),
         ("max", n) if n >= 2 => Ok(scalar::min_max(args, true)),
@@ -55,6 +58,9 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         ("concat_ws", n) if n >= 2 => Ok(string::concat_ws(args)),
         ("quote", 1) => Ok(string::quote(&args[0])),
         ("octet_length", 1) => Ok(string::octet_length(&args[0])),
+        ("like", 2) => Ok(like::like(&args[0], &args[1], None)?),
+        ("like", 3) => Ok(like::like(&args[0], &args[1], Some(&args[2]))?),
+        ("glob", 2) => Ok(like::glob(&args[0], &args[1])),
 
         // ---- math functions (M3b) ----
         ("sqrt", 1) => Ok(math::sqrt(&args[0])),
@@ -104,8 +110,8 @@ pub fn check(name: &str, n_arg: usize) -> Result<()> {
         "coalesce" => Some(n_arg >= 2),
         "ifnull" | "nullif" => Some(n_arg == 2),
 
-        // misc scalars (M3b)
-        "iif" | "if" => Some(n_arg == 3),
+        // misc scalars (M3b) — `iif(X,Y)` ≡ `iif(X,Y,NULL)`, so arity 2 or 3.
+        "iif" | "if" => Some(n_arg == 2 || n_arg == 3),
         "min" | "max" => Some(n_arg >= 2),
         "zeroblob" => Some(n_arg == 1),
         "likely" | "unlikely" => Some(n_arg == 1),
@@ -123,6 +129,8 @@ pub fn check(name: &str, n_arg: usize) -> Result<()> {
         "concat_ws" => Some(n_arg >= 2),
         "quote" => Some(n_arg == 1),
         "octet_length" => Some(n_arg == 1),
+        "like" => Some(n_arg == 2 || n_arg == 3),
+        "glob" => Some(n_arg == 2),
 
         // math functions (M3b)
         "sqrt" | "exp" | "ln" | "log10" | "log2" | "ceil" | "ceiling" | "floor" | "trunc"
@@ -192,11 +200,18 @@ mod tests {
             assert_eq!(cs(&[t("x"), t("a"), t("b")]), t("b"));
             assert_eq!(cs(&[t("0"), t("a"), t("b")]), t("b"));
             assert_eq!(cs(&[Value::Real(2.5), t("a"), t("b")]), t("a"));
+            // The 2-arg form `iif(X, Y)` ≡ `iif(X, Y, NULL)`: Y when truthy, else NULL.
+            assert_eq!(cs(&[Value::Int(1), t("a")]), t("a"));
+            assert_eq!(cs(&[Value::Int(0), t("a")]), Value::Null);
+            assert_eq!(cs(&[Value::Null, t("a")]), Value::Null);
         }
-        // `check` accepts both names at arity 3 and rejects other arities.
+        // `check` accepts both names at arity 2 and 3 and rejects other arities.
+        assert!(check("iif", 2).is_ok());
         assert!(check("iif", 3).is_ok());
+        assert!(check("if", 2).is_ok());
         assert!(check("if", 3).is_ok());
-        assert!(check("if", 2).is_err());
+        assert!(check("if", 1).is_err());
+        assert!(check("iif", 4).is_err());
     }
 
     #[test]

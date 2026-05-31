@@ -95,6 +95,32 @@ fn output_modes_match_oracle() {
 }
 
 #[test]
+fn json_mode_real_exponents_match_oracle() {
+    // REAL rendering in `.mode json`: the decimal/exponential boundary (1e15 decimal, 1e16
+    // exponential), positive exponents (kept, e.g. `1.0e+17`), the zero-padded negative exponent
+    // (`1.0e-07`), multi-digit mantissas, signed values, -0.0, and the Inf sentinel — all must be
+    // byte-identical to the oracle. Aliased so column names are stable across both engines.
+    let Some((dir, db)) = make_fixture("jsonexp") else {
+        return;
+    };
+    let rustqlite = env!("CARGO_BIN_EXE_rustsqlite");
+    let query = "SELECT 1e15 AS a, 1e16 AS b, 1e17 AS c, 5e22 AS d, 9.99e19 AS e, \
+                 -1e25 AS f, 1e-7 AS g, 1e-308 AS h, 2.5e-100 AS i, 1.5e300 AS j, 1.0 AS k, \
+                 -0.0 AS l, 3.14 AS m, 0.0001 AS n, 1e1000 AS o, -1e1000 AS p;";
+    let args = [".mode json", query];
+    let oracle = run(ORACLE, "-readonly", &db, &args);
+    let ours = run(rustqlite, "--readonly", &db, &args);
+    assert_eq!(
+        ours,
+        oracle,
+        "\n oracle={:?}\n  ours ={:?}",
+        String::from_utf8_lossy(&oracle),
+        String::from_utf8_lossy(&ours)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn mode_insert_table_arg_matches_oracle() {
     let Some((dir, db)) = make_fixture("ins") else {
         return;

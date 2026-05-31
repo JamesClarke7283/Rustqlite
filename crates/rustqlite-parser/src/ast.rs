@@ -15,6 +15,18 @@ pub enum Stmt {
     Select(SelectStmt),
     CreateTable(CreateTable),
     Insert(InsertStmt),
+    /// `EXPLAIN <stmt>` / `EXPLAIN QUERY PLAN <stmt>`. The inner statement is boxed (it is the
+    /// large variant). `kind` distinguishes the bytecode listing from the query-plan tree.
+    Explain(Box<Stmt>, ExplainKind),
+}
+
+/// Which form of `EXPLAIN` prefixed the statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplainKind {
+    /// Plain `EXPLAIN` — the VDBE bytecode listing.
+    Bytecode,
+    /// `EXPLAIN QUERY PLAN` — the high-level query plan tree.
+    QueryPlan,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -69,8 +69,10 @@ Built bottom-up so each layer is verified against real SQLite before the next.
 - **M1 — File format (read)** 🚧 — format codecs + async VFS + read-only pager + table-b-tree read cursor;
   open a real C-SQLite `.db` and read `sqlite_schema`.
 - **M2 — Parser** — full `parse.y` → pest grammar + AST + Pratt expressions.
-- **M3 — Read query path** — codegen + VDBE for `SELECT`, affinity, scalar funcs, `EXPLAIN`.
-- **M4 — Write path** — pager write + rollback journal + crash recovery; DML/DDL; b-tree balance.
+- **M3 — Read query path** ✅ — codegen + VDBE for `SELECT`, affinity, the full scalar-function set
+  (string/math/misc + `LIKE`/`GLOB`), all shell output modes, and `EXPLAIN` / `EXPLAIN QUERY PLAN`.
+- **M4 — Write path** 🚧 — pager write + rollback journal + crash recovery; DML/DDL; b-tree balance;
+  plus the `sqllogictest` harness (deferred here from M3 — its `.slt` corpora need `CREATE`/`INSERT`).
 - **M5 — Indexes & planner basics** · **M6 — Transactions & richer SQL** · **M7 — Advanced SQL**
   · **M8 — WAL & durability** · **M9 — Conformance hardening**.
 

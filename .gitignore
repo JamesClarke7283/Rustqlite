@@ -2,6 +2,9 @@
 **/*.rs.bk
 Cargo.lock.orig
 
+# Local agent/harness state (e.g. scheduled-task locks); never part of the project.
+/.claude/
+
 # Scratch databases produced by manual testing / differential runs.
 /*.db
 /*.db-journal

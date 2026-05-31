@@ -5,6 +5,7 @@
 //! scalars arrive in later milestones. Function names and edge-case behavior mirror upstream
 //! exactly (verified against the `sqlite3` binary).
 
+pub mod like;
 pub mod math;
 pub mod registry;
 pub mod scalar;

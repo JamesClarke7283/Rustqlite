@@ -92,4 +92,14 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   path. CLI runs `SELECT` in `list`/`csv`/`column` modes. Differential-tested against `sqlite3` 3.53.1.
   Deferred to **M3b**: `EXPLAIN`/`EXPLAIN QUERY PLAN`, the full scalar-function set, the remaining output
   modes, and the `sqllogictest` harness.
-- **M3b+ — write path, indexes, joins, aggregates, …**: pending.
+- **M3b — Read-path completion**: ✅ `EXPLAIN` (golden-tested bytecode renderer) and `EXPLAIN QUERY PLAN`
+  (oracle-matched `detail` wording, shell-faithful tree in the CLI); the full scalar set — string
+  (`instr`/`replace`/`trim`/`hex`/`unhex`/`char`/`unicode`/`concat`/`quote`/…), math
+  (`sqrt`/`ln`/`log`/trig/`pow`/`mod`/`pi`/…), and misc (`iif`/`min`/`max`/`coalesce`/`nullif`/…);
+  `LIKE`/`GLOB` (a faithful `patternCompare` port, ASCII-only case fold, GLOB classes, 3-arg `ESCAPE`);
+  volatile/connection functions (`random`/`randomblob`/`changes`/`sqlite_version`/…); and all shell
+  output modes (list/csv/column/line/quote/tabs/ascii/html/markdown/box/table/json/insert).
+  Moved to **M4**: the `sqllogictest` harness (its `.slt` corpora need the write path — `CREATE`/`INSERT`).
+- **M4 — Write path** (in progress): mutable pager + rollback journal + crash recovery, single-leaf
+  b-tree insert, `CREATE TABLE`/`INSERT`, then b-tree balance, overflow, `DELETE`/`UPDATE`, indexes, WAL.
+- **M5+ — indexes, joins, aggregates, subqueries, …**: pending.

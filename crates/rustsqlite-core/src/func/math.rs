@@ -26,17 +26,21 @@ fn real_or_null(r: f64) -> Value {
     }
 }
 
-/// Apply a unary `f64 -> f64` to `X` (NULL→NULL); a NaN result becomes NULL, `±Inf` is kept.
+/// Apply a unary `f64 -> f64` to `X`; a NaN result becomes NULL, `±Inf` is kept. Mirrors
+/// `math1Func`, which gates on `sqlite3_value_numeric_type`: a non-numeric argument (NULL, a
+/// non-fully-numeric string, or any BLOB) yields NULL *before* the function runs.
 fn math1(x: &Value, f: impl Fn(f64) -> f64) -> Value {
-    if x.is_null() {
+    if !x.is_numeric() {
         return Value::Null;
     }
     real_or_null(f(x.as_f64()))
 }
 
-/// Apply a binary `f64 -> f64` to `(X, Y)` (NULL→NULL); a NaN result becomes NULL, `±Inf` is kept.
+/// Apply a binary `f64 -> f64` to `(X, Y)`; a NaN result becomes NULL, `±Inf` is kept. Mirrors
+/// `math2Func`, which gates *each* argument on `sqlite3_value_numeric_type` (any non-numeric
+/// argument → NULL).
 fn math2(x: &Value, y: &Value, f: impl Fn(f64, f64) -> f64) -> Value {
-    if x.is_null() || y.is_null() {
+    if !x.is_numeric() || !y.is_numeric() {
         return Value::Null;
     }
     real_or_null(f(x.as_f64(), y.as_f64()))
@@ -71,10 +75,11 @@ pub fn log2(x: &Value) -> Value {
     log_one(x, f64::log2)
 }
 
-/// Shared one-argument log shape: NULL→NULL, then SQLite's `if(x<=0.0) return;` domain guard
-/// (so `0`/negatives are NULL, never `-Inf`/NaN), otherwise the computed REAL.
+/// Shared one-argument log shape: `logFunc` gates the argument on `sqlite3_value_numeric_type`
+/// (non-numeric → NULL), then applies SQLite's `if(x<=0.0) return;` domain guard (so `0`/negatives
+/// are NULL, never `-Inf`/NaN), otherwise the computed REAL.
 fn log_one(x: &Value, f: impl Fn(f64) -> f64) -> Value {
-    if x.is_null() {
+    if !x.is_numeric() {
         return Value::Null;
     }
     let xx = x.as_f64();
@@ -89,23 +94,28 @@ fn log_one(x: &Value, f: impl Fn(f64) -> f64) -> Value {
 /// `log(X)/log(B)` using the **natural** log (C `log`), and bails to NULL when `X<=0`, `B<=0`, or
 /// `log(B)<=0` (i.e. `B<=1`). Using `ln` (not `log10`) is required to reproduce the exact
 /// floating-point rounding, e.g. `log(10,1000)` → `2.9999999999999996`, not `3.0`.
+///
+/// Coercion asymmetry, faithful to `logFunc`: the **base** `B` is gated on
+/// `sqlite3_value_numeric_type` (a non-numeric base → NULL), but the **argument** `X` is read with
+/// `sqlite3_value_double` — its *leading numeric prefix* — so `log(10, '10x')` is `1.0` and
+/// `log(10, x'31303030')` (the blob `"1000"`) is `~3`, while `log('2x', 8)` is NULL.
 pub fn log_base(b: &Value, x: &Value) -> Value {
-    if b.is_null() || x.is_null() {
+    if !b.is_numeric() {
         return Value::Null;
     }
     let bb = b.as_f64();
-    let xx = x.as_f64();
+    if bb <= 0.0 {
+        return Value::Null; // first `if(x<=0.0) return;` (x == base here)
+    }
+    let ln_b = bb.ln();
+    if ln_b <= 0.0 {
+        return Value::Null; // `b = log(x_base); if( b<=0.0 ) return;` → base <= 1
+    }
+    let xx = x.as_f64(); // value_double(argv[1]) — leading prefix, no numeric_type gate
     if xx <= 0.0 {
         return Value::Null;
     }
-    let ln_b = bb.ln();
-    // SQLite checks `b = log(x_base); if( b<=0.0 ) return;`. `ln_b` is `<=0`, NaN (B<=0), or `0`
-    // (B==1) in the reject cases; only a strictly-positive base survives.
-    if ln_b > 0.0 {
-        real_or_null(xx.ln() / ln_b)
-    } else {
-        Value::Null
-    }
+    real_or_null(xx.ln() / ln_b)
 }
 
 // ---- rounding family ----
@@ -125,13 +135,15 @@ pub fn trunc(x: &Value) -> Value {
     round_like(x, f64::trunc)
 }
 
-/// Shared shape for ceil/floor/trunc: NULL→NULL, INTEGER passes through unchanged, anything else
-/// is coerced to REAL and the rounding applied, returning REAL.
+/// Shared shape for ceil/floor/trunc (`ceilingFunc`): gate on `sqlite3_value_numeric_type` — an
+/// INTEGER (including whole-numeric text such as `'5'`) passes through as INTEGER, a FLOAT (or
+/// fully-numeric float text) is rounded and returned as REAL, and anything non-numeric (a
+/// non-fully-numeric string, any BLOB, or NULL) yields NULL.
 fn round_like(x: &Value, f: impl Fn(f64) -> f64) -> Value {
-    match x {
-        Value::Null => Value::Null,
-        Value::Int(i) => Value::Int(*i),
-        other => Value::Real(f(other.as_f64())),
+    match x.numeric_type() {
+        1 => Value::Int(x.as_i64()),
+        2 => Value::Real(f(x.as_f64())),
+        _ => Value::Null,
     }
 }
 
@@ -142,9 +154,10 @@ pub fn pow(x: &Value, y: &Value) -> Value {
     math2(x, y, f64::powf)
 }
 
-/// `mod(X, Y)` — floating-point remainder (C `fmod`). `mod(X, 0)` → NULL.
+/// `mod(X, Y)` — floating-point remainder (C `fmod`). A `math2Func`: each argument is gated on
+/// `sqlite3_value_numeric_type` (non-numeric → NULL), and `mod(X, 0)` → NULL.
 pub fn mod_(x: &Value, y: &Value) -> Value {
-    if x.is_null() || y.is_null() {
+    if !x.is_numeric() || !y.is_numeric() {
         return Value::Null;
     }
     let yy = y.as_f64();
@@ -154,21 +167,20 @@ pub fn mod_(x: &Value, y: &Value) -> Value {
     real_or_null(x.as_f64() % yy)
 }
 
-/// `sign(X)` — `-1`, `0`, or `1` as INTEGER (NULL or non-numeric → NULL). Mirrors `signFunc`,
-/// which only acts on numeric storage classes.
+/// `sign(X)` — `-1`, `0`, or `1` as INTEGER. Mirrors `signFunc`, which gates on
+/// `sqlite3_value_numeric_type`: INTEGER/FLOAT (including fully-numeric text such as `'5'` or
+/// `'-2.5'`) yield the sign, while NULL, a non-fully-numeric string, or any BLOB yield NULL.
 pub fn sign(x: &Value) -> Value {
-    let r = match x {
-        Value::Int(i) => *i as f64,
-        Value::Real(r) => *r,
-        // TEXT/BLOB/NULL are not numeric → NULL (verified against the oracle).
-        _ => return Value::Null,
-    };
+    if !x.is_numeric() {
+        return Value::Null;
+    }
+    let r = x.as_f64();
     if r > 0.0 {
         Value::Int(1)
     } else if r < 0.0 {
         Value::Int(-1)
     } else {
-        // 0.0 and -0.0 → 0; NaN can't occur here for stored values.
+        // 0.0 and -0.0 → 0; NaN can't occur here for a value that passed the numeric gate.
         Value::Int(0)
     }
 }

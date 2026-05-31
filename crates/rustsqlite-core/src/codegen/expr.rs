@@ -215,7 +215,19 @@ fn compile_binary(
             b.emit(opcode, rl, rr, target);
             Ok(())
         }
-        BinaryOp::Like | BinaryOp::Glob => Err(Error::msg("LIKE/GLOB are not supported in M3a")),
+        BinaryOp::Like | BinaryOp::Glob => {
+            // Lower `X LIKE Y` to `like(Y, X)` and `X GLOB Y` to `glob(Y, X)` — upstream passes
+            // the pattern first. Mirror the `Expr::Function` lowering above: a contiguous arg
+            // block, then one `Opcode::Function` with `p4 = Symbol(name)`, `p5 = nArg`.
+            let name = if op == BinaryOp::Like { "like" } else { "glob" };
+            let start = b.alloc_regs(2);
+            compile_expr(b, right, start, ctx)?; // pattern (Y) → first arg
+            compile_expr(b, left, start + 1, ctx)?; // value (X) → second arg
+            let idx = b.emit(Opcode::Function, 0, start, target);
+            b.set_p4(idx, P4::Symbol(name.to_string()));
+            b.set_p5(idx, 2);
+            Ok(())
+        }
         _ => unreachable!("binary op already handled"),
     }
 }

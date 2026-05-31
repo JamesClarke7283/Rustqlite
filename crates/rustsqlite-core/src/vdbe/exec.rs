@@ -68,7 +68,8 @@ impl RuntimeCtx {
         static SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
         let bump = SEED_COUNTER.fetch_add(1, Ordering::Relaxed);
         // Mix the pid and counter through splitmix64's finalizer so even adjacent seeds diverge.
-        let mut seed = (u64::from(std::process::id()) << 32) ^ bump.wrapping_mul(0x9e3779b97f4a7c15);
+        let mut seed =
+            (u64::from(std::process::id()) << 32) ^ bump.wrapping_mul(0x9e3779b97f4a7c15);
         seed = (seed ^ (seed >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
         seed = (seed ^ (seed >> 27)).wrapping_mul(0x94d049bb133111eb);
         RuntimeCtx {
@@ -745,7 +746,10 @@ fn to_num(v: &Value) -> Option<Num> {
         Value::Int(i) => Some(Num::I(*i)),
         Value::Real(r) => Some(Num::R(*r)),
         Value::Text(s) => Some(parse_num(s)),
-        Value::Blob(_) => Some(Num::I(0)),
+        // A BLOB is coerced through its bytes-as-text, then the same leading-prefix parse as TEXT
+        // (`sqlite3VdbeMemNumerify` runs `sqlite3AtoF`/`Atoi64` over the raw bytes), so e.g.
+        // `x'2d35'` (the bytes `"-5"`) arithmetises as `-5`, matching the oracle.
+        Value::Blob(b) => Some(parse_num(&String::from_utf8_lossy(b))),
     }
 }
 

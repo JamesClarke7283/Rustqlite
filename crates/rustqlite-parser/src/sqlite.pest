@@ -89,6 +89,7 @@ K_NOT           = @{ ^"not"           ~ !ident_cont }
 K_IS            = @{ ^"is"            ~ !ident_cont }
 K_LIKE          = @{ ^"like"          ~ !ident_cont }
 K_GLOB          = @{ ^"glob"          ~ !ident_cont }
+K_ESCAPE        = @{ ^"escape"        ~ !ident_cont }
 K_IN            = @{ ^"in"            ~ !ident_cont }
 K_COLLATE       = @{ ^"collate"       ~ !ident_cont }
 K_CAST          = @{ ^"cast"          ~ !ident_cont }
@@ -98,19 +99,33 @@ K_ABORT         = @{ ^"abort"         ~ !ident_cont }
 K_FAIL          = @{ ^"fail"          ~ !ident_cont }
 K_IGNORE        = @{ ^"ignore"        ~ !ident_cont }
 K_ROLLBACK      = @{ ^"rollback"      ~ !ident_cont }
+K_EXPLAIN       = @{ ^"explain"       ~ !ident_cont }
+// QUERY and PLAN are matched only after EXPLAIN (in `explain_query_plan`); they are
+// deliberately NOT in the aggregate `keyword` rule below, because — unlike EXPLAIN — SQLite
+// does NOT reserve them: `query` and `plan` are valid identifiers (e.g. column names). Only
+// EXPLAIN is a fully reserved keyword, so only it joins `keyword`.
+K_QUERY         = @{ ^"query"         ~ !ident_cont }
+K_PLAN          = @{ ^"plan"          ~ !ident_cont }
 
 keyword = @{
       K_SELECT | K_ALL | K_DISTINCT | K_FROM | K_WHERE | K_GROUP | K_BY | K_HAVING
     | K_ORDER | K_ASC | K_DESC | K_LIMIT | K_OFFSET | K_AS | K_CREATE | K_TEMPORARY
     | K_TEMP | K_TABLE | K_IF | K_EXISTS | K_PRIMARY | K_KEY | K_AUTOINCREMENT
     | K_UNIQUE | K_DEFAULT | K_INSERT | K_REPLACE | K_INTO | K_VALUES | K_NULL
-    | K_TRUE | K_FALSE | K_AND | K_OR | K_NOT | K_IS | K_LIKE | K_GLOB | K_IN
+    | K_TRUE | K_FALSE | K_AND | K_OR | K_NOT | K_IS | K_LIKE | K_GLOB | K_ESCAPE | K_IN
     | K_COLLATE | K_CAST | K_ON | K_CONFLICT | K_ABORT | K_FAIL | K_IGNORE | K_ROLLBACK
+    | K_EXPLAIN
 }
 
 // ---- Top level: a list of statements separated/terminated by ';' ----
 sql = { SOI ~ statement? ~ (";" ~ statement?)* ~ EOI }
-statement = { select_stmt | create_table_stmt | insert_stmt }
+statement = { explain_prefix? ~ (select_stmt | create_table_stmt | insert_stmt) }
+
+// `EXPLAIN` / `EXPLAIN QUERY PLAN` may prefix a statement. The query-plan form is tried first
+// (it is the more specific, longer match).
+explain_query_plan = { K_EXPLAIN ~ K_QUERY ~ K_PLAN }
+explain_plain = { K_EXPLAIN }
+explain_prefix = { explain_query_plan | explain_plain }
 
 qualified_name = { ident ~ ("." ~ ident)? }
 
@@ -177,7 +192,14 @@ values_clause = { K_VALUES ~ value_row ~ ("," ~ value_row)* }
 value_row = { "(" ~ expr ~ ("," ~ expr)* ~ ")" }
 
 // ---- Expressions (folded by PrattParser in expr.rs) ----
-expr = { prefix* ~ primary ~ (infix ~ prefix* ~ primary)* }
+// `ESCAPE Z` is grammatically valid ONLY immediately after a `<operand> LIKE/NOT-LIKE <operand>`
+// comparison — never after GLOB (where `X GLOB Y ESCAPE Z` is a syntax error in SQLite). The
+// `like_clause` alternative wires `op_escape` only into the LIKE family; every other operator uses
+// the plain `other_infix`. The flat operator stream is then folded by the PrattParser (expr.rs),
+// where `op_escape` is an infix binding LOOSER than LIKE so the comparison folds first.
+expr = { prefix* ~ primary ~ (like_clause | other_infix)* }
+like_clause = _{ (op_not_like | op_like) ~ prefix* ~ primary ~ (op_escape ~ prefix* ~ primary)? }
+other_infix = _{ infix ~ prefix* ~ primary }
 primary = _{ literal | func_call | column_ref | "(" ~ expr ~ ")" }
 
 literal = { number | string | blob | bind_param | K_NULL | K_TRUE | K_FALSE }
@@ -193,9 +215,12 @@ prefix = _{ neg | pos | K_NOT }
 neg = { "-" }
 pos = { "+" }
 
+// The generic infix set. The LIKE family (`op_like`/`op_not_like`) is matched ONLY via `like_clause`
+// (so an ESCAPE may follow), so they are intentionally absent here.
 infix = _{
       op_or | op_and | op_concat | op_eq | op_ne | op_le | op_ge | op_lt | op_gt
-    | op_add | op_sub | op_mul | op_div | op_mod | op_isnot | op_is | op_like | op_glob
+    | op_add | op_sub | op_mul | op_div | op_mod | op_isnot | op_is
+    | op_not_glob | op_glob
 }
 op_or = { K_OR }
 op_and = { K_AND }
@@ -216,3 +241,11 @@ op_isnot = { K_IS ~ K_NOT }
 op_is = { K_IS }
 op_like = { K_LIKE }
 op_glob = { K_GLOB }
+// `NOT LIKE` / `NOT GLOB`: matched (in `like_clause`/`infix`) before the bare forms so the leading
+// NOT is not parsed as a prefix operator. They lower (expr.rs) to `NOT (X LIKE Y)` / `NOT (X GLOB Y)`.
+op_not_like = { K_NOT ~ K_LIKE }
+op_not_glob = { K_NOT ~ K_GLOB }
+// `op_escape` is the `ESCAPE` keyword of a LIKE clause (`X LIKE Y ESCAPE Z`); the Pratt builder
+// (expr.rs) treats it as an infix operator joining the LIKE comparison to its escape operand and
+// rewrites the result to the 3-arg `like(Y, X, Z)` builtin. Wired only after LIKE (`like_clause`).
+op_escape = { K_ESCAPE }

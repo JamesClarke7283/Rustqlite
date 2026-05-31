@@ -70,11 +70,18 @@ const GLOB_INFO: CompareInfo = CompareInfo {
 
 /// `like(pattern, str)` / `like(pattern, str, escape)` — registered scalar.
 ///
-/// Returns `Int(1)`/`Int(0)` for match/no-match, `Null` if `pattern` or `text` is NULL. A
-/// supplied escape that is NULL, empty, or longer than one character is an error (`Result::Err`),
-/// matching the oracle's `ESCAPE expression must be a single character`.
+/// Returns `Int(1)`/`Int(0)` for match/no-match, `Null` if `pattern` or `text` is NULL. A supplied
+/// escape that is empty or longer than one character is an error (`Result::Err`), matching the
+/// oracle's `ESCAPE expression must be a single character`. A NULL escape yields `Null` (matching
+/// upstream `likeFunc`, which returns the unset/NULL result), not an error.
 pub fn like(pattern: &Value, text: &Value, escape: Option<&Value>) -> Result<Value> {
     if pattern.is_null() || text.is_null() {
+        return Ok(Value::Null);
+    }
+    // A NULL escape argument makes the whole result NULL (not an error): upstream `likeFunc`
+    // does `zEsc = sqlite3_value_text(argv[2]); if( zEsc==0 ) return;`, leaving the result unset
+    // (i.e. NULL). Verified against the oracle: `'a' LIKE 'a' ESCAPE NULL` → NULL.
+    if matches!(escape, Some(Value::Null)) {
         return Ok(Value::Null);
     }
     // The default LIKE escape is `\0` (no escape). `matchOther` is the escape char for LIKE.
@@ -96,14 +103,15 @@ pub fn glob(pattern: &Value, text: &Value) -> Value {
 }
 
 /// Validate the optional 3rd `like()` argument: it must be exactly one Unicode character. A
-/// missing argument yields `None`; a NULL, empty, or multi-character escape is an error whose
-/// message matches the oracle.
+/// missing argument yields `None`; an empty or multi-character escape is an error whose message
+/// matches the oracle. A NULL escape is handled by the caller ([`like`]) — it makes the whole
+/// result NULL — so it never reaches here; it is treated defensively as a bad escape.
 fn parse_escape(escape: Option<&Value>) -> Result<Option<char>> {
     let ev = match escape {
         None => return Ok(None),
         Some(ev) => ev,
     };
-    let s = ev.to_text().ok_or_else(escape_error)?; // NULL escape → error (matches the oracle)
+    let s = ev.to_text().ok_or_else(escape_error)?;
     let mut chars = s.chars();
     match (chars.next(), chars.next()) {
         (Some(c), None) => Ok(Some(c)),
@@ -155,7 +163,12 @@ fn read(chars: &[char], i: &mut usize) -> char {
 /// Faithful port of `patternCompare` (`func.c`). `match_other` is the escape character for LIKE
 /// (or `'\0'` for none) and `'['` for GLOB. Operates over Unicode characters (the `Vec<char>`
 /// stands in for the C UTF-8 cursor, with index arithmetic replacing pointer arithmetic).
-fn pattern_compare(pattern: &[char], string: &[char], info: &CompareInfo, match_other: char) -> bool {
+fn pattern_compare(
+    pattern: &[char],
+    string: &[char],
+    info: &CompareInfo,
+    match_other: char,
+) -> bool {
     compare(pattern, 0, string, 0, info, match_other) == Outcome::Match
 }
 
@@ -186,10 +199,8 @@ fn compare(
             // Skip runs of matchAll; each interleaved matchOne consumes one input char.
             let mut c = read(pattern, &mut pi);
             while c == match_all || (c == match_one && match_one != '\0') {
-                if c == match_one {
-                    if read(string, &mut si) == '\0' {
-                        return Outcome::NoWildcardMatch;
-                    }
+                if c == match_one && read(string, &mut si) == '\0' {
+                    return Outcome::NoWildcardMatch;
                 }
                 c = read(pattern, &mut pi);
             }
@@ -311,7 +322,11 @@ fn match_set(pattern: &[char], pi: &mut usize, string: &[char], si: &mut usize) 
     }
     while c2 != '\0' && c2 != ']' {
         // `zPattern[0]` in the C — the next unread pattern char (or `\0`).
-        let next = if *pi < pattern.len() { pattern[*pi] } else { '\0' };
+        let next = if *pi < pattern.len() {
+            pattern[*pi]
+        } else {
+            '\0'
+        };
         if c2 == '-' && next != ']' && next != '\0' && prior_c != '\0' {
             c2 = read(pattern, pi);
             if c >= prior_c && c <= c2 {
@@ -326,7 +341,7 @@ fn match_set(pattern: &[char], pi: &mut usize, string: &[char], si: &mut usize) 
         }
         c2 = read(pattern, pi);
     }
-    if c2 == '\0' || (seen ^ invert) == false {
+    if c2 == '\0' || !(seen ^ invert) {
         return SetResult::NoMatch;
     }
     SetResult::Match
@@ -383,10 +398,15 @@ mod tests {
         // A dangling escape (escape at end of pattern) never matches.
         assert!(!m("abc\\", "abc\\"));
         assert!(!m("abc\\", "abc"));
-        // A non-single-character or NULL escape errors.
+        // A non-single-character escape errors (the oracle's message).
         assert!(like(&t("a%"), &t("abc"), Some(&t("xy"))).is_err());
         assert!(like(&t("a%"), &t("abc"), Some(&t(""))).is_err());
-        assert!(like(&t("a%"), &t("abc"), Some(&Value::Null)).is_err());
+        // A NULL escape makes the whole result NULL (not an error), matching the oracle:
+        // `'abc' LIKE 'a%' ESCAPE NULL` → NULL.
+        assert_eq!(
+            like(&t("a%"), &t("abc"), Some(&Value::Null)).unwrap(),
+            Value::Null
+        );
         // A single non-ASCII escape character is accepted.
         assert!(like(&t("aÀ%"), &t("a%c"), Some(&t("À"))).is_ok());
     }
@@ -399,9 +419,12 @@ mod tests {
         assert!(!globbed("a?c", "ac"));
         assert!(globbed("a?c", "aÀc")); // `?` matches one Unicode char
         assert!(globbed("[a-c]bc", "abc"));
-        assert!(globbed("[!b]", "a")); // `!` is NOT special — `[!b]` = the set {!, b}
-        assert!(globbed("[!a]", "a"));
-        assert!(!globbed("[!a]", "b"));
+        // `!` is NOT special in SQLite GLOB — `[!b]` is the literal set {!, b} (verified against
+        // the 3.53.1 oracle: `'a' GLOB '[!b]'` is 0, `'!' GLOB '[!b]'` is 1).
+        assert!(!globbed("[!b]", "a")); // `a` is neither `!` nor `b`
+        assert!(globbed("[!b]", "!")); // `!` is a literal member
+        assert!(globbed("[!a]", "a")); // `a` is a literal member of {!, a}
+        assert!(globbed("[!a]", "!"));
         assert!(globbed("[^b]", "a")); // `^` negation
         assert!(!globbed("[^a]", "a"));
         assert!(globbed("[a-z]", "x"));
@@ -413,7 +436,7 @@ mod tests {
         assert!(globbed("[?]", "?"));
         assert!(globbed("[a-]", "-")); // trailing `-` is literal
         assert!(globbed("[-a]", "-")); // leading `-` is literal
-        // `[a-c-z]`: range a-c, then literal `-`, then literal `z`.
+                                       // `[a-c-z]`: range a-c, then literal `-`, then literal `z`.
         assert!(globbed("[a-c-z]", "a"));
         assert!(globbed("[a-c-z]", "b"));
         assert!(globbed("[a-c-z]", "-"));

@@ -22,12 +22,19 @@ fn pratt() -> &'static PrattParser<Rule> {
             .op(Op::infix(Rule::op_or, Assoc::Left))
             .op(Op::infix(Rule::op_and, Assoc::Left))
             .op(Op::prefix(Rule::K_NOT))
+            // `X LIKE Y ESCAPE Z`: ESCAPE is modeled as an infix operator joining the whole LIKE
+            // comparison to its escape operand, registered LOOSER (earlier, here) than the LIKE row
+            // below so the comparison folds first. `map_infix` then receives `lhs = (X LIKE Y)` and
+            // `rhs = Z` and rewrites them to the 3-arg `like(Y, X, Z)` call.
+            .op(Op::infix(Rule::op_escape, Assoc::Left))
             .op(Op::infix(Rule::op_eq, Assoc::Left)
                 | Op::infix(Rule::op_ne, Assoc::Left)
                 | Op::infix(Rule::op_is, Assoc::Left)
                 | Op::infix(Rule::op_isnot, Assoc::Left)
                 | Op::infix(Rule::op_like, Assoc::Left)
-                | Op::infix(Rule::op_glob, Assoc::Left))
+                | Op::infix(Rule::op_glob, Assoc::Left)
+                | Op::infix(Rule::op_not_like, Assoc::Left)
+                | Op::infix(Rule::op_not_glob, Assoc::Left))
             .op(Op::infix(Rule::op_lt, Assoc::Left)
                 | Op::infix(Rule::op_le, Assoc::Left)
                 | Op::infix(Rule::op_gt, Assoc::Left)
@@ -82,6 +89,29 @@ fn fold(pairs: Pairs<'_, Rule>) -> Expr {
                 Rule::op_isnot => BinaryOp::IsNot,
                 Rule::op_like => BinaryOp::Like,
                 Rule::op_glob => BinaryOp::Glob,
+                // `X NOT LIKE Y` ≡ `NOT (X LIKE Y)` and `X NOT GLOB Y` ≡ `NOT (X GLOB Y)` — mirror
+                // upstream's `likeexpr`, which builds the negation around the plain comparison so
+                // NULL propagates through `OP_Not` (NOT NULL = NULL). No codegen change is needed.
+                Rule::op_not_like | Rule::op_not_glob => {
+                    let inner_op = if op.as_rule() == Rule::op_not_like {
+                        BinaryOp::Like
+                    } else {
+                        BinaryOp::Glob
+                    };
+                    return Expr::Unary {
+                        op: UnaryOp::Not,
+                        expr: Box::new(Expr::Binary {
+                            op: inner_op,
+                            left: Box::new(lhs),
+                            right: Box::new(rhs),
+                        }),
+                    };
+                }
+                // `X LIKE Y ESCAPE Z`: `lhs` is the already-folded LIKE comparison (`X LIKE Y` or
+                // `NOT (X LIKE Y)`) and `rhs` is the escape operand `Z`. Rewrite to the 3-arg
+                // `like(Y, X, Z)` builtin (preserving any wrapping NOT). The grammar only emits
+                // `op_escape` after a LIKE-family comparison, never after GLOB.
+                Rule::op_escape => return apply_like_escape(lhs, rhs),
                 other => unreachable!("unexpected infix operator {other:?}"),
             };
             Expr::Binary {
@@ -91,6 +121,34 @@ fn fold(pairs: Pairs<'_, Rule>) -> Expr {
             }
         })
         .parse(pairs)
+}
+
+/// Rewrite a folded LIKE comparison (`X LIKE Y`, or `NOT (X LIKE Y)`) plus its ESCAPE operand `Z`
+/// into the 3-argument `like(Y, X, Z)` builtin (pattern, text, escape — the same arg order as the
+/// 2-arg LIKE lowering in codegen), preserving any wrapping `NOT`. The grammar only attaches an
+/// ESCAPE to a LIKE-family comparison, so any other shape is unreachable.
+fn apply_like_escape(like_cmp: Expr, escape: Expr) -> Expr {
+    match like_cmp {
+        Expr::Binary {
+            op: BinaryOp::Like,
+            left,
+            right,
+        } => Expr::Function {
+            name: "like".to_string(),
+            distinct: false,
+            // left = X (text), right = Y (pattern) per the AST built above; the builtin takes
+            // (pattern, text, escape).
+            args: FunctionArgs::List(vec![*right, *left, escape]),
+        },
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } => Expr::Unary {
+            op: UnaryOp::Not,
+            expr: Box::new(apply_like_escape(*expr, escape)),
+        },
+        other => unreachable!("ESCAPE clause must follow a LIKE comparison, got {other:?}"),
+    }
 }
 
 fn map_primary(pair: Pair<'_, Rule>) -> Expr {

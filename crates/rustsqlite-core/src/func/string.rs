@@ -333,11 +333,22 @@ pub fn quote(x: &Value) -> Value {
     Value::Text(s)
 }
 
-/// Render a REAL for `quote`. SQLite's `sqlite3QuoteValue` uses `%!0.17g` — identical to the
-/// `sqlite3_column_text` path, so the faithful [`fp_to_text`](crate::util::fp::fp_to_text) is
-/// reused directly. (Infinity renders as `9.0e+999`/`-9.0e+999` and NaN as `Inf`-free output via
-/// that path, matching the oracle.)
+/// Render a REAL for `quote`. SQLite's `sqlite3QuoteValue` formats a FLOAT with `%!0.15g` (note
+/// the `0` **zero-pad** flag), unlike the bare `%!.15g` used by `sqlite3_column_text`. For finite
+/// values the zero-pad flag has no effect with no field width, so the faithful
+/// [`fp_to_text`](crate::util::fp::fp_to_text) renders them identically. The one place the flag
+/// matters is `±∞`: printf.c's `isSpecial` branch, when zero-padding, emits `9.0e+999` /
+/// `-9.0e+999` (via `s.z[0]='9'; s.iDP=1000`) instead of the bare `Inf` / `-Inf` the column path
+/// produces — so `quote()` special-cases infinity. (A NaN REAL is stored as NULL upstream, so it
+/// never reaches here.)
 fn quote_real(r: f64) -> String {
+    if r.is_infinite() {
+        return if r < 0.0 {
+            "-9.0e+999".to_string()
+        } else {
+            "9.0e+999".to_string()
+        };
+    }
     crate::util::fp::fp_to_text(r)
 }
 
