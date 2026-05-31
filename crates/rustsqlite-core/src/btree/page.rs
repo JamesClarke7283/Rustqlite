@@ -102,6 +102,111 @@ impl PageHeader {
     }
 }
 
+// ---- Page mutation (write path, M4) ----
+//
+// These operate directly on an owned page buffer (`&mut [u8]`, exactly `page_size` long) — the
+// copy the pager hands out via `read_page_for_write`. They mirror the no-freeblock subset of
+// `zeroPage`/`allocateSpace`/`insertCell` in `btree.c`; freeblock reuse and page balancing (when a
+// page fills) arrive in later phases.
+
+/// Initialize the b-tree page region of `page` as an **empty leaf-table** page. `base_offset` is
+/// 100 on page 1 (after the database header) and 0 otherwise. The page data area from
+/// `base_offset` to the end is zeroed (`zeroPage`), then the 8-byte leaf header is written with
+/// zero cells and the cell content area at the end of the page.
+pub fn init_empty_leaf(page: &mut [u8], base_offset: usize) {
+    let page_size = page.len();
+    for b in &mut page[base_offset..] {
+        *b = 0;
+    }
+    let h = base_offset;
+    page[h] = 0x0d; // leaf table page
+    page[h + 1..h + 3].copy_from_slice(&0u16.to_be_bytes()); // first freeblock = 0
+    page[h + 3..h + 5].copy_from_slice(&0u16.to_be_bytes()); // num cells = 0
+    // The cell content area starts at the end of the page; 65536 is stored as 0.
+    let ccs: u16 = if page_size == 65_536 {
+        0
+    } else {
+        page_size as u16
+    };
+    page[h + 5..h + 7].copy_from_slice(&ccs.to_be_bytes());
+    page[h + 7] = 0; // fragmented free bytes
+}
+
+/// The number of contiguous free bytes between the end of the cell-pointer array and the start of
+/// the cell content area on a **leaf** page — the space available for a new cell plus its 2-byte
+/// pointer. (This is the simple unallocated gap; reclaimable freeblocks inside the content area are
+/// not counted, since the first-slice insert path never creates them.)
+pub fn leaf_free_space(page: &[u8], base_offset: usize) -> usize {
+    let h = base_offset;
+    let num_cells = be_u16(&page[h + 3..h + 5]) as usize;
+    let raw_ccs = be_u16(&page[h + 5..h + 7]) as usize;
+    let cell_content_start = if raw_ccs == 0 { 65_536 } else { raw_ccs };
+    let ptr_array_end = h + LEAF_HEADER_SIZE + num_cells * 2;
+    cell_content_start.saturating_sub(ptr_array_end)
+}
+
+/// The 8-byte header length of a leaf b-tree page (interior pages use 12).
+const LEAF_HEADER_SIZE: usize = 8;
+
+/// Insert `cell` into a **leaf-table** page at cell-pointer index `idx` (the 0-based, key-sorted
+/// position). Allocates the cell's bytes from the content area (growing it downward), writes the
+/// new 2-byte pointer (shifting the pointers at `idx..` up by two), and bumps the cell count.
+/// Returns `Err` ([`page_full_error`]) when the cell plus its pointer do not fit — the caller will
+/// split the page once balancing lands (M4.5). `base_offset` is 100 on page 1, else 0.
+///
+/// Faithful to `insertCell`/`allocateSpace` in `btree.c` for the case with no reusable freeblocks.
+pub fn insert_leaf_cell(
+    page: &mut [u8],
+    base_offset: usize,
+    idx: usize,
+    cell: &[u8],
+) -> Result<()> {
+    let h = base_offset;
+    if page[h] != 0x0d {
+        return Err(Error::corrupt("insert_leaf_cell: not a leaf-table page"));
+    }
+    let num_cells = be_u16(&page[h + 3..h + 5]) as usize;
+    if idx > num_cells {
+        return Err(Error::corrupt("insert_leaf_cell: index past cell count"));
+    }
+    let raw_ccs = be_u16(&page[h + 5..h + 7]) as usize;
+    let cell_content_start = if raw_ccs == 0 { 65_536 } else { raw_ccs };
+    let ptr_array_end = h + LEAF_HEADER_SIZE + num_cells * 2;
+
+    // Need room for the cell bytes (in the content area) plus a 2-byte pointer (in the array).
+    if cell_content_start < ptr_array_end + cell.len() + 2 {
+        return Err(page_full_error());
+    }
+
+    // Allocate the cell from the top of the content area downward and copy it in.
+    let new_content_start = cell_content_start - cell.len();
+    page[new_content_start..new_content_start + cell.len()].copy_from_slice(cell);
+
+    // Make room in the pointer array: shift entries [idx, num_cells) up by one slot (2 bytes).
+    let ptr_at = |i: usize| h + LEAF_HEADER_SIZE + i * 2;
+    if idx < num_cells {
+        page.copy_within(ptr_at(idx)..ptr_at(num_cells), ptr_at(idx + 1));
+    }
+    page[ptr_at(idx)..ptr_at(idx) + 2].copy_from_slice(&(new_content_start as u16).to_be_bytes());
+
+    // Update the header: one more cell, content area moved down.
+    page[h + 3..h + 5].copy_from_slice(&((num_cells + 1) as u16).to_be_bytes());
+    let stored_ccs: u16 = if new_content_start == 65_536 {
+        0
+    } else {
+        new_content_start as u16
+    };
+    page[h + 5..h + 7].copy_from_slice(&stored_ccs.to_be_bytes());
+    Ok(())
+}
+
+/// The error returned when a cell does not fit on its leaf page. The b-tree split that handles this
+/// arrives with balancing (M4.5); until then the first-slice writer only stores rows that fit on a
+/// single page. The message is distinct so the caller can recognize the "needs split" condition.
+pub fn page_full_error() -> Error {
+    Error::msg("b-tree leaf page is full (page split not yet implemented)")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

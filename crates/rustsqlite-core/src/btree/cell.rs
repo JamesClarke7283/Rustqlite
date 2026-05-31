@@ -12,7 +12,7 @@
 //! [`local_payload_len`]).
 
 use crate::error::{Error, Result};
-use crate::format::{read_varint, read_varint_i64};
+use crate::format::{read_varint, read_varint_i64, write_varint};
 
 use super::be_u32;
 
@@ -111,6 +111,32 @@ pub fn parse_table_leaf_cell(
         local_payload,
         overflow_page,
     })
+}
+
+/// Build a **table-leaf** cell for the write path: `varint(payload_len) ++ varint(rowid) ++
+/// payload`. First-slice only — the payload must fit entirely on the page (overflow-page chains for
+/// large payloads arrive in M4.6, so this never appends an overflow pointer). The rowid is written
+/// as a varint over its two's-complement bit pattern (the inverse of [`read_varint_i64`]).
+pub fn build_table_leaf_cell(rowid: i64, payload: &[u8]) -> Vec<u8> {
+    let mut cell = Vec::with_capacity(9 + 9 + payload.len());
+    write_varint(payload.len() as u64, &mut cell);
+    write_varint(rowid as u64, &mut cell);
+    cell.extend_from_slice(payload);
+    cell
+}
+
+/// Read just the rowid of a table-leaf cell at `offset` (the second varint, after the payload-size
+/// varint). Cheaper than [`parse_table_leaf_cell`] when only the key is needed (insert-position
+/// search, `max_rowid`).
+pub fn table_leaf_cell_rowid(page: &[u8], offset: usize) -> Result<i64> {
+    let (_payload_size, n1) = read_varint(
+        page.get(offset..)
+            .ok_or_else(|| Error::corrupt("cell offset"))?,
+    )
+    .ok_or_else(|| Error::corrupt("table leaf payload-size varint"))?;
+    let (rowid, _) = read_varint_i64(&page[offset + n1..])
+        .ok_or_else(|| Error::corrupt("table leaf rowid varint"))?;
+    Ok(rowid)
 }
 
 pub fn parse_table_interior_cell(page: &[u8], offset: usize) -> Result<TableInteriorCell> {
