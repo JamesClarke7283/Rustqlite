@@ -48,12 +48,16 @@ async fn table_cursor_matches_scan_table() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let vfs = OsTokioVfs::new();
+    let vfs: Arc<dyn Vfs> = Arc::new(OsTokioVfs::new());
     let file = vfs
         .open(&path_str, OpenFlags::READONLY)
         .await
         .expect("open");
-    let pager = Arc::new(Pager::open(file).await.expect("pager"));
+    let pager = Arc::new(
+        Pager::open(vfs.clone(), path_str.clone(), file)
+            .await
+            .expect("pager"),
+    );
 
     let catalog = read_catalog(&pager).await.expect("catalog");
     let root = catalog.find_table("t").expect("table t").rootpage as u32;

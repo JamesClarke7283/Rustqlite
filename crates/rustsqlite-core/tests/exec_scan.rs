@@ -46,12 +46,16 @@ async fn hand_built_select_star_scans_table() {
         .expect("run sqlite3");
     assert!(out.status.success());
 
-    let vfs = OsTokioVfs::new();
+    let vfs: Arc<dyn Vfs> = Arc::new(OsTokioVfs::new());
     let file = vfs
         .open(&path_str, OpenFlags::READONLY)
         .await
         .expect("open");
-    let pager = Arc::new(Pager::open(file).await.expect("pager"));
+    let pager = Arc::new(
+        Pager::open(vfs.clone(), path_str.clone(), file)
+            .await
+            .expect("pager"),
+    );
     let root = read_catalog(&pager)
         .await
         .expect("catalog")

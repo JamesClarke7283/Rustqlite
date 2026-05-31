@@ -40,10 +40,10 @@ pub fn sqlite3_open(filename: &str) -> Result<Sqlite3> {
 pub fn sqlite3_open_v2(filename: &str, flags: OpenFlags) -> Result<Sqlite3> {
     block_on(async move {
         let is_memory = filename.is_empty() || filename == ":memory:";
-        let vfs: Box<dyn Vfs> = if is_memory {
-            Box::new(MemVfs::new())
+        let vfs: Arc<dyn Vfs> = if is_memory {
+            Arc::new(MemVfs::new())
         } else {
-            Box::new(OsTokioVfs::new())
+            Arc::new(OsTokioVfs::new())
         };
 
         let file = vfs.open(filename, flags).await?;
@@ -53,7 +53,9 @@ pub fn sqlite3_open_v2(filename: &str, flags: OpenFlags) -> Result<Sqlite3> {
         let pager = if size == 0 {
             None
         } else {
-            Some(Arc::new(Pager::open(file).await?))
+            Some(Arc::new(
+                Pager::open(vfs.clone(), filename.to_string(), file).await?,
+            ))
         };
 
         Ok(Sqlite3 {
