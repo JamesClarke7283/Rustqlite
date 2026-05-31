@@ -1,0 +1,13 @@
+[package]
+name = "rustqlite-parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "SQL parser for Rustqlite: a pest PEG grammar ported from SQLite's parse.y, with PrattParser expression precedence. No engine dependency."
+
+[dependencies]
+pest = { workspace = true }
+pest_derive = { workspace = true }

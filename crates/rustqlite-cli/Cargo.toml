@@ -1,0 +1,22 @@
+[package]
+name = "rustqlite-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The Rustqlite shell — a clap-derive CLI mirroring the sqlite3 command-line tool."
+
+[[bin]]
+name = "rustqlite"
+path = "src/main.rs"
+
+[dependencies]
+rustqlite = { workspace = true }
+rustqlite-parser = { workspace = true }
+clap = { workspace = true }
+rustyline = { workspace = true }
+# Note: the async tokio runtime lives inside the `rustqlite` engine (it owns a process-global
+# runtime and the C-API functions drive it via block_on), so the CLI itself stays synchronous
+# and does not depend on tokio directly.

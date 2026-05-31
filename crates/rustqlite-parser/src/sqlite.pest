@@ -1,0 +1,216 @@
+// sqlite.pest — a PEG grammar for Rustqlite, ported (incrementally) from SQLite's parse.y.
+//
+// This is the M2 starting point: it covers a faithful SUBSET of the statement set
+// (SELECT / CREATE TABLE / INSERT … VALUES) plus the full expression atom set, with
+// operator precedence handled in Rust via pest's PrattParser (see expr.rs). PEG cannot
+// express left recursion, so `expr` is intentionally a flat stream of primaries and
+// operators that the PrattParser folds into a tree.
+//
+// Each clause that begins with a keyword is wrapped in its own rule (e.g. `where_item`,
+// `from_item`) so AST construction can match by rule name rather than by position, and so
+// the keyword tokens themselves can simply be skipped.
+//
+// Faithfulness notes / known gaps tracked for the full parse.y port:
+//   * A bounded set of keywords is reserved (see `keyword`). SQLite allows many keywords
+//     as identifiers in context; that nuance is deferred.
+//   * JOIN syntax, compound SELECT, CTEs, window functions, UPSERT, triggers, etc. are
+//     deferred to later M2 work.
+
+// ---- Implicit whitespace & comments (applied only in non-atomic rules) ----
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT    = _{ line_comment | block_comment }
+line_comment  = _{ "--" ~ (!"\n" ~ ANY)* }
+block_comment = _{ "/*" ~ (!"*/" ~ ANY)* ~ ("*/" | EOI) }
+
+// ---- Lexical building blocks ----
+ident_start = _{ ASCII_ALPHA | "_" }
+ident_cont  = _{ ASCII_ALPHANUMERIC | "_" }
+
+// Identifiers: a bare word that is not a reserved keyword, or a quoted identifier.
+ident = @{ quoted_ident | (!keyword ~ ident_start ~ ident_cont*) }
+quoted_ident = @{
+      ("\"" ~ ((!"\"" ~ ANY) | "\"\"")* ~ "\"")
+    | ("`"  ~ ((!"`"  ~ ANY) | "``")*   ~ "`")
+    | ("["  ~ (!"]" ~ ANY)*             ~ "]")
+}
+
+// Numeric literals: hex, integer, real (with optional fraction/exponent).
+number = @{ hex_int | float_or_int }
+hex_int = @{ ^"0x" ~ ASCII_HEX_DIGIT+ }
+float_or_int = @{
+      (ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT*)? ~ exponent?)
+    | ("." ~ ASCII_DIGIT+ ~ exponent?)
+}
+exponent = _{ ^"e" ~ ("+" | "-")? ~ ASCII_DIGIT+ }
+
+// String literals use SQL '' escaping. Blob literals are x'..hex..'.
+string = @{ "'" ~ (("''") | (!"'" ~ ANY))* ~ "'" }
+blob   = @{ ^"x" ~ "'" ~ ASCII_HEX_DIGIT* ~ "'" }
+
+// Bind parameters: ?, ?NNN, :name, @name, $name
+bind_param = @{ ("?" ~ ASCII_DIGIT*) | (("@" | ":" | "$") ~ ident_cont+) }
+
+// ---- Keywords (each carries its own trailing word boundary so ordering is irrelevant) ----
+K_SELECT        = @{ ^"select"        ~ !ident_cont }
+K_ALL           = @{ ^"all"           ~ !ident_cont }
+K_DISTINCT      = @{ ^"distinct"      ~ !ident_cont }
+K_FROM          = @{ ^"from"          ~ !ident_cont }
+K_WHERE         = @{ ^"where"         ~ !ident_cont }
+K_GROUP         = @{ ^"group"         ~ !ident_cont }
+K_BY            = @{ ^"by"            ~ !ident_cont }
+K_HAVING        = @{ ^"having"        ~ !ident_cont }
+K_ORDER         = @{ ^"order"         ~ !ident_cont }
+K_ASC           = @{ ^"asc"           ~ !ident_cont }
+K_DESC          = @{ ^"desc"          ~ !ident_cont }
+K_LIMIT         = @{ ^"limit"         ~ !ident_cont }
+K_OFFSET        = @{ ^"offset"        ~ !ident_cont }
+K_AS            = @{ ^"as"            ~ !ident_cont }
+K_CREATE        = @{ ^"create"        ~ !ident_cont }
+K_TEMPORARY     = @{ ^"temporary"     ~ !ident_cont }
+K_TEMP          = @{ ^"temp"          ~ !ident_cont }
+K_TABLE         = @{ ^"table"         ~ !ident_cont }
+K_IF            = @{ ^"if"            ~ !ident_cont }
+K_EXISTS        = @{ ^"exists"        ~ !ident_cont }
+K_PRIMARY       = @{ ^"primary"       ~ !ident_cont }
+K_KEY           = @{ ^"key"           ~ !ident_cont }
+K_AUTOINCREMENT = @{ ^"autoincrement" ~ !ident_cont }
+K_UNIQUE        = @{ ^"unique"        ~ !ident_cont }
+K_DEFAULT       = @{ ^"default"       ~ !ident_cont }
+K_INSERT        = @{ ^"insert"        ~ !ident_cont }
+K_REPLACE       = @{ ^"replace"       ~ !ident_cont }
+K_INTO          = @{ ^"into"          ~ !ident_cont }
+K_VALUES        = @{ ^"values"        ~ !ident_cont }
+K_NULL          = @{ ^"null"          ~ !ident_cont }
+K_TRUE          = @{ ^"true"          ~ !ident_cont }
+K_FALSE         = @{ ^"false"         ~ !ident_cont }
+K_AND           = @{ ^"and"           ~ !ident_cont }
+K_OR            = @{ ^"or"            ~ !ident_cont }
+K_NOT           = @{ ^"not"           ~ !ident_cont }
+K_IS            = @{ ^"is"            ~ !ident_cont }
+K_LIKE          = @{ ^"like"          ~ !ident_cont }
+K_GLOB          = @{ ^"glob"          ~ !ident_cont }
+K_IN            = @{ ^"in"            ~ !ident_cont }
+K_COLLATE       = @{ ^"collate"       ~ !ident_cont }
+K_CAST          = @{ ^"cast"          ~ !ident_cont }
+K_ON            = @{ ^"on"            ~ !ident_cont }
+K_CONFLICT      = @{ ^"conflict"      ~ !ident_cont }
+K_ABORT         = @{ ^"abort"         ~ !ident_cont }
+K_FAIL          = @{ ^"fail"          ~ !ident_cont }
+K_IGNORE        = @{ ^"ignore"        ~ !ident_cont }
+K_ROLLBACK      = @{ ^"rollback"      ~ !ident_cont }
+
+keyword = @{
+      K_SELECT | K_ALL | K_DISTINCT | K_FROM | K_WHERE | K_GROUP | K_BY | K_HAVING
+    | K_ORDER | K_ASC | K_DESC | K_LIMIT | K_OFFSET | K_AS | K_CREATE | K_TEMPORARY
+    | K_TEMP | K_TABLE | K_IF | K_EXISTS | K_PRIMARY | K_KEY | K_AUTOINCREMENT
+    | K_UNIQUE | K_DEFAULT | K_INSERT | K_REPLACE | K_INTO | K_VALUES | K_NULL
+    | K_TRUE | K_FALSE | K_AND | K_OR | K_NOT | K_IS | K_LIKE | K_GLOB | K_IN
+    | K_COLLATE | K_CAST | K_ON | K_CONFLICT | K_ABORT | K_FAIL | K_IGNORE | K_ROLLBACK
+}
+
+// ---- Top level: a list of statements separated/terminated by ';' ----
+sql = { SOI ~ statement? ~ (";" ~ statement?)* ~ EOI }
+statement = { select_stmt | create_table_stmt | insert_stmt }
+
+qualified_name = { ident ~ ("." ~ ident)? }
+
+// ---- SELECT ----
+select_stmt = {
+    K_SELECT ~ (K_DISTINCT | K_ALL)? ~ result_columns
+    ~ from_item?
+    ~ where_item?
+    ~ group_item?
+    ~ having_item?
+    ~ order_item?
+    ~ limit_item?
+}
+result_columns = { result_column ~ ("," ~ result_column)* }
+result_column = { table_star | result_star | (expr ~ as_alias?) }
+result_star = { "*" }
+table_star = { ident ~ "." ~ "*" }
+as_alias = { K_AS? ~ alias }
+alias = @{ ident }
+
+from_item = { K_FROM ~ from_clause }
+from_clause = { table_ref ~ ("," ~ table_ref)* }
+table_ref = { qualified_name ~ as_alias? }
+
+where_item = { K_WHERE ~ expr }
+group_item = { K_GROUP ~ K_BY ~ group_by }
+group_by = { expr ~ ("," ~ expr)* }
+having_item = { K_HAVING ~ expr }
+order_item = { K_ORDER ~ K_BY ~ order_by }
+order_by = { ordering_term ~ ("," ~ ordering_term)* }
+ordering_term = { expr ~ (K_ASC | K_DESC)? }
+limit_item = { K_LIMIT ~ expr ~ (offset_item | limit_comma)? }
+offset_item = { K_OFFSET ~ expr }
+limit_comma = { "," ~ expr }
+
+// ---- CREATE TABLE ----
+create_table_stmt = {
+    K_CREATE ~ (K_TEMPORARY | K_TEMP)? ~ K_TABLE
+    ~ if_not_exists?
+    ~ qualified_name
+    ~ "(" ~ column_def ~ ("," ~ column_def)* ~ ")"
+}
+if_not_exists = { K_IF ~ K_NOT ~ K_EXISTS }
+column_def = { ident ~ type_name? ~ column_constraint* }
+// Type names are one or more non-keyword words (e.g. INTEGER, "DOUBLE PRECISION",
+// "UNSIGNED BIG INT"), optionally with a size like VARCHAR(255). Using `ident` makes the
+// repetition stop naturally at a reserved constraint keyword (PRIMARY/NOT/UNIQUE/DEFAULT).
+type_name = { ident+ ~ ("(" ~ signed_number ~ ("," ~ signed_number)? ~ ")")? }
+column_constraint = { c_primary_key | c_not_null | c_unique | c_default }
+c_primary_key = { K_PRIMARY ~ K_KEY ~ (K_ASC | K_DESC)? ~ K_AUTOINCREMENT? }
+c_not_null = { K_NOT ~ K_NULL }
+c_unique = { K_UNIQUE }
+c_default = { K_DEFAULT ~ (("(" ~ expr ~ ")") | literal | signed_number) }
+signed_number = @{ ("+" | "-")? ~ (hex_int | float_or_int) }
+
+// ---- INSERT ----
+insert_stmt = {
+    insert_verb ~ K_INTO ~ qualified_name ~ column_list? ~ values_clause
+}
+insert_verb = { (K_INSERT ~ (K_OR ~ conflict_action)?) | K_REPLACE }
+conflict_action = { K_ROLLBACK | K_ABORT | K_FAIL | K_IGNORE | K_REPLACE }
+column_list = { "(" ~ ident ~ ("," ~ ident)* ~ ")" }
+values_clause = { K_VALUES ~ value_row ~ ("," ~ value_row)* }
+value_row = { "(" ~ expr ~ ("," ~ expr)* ~ ")" }
+
+// ---- Expressions (folded by PrattParser in expr.rs) ----
+expr = { prefix* ~ primary ~ (infix ~ prefix* ~ primary)* }
+primary = _{ literal | func_call | column_ref | "(" ~ expr ~ ")" }
+
+literal = { number | string | blob | bind_param | K_NULL | K_TRUE | K_FALSE }
+
+func_call = { func_name ~ "(" ~ (func_star | arg_list)? ~ ")" }
+func_name = @{ ident }
+func_star = { "*" }
+arg_list = { K_DISTINCT? ~ expr ~ ("," ~ expr)* }
+
+column_ref = { ident ~ ("." ~ ident ~ ("." ~ ident)?)? }
+
+prefix = _{ neg | pos | K_NOT }
+neg = { "-" }
+pos = { "+" }
+
+infix = _{
+      op_or | op_and | op_concat | op_eq | op_ne | op_le | op_ge | op_lt | op_gt
+    | op_add | op_sub | op_mul | op_div | op_mod | op_is | op_like | op_glob
+}
+op_or = { K_OR }
+op_and = { K_AND }
+op_concat = { "||" }
+op_eq = { "==" | "=" }
+op_ne = { "!=" | "<>" }
+op_le = { "<=" }
+op_ge = { ">=" }
+op_lt = { "<" }
+op_gt = { ">" }
+op_add = { "+" }
+op_sub = { "-" }
+op_mul = { "*" }
+op_div = { "/" }
+op_mod = { "%" }
+op_is = { K_IS }
+op_like = { K_LIKE }
+op_glob = { K_GLOB }

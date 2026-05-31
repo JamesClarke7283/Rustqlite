@@ -1,0 +1,6 @@
+# Pin the toolchain so every contributor (and CI) builds Rustqlite identically.
+# Faithfulness to a byte-compatible on-disk format benefits from a deterministic build.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

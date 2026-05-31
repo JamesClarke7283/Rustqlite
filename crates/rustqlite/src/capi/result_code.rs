@@ -1,0 +1,13 @@
+//! Result codes (mirrors the `SQLITE_*` codes in `sqlite3.h`).
+//!
+//! The canonical definitions live in [`crate::error`]; this module re-exports them under the
+//! `capi` grouping so the C-API surface is found in one place.
+
+pub use crate::error::{
+    ResultCode, SQLITE_ABORT, SQLITE_AUTH, SQLITE_BUSY, SQLITE_CANTOPEN, SQLITE_CONSTRAINT,
+    SQLITE_CORRUPT, SQLITE_DONE, SQLITE_EMPTY, SQLITE_ERROR, SQLITE_FORMAT, SQLITE_FULL,
+    SQLITE_INTERNAL, SQLITE_INTERRUPT, SQLITE_IOERR, SQLITE_LOCKED, SQLITE_MISMATCH, SQLITE_MISUSE,
+    SQLITE_NOLFS, SQLITE_NOMEM, SQLITE_NOTADB, SQLITE_NOTFOUND, SQLITE_NOTICE, SQLITE_OK,
+    SQLITE_PERM, SQLITE_PROTOCOL, SQLITE_RANGE, SQLITE_READONLY, SQLITE_ROW, SQLITE_SCHEMA,
+    SQLITE_TOOBIG, SQLITE_WARNING,
+};

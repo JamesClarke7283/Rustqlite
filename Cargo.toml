@@ -1,0 +1,48 @@
+# Rustqlite — a faithful Rust reimplementation of SQLite3.
+#
+# Three crates, dependency direction rustqlite-cli -> rustqlite -> rustqlite-parser.
+# Versions are pinned here (workspace.dependencies) so the whole tree builds against a
+# single, vetted set of dependencies. See AGENTS.md for the dependency rationale.
+[workspace]
+resolver = "2"
+members = [
+    "crates/rustqlite-parser",
+    "crates/rustqlite",
+    "crates/rustqlite-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.96"
+license = "Apache-2.0"
+authors = ["James David Clarke <james@jamesdavidclarke.com>"]
+repository = "https://github.com/jamesdavidclarke/Rustqlite"
+description = "A faithful, file-format-compatible reimplementation of SQLite3 in Rust."
+
+[workspace.dependencies]
+# Internal crates.
+rustqlite = { path = "crates/rustqlite", version = "0.0.1" }
+rustqlite-parser = { path = "crates/rustqlite-parser", version = "0.0.1" }
+
+# Async runtime for the VFS/pager I/O layer (the engine is async on tokio).
+tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "sync", "macros"] }
+# Object-safe async trait methods for the Vfs / VfsFile traits.
+async-trait = "0.1"
+
+# Parser: PEG grammar ported from SQLite's parse.y, precedence via PrattParser.
+pest = "2.7"
+pest_derive = "2.7"
+
+# CLI: clap derive for sqlite3-shell-compatible flags; rustyline for line editing.
+clap = { version = "4", features = ["derive"] }
+rustyline = "14"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# Keep dev builds fast but with overflow checks on (faithfulness work benefits from
+# catching arithmetic mistakes early in the codecs).
+[profile.dev]
+overflow-checks = true
