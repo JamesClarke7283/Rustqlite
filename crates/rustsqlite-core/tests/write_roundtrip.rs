@@ -218,3 +218,58 @@ fn delete_roundtrip_and_c_oracle() {
     );
     assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
 }
+
+#[test]
+fn drop_table_roundtrip_and_c_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("drop");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE keepme(a);");
+        exec(&mut conn, "CREATE TABLE dropme(b, c);");
+        for n in 1..=5 {
+            exec(
+                &mut conn,
+                &format!("INSERT INTO dropme VALUES ({n}, 'r{n}');"),
+            );
+        }
+        // Drop the table; C oracle should then see only `keepme` in `sqlite_schema`.
+        exec(&mut conn, "DROP TABLE dropme;");
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(
+        db.query("SELECT count(*) FROM sqlite_schema WHERE type='table';"),
+        "1"
+    );
+    assert_eq!(
+        db.query("SELECT name FROM sqlite_schema WHERE type='table';"),
+        "keepme"
+    );
+    // The schema cookie was bumped to 3 (one DDL per statement: CREATE keepme, CREATE dropme,
+    // DROP dropme). C's `PRAGMA schema_version` agrees.
+    assert_eq!(db.query("PRAGMA schema_version;"), "3");
+}
+
+#[test]
+fn drop_table_if_exists_unknown_is_silent() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("dropif");
+    // A fresh database: we need at least one DDL for the pager to have page 1, otherwise
+    // the codegen is invoked on an empty file. (CREATE TABLE then DROP TABLE IF EXISTS of a
+    // different name.)
+    let mut conn = sqlite3_open(db.str()).expect("open");
+    exec(&mut conn, "CREATE TABLE real(a);");
+    exec(
+        &mut conn,
+        "DROP TABLE IF EXISTS nosuch;",
+    );
+    let _ = conn;
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(
+        db.query("SELECT count(*) FROM sqlite_schema WHERE type='table';"),
+        "1"
+    );
+}

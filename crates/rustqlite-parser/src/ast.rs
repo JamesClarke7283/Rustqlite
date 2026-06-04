@@ -16,6 +16,7 @@ pub enum Stmt {
     CreateTable(CreateTable),
     Insert(InsertStmt),
     Delete(DeleteStmt),
+    DropTable(DropTableStmt),
     /// `EXPLAIN <stmt>` / `EXPLAIN QUERY PLAN <stmt>`. The inner statement is boxed (it is the
     /// large variant). `kind` distinguishes the bytecode listing from the query-plan tree.
     Explain(Box<Stmt>, ExplainKind),
@@ -109,6 +110,14 @@ pub struct DeleteStmt {
     pub schema: Option<String>,
     pub table: String,
     pub where_clause: Option<Expr>,
+}
+
+/// `DROP TABLE [IF EXISTS] [schema.]tbl`. The first M4.6 slice omits `DROP INDEX/VIEW/TRIGGER`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropTableStmt {
+    pub if_exists: bool,
+    pub schema: Option<String>,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

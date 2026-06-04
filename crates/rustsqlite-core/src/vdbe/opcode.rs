@@ -35,6 +35,9 @@ pub enum Opcode {
     /// `CreateBtree p1 p2 p3`: create a new b-tree (table when `p3 == 1`) in database `p1` and
     /// store its root page number in `r[p2]`. Mirrors `OP_CreateBtree`.
     CreateBtree,
+    /// `Destroy p1 p2 p3`: erase the b-tree rooted at page `p1`. Currently `p2`/`p3` are
+    /// unused (no `iMoved` / db-index plumbing in the first slice). Mirrors `OP_Destroy`.
+    Destroy,
 
     // --- cursors ---
     /// `OpenRead p1 p2 p3 p4`: open read cursor `p1` on the b-tree rooted at page `p2`; `p4`
@@ -192,6 +195,7 @@ impl Opcode {
             Opcode::SetCookie => "SetCookie",
             Opcode::ParseSchema => "ParseSchema",
             Opcode::CreateBtree => "CreateBtree",
+            Opcode::Destroy => "Destroy",
             Opcode::OpenRead => "OpenRead",
             Opcode::OpenWrite => "OpenWrite",
             Opcode::Close => "Close",

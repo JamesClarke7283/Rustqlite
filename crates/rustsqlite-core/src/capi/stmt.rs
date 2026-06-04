@@ -8,12 +8,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use rustqlite_parser::{parse, DeleteStmt, ExplainKind, InsertStmt, SelectStmt, Stmt};
+use rustqlite_parser::{parse, DeleteStmt, DropTableStmt, ExplainKind, InsertStmt, SelectStmt, Stmt};
 
 use crate::codegen;
 use crate::error::{Error, Result, ResultCode};
 use crate::pager::Pager;
-use crate::schema::{read_catalog, Table};
+use crate::schema::{read_catalog, schema_cookie, Table};
 use crate::types::Value;
 use crate::vdbe::{explain, Program, StepResult, Vdbe};
 
@@ -138,6 +138,27 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 last_error: None,
             })
         }
+        Stmt::DropTable(drop) => {
+            // DROP TABLE: resolve the table (None if missing AND IF EXISTS), then compile
+            // a write program that destroys the b-tree and removes the schema row.
+            let pager = db.pager_arc()?;
+            let (table_opt, schema_cookie) = resolve_drop_target(&pager, &drop)?;
+            let program = Arc::new(codegen::compile_drop_table(
+                &drop,
+                schema_cookie,
+                table_opt.as_ref(),
+            )?);
+            let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
+            Ok(Sqlite3Stmt {
+                sql: sql.to_string(),
+                program,
+                column_names: Vec::new(),
+                backing: Backing::Vdbe(vdbe),
+                explain: 0,
+                counts: Some(db.counts_handle()),
+                last_error: None,
+            })
+        }
     }
 }
 
@@ -148,6 +169,22 @@ fn resolve_delete_table(pager: &Arc<Pager>, del: &DeleteStmt) -> Result<Table> {
         .find_table(&del.table)
         .ok_or_else(|| Error::msg(format!("no such table: {}", del.table)))?;
     Table::from_schema_object(obj)
+}
+
+/// Resolve a `DROP TABLE` target: returns the table when present in the catalog (else
+/// `None`, which the codegen turns into either an error or a no-op depending on the
+/// `IF EXISTS` flag), and the current schema cookie for the codegen to bump.
+fn resolve_drop_target(
+    pager: &Arc<Pager>,
+    drop: &DropTableStmt,
+) -> Result<(Option<Table>, u32)> {
+    let catalog = block_on(read_catalog(pager))?;
+    let cookie = schema_cookie(pager);
+    let table = catalog
+        .find_table(&drop.name)
+        .map(|obj| Table::from_schema_object(obj))
+        .transpose()?;
+    Ok((table, cookie))
 }
 
 /// Resolve the table an `INSERT` targets from the current catalog.

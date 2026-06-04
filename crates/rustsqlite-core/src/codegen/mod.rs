@@ -10,6 +10,7 @@
 pub mod builder;
 pub mod create;
 pub mod delete;
+pub mod drop;
 pub mod expr;
 pub mod insert;
 pub mod select;
@@ -18,7 +19,7 @@ use crate::error::Result;
 use crate::schema::Table;
 use crate::vdbe::Program;
 
-use rustqlite_parser::{CreateTable, DeleteStmt, InsertStmt, SelectStmt};
+use rustqlite_parser::{CreateTable, DeleteStmt, DropTableStmt, InsertStmt, SelectStmt};
 
 /// Compile a single-table (or constant) `SELECT` into a VDBE program plus its result column
 /// names. `table` is the resolved table for the lone `FROM` entry, or `None` for a `SELECT`
@@ -49,4 +50,16 @@ pub fn compile_insert(ins: &InsertStmt, table: &Table) -> Result<Program> {
 /// resolved `table`.
 pub fn compile_delete(del: &DeleteStmt, table: &Table) -> Result<Program> {
     delete::compile_delete(del, table)
+}
+
+/// Compile a `DROP TABLE [IF EXISTS] <name>` into a VDBE write program. `current_schema_cookie`
+/// is the value before this statement runs; the program bumps it by one. `resolved_table`
+/// is `Some(table)` when the table exists in the catalog; the codegen errors with
+/// "no such table" when it's `None` and the statement did not say `IF EXISTS`.
+pub fn compile_drop_table(
+    drop: &DropTableStmt,
+    current_schema_cookie: u32,
+    resolved_table: Option<&Table>,
+) -> Result<Program> {
+    drop::compile_drop_table(drop, drop.if_exists, current_schema_cookie, resolved_table)
 }

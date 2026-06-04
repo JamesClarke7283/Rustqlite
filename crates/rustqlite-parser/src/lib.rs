@@ -63,13 +63,14 @@ fn build_statement(pair: Pair<'_, Rule>) -> Stmt {
     build_inner_stmt(first)
 }
 
-/// Build the select/create/insert/delete statement from its grammar pair.
+/// Build the select/create/insert/delete/drop statement from its grammar pair.
 fn build_inner_stmt(pair: Pair<'_, Rule>) -> Stmt {
     match pair.as_rule() {
         Rule::select_stmt => Stmt::Select(build_select(pair)),
         Rule::create_table_stmt => Stmt::CreateTable(build_create_table(pair)),
         Rule::insert_stmt => Stmt::Insert(build_insert(pair)),
         Rule::delete_stmt => Stmt::Delete(build_delete(pair)),
+        Rule::drop_table_stmt => Stmt::DropTable(build_drop_table(pair)),
         other => unreachable!("unexpected statement {other:?}"),
     }
 }
@@ -418,6 +419,26 @@ fn build_delete(pair: Pair<'_, Rule>) -> DeleteStmt {
     stmt
 }
 
+fn build_drop_table(pair: Pair<'_, Rule>) -> DropTableStmt {
+    let mut stmt = DropTableStmt {
+        if_exists: false,
+        schema: None,
+        name: String::new(),
+    };
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::if_exists => stmt.if_exists = true,
+            Rule::qualified_name => {
+                let (s, n) = build_qualified_name(part);
+                stmt.schema = s;
+                stmt.name = n;
+            }
+            _ => {}
+        }
+    }
+    stmt
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,6 +633,24 @@ mod tests {
         assert_eq!(d.schema.as_deref(), Some("main"));
         assert_eq!(d.table, "t");
         assert!(d.where_clause.is_some());
+    }
+
+    #[test]
+    fn drop_table_optional_if_exists() {
+        let Stmt::DropTable(d) = &parse("DROP TABLE t;").unwrap()[0] else {
+            panic!("expected DROP TABLE")
+        };
+        assert_eq!(d.name, "t");
+        assert!(!d.if_exists);
+
+        let Stmt::DropTable(d) =
+            &parse("DROP TABLE IF EXISTS main.t;").unwrap()[0]
+        else {
+            panic!("expected DROP TABLE IF EXISTS")
+        };
+        assert!(d.if_exists);
+        assert_eq!(d.schema.as_deref(), Some("main"));
+        assert_eq!(d.name, "t");
     }
 
     #[test]

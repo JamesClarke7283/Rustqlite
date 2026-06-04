@@ -11,6 +11,7 @@ pub mod balance;
 pub mod cell;
 pub mod cursor;
 pub mod delete;
+pub mod destroy;
 pub mod insert;
 pub mod page;
 
@@ -20,6 +21,7 @@ pub use cell::{
 };
 pub use cursor::{scan_table, TableCursor};
 pub use delete::leaf_delete_current;
+pub use destroy::destroy as btree_destroy;
 pub use insert::{max_rowid, table_insert};
 pub use page::{PageHeader, PageType};
 

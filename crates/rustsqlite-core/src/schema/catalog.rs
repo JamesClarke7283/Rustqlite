@@ -73,6 +73,13 @@ pub async fn read_catalog(pager: &Pager) -> Result<Catalog> {
     Ok(Catalog { objects })
 }
 
+/// The current schema cookie from the pager's cached header (header bytes 40-43, the value
+/// the on-disk `sqlite_schema` was last written with). Used by the DDL codegen to compute
+/// the new value the next DDL statement should install via `SetCookie`.
+pub fn schema_cookie(pager: &Pager) -> u32 {
+    pager.header().schema_cookie
+}
+
 fn text_at(values: &[Value], i: usize) -> Option<String> {
     match values.get(i) {
         Some(Value::Text(s)) => Some(s.clone()),

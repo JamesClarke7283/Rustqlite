@@ -319,6 +319,39 @@ impl Pager {
         f(&mut self.state.lock().unwrap().header);
     }
 
+    /// Add a page to the freelist: the page becomes the new first trunk, its first 4 bytes
+    /// hold the previous first-trunk page number, and the freelist count in the header is
+    /// bumped by one. The page is journaled (so a rollback restores the freelist). The
+    /// on-page content beyond the 4-byte next-pointer is zeroed, matching SQLite's freelist
+    /// trunk layout.
+    pub async fn free_page(&self, pgno: u32) -> Result<()> {
+        // Capture the pre-image in the journal (the page may already have data on disk; this
+        // records it so a rollback can restore the freelist state).
+        let preimage = self.get_page(pgno).await?;
+        self.journal_page(pgno, &preimage).await?;
+
+        let prev_first = {
+            let st = self.state.lock().unwrap();
+            st.header.first_freelist_trunk
+        };
+
+        // Write the freelist trunk header into the page: first 4 bytes = previous first
+        // trunk, rest = 0.
+        let mut buf = preimage.to_vec();
+        buf[0..4].copy_from_slice(&prev_first.to_be_bytes());
+        for b in &mut buf[4..] {
+            *b = 0;
+        }
+        self.write_page(pgno, buf)?;
+
+        // Update the header to point at the new first trunk and bump the count.
+        self.with_header_mut(|h| {
+            h.first_freelist_trunk = pgno;
+            h.freelist_count = h.freelist_count.wrapping_add(1);
+        });
+        Ok(())
+    }
+
     /// Whether a write transaction is currently open.
     pub fn in_write_txn(&self) -> bool {
         self.txn.lock().unwrap().is_some()

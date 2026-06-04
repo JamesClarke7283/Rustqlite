@@ -571,6 +571,15 @@ impl Vdbe {
                     self.regs[p2 as usize] = Value::Int(i64::from(root));
                     self.pc += 1;
                 }
+                Opcode::Destroy => {
+                    let pager = self
+                        .pager
+                        .clone()
+                        .ok_or_else(|| Error::msg("no database is open"))?;
+                    let root = p1 as u32;
+                    btree::btree_destroy(&pager, root).await?;
+                    self.pc += 1;
+                }
                 Opcode::NewRowid => {
                     let pager = self
                         .pager
