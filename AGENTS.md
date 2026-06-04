@@ -100,6 +100,10 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   volatile/connection functions (`random`/`randomblob`/`changes`/`sqlite_version`/…); and all shell
   output modes (list/csv/column/line/quote/tabs/ascii/html/markdown/box/table/json/insert).
   Moved to **M4**: the `sqllogictest` harness (its `.slt` corpora need the write path — `CREATE`/`INSERT`).
-- **M4 — Write path** (in progress): mutable pager + rollback journal + crash recovery, single-leaf
-  b-tree insert, `CREATE TABLE`/`INSERT`, then b-tree balance, overflow, `DELETE`/`UPDATE`, indexes, WAL.
-- **M5+ — indexes, joins, aggregates, subqueries, …**: pending.
+- **M4 — Write path** ✅: mutable pager + rollback journal + crash recovery, b-tree page split +
+  root promotion with overflow-page chains, `CREATE TABLE` / `INSERT ... VALUES` /
+  `DELETE` / `DROP TABLE`. The `sqllogictest` harness is wired (`crates/rustqlite/tests/slt.rs`
+  + `xtask/fetch-slt.sh`) and exercises the engine in-process; the manifest is populated
+  as M4.6+ features land.
+- **M5+ — indexes, joins, aggregates, subqueries, `UPDATE`, `INSERT ... SELECT`, UPSERT,
+  compound SELECT, triggers, views, …**: pending.

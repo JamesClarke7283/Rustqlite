@@ -71,8 +71,12 @@ Built bottom-up so each layer is verified against real SQLite before the next.
 - **M2 — Parser** — full `parse.y` → pest grammar + AST + Pratt expressions.
 - **M3 — Read query path** ✅ — codegen + VDBE for `SELECT`, affinity, the full scalar-function set
   (string/math/misc + `LIKE`/`GLOB`), all shell output modes, and `EXPLAIN` / `EXPLAIN QUERY PLAN`.
-- **M4 — Write path** 🚧 — pager write + rollback journal + crash recovery; DML/DDL; b-tree balance;
-  plus the `sqllogictest` harness (deferred here from M3 — its `.slt` corpora need `CREATE`/`INSERT`).
+- **M4 — Write path** ✅ — pager write + rollback journal + crash recovery; `CREATE TABLE` /
+  `INSERT ... VALUES` / `DELETE` / `DROP TABLE` (DML/DDL); b-tree page split + root promotion with
+  overflow-page chains; the `sqllogictest` harness (deferred here from M3 — its `.slt` corpora
+  need `CREATE`/`INSERT`/`DELETE`/`DROP`). The engine now writes valid C-SQLite-readable
+  databases of arbitrary size; the differential tests (`tests/diff.rs`, `tests/fileformat.rs`,
+  `tests/write_roundtrip.rs`, `crates/rustqlite/tests/cli_modes.rs`) all pass.
 - **M5 — Indexes & planner basics** · **M6 — Transactions & richer SQL** · **M7 — Advanced SQL**
   · **M8 — WAL & durability** · **M9 — Conformance hardening**.
 
