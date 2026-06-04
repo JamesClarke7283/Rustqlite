@@ -7,36 +7,25 @@
 //! row when no predicate is supplied). `ORDER BY` / `LIMIT` / multi-table `DELETE t1, t2 FROM …`
 //! are deferred.
 //!
-//! The layout below is the standard `sqlite3VdbeAddOp*` sequence from upstream:
-//!
-//! ```text
-//!   Init        0, end                       ; jump past the setup
-//!   Transaction 0, 1                         ; open the write transaction
-//!   OpenWrite   0, <rootpage>, 0             ; open the table b-tree
-//!   Rewind      0, end_loop                  ; empty table → skip
-//! loop_top:
-//!   Next        0, end_loop                  ; advance to next row, fall through if valid
-//!   (compile_jump <where> → end_of_body)     ; row matches predicate → delete (only when WHERE is set)
-//!   Delete      0                             ; remove the row at the current cursor
-//! end_of_body:
-//!   Goto        loop_top
-//! end_loop:
-//!   Halt
-//! end:
-//! ```
+//! M5.1: when the prepare path passes a non-empty `indexes` list, the program also emits one
+//! `OpenWrite` + `IdxDelete` per index per row, keeping the indexes in sync. The OLD key
+//! record is built from the row's column values (read via `Column` opcodes) followed by the
+//! rowid.
 
 use rustqlite_parser::{DeleteStmt, Expr};
 
 use crate::error::{Error, Result};
-use crate::schema::Table;
+use crate::schema::{IndexObject, Table};
 use crate::vdbe::program::Program;
 use crate::vdbe::Opcode;
 
 use super::builder::ProgramBuilder;
 use super::expr::{compile_jump, Ctx};
 
-/// Compile `DELETE FROM <table> [WHERE <expr>]`.
-pub fn compile_delete(del: &DeleteStmt, table: &Table) -> Result<Program> {
+/// Compile `DELETE FROM <table> [WHERE <expr>]` against `table` with `indexes` as the list of
+/// indexes whose entries must be removed alongside each deleted row. Empty `indexes` (the M3a
+/// default) means "no indexes to maintain".
+pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) -> Result<Program> {
     if del.schema.is_some() {
         return Err(Error::msg(
             "schema-qualified DELETE is not yet supported",
@@ -58,6 +47,13 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table) -> Result<Program> {
     b.emit(Opcode::Transaction, 0, 1, 0);
     b.emit(Opcode::OpenWrite, cursor, table.rootpage as i32, 0);
 
+    // Reserve cursor numbers for the indexes (1, 2, …). The table cursor is 0.
+    let index_cursor_base: i32 = 1;
+    for (i, idx) in indexes.iter().enumerate() {
+        let ic = (index_cursor_base + i as i32) as i32;
+        b.emit(Opcode::OpenWrite, ic, idx.rootpage as i32, 0);
+    }
+
     // Top of the loop. `Rewind` jumps to `end_loop` when the table is empty. The body of
     // the loop reads its row, evaluates the WHERE (if any), and either deletes or skips.
     // `Next` advances and, on a valid row, jumps back to the top of the body.
@@ -66,13 +62,61 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table) -> Result<Program> {
     let loop_body = b.new_label();
     b.resolve(loop_body);
 
-    // The body proper. When the WHERE is set, we jump to `end_of_body` on a false predicate.
+    // The body proper. The WHERE check is FIRST so that non-matching rows skip both the
+    // index maintenance and the table delete. Index maintenance (IdxDelete per index) runs
+    // before the table Delete so we can read the OLD column values; the `Rowid` is captured
+    // before the table delete for the same reason.
     if let Some(where_expr) = &del.where_clause {
         let end_of_body = b.new_label();
         compile_where(&mut b, where_expr, end_of_body, ctx)?;
+        // For the WHERE-matching rows only: capture rowid, IdxDelete per index, then Delete.
+        let rowid_reg = b.alloc_reg();
+        b.emit(Opcode::Rowid, cursor, rowid_reg, 0);
+        for (i, idx) in indexes.iter().enumerate() {
+            let ic = (index_cursor_base + i as i32) as i32;
+            if idx.columns.len() != 1 {
+                return Err(Error::msg(format!(
+                    "DELETE: index {} has {} columns; only single-column indexes are supported in M5.1",
+                    idx.name,
+                    idx.columns.len()
+                )));
+            }
+            let indexed_ci = table
+                .column_index(&idx.columns[0].name)
+                .expect("validated at INSERT time");
+            let key_start = b.alloc_regs(2);
+            b.emit(Opcode::Column, cursor, indexed_ci as i32, key_start);
+            b.emit(Opcode::SCopy, rowid_reg, key_start + 1, 0);
+            let key_rec = b.alloc_reg();
+            b.emit(Opcode::MakeRecord, key_start, 2, key_rec);
+            b.emit(Opcode::IdxDelete, ic, key_start, 2);
+        }
         b.emit(Opcode::Delete, cursor, 0, 0);
         b.resolve(end_of_body);
     } else {
+        // Unfiltered delete: every row matches, so unconditionally capture and remove
+        // the OLD rowid + index keys.
+        let rowid_reg = b.alloc_reg();
+        b.emit(Opcode::Rowid, cursor, rowid_reg, 0);
+        for (i, idx) in indexes.iter().enumerate() {
+            let ic = (index_cursor_base + i as i32) as i32;
+            if idx.columns.len() != 1 {
+                return Err(Error::msg(format!(
+                    "DELETE: index {} has {} columns; only single-column indexes are supported in M5.1",
+                    idx.name,
+                    idx.columns.len()
+                )));
+            }
+            let indexed_ci = table
+                .column_index(&idx.columns[0].name)
+                .expect("validated at INSERT time");
+            let key_start = b.alloc_regs(2);
+            b.emit(Opcode::Column, cursor, indexed_ci as i32, key_start);
+            b.emit(Opcode::SCopy, rowid_reg, key_start + 1, 0);
+            let key_rec = b.alloc_reg();
+            b.emit(Opcode::MakeRecord, key_start, 2, key_rec);
+            b.emit(Opcode::IdxDelete, ic, key_start, 2);
+        }
         b.emit(Opcode::Delete, cursor, 0, 0);
     }
 
@@ -112,6 +156,7 @@ mod tests {
         let ast = parse(sql).unwrap().into_iter().next().unwrap();
         let Stmt::CreateTable(ct) = ast else { panic!("expected CREATE TABLE") };
         Table::from_schema_object(&SchemaObject {
+            rowid: 1,
             obj_type: "table".into(),
             name: ct.name.clone(),
             tbl_name: ct.name.clone(),
@@ -132,7 +177,7 @@ mod tests {
     fn unfiltered_delete_walks_table() {
         let t = table_of("CREATE TABLE t(a, b)");
         let d = delete_of("DELETE FROM t;");
-        let prog = compile_delete(&d, &t).unwrap();
+        let prog = compile_delete(&d, &t, &[]).unwrap();
         let names: Vec<&str> = prog.instructions.iter().map(|i| i.opcode.name()).collect();
         assert!(names.contains(&"OpenWrite"));
         assert!(names.contains(&"Rewind"));
@@ -146,7 +191,7 @@ mod tests {
     fn where_filter_emits_jump() {
         let t = table_of("CREATE TABLE t(a, b)");
         let d = delete_of("DELETE FROM t WHERE a > 1;");
-        let prog = compile_delete(&d, &t).unwrap();
+        let prog = compile_delete(&d, &t, &[]).unwrap();
         let cmp = prog
             .instructions
             .iter()

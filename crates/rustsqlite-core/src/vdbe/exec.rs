@@ -13,7 +13,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::btree::{self, TableCursor};
+use crate::btree::{self, IndexCursor, TableCursor};
 use crate::error::{Error, Result};
 use crate::format::{decode_record, encode_record, TextEncoding};
 use crate::func;
@@ -24,7 +24,8 @@ use super::compare::{apply_affinity, mem_compare};
 use super::cursor::VdbeCursor;
 use super::opcode::Opcode;
 use super::program::{
-    p5_to_aff, Instruction, Program, P4, P5_ISUPDATE, P5_JUMPIFNULL, P5_NULLEQ, P5_STOREP2,
+    p5_to_aff, Instruction, Program, P4, P5_ISUPDATE, P5_JUMPIFNULL, P5_NCHANGE, P5_NULLEQ,
+    P5_STOREP2,
 };
 use super::sorter::Sorter;
 
@@ -299,8 +300,15 @@ impl Vdbe {
                         .pager
                         .clone()
                         .ok_or_else(|| Error::msg("no database is open"))?;
-                    let cursor = TableCursor::new(pager, p2 as u32);
-                    self.set_cursor(p1 as usize, VdbeCursor::Table(cursor));
+                    // An `OpenRead` with `P4::KeyInfo` opens an index b-tree; a bare
+                    // `OpenRead` (no KeyInfo) opens a table b-tree — same as M3a.
+                    if matches!(&inst.p4, P4::KeyInfo(_)) {
+                        let cursor = IndexCursor::new(pager, p2 as u32);
+                        self.set_cursor(p1 as usize, VdbeCursor::Index(cursor));
+                    } else {
+                        let cursor = TableCursor::new(pager, p2 as u32);
+                        self.set_cursor(p1 as usize, VdbeCursor::Table(cursor));
+                    }
                     self.cursor_root.insert(p1, p2 as u32);
                     self.pc += 1;
                 }
@@ -314,12 +322,35 @@ impl Vdbe {
                         .pager
                         .clone()
                         .ok_or_else(|| Error::msg("no database is open"))?;
-                    let cursor = TableCursor::new(pager, p2 as u32);
-                    self.set_cursor(p1 as usize, VdbeCursor::Table(cursor));
+                    if matches!(&inst.p4, P4::KeyInfo(_)) {
+                        let cursor = IndexCursor::new(pager, p2 as u32);
+                        self.set_cursor(p1 as usize, VdbeCursor::Index(cursor));
+                    } else {
+                        let cursor = TableCursor::new(pager, p2 as u32);
+                        self.set_cursor(p1 as usize, VdbeCursor::Table(cursor));
+                    }
                     self.cursor_root.insert(p1, p2 as u32);
                     self.pc += 1;
                 }
-                Opcode::Close => {
+                Opcode::OpenWriteReg => {
+                    // Open a write cursor on the b-tree whose root page is the value of `r[p2]`.
+                    // The M5.1 first slice uses this for `CREATE INDEX`'s populate pass: the
+                    // index b-tree's root is computed by `CreateBtree` and lands in a register;
+                    // this opcode opens a cursor on that value.
+                    let pager = self
+                        .pager
+                        .clone()
+                        .ok_or_else(|| Error::msg("no database is open"))?;
+                    let root = self.regs[p2 as usize].as_i64() as u32;
+                    let cursor = if p3 == 1 {
+                        VdbeCursor::Table(TableCursor::new(pager, root))
+                    } else {
+                        VdbeCursor::Index(IndexCursor::new(pager, root))
+                    };
+                    self.set_cursor(p1 as usize, cursor);
+                    self.cursor_root.insert(p1, root);
+                    self.pc += 1;
+                }                Opcode::Close => {
                     if let Some(slot) = self.cursors.get_mut(p1 as usize) {
                         *slot = None;
                     }
@@ -327,25 +358,67 @@ impl Vdbe {
                 }
 
                 Opcode::Rewind => {
-                    let cur = self.table_cursor_mut(p1)?;
-                    cur.rewind().await?;
-                    let valid = cur.is_valid();
-                    self.decoded = None;
-                    if valid {
-                        self.pc += 1;
-                    } else {
-                        self.pc = p2 as usize;
+                    // Rewind the cursor and jump to `p2` if it is empty. Works on both
+                    // table and index cursors (M5.1: a single rewind on the chosen cursor
+                    // type, dispatching through the VdbeCursor enum).
+                    let cur = self.cursor_mut(p1)?;
+                    match cur {
+                        VdbeCursor::Table(c) => {
+                            c.rewind().await?;
+                            let valid = c.is_valid();
+                            self.decoded = None;
+                            if valid {
+                                self.pc += 1;
+                            } else {
+                                self.pc = p2 as usize;
+                            }
+                        }
+                        VdbeCursor::Index(c) => {
+                            c.rewind().await?;
+                            let valid = c.is_valid();
+                            if valid {
+                                self.pc += 1;
+                            } else {
+                                self.pc = p2 as usize;
+                            }
+                        }
+                        VdbeCursor::Sorter(_) => {
+                            return Err(Error::msg("Rewind is not valid on a sorter cursor"))
+                        }
                     }
                 }
                 Opcode::Next => {
-                    let cur = self.table_cursor_mut(p1)?;
-                    cur.next().await?;
-                    let valid = cur.is_valid();
-                    self.decoded = None;
-                    if valid {
-                        self.pc = p2 as usize;
-                    } else {
-                        self.pc += 1;
+                    // Advance the cursor; jump to `p2` on a valid row, fall through on
+                    // exhaustion. Works on both table and index cursors.
+                    let cur = self.cursor_mut(p1)?;
+                    match cur {
+                        VdbeCursor::Table(c) => {
+                            c.next().await?;
+                            let valid = c.is_valid();
+                            self.decoded = None;
+                            if valid {
+                                self.pc = p2 as usize;
+                            } else {
+                                self.pc += 1;
+                            }
+                        }
+                        VdbeCursor::Index(c) => {
+                            c.next().await?;
+                            let valid = c.is_valid();
+                            if valid {
+                                self.pc = p2 as usize;
+                            } else {
+                                self.pc += 1;
+                            }
+                        }
+                        VdbeCursor::Sorter(s) => {
+                            s.next();
+                            if s.is_valid() {
+                                self.pc = p2 as usize;
+                            } else {
+                                self.pc += 1;
+                            }
+                        }
                     }
                 }
 
@@ -367,6 +440,110 @@ impl Vdbe {
                 Opcode::Column => {
                     let val = self.column(p1 as usize, p2 as usize).await?;
                     self.regs[p3 as usize] = val;
+                    self.pc += 1;
+                }
+
+                // ---- index seeks (M5.1) ----
+                Opcode::SeekGE | Opcode::SeekGT | Opcode::SeekLE | Opcode::SeekLT => {
+                    let op = match inst.opcode {
+                        Opcode::SeekGE => btree::index_cursor::SeekOp::Ge,
+                        Opcode::SeekGT => btree::index_cursor::SeekOp::Gt,
+                        Opcode::SeekLE => btree::index_cursor::SeekOp::Le,
+                        Opcode::SeekLT => btree::index_cursor::SeekOp::Lt,
+                        _ => unreachable!(),
+                    };
+                    let n = p4_len(&inst.p4);
+                    let key: Vec<Value> = self.regs[p3 as usize..p3 as usize + n].to_vec();
+                    let cursor = self.index_cursor_mut(p1)?;
+                    let found = cursor.seek(op, &key).await?;
+                    if !found {
+                        self.pc = p2 as usize;
+                    } else {
+                        self.pc += 1;
+                    }
+                }
+                Opcode::IdxGE | Opcode::IdxGT | Opcode::IdxLE | Opcode::IdxLT => {
+                    // Compare the current entry's prefix (first `n` values of the key record)
+                    // against the search key; jump to `p2` when the comparison falls in the
+                    // "outside the range" direction. Together with the preceding `Seek*` this
+                    // implements the indexed comparison operators.
+                    //
+                    // The post-seek boundary check is *inverted* from the operator name:
+                    //   SeekGE+IdxGT  → `WHERE col > X`   → jump when entry `<=` X (we want strict >).
+                    //   SeekGE+IdxGE  → `WHERE col >= X`  → jump when entry `<`  X (already handled by SeekGE).
+                    //   SeekLE+IdxLT  → `WHERE col < X`   → jump when entry `>=` X.
+                    //   SeekLE+IdxLE  → `WHERE col <= X`  → jump when entry `>`  X.
+                    //
+                    // For an `=` operator (the M5.1 first slice's only shape), we use
+                    // SeekGE+IdxGT where the `IdxGT` jumps when entry `>` key (i.e., NOT
+                    // matching). Note the inverted semantics: the post-seek opcode is named
+                    // for the boundary direction we *don't* want, not the one we do.
+                    let n = p4_len(&inst.p4);
+                    let search_key: Vec<Value> = self.regs[p3 as usize..p3 as usize + n].to_vec();
+                    let cursor = self.index_cursor(p1)?;
+                    let payload = cursor.payload();
+                    let values = decode_record(payload, self.encoding)?;
+                    let prefix = &values[..values.len().saturating_sub(1).min(n)];
+                    let ord = compare_prefix(prefix, &search_key, Collation::Binary);
+                    let jump = match inst.opcode {
+                        // The "GE"/"GT"/"LE"/"LT" suffixes name the "leave the loop" direction
+                        // — the boundary beyond which the entry is no longer in range.
+                        // SeekGE+IdxGE means `>=`; the post-seek check fires only on `==`,
+                        // which is in range. So IdxGE jumps on `<` (Less).
+                        Opcode::IdxGE => matches!(ord, Ordering::Less),
+                        // SeekGE+IdxGT means `>`; the post-seek check fires on `==` and `<`.
+                        // Inverted: jump when entry is `>` (the next entry in index order, if any,
+                        // is the first one strictly greater; we want to stop before it).
+                        Opcode::IdxGT => matches!(ord, Ordering::Greater),
+                        // SeekLE+IdxLE means `<=`; post-seek check on `>`.
+                        Opcode::IdxLE => matches!(ord, Ordering::Greater),
+                        // SeekLE+IdxLT means `<`; post-seek check on `==` and `>`.
+                        Opcode::IdxLT => matches!(ord, Ordering::Greater),
+                        _ => unreachable!(),
+                    };
+                    if jump {
+                        self.pc = p2 as usize;
+                    } else {
+                        self.pc += 1;
+                    }
+                }
+                Opcode::IdxRowid => {
+                    let rowid = self.index_cursor(p1)?.rowid()?;
+                    self.regs[p2 as usize] = Value::Int(rowid);
+                    self.pc += 1;
+                }
+                Opcode::IdxInsert => {
+                    let pager = self
+                        .pager
+                        .clone()
+                        .ok_or_else(|| Error::msg("no database is open"))?;
+                    let root = self.cursor_root_of(p1)?;
+                    let record = match &self.regs[p2 as usize] {
+                        Value::Blob(b) => b.clone(),
+                        _ => return Err(Error::msg("IdxInsert expects a record blob in p2")),
+                    };
+                    btree::index_insert(&pager, root, &record).await?;
+                    if p5 & P5_NCHANGE != 0 {
+                        self.ctx.changes += 1;
+                        self.ctx.total_changes += 1;
+                    }
+                    self.pc += 1;
+                }
+                Opcode::IdxDelete => {
+                    let pager = self
+                        .pager
+                        .clone()
+                        .ok_or_else(|| Error::msg("no database is open"))?;
+                    let root = self.cursor_root_of(p1)?;
+                    let n = p3 as usize;
+                    let key: Vec<Value> = self.regs[p2 as usize..p2 as usize + n].to_vec();
+                    let key_record = encode_record(&key);
+                    btree::index_leaf_delete(&pager, root, &key_record).await?;
+                    if let Some(cur) = self.cursors.get_mut(p1 as usize).and_then(|c| c.as_mut()) {
+                        if let VdbeCursor::Index(c) = cur {
+                            c.mark_deleted();
+                        }
+                    }
                     self.pc += 1;
                 }
 
@@ -586,7 +763,14 @@ impl Vdbe {
                         .pager
                         .clone()
                         .ok_or_else(|| Error::msg("no database is open"))?;
-                    let root = btree::create_table_btree(&pager).await?;
+                    // p3 selects the b-tree type: 1 = table, 0 = index. M5.1: the index
+                    // case allocates a leaf-index page (mirrors `sqlite3BtreeCreateTable` for
+                    // `idxType == SQLITE_IDXTYPE_APPDEF`).
+                    let root = if p3 == 1 {
+                        btree::create_table_btree(&pager).await?
+                    } else {
+                        btree::create_index_btree(&pager).await?
+                    };
                     self.regs[p2 as usize] = Value::Int(i64::from(root));
                     self.pc += 1;
                 }
@@ -776,6 +960,31 @@ impl Vdbe {
             .ok_or_else(|| Error::msg("cursor is not an open table cursor"))
     }
 
+    fn index_cursor(&self, p1: i32) -> Result<&IndexCursor> {
+        self.cursors
+            .get(p1 as usize)
+            .and_then(|c| c.as_ref())
+            .and_then(|c| c.as_index())
+            .ok_or_else(|| Error::msg("cursor is not an open index cursor"))
+    }
+
+    fn index_cursor_mut(&mut self, p1: i32) -> Result<&mut IndexCursor> {
+        self.cursors
+            .get_mut(p1 as usize)
+            .and_then(|c| c.as_mut())
+            .and_then(|c| c.as_index_mut())
+            .ok_or_else(|| Error::msg("cursor is not an open index cursor"))
+    }
+
+    /// Mutably borrow any cursor by index (table, index, or sorter). Used by the
+    /// `Rewind` / `Next` opcodes which need to work across all three cursor kinds.
+    fn cursor_mut(&mut self, p1: i32) -> Result<&mut VdbeCursor> {
+        self.cursors
+            .get_mut(p1 as usize)
+            .and_then(|c| c.as_mut())
+            .ok_or_else(|| Error::msg("cursor is not open"))
+    }
+
     fn sorter_mut(&mut self, p1: i32) -> Result<&mut Sorter> {
         self.cursors
             .get_mut(p1 as usize)
@@ -885,6 +1094,28 @@ fn as_p4_blob(p4: &P4) -> Vec<u8> {
         P4::Blob(b) => b.clone(),
         _ => Vec::new(),
     }
+}
+
+/// The integer in `P4::Int`, used to encode the `nField` operand of `SeekGE`/`IdxGE` etc.
+/// Defaults to 0 when the operand is not an integer (the engine uses 0 to mean "no key" for
+/// those opcodes).
+fn p4_len(p4: &P4) -> usize {
+    match p4 {
+        P4::Int(n) => (*n).max(0) as usize,
+        _ => 0,
+    }
+}
+
+/// Compare two key prefixes field-by-field under the BINARY collation.
+fn compare_prefix(prefix: &[Value], key: &[Value], coll: Collation) -> Ordering {
+    let n = prefix.len().min(key.len());
+    for i in 0..n {
+        match mem_compare(&prefix[i], &key[i], coll) {
+            Ordering::Equal => {}
+            non_eq => return non_eq,
+        }
+    }
+    prefix.len().cmp(&key.len())
 }
 
 fn char_to_aff(ch: u8) -> Affinity {

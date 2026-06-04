@@ -11,25 +11,30 @@ pub mod builder;
 pub mod create;
 pub mod delete;
 pub mod drop;
+pub mod drop_index;
 pub mod expr;
+pub mod index;
+pub mod index_planner;
 pub mod insert;
 pub mod select;
 pub mod update;
 
 use crate::error::Result;
-use crate::schema::Table;
+use crate::schema::{IndexObject, Table};
 use crate::vdbe::Program;
 
-use rustqlite_parser::{CreateTable, DeleteStmt, DropTableStmt, InsertStmt, SelectStmt, UpdateStmt};
-
+use rustqlite_parser::{CreateIndex, CreateTable, DeleteStmt, DropIndexStmt, DropTableStmt, InsertStmt, SelectStmt, UpdateStmt};
 /// Compile a single-table (or constant) `SELECT` into a VDBE program plus its result column
 /// names. `table` is the resolved table for the lone `FROM` entry, or `None` for a `SELECT`
-/// with no `FROM`.
+/// with no `FROM`. `indexes` is the list of indexes attached to `table`; the M5.1 first
+/// slice uses them to route indexed-equality lookups (see [`index_planner`]) — an empty slice
+/// is the M3a default.
 pub fn compile_select(
     select: &SelectStmt,
     table: Option<&Table>,
+    indexes: &[IndexObject],
 ) -> Result<(Program, Vec<String>)> {
-    select::compile(select, table)
+    select::compile(select, table, indexes)
 }
 
 /// Compile a `CREATE TABLE` into a VDBE write program. `sql_text` is stored verbatim in the new
@@ -42,15 +47,31 @@ pub fn compile_create_table(
     create::compile_create_table(ct, sql_text, schema_cookie)
 }
 
-/// Compile an `INSERT ... VALUES` into a VDBE write program against the resolved `table`.
-pub fn compile_insert(ins: &InsertStmt, table: &Table) -> Result<Program> {
-    insert::compile_insert(ins, table)
+/// Compile a `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON tbl(col)` into a VDBE write program
+/// that also populates the new index from the table's current rows. `table` is the catalog-
+/// resolved table (the codegen verifies the indexed column exists); `sql_text` is the verbatim
+/// `CREATE INDEX` source.
+pub fn compile_create_index(
+    ci: &CreateIndex,
+    table: &Table,
+    sql_text: &str,
+    schema_cookie: u32,
+) -> Result<Program> {
+    index::compile_create_index(ci, table, sql_text, schema_cookie)
+}
+
+/// Compile an `INSERT ... VALUES` into a VDBE write program against the resolved `table`. The
+/// `indexes` slice is the list of `IndexObject`s attached to `table` (the prepare path
+/// resolves them from the catalog); the program emits per-row `IdxInsert` for each.
+pub fn compile_insert(ins: &InsertStmt, table: &Table, indexes: &[IndexObject]) -> Result<Program> {
+    insert::compile_insert(ins, table, indexes)
 }
 
 /// Compile a `DELETE FROM <table> [WHERE <expr>]` into a VDBE write program against the
-/// resolved `table`.
-pub fn compile_delete(del: &DeleteStmt, table: &Table) -> Result<Program> {
-    delete::compile_delete(del, table)
+/// resolved `table`. `indexes` is the list of indexes attached to `table`; the program
+/// emits per-row `IdxDelete` for each (single-column) index.
+pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) -> Result<Program> {
+    delete::compile_delete(del, table, indexes)
 }
 
 /// Compile a `DROP TABLE [IF EXISTS] <name>` into a VDBE write program. `current_schema_cookie`
@@ -65,9 +86,27 @@ pub fn compile_drop_table(
     drop::compile_drop_table(drop, drop.if_exists, current_schema_cookie, resolved_table)
 }
 
+/// Compile a `DROP INDEX [IF EXISTS] [schema.]name` into a VDBE write program. `index` is the
+/// catalog-resolved index (when `None`, the caller must be using `IF EXISTS` — the codegen
+/// routes that to a no-op `Halt`). `current_schema_cookie` is the value before this statement
+/// runs; the program bumps it by one. `schema_rowid` is the rowid of the matching
+/// `sqlite_schema` row (so we can `Delete` it without scanning the b-tree).
+pub fn compile_drop_index(
+    drop: &DropIndexStmt,
+    index: Option<&IndexObject>,
+    current_schema_cookie: u32,
+    schema_rowid: i64,
+) -> Result<Program> {
+    match index {
+        Some(idx) => drop_index::compile_drop_index(drop, idx, current_schema_cookie, schema_rowid),
+        None => Ok(drop_index::compile_drop_index_noop()),
+    }
+}
+
 /// Compile an `UPDATE [OR action] tbl SET col = expr [, …] [WHERE expr]` into a VDBE write
 /// program against the resolved `table`. The first M5.0 slice: single-table, no triggers /
-/// FK / indexes / UPSERT, `OR action` other than ABORT errors at codegen time.
-pub fn compile_update(upd: &UpdateStmt, table: &Table) -> Result<Program> {
-    update::compile_update(upd, table)
+/// FK / `OR action` other than ABORT (errors at codegen time). M5.1: `indexes` drives per-row
+/// `IdxDelete` + `IdxInsert` maintenance for each single-column index on the table.
+pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) -> Result<Program> {
+    update::compile_update(upd, table, indexes)
 }

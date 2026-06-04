@@ -4,24 +4,35 @@
 //! index b-trees are key-keyed. This module decodes the on-disk page and cell layout and
 //! provides read cursors over it. For M1 the read cursor walks **table** b-trees (enough to
 //! read `sqlite_schema` and table-scan rows, following overflow chains). The write path
-//! ([`insert`]) adds single-leaf table insertion + rowid allocation + b-tree creation; index
-//! cursors and page balancing ([`balance`]) arrive in later milestones.
+//! ([`insert`]) adds single-leaf table insertion + rowid allocation + b-tree creation. M5.1
+//! adds the index b-tree layer ([`index`], [`index_cursor`], [`index_insert`],
+//! [`index_delete`]) that backs `CREATE INDEX` / `DROP INDEX` and the index-aware `WHERE` /
+//! `ORDER BY` paths.
 
 pub mod balance;
 pub mod cell;
 pub mod cursor;
 pub mod delete;
 pub mod destroy;
+pub mod index;
+pub mod index_cursor;
+pub mod index_delete;
+pub mod index_insert;
 pub mod insert;
 pub mod page;
 
 pub use cell::{
+    assemble_index_payload, build_index_interior_cell, build_index_leaf_cell,
     build_table_leaf_cell, parse_index_interior_cell, parse_index_leaf_cell,
     parse_table_interior_cell, parse_table_leaf_cell, table_leaf_cell_rowid,
 };
 pub use cursor::{scan_table, TableCursor};
 pub use delete::leaf_delete_current;
 pub use destroy::destroy as btree_destroy;
+pub use index::{create_index_btree, scan_index};
+pub use index_cursor::IndexCursor;
+pub use index_delete::index_leaf_delete;
+pub use index_insert::{index_insert, index_insert_after_root_promotion};
 pub use insert::{max_rowid, table_insert};
 pub use page::{PageHeader, PageType};
 

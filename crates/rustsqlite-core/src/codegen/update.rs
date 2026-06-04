@@ -56,7 +56,7 @@
 use rustqlite_parser::{Assignment, UpdateStmt};
 
 use crate::error::{Error, Result};
-use crate::schema::Table;
+use crate::schema::{IndexObject, Table};
 use crate::types::Affinity;
 use crate::vdbe::program::{Program, P4, P5_ISUPDATE};
 use crate::vdbe::Opcode;
@@ -64,8 +64,10 @@ use crate::vdbe::Opcode;
 use super::builder::ProgramBuilder;
 use super::expr::{compile_expr, compile_jump, Ctx};
 
-/// Compile `UPDATE [OR action] tbl SET col = expr [, …] [WHERE expr]`.
-pub fn compile_update(upd: &UpdateStmt, table: &Table) -> Result<Program> {
+/// Compile `UPDATE [OR action] tbl SET col = expr [, …] [WHERE expr]`. `indexes` is the list
+/// of indexes attached to `table`; the codegen emits per-row `IdxDelete` + `IdxInsert`
+/// maintenance for each (single-column) index.
+pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) -> Result<Program> {
     if upd.schema.is_some() {
         return Err(Error::msg(
             "schema-qualified UPDATE is not yet supported",
@@ -143,6 +145,21 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table) -> Result<Program> {
     let open = b.emit(Opcode::OpenWrite, cursor, table.rootpage as i32, 0);
     b.set_p4(open, P4::Int(ncol as i64));
 
+    // (3b) Open the indexes as write cursors (cursor 2, 3, …) so the second pass can
+    // IdxDelete the OLD key and IdxInsert the NEW key for each index.
+    let index_cursor_base: i32 = 2;
+    for (i, idx) in indexes.iter().enumerate() {
+        if idx.columns.len() != 1 {
+            return Err(Error::msg(format!(
+                "UPDATE: index {} has {} columns; only single-column indexes are supported in M5.1",
+                idx.name,
+                idx.columns.len()
+            )));
+        }
+        let ic = (index_cursor_base + i as i32) as i32;
+        b.emit(Opcode::OpenWrite, ic, idx.rootpage as i32, 0);
+    }
+
     // (4) First pass: scan, evaluate WHERE, capture matching rowids into the sorter.
     let end_scan = b.new_label();
     b.emit_jump(Opcode::Rewind, cursor, end_scan, 0);
@@ -193,6 +210,33 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table) -> Result<Program> {
             b.emit(Opcode::RealAffinity, reg_new + ci as i32, 0, 0);
         }
     }
+
+    // (6b) Snapshot the OLD values for the indexed columns (if any) BEFORE the SET
+    // assignments overwrite them. We need them for the per-index `IdxDelete` later in this
+    // loop body. The snapshot is one register per indexed column.
+    let mut old_value_reg: std::collections::HashMap<usize, i32> = std::collections::HashMap::new();
+    for (i, idx) in indexes.iter().enumerate() {
+        if idx.columns.len() != 1 {
+            // Validated earlier; defensive guard.
+            return Err(Error::msg(format!(
+                "UPDATE: index {} has {} columns; only single-column indexes are supported in M5.1",
+                idx.name,
+                idx.columns.len()
+            )));
+        }
+        let indexed_ci = table
+            .column_index(&idx.columns[0].name)
+            .expect("validated earlier");
+        // Skip if we already snapshotted this column (multiple indexes on the same column
+        // would otherwise redundantly copy; harmless but wasteful).
+        if !old_value_reg.contains_key(&indexed_ci) {
+            let r = b.alloc_reg();
+            b.emit(Opcode::SCopy, reg_new + indexed_ci as i32, r, 0);
+            old_value_reg.insert(indexed_ci, r);
+        }
+        let _ = i; // silence: the index is keyed on (i, idx.name) but we only need the column
+    }
+
     for (ci, slot) in target_col.iter().enumerate() {
         if let Some((_, value)) = slot {
             compile_expr(&mut b, value, reg_new + ci as i32, ctx)?;
@@ -213,10 +257,50 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table) -> Result<Program> {
     // and the Insert both carry `P5_ISUPDATE` so the change counters fire once.
     let reg_new_rec = b.alloc_reg();
     b.emit(Opcode::MakeRecord, reg_new, ncol as i32, reg_new_rec);
+
+    // (9b) Index maintenance: for each single-column index, build the OLD key (using the
+    // snapshotted old value captured at (6b) above) and IdxDelete it. Then build the NEW
+    // key (using `reg_new + indexed_ci`, which holds the SET-overwritten value if the
+    // indexed column was reassigned, or the unchanged value if not) and IdxInsert it.
+    for (i, idx) in indexes.iter().enumerate() {
+        let ic = (index_cursor_base + i as i32) as i32;
+        let indexed_ci = table
+            .column_index(&idx.columns[0].name)
+            .expect("validated at INSERT/compile time");
+        // OLD key record: [snapshotted_old, rowid]
+        let old_val_reg = *old_value_reg
+            .get(&indexed_ci)
+            .expect("snapshot exists for every indexed column");
+        let old_key = b.alloc_regs(2);
+        b.emit(Opcode::SCopy, old_val_reg, old_key, 0);
+        b.emit(Opcode::SCopy, reg_old_rowid2, old_key + 1, 0);
+        let old_key_rec = b.alloc_reg();
+        b.emit(Opcode::MakeRecord, old_key, 2, old_key_rec);
+        b.emit(Opcode::IdxDelete, ic, old_key, 2);
+        // (the IdxDelete reads the key from r[p2..p2+p3]; the SCopy built the [old, rowid]
+        // pair into old_key/old_key+1, so p2=old_key, p3=2.)
+    }
+
     let del_idx = b.emit(Opcode::Delete, cursor, 0, 0);
     b.set_p5(del_idx, P5_ISUPDATE);
     let ins_idx = b.emit(Opcode::Insert, cursor, reg_new_rec, reg_old_rowid2);
     b.set_p5(ins_idx, P5_ISUPDATE);
+
+    // (9c) New-key IdxInsert (post-Insert, so the new value is in `reg_new + indexed_ci`
+    // regardless of whether the SET overwrote it).
+    for (i, idx) in indexes.iter().enumerate() {
+        let ic = (index_cursor_base + i as i32) as i32;
+        let indexed_ci = table
+            .column_index(&idx.columns[0].name)
+            .expect("validated at INSERT/compile time");
+        let new_key = b.alloc_regs(2);
+        b.emit(Opcode::SCopy, reg_new + indexed_ci as i32, new_key, 0);
+        b.emit(Opcode::SCopy, reg_old_rowid2, new_key + 1, 0);
+        let new_key_rec = b.alloc_reg();
+        b.emit(Opcode::MakeRecord, new_key, 2, new_key_rec);
+        let idx_ins = b.emit(Opcode::IdxInsert, ic, new_key_rec, 0);
+        b.set_p4(idx_ins, P4::Int(0));
+    }
 
     b.resolve(sort_next);
     b.emit_jump(Opcode::SorterNext, sorter, update_top, 0);
@@ -248,6 +332,7 @@ mod tests {
 
     fn table_of(sql: &str) -> Table {
         let obj = SchemaObject {
+            rowid: 1,
             obj_type: "table".into(),
             name: "t".into(),
             tbl_name: "t".into(),
@@ -268,7 +353,7 @@ mod tests {
     fn rejects_or_action() {
         let t = table_of("CREATE TABLE t(a, b)");
         let u = update_of("UPDATE OR REPLACE t SET a = 1;");
-        let err = compile_update(&u, &t).unwrap_err();
+        let err = compile_update(&u, &t, &[]).unwrap_err();
         assert!(err.to_string().contains("ON CONFLICT"));
     }
 
@@ -276,7 +361,7 @@ mod tests {
     fn rejects_unknown_column() {
         let t = table_of("CREATE TABLE t(a, b)");
         let u = update_of("UPDATE t SET nope = 1;");
-        let err = compile_update(&u, &t).unwrap_err();
+        let err = compile_update(&u, &t, &[]).unwrap_err();
         assert!(err.to_string().contains("no column named nope"));
     }
 
@@ -284,7 +369,7 @@ mod tests {
     fn rejects_rowid_alias_set() {
         let t = table_of("CREATE TABLE t(id INTEGER PRIMARY KEY, v)");
         let u = update_of("UPDATE t SET id = 5;");
-        let err = compile_update(&u, &t).unwrap_err();
+        let err = compile_update(&u, &t, &[]).unwrap_err();
         assert!(err.to_string().contains("INTEGER PRIMARY KEY"));
     }
 
@@ -292,7 +377,7 @@ mod tests {
     fn golden_opcode_shape() {
         let t = table_of("CREATE TABLE t(a, b)");
         let u = update_of("UPDATE t SET a = 1 WHERE b > 0;");
-        let prog = compile_update(&u, &t).unwrap();
+        let prog = compile_update(&u, &t, &[]).unwrap();
         let names: Vec<&str> = prog.instructions.iter().map(|i| i.opcode.name()).collect();
         // Two-pass shape, in this order.
         assert!(names.contains(&"Transaction"));

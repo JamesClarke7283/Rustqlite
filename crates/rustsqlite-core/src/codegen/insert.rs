@@ -8,20 +8,28 @@
 //! First-slice scope: `VALUES` rows of literal/constant expressions, the rowid alias rule, and an
 //! optional explicit column list. `INSERT ... SELECT`, `DEFAULT VALUES`, `UPSERT`, and conflict
 //! resolution beyond the default ABORT are out of scope.
+//!
+//! M5.1: when the prepare path passes a non-empty `indexes` list, the program also emits one
+//! `OpenWrite` + `IdxInsert` pair per index per row, keeping the index b-trees in sync with the
+//! table. The index-key record is built from the table's record registers (a `Copy` of the
+//! indexed column value followed by an `SCopy` of the rowid), then `MakeRecord`-ed.
 
 use rustqlite_parser::{Expr, InsertStmt};
 
 use crate::error::{Error, Result};
-use crate::schema::Table;
+use crate::schema::{IndexObject, Table};
 use crate::types::Affinity;
-use crate::vdbe::program::{Program, P4};
+use crate::vdbe::program::{Program, P4, P5_NCHANGE};
 use crate::vdbe::Opcode;
 
 use super::builder::ProgramBuilder;
 use super::expr::{compile_expr, Ctx};
 
-/// Compile an `INSERT INTO <table> VALUES (...)[, (...)]` statement.
-pub fn compile_insert(ins: &InsertStmt, table: &Table) -> Result<Program> {
+/// Compile an `INSERT INTO <table> VALUES (...)[, (...)]` statement. `indexes` is the list of
+/// indexes attached to `table` (the prepare path passes this from the catalog; an empty slice
+/// means "no indexes", matching the M3a behavior). Index maintenance is emitted per row per
+/// index.
+pub fn compile_insert(ins: &InsertStmt, table: &Table, indexes: &[IndexObject]) -> Result<Program> {
     if ins.rows.is_empty() {
         return Err(Error::msg("INSERT must supply at least one VALUES row"));
     }
@@ -48,6 +56,20 @@ pub fn compile_insert(ins: &InsertStmt, table: &Table) -> Result<Program> {
         ins.columns.len()
     };
 
+    // Validate that every index's columns are present on the table. The prepare path is
+    // responsible for this (it built the IndexObject from the catalog), so any error here is a
+    // bug in the loader — we still surface a clear message rather than panic.
+    for idx in indexes {
+        for ic in &idx.columns {
+            if table.column_index(&ic.name).is_none() {
+                return Err(Error::msg(format!(
+                    "index {} references unknown column {} on table {}",
+                    idx.name, ic.name, table.name
+                )));
+            }
+        }
+    }
+
     let cursor = 0i32;
     let ctx = Ctx { table, cursor };
     let mut b = ProgramBuilder::new();
@@ -58,6 +80,13 @@ pub fn compile_insert(ins: &InsertStmt, table: &Table) -> Result<Program> {
 
     b.emit(Opcode::Transaction, 0, 1, 0); // open the write transaction
     b.emit(Opcode::OpenWrite, cursor, table.rootpage as i32, 0);
+
+    // Reserve cursor numbers for the indexes (1, 2, …). The table cursor is 0.
+    let index_cursor_base: i32 = 1;
+    for (i, idx) in indexes.iter().enumerate() {
+        let ic = (index_cursor_base + i as i32) as i32;
+        b.emit(Opcode::OpenWrite, ic, idx.rootpage as i32, 0);
+    }
 
     for row in &ins.rows {
         if row.len() != expected {
@@ -114,6 +143,33 @@ pub fn compile_insert(ins: &InsertStmt, table: &Table) -> Result<Program> {
         let record = b.alloc_reg();
         b.emit(Opcode::MakeRecord, rec_start, ncol as i32, record);
         b.emit(Opcode::Insert, cursor, record, rowid_reg);
+
+        // Index maintenance: for each index, build the key record (indexed columns + rowid),
+        // MakeRecord it, IdxInsert into the index cursor. Single-column indexes only (the
+        // M5.1 first slice; multi-column is the follow-up).
+        for (i, idx) in indexes.iter().enumerate() {
+            let ic = (index_cursor_base + i as i32) as i32;
+            // We assume the first slice's `idx.columns.len() == 1` (validated at
+            // `compile_create_index` time); a defensive error here flags a future slip.
+            if idx.columns.len() != 1 {
+                return Err(Error::msg(format!(
+                    "INSERT: index {} has {} columns; only single-column indexes are supported in M5.1",
+                    idx.name,
+                    idx.columns.len()
+                )));
+            }
+            let indexed_ci = table
+                .column_index(&idx.columns[0].name)
+                .expect("validated above");
+            let key_start = b.alloc_regs(2); // [indexed_col, rowid]
+            b.emit(Opcode::SCopy, rec_start + indexed_ci as i32, key_start, 0);
+            b.emit(Opcode::SCopy, rowid_reg, key_start + 1, 0);
+            let key_rec = b.alloc_reg();
+            b.emit(Opcode::MakeRecord, key_start, 2, key_rec);
+            let ins_idx = b.emit(Opcode::IdxInsert, ic, key_rec, 0);
+            b.set_p4(ins_idx, P4::Int(0)); // nMem = 0
+            b.set_p5(ins_idx, P5_NCHANGE);
+        }
     }
 
     b.emit(Opcode::Halt, 0, 0, 0); // commits the write transaction
@@ -170,6 +226,7 @@ mod tests {
 
     fn table_of(create: &str) -> Table {
         let obj = SchemaObject {
+            rowid: 1,
             obj_type: "table".into(),
             name: "t".into(),
             tbl_name: "t".into(),
@@ -190,7 +247,7 @@ mod tests {
     fn positional_insert_uses_newrowid() {
         let t = table_of("CREATE TABLE t(a, b)");
         let ins = insert_of("INSERT INTO t VALUES (1, 'x'), (2, 'y');");
-        let prog = compile_insert(&ins, &t).unwrap();
+        let prog = compile_insert(&ins, &t, &[]).unwrap();
         let names: Vec<&str> = prog.instructions.iter().map(|i| i.opcode.name()).collect();
         assert!(names.contains(&"OpenWrite"));
         // Two rows → two NewRowid + two Insert (no rowid alias).
@@ -209,7 +266,7 @@ mod tests {
     fn rowid_alias_guards_newrowid_with_notnull() {
         let t = table_of("CREATE TABLE t(id INTEGER PRIMARY KEY, v)");
         let ins = insert_of("INSERT INTO t VALUES (5, 'x');");
-        let prog = compile_insert(&ins, &t).unwrap();
+        let prog = compile_insert(&ins, &t, &[]).unwrap();
         let names: Vec<&str> = prog.instructions.iter().map(|i| i.opcode.name()).collect();
         // The alias value becomes the rowid; NewRowid is emitted but guarded by NotNull so it only
         // runs when the supplied value is NULL (auto-assign).
@@ -222,7 +279,7 @@ mod tests {
     fn explicit_column_list_maps_values() {
         let t = table_of("CREATE TABLE t(a, b, c)");
         let ins = insert_of("INSERT INTO t (b, a) VALUES (10, 20);");
-        let prog = compile_insert(&ins, &t).unwrap();
+        let prog = compile_insert(&ins, &t, &[]).unwrap();
         // 3 record slots are allocated per row; the unlisted column c is NULL.
         let null_count = prog
             .instructions

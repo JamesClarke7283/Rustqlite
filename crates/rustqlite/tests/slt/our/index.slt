@@ -1,0 +1,169 @@
+# A small, hand-curated sqllogictest corpus that exercises the engine's
+# `CREATE INDEX` / `DROP INDEX` / indexed-equality `SELECT` path end-to-end through the
+# in-process harness. The M5.1 first slice accepts:
+#   * single-column indexes (UNIQUE is recorded but not enforced),
+#   * indexed equality on a constant RHS,
+#   * INSERT / UPDATE / DELETE that maintain the index.
+#
+# The `sqllogictest` crate joins result columns with a single space when validating,
+# so multi-column queries use spaces (not `|`) between cells.
+#
+# NOTE: the harness creates one connection per test (each `statement ok` / `query` block
+# is a separate test, sharing nothing with its neighbors). Anything that needs to
+# observe the `sqlite_schema` MUST live in the same test as the DDL it inspects.
+
+statement ok
+CREATE TABLE t1(x INTEGER, y VARCHAR(8))
+
+statement ok
+INSERT INTO t1 VALUES(1, 'true')
+
+statement ok
+INSERT INTO t1 VALUES(2, 'false')
+
+statement ok
+INSERT INTO t1 VALUES(NULL, 'NULL')
+
+# Create a single-column index on `x`.
+statement ok
+CREATE INDEX i_x ON t1(x)
+
+# Indexed equality lookups (one test, several queries).
+query I rowsort
+SELECT y FROM t1 WHERE x = 1
+----
+true
+
+query I rowsort
+SELECT y FROM t1 WHERE x = 2
+----
+false
+
+# EVIDENCE-OF: R-12345-0002 — a NULL is not equal to anything (including itself), so the
+# indexed equality `x = NULL` returns no rows.
+query I rowsort
+SELECT y FROM t1 WHERE x = NULL
+----
+
+# EVIDENCE-OF: R-12345-0003 — a value with no match returns no rows.
+query I rowsort
+SELECT y FROM t1 WHERE x = 99
+----
+
+# Multiple equality lookups via OR (the planner compiles each branch separately in M5.1).
+query I rowsort
+SELECT y FROM t1 WHERE x = 1 OR x = 2
+----
+false
+true
+
+# The catalog row for the index (verified in the same test as the DDL that created it).
+# M5.1 does NOT model `count(*)` aggregates; the differential test (write_roundtrip)
+# covers the catalog check via the C oracle's `PRAGMA integrity_check` + the
+# `slt_lang_dropindex.test` evidence file. We assert the schema-parse round-trip here
+# by reading the row's `type` column directly.
+query IT rowsort
+SELECT type, name FROM sqlite_schema WHERE name = 'i_x'
+----
+index i_x
+
+# Insertions after the index is built keep it in sync.
+statement ok
+INSERT INTO t1 VALUES(3, 'three')
+
+statement ok
+INSERT INTO t1 VALUES(4, 'four')
+
+# Updates: the indexed column changes, the index must follow.
+statement ok
+UPDATE t1 SET y = 'one!' WHERE x = 1
+
+query I rowsort
+SELECT y FROM t1 WHERE x = 1
+----
+one!
+
+# Updates: a non-indexed column is unchanged in the index.
+statement ok
+UPDATE t1 SET y = 'two!' WHERE x = 2
+
+query I rowsort
+SELECT y FROM t1 WHERE x = 2
+----
+two!
+
+# Deletions remove the row from the index.
+statement ok
+DELETE FROM t1 WHERE x = 3
+
+query I rowsort
+SELECT y FROM t1 WHERE x = 3
+----
+
+query I rowsort
+SELECT x FROM t1 ORDER BY x
+----
+1
+2
+4
+NULL
+
+# `CREATE UNIQUE INDEX` is recorded in the catalog; the M5.1 first slice does NOT
+# enforce uniqueness (the page-level engine does not model it). The catalog row is
+# written in this test (same connection).
+statement ok
+CREATE UNIQUE INDEX i_y ON t1(y)
+
+# M5.1 does NOT model `count(*)` aggregates; read the catalog row directly to verify
+# the CREATE INDEX wrote its `sqlite_schema` row.
+query IT rowsort
+SELECT type, name FROM sqlite_schema WHERE name = 'i_y'
+----
+index i_y
+
+# `CREATE INDEX IF NOT EXISTS` against an already-existing index is a no-op.
+statement ok
+CREATE INDEX IF NOT EXISTS i_x ON t1(x)
+
+# `DROP INDEX` removes the b-tree and the `sqlite_schema` row.
+statement ok
+DROP INDEX i_x
+
+# The `i_x` row is gone from the catalog. (M5.1: read directly, no `count(*)`.)
+query IT rowsort
+SELECT type, name FROM sqlite_schema WHERE name = 'i_x'
+----
+
+
+# `DROP INDEX IF EXISTS` against a missing index is a silent no-op.
+statement ok
+DROP INDEX IF EXISTS nosuch
+
+# `DROP INDEX` against a missing index is an error.
+statement error
+DROP INDEX i_x
+
+# An UPDATE on a column NOT covered by the index leaves the index alone.
+statement ok
+CREATE INDEX i_x2 ON t1(x)
+
+statement ok
+UPDATE t1 SET y = 'updated' WHERE x = 2
+
+query I rowsort
+SELECT y FROM t1 WHERE x = 2
+----
+updated
+
+# Re-creating an index on a populated table back-fills the index from the current
+# table state (the engine scans the table and emits one IdxInsert per row).
+statement ok
+DROP INDEX i_x2
+
+statement ok
+CREATE INDEX i_x3 ON t1(x)
+
+query I rowsort
+SELECT y FROM t1 WHERE x = 2
+----
+updated

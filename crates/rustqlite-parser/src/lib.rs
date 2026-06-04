@@ -72,6 +72,8 @@ fn build_inner_stmt(pair: Pair<'_, Rule>) -> Stmt {
         Rule::delete_stmt => Stmt::Delete(build_delete(pair)),
         Rule::drop_table_stmt => Stmt::DropTable(build_drop_table(pair)),
         Rule::update_stmt => Stmt::Update(build_update(pair)),
+        Rule::create_index_stmt => Stmt::CreateIndex(build_create_index(pair)),
+        Rule::drop_index_stmt => Stmt::DropIndex(build_drop_index(pair)),
         other => unreachable!("unexpected statement {other:?}"),
     }
 }
@@ -497,6 +499,78 @@ fn build_assignment(pair: Pair<'_, Rule>) -> Assignment {
         column,
         value: value.expect("assignment has a value expr"),
     }
+}
+
+fn build_create_index(pair: Pair<'_, Rule>) -> CreateIndex {
+    let mut ci = CreateIndex {
+        unique: false,
+        if_not_exists: false,
+        schema: None,
+        name: String::new(),
+        table: String::new(),
+        columns: Vec::new(),
+    };
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::K_UNIQUE => ci.unique = true,
+            Rule::if_not_exists => ci.if_not_exists = true,
+            // The first qualified_name is the index's own name (and optional schema).
+            Rule::qualified_name if ci.name.is_empty() => {
+                let (s, n) = build_qualified_name(part);
+                ci.schema = s;
+                ci.name = n;
+            }
+            // The bare ident after K_ON is the table being indexed.
+            Rule::ident if ci.table.is_empty() => {
+                ci.table = part.as_str().to_string();
+            }
+            Rule::indexed_column => ci.columns.push(build_indexed_column(part)),
+            _ => {}
+        }
+    }
+    ci
+}
+
+fn build_indexed_column(pair: Pair<'_, Rule>) -> IndexedColumn {
+    let mut name: Option<String> = None;
+    let mut collation = None;
+    let mut desc = false;
+    // Walk the children in order: the first `ident` is the column name, the second (if present)
+    // is the COLLATE name, and the trailing K_ASC/K_DESC sets the sort direction.
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::ident if name.is_none() => name = Some(part.as_str().to_string()),
+            Rule::ident => collation = Some(part.as_str().to_string()),
+            Rule::K_DESC => desc = true,
+            Rule::K_ASC => desc = false,
+            _ => {}
+        }
+    }
+    IndexedColumn {
+        name: name.unwrap_or_default(),
+        collation,
+        desc,
+    }
+}
+
+fn build_drop_index(pair: Pair<'_, Rule>) -> DropIndexStmt {
+    let mut stmt = DropIndexStmt {
+        if_exists: false,
+        schema: None,
+        name: String::new(),
+    };
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::if_exists => stmt.if_exists = true,
+            Rule::qualified_name => {
+                let (s, n) = build_qualified_name(part);
+                stmt.schema = s;
+                stmt.name = n;
+            }
+            _ => {}
+        }
+    }
+    stmt
 }
 
 #[cfg(test)]

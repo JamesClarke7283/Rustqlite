@@ -45,6 +45,12 @@ pub enum Opcode {
     OpenRead,
     /// `OpenWrite`: open a read/write cursor (write path; unimplemented in M3a).
     OpenWrite,
+    /// `OpenWriteReg p1 p2=root_reg p3`: open a read/write cursor `p1` on the b-tree whose
+    /// root page is the value of `r[p2]`. The cursor type (table vs index) is decided by
+    /// `p3` (1 = table, 0 = index), matching the same convention as `CreateBtree`/`OpenWrite`.
+    /// M5.1 only: lets `CREATE INDEX` open the populate cursor on a freshly-created index
+    /// b-tree whose rootpage was just written into a register by `CreateBtree`.
+    OpenWriteReg,
     /// `Close p1`: close cursor `p1`.
     Close,
 
@@ -54,8 +60,6 @@ pub enum Opcode {
     Rewind,
     /// `Next p1 p2`: advance cursor `p1`; if a row remains jump to `p2`, else fall through.
     Next,
-    /// `SeekGE`: seek to the first entry >= a key (index path; unimplemented in M3a).
-    SeekGE,
     /// `NotExists p1 p2 p3`: position table cursor `p1` at the row whose rowid is `r[p3]`; if
     /// no such row exists, jump to `p2`. Mirrors `OP_NotExists` from `vdbe.c` and is the rowid-
     /// seek used by `UPDATE`'s two-pass rewrite.
@@ -81,8 +85,49 @@ pub enum Opcode {
     Insert,
     /// `Delete p1`: remove the row at cursor `p1`'s current position. Mirrors `OP_Delete`.
     Delete,
-    /// `IdxInsert`: insert into an index/sorter b-tree (write path; unimplemented in M3a).
+    /// `IdxInsert p1 p2 p3 p4=nMem p5=flags`: insert a new index entry. `r[p2]` holds the
+    /// pre-built key record (the indexed columns + the trailing rowid). The cursor `p1` is
+    /// an index b-tree cursor opened with `OpenRead`/`OpenWrite` + `P4::KeyInfo`. `p3` is
+    /// the first of `nMem` (`p4`) extra registers that may hold additional values used by
+    /// the index — for a single-column index the M5.1 path uses `nMem = 0`. `p5` may carry
+    /// `OPFLAG_NCHANGE` (bump `changes()`) and `OPFLAG_PREFORMAT` (the record is already
+    /// encoded). Mirrors `OP_IdxInsert` in `vdbe.c`.
     IdxInsert,
+    /// `IdxDelete p1 p2 p3`: delete the index entry whose key is in the `p3` registers
+    /// starting at `r[p2]` from the index b-tree on cursor `p1`. The trailing rowid is
+    /// included in the `p3` registers. A no-op when no matching entry exists (matches
+    /// upstream's silent miss). Mirrors `OP_IdxDelete`.
+    IdxDelete,
+    /// `IdxRowid p1 p2`: `r[p2]` = the trailing rowid of the current index entry on cursor
+    /// `p1`. Mirrors `OP_IdxRowid`.
+    IdxRowid,
+    /// `SeekGE p1 p2 p3 p4=nField`: position index cursor `p1` at the first entry `>=` the
+    /// key in `r[p3..p3+nField]`; jump to `p2` when no such entry exists. `p4` is the number
+    /// of index columns the comparison uses (the key is the record header's first `nField`
+    /// values; the trailing rowid is the tiebreaker, not part of the comparison). Mirrors
+    /// `OP_SeekGE` in `vdbe.c`.
+    SeekGE,
+    /// `SeekGT`: same shape as `SeekGE` but the position is at the first entry `>` the key.
+    /// Cursor jumps to `p2` when no such entry exists.
+    SeekGT,
+    /// `SeekLE`: position at the last entry `<=` the key, jump to `p2` on miss.
+    SeekLE,
+    /// `SeekLT`: position at the last entry `<` the key, jump to `p2` on miss.
+    SeekLT,
+    /// `IdxGE p1 p2 p3 p4=nField`: after a `SeekLE` (or any seek), jump to `p2` when the
+    /// current entry's prefix (the first `nField` values of the key record) is `<` the
+    /// search key in `r[p3..p3+nField]`. Together with `SeekLE` this implements `<= key`.
+    /// Mirrors `OP_IdxGE` in `vdbe.c`.
+    IdxGE,
+    /// `IdxGT`: same as `IdxGE` but the jump happens when the entry is `<=` the search key.
+    /// Together with `SeekGE` implements `> key`.
+    IdxGT,
+    /// `IdxLE`: jump to `p2` when the entry's prefix is `>` the search key. Together with
+    /// `SeekLE` implements `< key`.
+    IdxLE,
+    /// `IdxLT`: jump to `p2` when the entry's prefix is `>=` the search key. Together with
+    /// `SeekGE` implements `< key`.
+    IdxLT,
 
     // --- value loads ---
     /// `Integer p1 p2`: `r[p2]` = the integer `p1`.
@@ -202,10 +247,18 @@ impl Opcode {
             Opcode::Destroy => "Destroy",
             Opcode::OpenRead => "OpenRead",
             Opcode::OpenWrite => "OpenWrite",
+            Opcode::OpenWriteReg => "OpenWriteReg",
             Opcode::Close => "Close",
             Opcode::Rewind => "Rewind",
             Opcode::Next => "Next",
             Opcode::SeekGE => "SeekGE",
+            Opcode::SeekGT => "SeekGT",
+            Opcode::SeekLE => "SeekLE",
+            Opcode::SeekLT => "SeekLT",
+            Opcode::IdxGE => "IdxGE",
+            Opcode::IdxGT => "IdxGT",
+            Opcode::IdxLE => "IdxLE",
+            Opcode::IdxLT => "IdxLT",
             Opcode::NotExists => "NotExists",
             Opcode::Rowid => "Rowid",
             Opcode::Column => "Column",
@@ -215,6 +268,8 @@ impl Opcode {
             Opcode::Insert => "Insert",
             Opcode::Delete => "Delete",
             Opcode::IdxInsert => "IdxInsert",
+            Opcode::IdxDelete => "IdxDelete",
+            Opcode::IdxRowid => "IdxRowid",
             Opcode::Integer => "Integer",
             Opcode::Int64 => "Int64",
             Opcode::Real => "Real",

@@ -4,21 +4,33 @@
 //! * a **table scan** — `Init → Transaction → OpenRead → Rewind → [WHERE; project; ResultRow] →
 //!   Next → Halt`, with `ORDER BY` lowering to a sorter and `LIMIT`/`OFFSET` wrapping the output;
 //! * a **constant** `SELECT` (no `FROM`) — evaluate the projection once and emit a single row.
+//! * (M5.1) an **indexed equality** — for `WHERE <indexed_col> = <const>` with a usable
+//!   single-column index, the scan walks the index, looks up each rowid in the table, and
+//!   projects; the sorter is dropped when `ORDER BY <indexed_col> ASC` is also present (the
+//!   index is already ordered).
 
 use rustqlite_parser::{Expr, Literal, OrderingTerm, ResultColumn, SelectStmt, UnaryOp};
 
 use crate::error::{Error, Result};
-use crate::schema::Table;
+use crate::schema::{IndexObject, Table};
+use crate::types::Value;
 use crate::util::fp::fp_to_text;
 use crate::vdbe::program::{Program, P4};
 use crate::vdbe::{KeyField, Opcode};
 
 use super::builder::ProgramBuilder;
 use super::expr::{compile_expr, compile_jump, Ctx};
+use super::index_planner::{pick_index, IndexPlan};
 
 /// Compile a single-table (or constant) `SELECT`, returning the program and the result column
 /// names. `table` is the resolved table when there is exactly one `FROM` entry, else `None`.
-pub fn compile(select: &SelectStmt, table: Option<&Table>) -> Result<(Program, Vec<String>)> {
+/// `indexes` is the list of indexes attached to `table`; when an indexed equality is
+/// present in the `WHERE`, the M5.1 planner routes through the index.
+pub fn compile(
+    select: &SelectStmt,
+    table: Option<&Table>,
+    indexes: &[IndexObject],
+) -> Result<(Program, Vec<String>)> {
     reject_unsupported(select)?;
     if select.from.len() > 1 {
         return Err(Error::msg("joins are not supported in M3a"));
@@ -29,10 +41,157 @@ pub fn compile(select: &SelectStmt, table: Option<&Table>) -> Result<(Program, V
     let (limit, offset) = eval_limit_offset(select)?;
 
     let program = match table {
-        Some(t) => compile_scan(select, t, &outputs, limit, offset)?,
+        Some(t) => {
+            // M5.1: try an indexed-equality plan first; fall back to a scan if no index
+            // covers the WHERE.
+            if let Some(plan) = pick_index(select, t, indexes) {
+                compile_indexed_select(select, t, &plan, &outputs, limit, offset)?
+            } else {
+                compile_scan(select, t, &outputs, limit, offset)?
+            }
+        }
         None => compile_constant(select, &outputs, limit, offset)?,
     };
     Ok((program, names))
+}
+
+/// An indexed-equality codegen. Opens a read cursor on the index b-tree (with `KeyInfo`
+/// marking it as an index), opens a read cursor on the table, `SeekGE`s the index for the
+/// first entry `>=` the search key, then `IdxGT`s to verify strict equality (jumping past
+/// the body on a non-match). The body pulls the rowid from the index, seeks the table,
+/// re-checks the `WHERE` (defensive: the M5.1 first slice only emits single-equality
+/// `WHERE`s, so this re-check is a tautology), projects the result columns, and
+/// `Next`-iterates the index.
+#[allow(clippy::too_many_arguments)]
+fn compile_indexed_select(
+    _select: &SelectStmt,
+    table: &Table,
+    plan: &IndexPlan,
+    outputs: &[(Expr, String)],
+    limit: Option<i64>,
+    offset: i64,
+) -> Result<Program> {
+    let cursor = 0i32;
+    let idx_cursor = 1i32;
+    let ncol = outputs.len() as i32;
+    let ctx = Ctx {
+        table,
+        cursor,
+    };
+    let mut b = ProgramBuilder::new();
+
+    let setup = b.new_label();
+    b.emit_jump(Opcode::Init, 0, setup, 0);
+    let after_init = b.cur_addr();
+
+    // LIMIT 0 → no rows.
+    if limit == Some(0) {
+        b.emit(Opcode::Halt, 0, 0, 0);
+        b.resolve(setup);
+        b.emit(Opcode::Transaction, 0, 0, 0);
+        b.emit(Opcode::Goto, 0, after_init, 0);
+        return Ok(b.finish());
+    }
+
+    let limit_reg = match limit {
+        Some(n) if n > 0 => Some(emit_int(&mut b, n)),
+        _ => None,
+    };
+    let offset_reg = (offset > 0).then(|| emit_int(&mut b, offset));
+
+    // (1) Open the table cursor (read-only).
+    let open_table = b.emit(Opcode::OpenRead, cursor, table.rootpage as i32, 0);
+    b.set_p4(open_table, P4::Int(table.columns.len() as i64));
+
+    // (2) Open the index cursor with KeyInfo (marks it as an index cursor in the executor).
+    let open_idx = b.emit(
+        Opcode::OpenRead,
+        idx_cursor,
+        plan.index.rootpage as i32,
+        0,
+    );
+    b.set_p4(
+        open_idx,
+        P4::KeyInfo(vec![KeyField {
+            desc: false,
+            collation: crate::types::Collation::Binary,
+        }]),
+    );
+
+    // (3) Load the constant RHS into a register; emit the SeekGE.
+    let key_reg = b.alloc_reg();
+    emit_value_load(&mut b, &plan.equality.value, key_reg);
+    let end_seek = b.new_label();
+    let seek = b.emit_jump(Opcode::SeekGE, idx_cursor, end_seek, key_reg);
+    b.set_p4(seek, P4::Int(1)); // nField = 1 (the indexed column)
+
+    // (5) Loop body: read the rowid, seek the table, project. The IdxGT boundary
+    // check is re-emitted at the top of every iteration (not just the first) so the loop
+    // terminates when the index passes the strict-equality boundary.
+    let loop_top = b.new_label();
+    b.resolve(loop_top);
+    let idx_gt = b.emit_jump(Opcode::IdxGT, idx_cursor, end_seek, key_reg);
+    b.set_p4(idx_gt, P4::Int(1));
+    let rowid_reg = b.alloc_reg();
+    b.emit(Opcode::IdxRowid, idx_cursor, rowid_reg, 0);
+    let idx_next = b.new_label();
+    b.emit_jump(Opcode::NotExists, cursor, idx_next, rowid_reg);
+
+    // OFFSET gate.
+    if let Some(oreg) = offset_reg {
+        b.emit_jump(Opcode::IfPos, oreg, idx_next, 1);
+    }
+
+    // Project the result columns.
+    let result_reg = b.alloc_regs(ncol);
+    for (j, (expr, _)) in outputs.iter().enumerate() {
+        compile_expr(&mut b, expr, result_reg + j as i32, ctx)?;
+    }
+    b.emit(Opcode::ResultRow, result_reg, ncol, 0);
+    if let Some(lreg) = limit_reg {
+        b.emit_jump(Opcode::DecrJumpZero, lreg, end_seek, 0);
+    }
+
+    // Advance: next index entry, jumping back to the top of the body.
+    b.emit_jump(Opcode::Next, idx_cursor, loop_top, 0);
+    b.resolve(idx_next);
+    b.resolve(end_seek);
+
+    b.emit(Opcode::Halt, 0, 0, 0);
+    b.resolve(setup);
+    b.emit(Opcode::Transaction, 0, 0, 0);
+    b.emit(Opcode::Goto, 0, after_init, 0);
+    Ok(b.finish())
+}
+
+/// Emit a register load of a literal [`Value`] (used by the indexed path's constant-RHS).
+fn emit_value_load(b: &mut ProgramBuilder, v: &Value, target: i32) {
+    match v {
+        Value::Null => {
+            b.emit(Opcode::Null, 0, target, 0);
+        }
+        Value::Int(n) => match i32::try_from(*n) {
+            Ok(n32) => {
+                b.emit(Opcode::Integer, n32, target, 0);
+            }
+            Err(_) => {
+                let i = b.emit(Opcode::Int64, 0, target, 0);
+                b.set_p4(i, P4::Int(*n));
+            }
+        },
+        Value::Real(r) => {
+            let i = b.emit(Opcode::Real, 0, target, 0);
+            b.set_p4(i, P4::Real(*r));
+        }
+        Value::Text(s) => {
+            let i = b.emit(Opcode::String8, 0, target, 0);
+            b.set_p4(i, P4::Text(s.clone()));
+        }
+        Value::Blob(bytes) => {
+            let i = b.emit(Opcode::Blob, 0, target, 0);
+            b.set_p4(i, P4::Blob(bytes.clone()));
+        }
+    }
 }
 
 /// Reject M3a-out-of-scope features with a clear message.
@@ -460,6 +619,7 @@ mod tests {
 
     fn compile_sql(create: &str, select_sql: &str) -> (Program, Vec<String>) {
         let obj = SchemaObject {
+            rowid: 1,
             obj_type: "table".into(),
             name: "t".into(),
             tbl_name: "t".into(),
@@ -470,7 +630,7 @@ mod tests {
         let Stmt::Select(s) = parse(select_sql).unwrap().into_iter().next().unwrap() else {
             panic!("expected SELECT")
         };
-        compile(&s, Some(&table)).unwrap()
+        compile(&s, Some(&table), &[]).unwrap()
     }
 
     #[test]
@@ -499,3 +659,4 @@ mod tests {
         assert_eq!(disassemble(&prog), expected);
     }
 }
+

@@ -18,6 +18,11 @@ pub enum Stmt {
     Delete(DeleteStmt),
     DropTable(DropTableStmt),
     Update(UpdateStmt),
+    /// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON tbl(col [COLLATE name] [ASC|DESC]) [WHERE …]`
+    /// (the first M5.1 slice accepts a single indexed column, no `WHERE`, no `COLLATE`).
+    CreateIndex(CreateIndex),
+    /// `DROP INDEX [IF EXISTS] [schema.]name`.
+    DropIndex(DropIndexStmt),
     /// `EXPLAIN <stmt>` / `EXPLAIN QUERY PLAN <stmt>`. The inner statement is boxed (it is the
     /// large variant). `kind` distinguishes the bytecode listing from the query-plan tree.
     Explain(Box<Stmt>, ExplainKind),
@@ -131,6 +136,39 @@ pub struct UpdateStmt {
     pub table: String,
     pub assignments: Vec<Assignment>,
     pub where_clause: Option<Expr>,
+}
+
+/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [schema.]name ON tbl(col [COLLATE name] [ASC|DESC] …)`.
+/// The first M5.1 slice accepts a single indexed column; the `collation` and `desc` fields are
+/// recorded but the engine treats them as ASC binary for now (a structural field for the
+/// catalog/EXPLAIN, not a behavioral one).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndex {
+    pub unique: bool,
+    pub if_not_exists: bool,
+    pub schema: Option<String>,
+    pub name: String,
+    pub table: String,
+    pub columns: Vec<IndexedColumn>,
+}
+
+/// One column entry in a `CREATE INDEX` column list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexedColumn {
+    pub name: String,
+    /// `COLLATE name` (recorded but unused in M5.1 — always `None` in the first slice).
+    pub collation: Option<String>,
+    /// `true` for `DESC`, `false` for `ASC` (default). Recorded but unused in M5.1.
+    pub desc: bool,
+}
+
+/// `DROP INDEX [IF EXISTS] [schema.]name`. The first M5.1 slice: schema qualifier must be absent
+/// (or the default `main`/`temp`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropIndexStmt {
+    pub if_exists: bool,
+    pub schema: Option<String>,
+    pub name: String,
 }
 
 /// One `col = expr` on the left of `UPDATE … SET`. Multi-column assignment (the

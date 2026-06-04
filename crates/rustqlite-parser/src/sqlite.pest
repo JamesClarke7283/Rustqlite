@@ -104,6 +104,7 @@ K_DELETE        = @{ ^"delete"        ~ !ident_cont }
 K_DROP          = @{ ^"drop"          ~ !ident_cont }
 K_UPDATE        = @{ ^"update"        ~ !ident_cont }
 K_SET           = @{ ^"set"           ~ !ident_cont }
+K_INDEX         = @{ ^"index"         ~ !ident_cont }
 // QUERY and PLAN are matched only after EXPLAIN (in `explain_query_plan`); they are
 // deliberately NOT in the aggregate `keyword` rule below, because — unlike EXPLAIN — SQLite
 // does NOT reserve them: `query` and `plan` are valid identifiers (e.g. column names). Only
@@ -118,12 +119,12 @@ keyword = @{
     | K_UNIQUE | K_DEFAULT | K_INSERT | K_REPLACE | K_INTO | K_VALUES | K_NULL
     | K_TRUE | K_FALSE | K_AND | K_OR | K_NOT | K_IS | K_LIKE | K_GLOB | K_ESCAPE | K_IN
     | K_COLLATE | K_CAST | K_ON | K_CONFLICT | K_ABORT | K_FAIL | K_IGNORE | K_ROLLBACK
-    | K_EXPLAIN | K_DELETE | K_DROP | K_UPDATE | K_SET
+    | K_EXPLAIN | K_DELETE | K_DROP | K_UPDATE | K_SET | K_INDEX
 }
 
 // ---- Top level: a list of statements separated/terminated by ';' ----
 sql = { SOI ~ statement? ~ (";" ~ statement?)* ~ EOI }
-statement = { explain_prefix? ~ (select_stmt | create_table_stmt | insert_stmt | delete_stmt | drop_table_stmt | update_stmt) }
+statement = { explain_prefix? ~ (select_stmt | create_table_stmt | insert_stmt | delete_stmt | drop_table_stmt | update_stmt | create_index_stmt | drop_index_stmt) }
 
 // `EXPLAIN` / `EXPLAIN QUERY PLAN` may prefix a statement. The query-plan form is tried first
 // (it is the more specific, longer match).
@@ -212,6 +213,23 @@ update_stmt = { K_UPDATE ~ or_action? ~ qualified_name ~ K_SET ~ assignment_list
 or_action = { K_OR ~ (K_ROLLBACK | K_ABORT | K_FAIL | K_IGNORE | K_REPLACE) }
 assignment_list = { assignment ~ ("," ~ assignment)* }
 assignment = { ident ~ "=" ~ expr }
+
+
+// ---- CREATE INDEX (M5.1) ----
+// First slice: `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON tbl(col [COLLATE n] [ASC|DESC])`.
+// A single indexed column only. The `COLLATE` and `ASC`/`DESC` are recorded but the engine
+// treats all indexes as ASC binary in the first slice. No partial-index `WHERE` clause.
+create_index_stmt = {
+    K_CREATE ~ K_UNIQUE? ~ K_INDEX ~ if_not_exists?
+    ~ qualified_name ~ K_ON ~ ident
+    ~ "(" ~ indexed_column ~ ("," ~ indexed_column)* ~ ")"
+}
+indexed_column = { ident ~ (K_COLLATE ~ ident)? ~ (K_ASC | K_DESC)? }
+
+// ---- DROP INDEX (M5.1) ----
+// First slice: `DROP INDEX [IF EXISTS] [schema.]name`. A schema qualifier other than `main` is
+// rejected at codegen (we still parse it for fidelity).
+drop_index_stmt = { K_DROP ~ K_INDEX ~ if_exists? ~ qualified_name }
 
 
 // ---- Expressions (folded by PrattParser in expr.rs) ----

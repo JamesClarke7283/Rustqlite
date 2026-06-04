@@ -66,6 +66,16 @@ pub struct Program {
     pub num_registers: usize,
 }
 
+impl Program {
+    /// A no-op program (the VDBE executes `Halt` immediately and reports `Done`). Used for
+    /// `CREATE INDEX IF NOT EXISTS` against a pre-existing index and similar no-op DDL.
+    pub fn empty() -> Program {
+        let mut p = Program::default();
+        p.instructions.push(Instruction::new(Opcode::Halt, 0, 0, 0));
+        p
+    }
+}
+
 // ---- `p5` flag bits for the comparison opcodes (Eq/Ne/Lt/Le/Gt/Ge) ----
 //
 // The low nibble carries the comparison affinity to apply to both operands before comparing;
@@ -98,6 +108,17 @@ pub const P5_NULLEQ: u8 = 0x80;
 /// its `last_insert_rowid()` write so an `UPDATE` does not clobber the connection's last-insert
 /// rowid (matches upstream: only `INSERT` updates `last_insert_rowid()`).
 pub const P5_ISUPDATE: u8 = 0x04;
+
+/// Flag bit for `IdxInsert`: bump `db->nChange` (i.e. `changes()`) when the insert lands.
+/// Mirrors `OPFLAG_NCHANGE` from `vdbe.c`. The M5.1 path uses it on every index maintenance
+/// `IdxInsert` so a non-`UPDATE` write correctly reflects the extra row.
+pub const P5_NCHANGE: u8 = 0x01;
+
+/// Flag bit for `IdxInsert`: the record in `r[p2]` is already encoded (the BLOB bytes of the
+/// key record, not a list of values to `MakeRecord` from). The M5.1 codegen always pre-builds
+/// the record with `MakeRecord` and then immediately `IdxInsert`s it, so this is always set.
+/// Mirrors `OPFLAG_PREFORMAT`.
+pub const P5_PREFORMAT: u8 = 0x02;
 
 /// Encode an [`crate::types::Affinity`] (or `None`) into the comparison `p5` affinity bits.
 pub fn aff_to_p5(aff: Option<crate::types::Affinity>) -> u8 {

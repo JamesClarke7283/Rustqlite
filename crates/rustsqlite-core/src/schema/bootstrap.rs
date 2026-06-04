@@ -5,7 +5,7 @@
 //! row has the five fixed columns `(type, name, tbl_name, rootpage, sql)` — see
 //! [`SchemaObject`](super::catalog::SchemaObject) for the read side. This module builds the value
 //! tuple for such a row so the code generator / executor can `encode_record` it and insert it into
-//! page 1.
+//! page 1. M5.1 adds [`index_schema_row`] for the analogous `CREATE INDEX` writer.
 
 use crate::types::Value;
 
@@ -24,6 +24,19 @@ pub fn table_schema_row(name: &str, rootpage: i64, sql: &str) -> Vec<Value> {
         Value::Text("table".to_string()),
         Value::Text(name.to_string()),
         Value::Text(name.to_string()),
+        Value::Int(rootpage),
+        Value::Text(sql.to_string()),
+    ]
+}
+
+/// Build the five-value `sqlite_schema` row for a `CREATE INDEX`:
+/// `('index', name, tbl_name, rootpage, sql)`. The `name` (the index's own name) and `tbl_name`
+/// (the underlying table) differ here; the rowid-tuple layout is the same as the table version.
+pub fn index_schema_row(name: &str, tbl_name: &str, rootpage: i64, sql: &str) -> Vec<Value> {
+    vec![
+        Value::Text("index".to_string()),
+        Value::Text(name.to_string()),
+        Value::Text(tbl_name.to_string()),
         Value::Int(rootpage),
         Value::Text(sql.to_string()),
     ]

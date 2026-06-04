@@ -5,16 +5,16 @@
 # Set `RUSTQLITE_FULL_SLT=1` to also exercise every file in this manifest
 # (today: all of them; the env var is wired for a future sub-corpus gate).
 #
-# The M4 milestone is a write-path: the most useful smoke runs are the
-# evidence/ files (small, fast, exercise DML/DDL with the engine we just
-# wrote). Files that depend on un-shipped features (CREATE INDEX, UPDATE,
-# REPLACE, REINDEX, triggers, views, CASE/WHEN expressions, subqueries)
-# are excluded; they fail today and are tracked in the M5+ roadmap.
+# The M5.1 milestone introduces a write-path + index: the most useful smoke runs are the
+# `evidence/` files (small, fast, exercise DML/DDL with the engine we just wrote) plus
+# the in-tree `our/*.slt` files. Files that depend on un-shipped features
+# (CREATE INDEX over partial-index WHERE, REPLACE conflict handler, REINDEX, triggers,
+# views, CASE/WHEN expressions, subqueries, UPSERT, multi-column indexes, expression
+# indexes) are excluded; they fail today and are tracked in the M5+ roadmap.
 #
-# As each M4.6+ feature lands, the matching evidence/ test(s) is added
-# here. The full upstream corpus (~5,000 .slt files in `random/` and
-# `select{2,3,4,5}.test`) is wired through `xtask/fetch-slt.sh` and the
-# test will exercise it when M5+ lands.
+# As each M5+ feature lands, the matching evidence/ test(s) is added here. The full
+# upstream corpus (~5,000 .slt files in `random/` and `select{2,3,4,5}.test`) is
+# wired through `xtask/fetch-slt.sh` and the test will exercise it when M5+ lands.
 #
 # In-tree files: a path beginning with `our/` is read from the repo's own
 # `crates/rustqlite/tests/slt/` directory. Use this for hand-rolled smoke
@@ -27,3 +27,12 @@
 # rolled `our/update.slt` covers the same UPDATE surface against our own
 # engine. The full file lands in the manifest when both gaps close.
 our/update.slt
+
+# M5.1 — single-column indexes + DROP INDEX + indexed-equality SELECT.
+our/index.slt
+
+# M5.1 — `DROP INDEX` from the upstream evidence corpus. Small (~75 lines),
+# exercises CREATE/DROP INDEX without the partial-index / multi-column /
+# skipif-onlyif dependencies that the rest of the slt_lang_*.test family
+# rely on.
+evidence/slt_lang_dropindex.test

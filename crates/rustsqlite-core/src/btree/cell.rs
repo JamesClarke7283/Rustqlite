@@ -73,7 +73,7 @@ fn table_leaf_max_local(usable: usize) -> usize {
 }
 
 /// `X` for index pages (leaf and interior).
-fn index_max_local(usable: usize) -> usize {
+pub(crate) fn index_max_local(usable: usize) -> usize {
     ((usable - 12) * 64 / 255) - 23
 }
 
@@ -248,6 +248,138 @@ pub fn parse_index_interior_cell(
         local_payload,
         overflow_page,
     })
+}
+
+/// Build an **index-leaf** cell for the write path: `varint(payload_len) ++ key_record ++
+/// [overflow]`. The key record is the index columns followed by the table's rowid, all encoded
+/// by [`crate::format::encode_record`]. If the payload fits in the index-leaf's local-only
+/// window (`X = ((usable - 12) * 64 / 255) - 23`), no overflow is used; otherwise the tail is
+/// spilled to a chain of freshly allocated pages and the cell ends with a 4-byte pointer to
+/// the first overflow page.
+pub fn build_index_leaf_cell(
+    pager: &crate::pager::Pager,
+    key_record: &[u8],
+    usable: usize,
+) -> Vec<u8> {
+    let max_local = index_max_local(usable);
+    let (local_len, has_overflow) = local_payload_len(key_record.len(), usable, max_local);
+    let mut cell = Vec::with_capacity(9 + local_len + if has_overflow { 4 } else { 0 });
+    write_varint(key_record.len() as u64, &mut cell);
+    cell.extend_from_slice(&key_record[..local_len]);
+
+    if has_overflow {
+        let tail = &key_record[local_len..];
+        let chunk = usable - 4;
+        let first_pgno = pager.allocate_page();
+        let mut curr_pgno = first_pgno;
+        let mut offset = 0usize;
+        loop {
+            let take = (tail.len() - offset).min(chunk);
+            let is_last = offset + take == tail.len();
+            let next_pgno = if is_last {
+                0u32
+            } else {
+                pager.allocate_page()
+            };
+            let mut buf = vec![0u8; pager.page_size()];
+            buf[0..4].copy_from_slice(&next_pgno.to_be_bytes());
+            buf[4..4 + take].copy_from_slice(&tail[offset..offset + take]);
+            pager.write_page(curr_pgno, buf).expect("write overflow page");
+            offset += take;
+            if is_last {
+                break;
+            }
+            curr_pgno = next_pgno;
+        }
+        cell.extend_from_slice(&first_pgno.to_be_bytes());
+    }
+    cell
+}
+
+/// Build an **index-interior** cell: `u32(left_child) ++ varint(payload_size) ++ key_record ++
+/// [overflow]`. The key record here is the largest key in the left-child subtree (a copy of the
+/// first record on the boundary leaf). Mirrors `build_table_interior_cell` for the index
+/// b-tree case.
+pub fn build_index_interior_cell(
+    left_child: u32,
+    key_record: &[u8],
+    pager: &crate::pager::Pager,
+    usable: usize,
+) -> Vec<u8> {
+    let max_local = index_max_local(usable);
+    let (local_len, has_overflow) = local_payload_len(key_record.len(), usable, max_local);
+    let mut cell = Vec::with_capacity(4 + 9 + local_len + if has_overflow { 4 } else { 0 });
+    cell.extend_from_slice(&left_child.to_be_bytes());
+    write_varint(key_record.len() as u64, &mut cell);
+    cell.extend_from_slice(&key_record[..local_len]);
+
+    if has_overflow {
+        // The first-slice path defers the index-split case (M5.1 ships single-leaf indexes).
+        // The builder still produces correct bytes if no overflow is needed; the caller checks.
+        let tail = &key_record[local_len..];
+        let chunk = usable - 4;
+        let first_pgno = pager.allocate_page();
+        let mut curr_pgno = first_pgno;
+        let mut offset = 0usize;
+        loop {
+            let take = (tail.len() - offset).min(chunk);
+            let is_last = offset + take == tail.len();
+            let next_pgno = if is_last {
+                0u32
+            } else {
+                pager.allocate_page()
+            };
+            let mut buf = vec![0u8; pager.page_size()];
+            buf[0..4].copy_from_slice(&next_pgno.to_be_bytes());
+            buf[4..4 + take].copy_from_slice(&tail[offset..offset + take]);
+            pager.write_page(curr_pgno, buf).expect("write overflow page");
+            offset += take;
+            if is_last {
+                break;
+            }
+            curr_pgno = next_pgno;
+        }
+        cell.extend_from_slice(&first_pgno.to_be_bytes());
+    }
+    cell
+}
+
+/// Assemble a full index-cell payload (the key record, including its trailing rowid) from the
+/// local bytes and an optional overflow chain. Mirrors `assemble_index_payload` in
+/// `cursor.rs` — separated so the write-side test code and the cursor can share the helper.
+pub async fn assemble_index_payload(
+    pager: &crate::pager::Pager,
+    cell: &IndexLeafCell<'_>,
+) -> Result<Vec<u8>> {
+    let total = cell.payload_size as usize;
+    let mut payload = Vec::with_capacity(total);
+    payload.extend_from_slice(cell.local_payload);
+
+    let usable = pager.usable_size();
+    let mut next = cell.overflow_page;
+    while payload.len() < total {
+        let Some(pgno) = next.filter(|&p| p != 0) else {
+            break;
+        };
+        let page = pager.get_page(pgno).await?;
+        let next_pgno = be_u32(&page[0..4]);
+        let want = (total - payload.len()).min(usable - 4);
+        if 4 + want > page.len() {
+            return Err(Error::corrupt("overflow page shorter than expected"));
+        }
+        payload.extend_from_slice(&page[4..4 + want]);
+        next = if next_pgno == 0 {
+            None
+        } else {
+            Some(next_pgno)
+        };
+    }
+
+    if payload.len() < total {
+        return Err(Error::corrupt("payload shorter than declared size"));
+    }
+    payload.truncate(total);
+    Ok(payload)
 }
 
 #[cfg(test)]

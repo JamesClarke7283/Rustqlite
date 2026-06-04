@@ -107,7 +107,51 @@ impl PageHeader {
 // These operate directly on an owned page buffer (`&mut [u8]`, exactly `page_size` long) — the
 // copy the pager hands out via `read_page_for_write`. They mirror the no-freeblock subset of
 // `zeroPage`/`allocateSpace`/`insertCell` in `btree.c`; freeblock reuse and page balancing (when a
-// page fills) arrive in later phases.
+// page fills) arrive in later phases. M5.1 adds the index-page equivalents for the
+// `CREATE INDEX` / `DROP INDEX` / `IdxInsert` write path.
+
+/// Initialize the b-tree page region of `page` as an **empty leaf-index** page (page type
+/// `0x0a`), with the cell content area at the end of the page. Used by the M5.1 index layer
+/// for the new root of a fresh index b-tree. Mirrors [`init_empty_leaf`]; same on-page layout,
+/// just a different page-type byte.
+pub fn init_empty_index_leaf(page: &mut [u8], base_offset: usize) {
+    let page_size = page.len();
+    for b in &mut page[base_offset..] {
+        *b = 0;
+    }
+    let h = base_offset;
+    page[h] = 0x0a; // leaf index page
+    page[h + 1..h + 3].copy_from_slice(&0u16.to_be_bytes());
+    page[h + 3..h + 5].copy_from_slice(&0u16.to_be_bytes());
+    let ccs: u16 = if page_size == 65_536 {
+        0
+    } else {
+        page_size as u16
+    };
+    page[h + 5..h + 7].copy_from_slice(&ccs.to_be_bytes());
+    page[h + 7] = 0;
+}
+
+/// Initialize the b-tree page region of `page` as an **empty interior-index** page (page type
+/// `0x02`), with `right_most` as the right-most child pointer. Mirrors [`init_empty_interior`].
+pub fn init_empty_interior_index(page: &mut [u8], base_offset: usize, right_most: u32) {
+    let page_size = page.len();
+    for b in &mut page[base_offset..] {
+        *b = 0;
+    }
+    let h = base_offset;
+    page[h] = 0x02; // interior index page
+    page[h + 1..h + 3].copy_from_slice(&0u16.to_be_bytes());
+    page[h + 3..h + 5].copy_from_slice(&0u16.to_be_bytes());
+    let ccs: u16 = if page_size == 65_536 {
+        0
+    } else {
+        page_size as u16
+    };
+    page[h + 5..h + 7].copy_from_slice(&ccs.to_be_bytes());
+    page[h + 7] = 0;
+    page[h + 8..h + 12].copy_from_slice(&right_most.to_be_bytes());
+}
 
 /// Initialize the b-tree page region of `page` as an **empty leaf-table** page. `base_offset` is
 /// 100 on page 1 (after the database header) and 0 otherwise. The page data area from
@@ -171,11 +215,13 @@ pub fn leaf_free_space(page: &[u8], base_offset: usize) -> usize {
 /// The 8-byte header length of a leaf b-tree page (interior pages use 12).
 const LEAF_HEADER_SIZE: usize = 8;
 
-/// Insert `cell` into a **leaf-table** page at cell-pointer index `idx` (the 0-based, key-sorted
-/// position). Allocates the cell's bytes from the content area (growing it downward), writes the
-/// new 2-byte pointer (shifting the pointers at `idx..` up by two), and bumps the cell count.
-/// Returns `Err` ([`page_full_error`]) when the cell plus its pointer do not fit — the caller will
-/// split the page once balancing lands (M4.5). `base_offset` is 100 on page 1, else 0.
+/// Insert `cell` into a **leaf-table or leaf-index** page at cell-pointer index `idx`
+/// (the 0-based, key-sorted position). Allocates the cell's bytes from the content area
+/// (growing it downward), writes the new 2-byte pointer (shifting the pointers at `idx..` up by
+/// two), and bumps the cell count. Returns `Err` ([`page_full_error`]) when the cell plus its
+/// pointer do not fit — the caller will split the page once balancing lands (M4.5; the M5.1
+/// index path defers the split case to a follow-up slice and propagates the error verbatim).
+/// `base_offset` is 100 on page 1, else 0.
 ///
 /// Faithful to `insertCell`/`allocateSpace` in `btree.c` for the case with no reusable freeblocks.
 pub fn insert_leaf_cell(
@@ -185,8 +231,9 @@ pub fn insert_leaf_cell(
     cell: &[u8],
 ) -> Result<()> {
     let h = base_offset;
-    if page[h] != 0x0d {
-        return Err(Error::corrupt("insert_leaf_cell: not a leaf-table page"));
+    let page_type = page[h];
+    if page_type != 0x0d && page_type != 0x0a {
+        return Err(Error::corrupt("insert_leaf_cell: not a leaf-table or leaf-index page"));
     }
     let num_cells = be_u16(&page[h + 3..h + 5]) as usize;
     if idx > num_cells {
@@ -246,9 +293,11 @@ pub fn interior_free_space(page: &[u8], base_offset: usize) -> usize {
 /// The 12-byte header length of an interior b-tree page.
 const INTERIOR_HEADER_SIZE: usize = 12;
 
-/// Insert a **table-interior** cell at cell-pointer index `idx` on an interior-table page. The
-/// page's cell-pointer array grows downward the same way the leaf's does. Returns [`page_full_error`]
-/// if the cell does not fit (the caller will route into the split path).
+/// Insert a **table-interior or index-interior** cell at cell-pointer index `idx` on an
+/// interior page. The page's cell-pointer array grows downward the same way the leaf's does.
+/// Returns [`page_full_error`] if the cell does not fit (the caller will route into the split
+/// path). The `0x05` (interior-table) and `0x02` (interior-index) page types both use this
+/// helper — they share the same 12-byte header + 2-byte-cell-pointer layout.
 pub fn insert_interior_cell(
     page: &mut [u8],
     base_offset: usize,
@@ -256,8 +305,9 @@ pub fn insert_interior_cell(
     cell: &[u8],
 ) -> Result<()> {
     let h = base_offset;
-    if page[h] != 0x05 {
-        return Err(Error::corrupt("insert_interior_cell: not an interior-table page"));
+    let page_type = page[h];
+    if page_type != 0x05 && page_type != 0x02 {
+        return Err(Error::corrupt("insert_interior_cell: not an interior-table or interior-index page"));
     }
     let num_cells = be_u16(&page[h + 3..h + 5]) as usize;
     if idx > num_cells {
@@ -291,10 +341,10 @@ pub fn insert_interior_cell(
 }
 
 /// Reset a page's cell-pointer array to a fresh, empty list of `cells` and a free space
-/// starting at `cell_content_start` (a byte offset within the page). Both leaf-table and
-/// interior-table pages use this layout: an 8-/12-byte header, then a `2 * num_cells` pointer
-/// array, then the cell content area. Used by the split path to build a fresh sibling page
-/// out of a redistributed set of cells.
+/// starting at `cell_content_start` (a byte offset within the page). All four b-tree page
+/// types (leaf-table, interior-table, leaf-index, interior-index) share this layout: an
+/// 8-/12-byte header, then a `2 * num_cells` pointer array, then the cell content area.
+/// Used by the split path to build a fresh sibling page out of a redistributed set of cells.
 pub fn write_page_cells(
     page: &mut [u8],
     base_offset: usize,
@@ -310,11 +360,8 @@ pub fn write_page_cells(
     match page_type {
         PageType::LeafTable => page[h] = 0x0d,
         PageType::InteriorTable => page[h] = 0x05,
-        _ => {
-            return Err(Error::msg(
-                "write_page_cells: only table b-tree pages are supported",
-            ))
-        }
+        PageType::LeafIndex => page[h] = 0x0a,
+        PageType::InteriorIndex => page[h] = 0x02,
     }
     page[h + 1..h + 3].copy_from_slice(&0u16.to_be_bytes());
     page[h + 3..h + 5].copy_from_slice(&(cells.len() as u16).to_be_bytes());

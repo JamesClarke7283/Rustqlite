@@ -8,12 +8,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use rustqlite_parser::{parse, DeleteStmt, DropTableStmt, ExplainKind, InsertStmt, SelectStmt, Stmt, UpdateStmt};
+use rustqlite_parser::{parse, DropIndexStmt, DropTableStmt, ExplainKind, SelectStmt, Stmt};
 
 use crate::codegen;
 use crate::error::{Error, Result, ResultCode};
 use crate::pager::Pager;
-use crate::schema::{read_catalog, schema_cookie, Table};
+use crate::schema::{read_catalog, schema_cookie, IndexObject, Table};
 use crate::types::Value;
 use crate::vdbe::{explain, Program, StepResult, Vdbe};
 
@@ -108,8 +108,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
         Stmt::Insert(ins) => {
             // INSERT: resolve the target table from the catalog and compile a write program.
             let pager = db.pager_arc()?;
-            let table = resolve_insert_table(&pager, &ins)?;
-            let program = Arc::new(codegen::compile_insert(&ins, &table)?);
+            let (table, indexes) = resolve_table_and_indexes(&pager, &ins.table)?;
+            let program = Arc::new(codegen::compile_insert(&ins, &table, &indexes)?);
             let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
@@ -124,8 +124,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
         Stmt::Delete(del) => {
             // DELETE: resolve the target table from the catalog and compile a write program.
             let pager = db.pager_arc()?;
-            let table = resolve_delete_table(&pager, &del)?;
-            let program = Arc::new(codegen::compile_delete(&del, &table)?);
+            let (table, indexes) = resolve_table_and_indexes(&pager, &del.table)?;
+            let program = Arc::new(codegen::compile_delete(&del, &table, &indexes)?);
             let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
@@ -164,8 +164,67 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             // ABORT, schema-qualified names, unknown columns, and (defensively) updates of
             // the rowid-alias column.
             let pager = db.pager_arc()?;
-            let table = resolve_update_table(&pager, &upd)?;
-            let program = Arc::new(codegen::compile_update(&upd, &table)?);
+            let (table, indexes) = resolve_table_and_indexes(&pager, &upd.table)?;
+            let program = Arc::new(codegen::compile_update(&upd, &table, &indexes)?);
+            let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
+            Ok(Sqlite3Stmt {
+                sql: sql.to_string(),
+                program,
+                column_names: Vec::new(),
+                backing: Backing::Vdbe(vdbe),
+                explain: 0,
+                counts: Some(db.counts_handle()),
+                last_error: None,
+            })
+        }
+        Stmt::CreateIndex(ci) => {
+            // CREATE INDEX: ensure the database is open, resolve the target table, then
+            // compile a write program that creates the index b-tree, populates it from the
+            // table's current rows, and inserts a row into `sqlite_schema`.
+            let pager = db.ensure_pager()?;
+            let catalog = block_on(read_catalog(&pager))?;
+            // `IF NOT EXISTS` against a pre-existing index of the same shape is a no-op.
+            if ci.if_not_exists && catalog.find_index(&ci.name).is_some() {
+                return Ok(Sqlite3Stmt {
+                    sql: sql.to_string(),
+                    program: Arc::new(Program::empty()),
+                    column_names: Vec::new(),
+                    backing: Backing::Vdbe(Vdbe::new(Arc::new(Program::empty()), None)),
+                    explain: 0,
+                    counts: Some(db.counts_handle()),
+                    last_error: None,
+                });
+            }
+            let table_obj = catalog.find_table(&ci.table).ok_or_else(|| {
+                Error::msg(format!("no such table: {}", ci.table))
+            })?;
+            let table = Table::from_schema_object(table_obj)?;
+            let schema_cookie = schema_cookie(&pager);
+            let sql_text = create_table_text(sql);
+            let program = Arc::new(codegen::compile_create_index(
+                &ci, &table, sql_text, schema_cookie,
+            )?);
+            let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
+            Ok(Sqlite3Stmt {
+                sql: sql.to_string(),
+                program,
+                column_names: Vec::new(),
+                backing: Backing::Vdbe(vdbe),
+                explain: 0,
+                counts: Some(db.counts_handle()),
+                last_error: None,
+            })
+        }
+        Stmt::DropIndex(di) => {
+            // DROP INDEX: resolve the target index from the catalog. `IF EXISTS` against
+            // a missing index is a no-op; otherwise the codegen errors at compile time.
+            let pager = db.pager_arc()?;
+            let catalog = block_on(read_catalog(&pager))?;
+            let (index, schema_rowid) = resolve_drop_index_target(&pager, &catalog, &di)?;
+            let schema_cookie = schema_cookie(&pager);
+            let program = Arc::new(codegen::compile_drop_index(
+                &di, index.as_ref(), schema_cookie, schema_rowid,
+            )?);
             let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
@@ -180,13 +239,76 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
     }
 }
 
-/// Resolve the table a `DELETE` targets from the current catalog.
-fn resolve_delete_table(pager: &Arc<Pager>, del: &DeleteStmt) -> Result<Table> {
+/// Resolve the table a `DELETE` targets from the current catalog, plus the list of indexes
+/// attached to that table. Used by INSERT / UPDATE / DELETE to drive the index maintenance
+/// that the codegen emits.
+fn resolve_table_and_indexes(
+    pager: &Arc<Pager>,
+    table_name: &str,
+) -> Result<(Table, Vec<IndexObject>)> {
     let catalog = block_on(read_catalog(pager))?;
-    let obj = catalog
-        .find_table(&del.table)
-        .ok_or_else(|| Error::msg(format!("no such table: {}", del.table)))?;
-    Table::from_schema_object(obj)
+    let table_obj = catalog
+        .find_table(table_name)
+        .ok_or_else(|| Error::msg(format!("no such table: {table_name}")))?;
+    let table = Table::from_schema_object(table_obj)?;
+    let mut indexes = Vec::new();
+    for obj in catalog.indexes() {
+        if obj.tbl_name.eq_ignore_ascii_case(table_name) {
+            indexes.push(IndexObject::from_schema_object(obj)?);
+        }
+    }
+    Ok((table, indexes))
+}
+
+/// Resolve the implicit `sqlite_schema` (alias `sqlite_master`) table for a `SELECT` against
+/// the catalog. The page-1 b-tree IS the `sqlite_schema` table; we synthesize a
+/// [`Table`] directly (no catalog row is required) so the scan can open rootpage 1 with the
+/// known 5-column schema (`type, name, tbl_name, rootpage, sql`).
+fn resolve_sqlite_schema(pager: &Arc<Pager>) -> Result<Table> {
+    use crate::types::Affinity;
+    let _ = pager; // the pager is the source of truth; the table shape is hard-coded
+    Ok(Table {
+        name: "sqlite_schema".to_string(),
+        rootpage: 1,
+        columns: vec![
+            crate::schema::Column {
+                name: "type".to_string(),
+                affinity: Affinity::Text,
+                collation: crate::types::Collation::Binary,
+                notnull: false,
+                pk: false,
+            },
+            crate::schema::Column {
+                name: "name".to_string(),
+                affinity: Affinity::Text,
+                collation: crate::types::Collation::Binary,
+                notnull: false,
+                pk: false,
+            },
+            crate::schema::Column {
+                name: "tbl_name".to_string(),
+                affinity: Affinity::Text,
+                collation: crate::types::Collation::Binary,
+                notnull: false,
+                pk: false,
+            },
+            crate::schema::Column {
+                name: "rootpage".to_string(),
+                affinity: Affinity::Integer,
+                collation: crate::types::Collation::Binary,
+                notnull: false,
+                pk: false,
+            },
+            crate::schema::Column {
+                name: "sql".to_string(),
+                affinity: Affinity::Text,
+                collation: crate::types::Collation::Binary,
+                notnull: false,
+                pk: false,
+            },
+        ],
+        rowid_alias: None,
+    })
 }
 
 /// Resolve a `DROP TABLE` target: returns the table when present in the catalog (else
@@ -205,22 +327,27 @@ fn resolve_drop_target(
     Ok((table, cookie))
 }
 
-/// Resolve the table an `INSERT` targets from the current catalog.
-fn resolve_insert_table(pager: &Arc<Pager>, ins: &InsertStmt) -> Result<Table> {
-    let catalog = block_on(read_catalog(pager))?;
-    let obj = catalog
-        .find_table(&ins.table)
-        .ok_or_else(|| Error::msg(format!("no such table: {}", ins.table)))?;
-    Table::from_schema_object(obj)
-}
-
-/// Resolve the table an `UPDATE` targets from the current catalog.
-fn resolve_update_table(pager: &Arc<Pager>, upd: &UpdateStmt) -> Result<Table> {
-    let catalog = block_on(read_catalog(pager))?;
-    let obj = catalog
-        .find_table(&upd.table)
-        .ok_or_else(|| Error::msg(format!("no such table: {}", upd.table)))?;
-    Table::from_schema_object(obj)
+/// Resolve the index a `DROP INDEX` targets from the current catalog. Returns
+/// `(Some(IndexObject), rowid)` when found, `(None, 0)` when missing and `IF EXISTS` was
+/// given. Errors with `no such index` when missing and `IF EXISTS` was not given.
+fn resolve_drop_index_target(
+    _pager: &Arc<Pager>,
+    catalog: &crate::schema::Catalog,
+    di: &DropIndexStmt,
+) -> Result<(Option<IndexObject>, i64)> {
+    // Use the actual b-tree rowid (preserved on each `SchemaObject` by the catalog reader) so
+    // the `Delete` opcode targets the right row even when other rows have been deleted.
+    for obj in catalog.objects.iter() {
+        if obj.is_index() && obj.name.eq_ignore_ascii_case(&di.name) {
+            let idx = IndexObject::from_schema_object(obj)?;
+            return Ok((Some(idx), obj.rowid));
+        }
+    }
+    if di.if_exists {
+        Ok((None, 0))
+    } else {
+        Err(Error::msg(format!("no such index: {}", di.name)))
+    }
 }
 
 /// Extract the verbatim `CREATE TABLE` text to store in `sqlite_schema.sql`. SQLite stores the
@@ -304,21 +431,38 @@ struct CompiledSelect {
 /// Resolve the single FROM table (if any) from the catalog and compile the SELECT. Shared by the
 /// normal SELECT path and the EXPLAIN path.
 fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelect> {
-    let (table, pager) = if let Some(table_ref) = select.from.first() {
+    let (table, pager, indexes) = if let Some(table_ref) = select.from.first() {
         if select.from.len() > 1 {
             return Err(Error::msg("joins are not supported"));
         }
-        let pager = db.pager_arc()?;
-        let catalog = block_on(read_catalog(&pager))?;
-        let obj = catalog
-            .find_table(&table_ref.name)
-            .ok_or_else(|| Error::msg(format!("no such table: {}", table_ref.name)))?;
-        (Some(Table::from_schema_object(obj)?), Some(pager))
+        // The implicit `sqlite_schema` / `sqlite_master` table lives at page 1 and is not
+        // listed in the catalog (it IS the catalog); synthesize a `Table` for it directly.
+        if table_ref.name.eq_ignore_ascii_case("sqlite_schema")
+            || table_ref.name.eq_ignore_ascii_case("sqlite_master")
+        {
+            let pager = db.pager_arc()?;
+            let table = resolve_sqlite_schema(&pager)?;
+            (Some(table), Some(pager), Vec::new())
+        } else {
+            let pager = db.pager_arc()?;
+            let catalog = block_on(read_catalog(&pager))?;
+            let obj = catalog
+                .find_table(&table_ref.name)
+                .ok_or_else(|| Error::msg(format!("no such table: {}", table_ref.name)))?;
+            let table = Table::from_schema_object(obj)?;
+            let mut indexes = Vec::new();
+            for obj in catalog.indexes() {
+                if obj.tbl_name.eq_ignore_ascii_case(&table_ref.name) {
+                    indexes.push(IndexObject::from_schema_object(obj)?);
+                }
+            }
+            (Some(table), Some(pager), indexes)
+        }
     } else {
-        (None, None)
+        (None, None, Vec::new())
     };
 
-    let (program, column_names) = codegen::compile_select(select, table.as_ref())?;
+    let (program, column_names) = codegen::compile_select(select, table.as_ref(), &indexes)?;
     Ok(CompiledSelect {
         program,
         column_names,

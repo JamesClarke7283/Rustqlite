@@ -5,8 +5,12 @@
 //! and resolving each column's affinity, collation, and constraints — plus detecting the
 //! INTEGER-PRIMARY-KEY rowid alias, which codegen reads from the cell rowid (an `Rowid` opcode)
 //! rather than the record body (a `Column` opcode), because it is stored as NULL on disk.
+//!
+//! M5.1 adds [`IndexObject`] — the analogous view of a `sqlite_schema` index row, derived
+//! from its stored `CREATE INDEX` text. The codegen and the planner read the indexed columns
+//! from this struct; the page-level index b-tree is rooted at `rootpage`.
 
-use rustqlite_parser::{parse, ColumnConstraint, CreateTable, Stmt};
+use rustqlite_parser::{parse, ColumnConstraint, CreateIndex, CreateTable, Stmt};
 
 use crate::error::{Error, Result};
 use crate::schema::SchemaObject;
@@ -31,6 +35,29 @@ pub struct Table {
     pub columns: Vec<Column>,
     /// Index into `columns` of the `INTEGER PRIMARY KEY` rowid-alias column, if there is one.
     pub rowid_alias: Option<usize>,
+}
+
+/// A resolved index: the table it indexes, the b-tree root page, the indexed columns, and
+/// whether `UNIQUE` was declared. The M5.1 first slice accepts only single-column indexes;
+/// `columns[0]` is the equality-usable column. The `unique` flag is recorded but uniqueness
+/// is not enforced yet (see the M5.1 module doc-comment).
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndexObject {
+    pub name: String,
+    pub table: String,
+    pub rootpage: i64,
+    pub columns: Vec<IndexedColumn>,
+    pub unique: bool,
+}
+
+/// One column entry in an `IndexObject`. The M5.1 first slice uses only `name` (and that
+/// the indexed-column count is exactly 1); `collation` and `desc` are recorded for the
+/// catalog/EXPLAIN metadata but do not yet affect the comparison.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndexedColumn {
+    pub name: String,
+    pub collation: Option<String>,
+    pub desc: bool,
 }
 
 /// How a column reference resolves against a table.
@@ -144,6 +171,55 @@ impl Table {
     }
 }
 
+impl IndexObject {
+    /// Build an `IndexObject` from a `sqlite_schema` row by parsing its `CREATE INDEX` text.
+    /// Returns an error when the stored SQL is missing, doesn't parse, or doesn't reduce to
+    /// a `CREATE INDEX` statement.
+    pub fn from_schema_object(obj: &SchemaObject) -> Result<IndexObject> {
+        let sql = obj.sql.as_deref().ok_or_else(|| {
+            Error::msg(format!("index \"{}\" has no CREATE statement", obj.name))
+        })?;
+        let stmts = parse(sql)
+            .map_err(|e| Error::msg(format!("cannot parse schema for index \"{}\": {e}", obj.name)))?;
+        let ci = match stmts.into_iter().next() {
+            Some(Stmt::CreateIndex(ci)) => ci,
+            _ => {
+                return Err(Error::msg(format!(
+                    "schema object \"{}\" is not a CREATE INDEX this build can model",
+                    obj.name
+                )))
+            }
+        };
+        Ok(IndexObject::from_create(&ci, obj.rootpage, obj.name.clone()))
+    }
+
+    fn from_create(ci: &CreateIndex, rootpage: i64, name: String) -> IndexObject {
+        let columns = ci
+            .columns
+            .iter()
+            .map(|c| IndexedColumn {
+                name: c.name.clone(),
+                collation: c.collation.clone(),
+                desc: c.desc,
+            })
+            .collect();
+        IndexObject {
+            name,
+            table: ci.table.clone(),
+            rootpage,
+            columns,
+            unique: ci.unique,
+        }
+    }
+
+    /// The first indexed column (the M5.1 first slice only accepts single-column indexes, so
+    /// this is also the only one). Returns `None` for a multi-column index, which the planner
+    /// cannot currently use.
+    pub fn first_column(&self) -> Option<&IndexedColumn> {
+        self.columns.first()
+    }
+}
+
 /// Whether `name` is one of SQLite's magic rowid names (case-insensitive).
 pub fn is_rowid_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("rowid")
@@ -157,6 +233,7 @@ mod tests {
 
     fn table_from_sql(sql: &str) -> Table {
         let obj = SchemaObject {
+            rowid: 1,
             obj_type: "table".into(),
             name: "t".into(),
             tbl_name: "t".into(),
@@ -208,6 +285,7 @@ mod tests {
     #[test]
     fn without_rowid_is_unsupported() {
         let obj = SchemaObject {
+            rowid: 1,
             obj_type: "table".into(),
             name: "t".into(),
             tbl_name: "t".into(),

@@ -115,3 +115,20 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   Still M5+: indexes, joins, aggregates, subqueries, `INSERT ... SELECT`, UPSERT,
   compound SELECT, triggers, views, `UPDATE` of the rowid-alias column, `RETURNING`,
   conflict resolution other than ABORT.
+- **M5.1 — single-column indexes** ✅: `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON tbl(col)`
+  (single-column, `UNIQUE` recorded in the catalog but not enforced at `IdxInsert` time — the
+  page-level engine does not yet model uniqueness), `DROP INDEX [IF EXISTS] name`, indexed
+  equality `WHERE col = <const>` (uses the new `SeekGE` / `IdxGT` boundary-check opcodes over an
+  `IndexCursor`; `IdхGT` jumps when the entry is `>` the boundary, so the equality range
+  terminates at the first strictly-greater key), indexed equality + `ORDER BY` (the indexed
+  `SELECT` path emits a seek-and-walk, no sorter), and per-row index maintenance from
+  `INSERT` / `UPDATE` / `DELETE` (the index `Delete` runs *after* the WHERE check so
+  non-matching rows don't drop index entries; the `UPDATE` path snapshots the OLD indexed
+  value into a fresh register before the SET, then `IdxDelete` of the old key + table
+  `Delete`/`Insert` + `IdxInsert` of the new key). Population is single-leaf only — the
+  page-full error propagates; index page splits land in a follow-up. Differential-tested vs
+  the C oracle (round-trip + indexed lookup) in `crates/rustsqlite-core/tests/write_roundtrip.rs`
+  (11 tests) and the in-process slt harness (`our/index.slt` + `evidence/slt_lang_dropindex.test`).
+  M5+ continues with: index page splits, multi-column indexes, partial/expression indexes,
+  enforced `UNIQUE`, `ORDER BY` over a non-indexed column with the index used as a
+  scan-time ordering hint, joins, aggregates, subqueries.
