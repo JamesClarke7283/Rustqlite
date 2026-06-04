@@ -77,7 +77,10 @@ Built bottom-up so each layer is verified against real SQLite before the next.
   need `CREATE`/`INSERT`/`DELETE`/`DROP`). The engine now writes valid C-SQLite-readable
   databases of arbitrary size; the differential tests (`tests/diff.rs`, `tests/fileformat.rs`,
   `tests/write_roundtrip.rs`, `crates/rustqlite/tests/cli_modes.rs`) all pass.
-- **M5 — Indexes & planner basics** · **M6 — Transactions & richer SQL** · **M7 — Advanced SQL**
+- **M5 — Indexes & planner basics** 🚧 — `UPDATE` (single-table, two-pass sorter-as-rowset shape,
+  faithful `OP_NotExists` + `P5_ISUPDATE`) is the first M5 slice to land. Pending: index b-trees,
+  `CREATE INDEX` / `DROP INDEX`, the planner deciding to use an index for a `WHERE`/`ORDER BY`.
+  · **M6 — Transactions & richer SQL** · **M7 — Advanced SQL**
   · **M8 — WAL & durability** · **M9 — Conformance hardening**.
 
 See [`AGENTS.md`](AGENTS.md) for contributor guidance and [`TESTING.md`](TESTING.md) for how to run

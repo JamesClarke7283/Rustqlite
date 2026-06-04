@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use rustqlite_parser::{parse, DeleteStmt, DropTableStmt, ExplainKind, InsertStmt, SelectStmt, Stmt};
+use rustqlite_parser::{parse, DeleteStmt, DropTableStmt, ExplainKind, InsertStmt, SelectStmt, Stmt, UpdateStmt};
 
 use crate::codegen;
 use crate::error::{Error, Result, ResultCode};
@@ -65,7 +65,6 @@ pub fn sqlite3_prepare_v2<'a>(db: &mut Sqlite3, sql: &'a str) -> Result<(Sqlite3
 
 fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
     let ast = parse(sql).map_err(|e| Error::msg(format!("near syntax error: {e}")))?;
-    eprintln!("DBG prepare sql={sql:?} nstmts={}", ast.len());
     let stmt = ast
         .into_iter()
         .next()
@@ -159,6 +158,25 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 last_error: None,
             })
         }
+        Stmt::Update(upd) => {
+            // UPDATE: resolve the target table from the catalog and compile the two-pass
+            // (sorter-as-rowset) write program. The codegen rejects OR actions other than
+            // ABORT, schema-qualified names, unknown columns, and (defensively) updates of
+            // the rowid-alias column.
+            let pager = db.pager_arc()?;
+            let table = resolve_update_table(&pager, &upd)?;
+            let program = Arc::new(codegen::compile_update(&upd, &table)?);
+            let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
+            Ok(Sqlite3Stmt {
+                sql: sql.to_string(),
+                program,
+                column_names: Vec::new(),
+                backing: Backing::Vdbe(vdbe),
+                explain: 0,
+                counts: Some(db.counts_handle()),
+                last_error: None,
+            })
+        }
     }
 }
 
@@ -193,6 +211,15 @@ fn resolve_insert_table(pager: &Arc<Pager>, ins: &InsertStmt) -> Result<Table> {
     let obj = catalog
         .find_table(&ins.table)
         .ok_or_else(|| Error::msg(format!("no such table: {}", ins.table)))?;
+    Table::from_schema_object(obj)
+}
+
+/// Resolve the table an `UPDATE` targets from the current catalog.
+fn resolve_update_table(pager: &Arc<Pager>, upd: &UpdateStmt) -> Result<Table> {
+    let catalog = block_on(read_catalog(pager))?;
+    let obj = catalog
+        .find_table(&upd.table)
+        .ok_or_else(|| Error::msg(format!("no such table: {}", upd.table)))?;
     Table::from_schema_object(obj)
 }
 
@@ -313,11 +340,11 @@ impl Sqlite3Stmt {
                     // Taken (not just read) so re-stepping a finished statement does not double the
                     // running `total_changes`.
                     if let Some(counts) = self.counts.take() {
-                        let (changes, _total, last_rowid) = vdbe.change_counts();
+                        let (changes, _total, last_rowid, did_insert) = vdbe.change_counts();
                         let mut c = counts.lock().unwrap();
                         c.changes = changes;
                         c.total_changes += changes;
-                        if changes > 0 {
+                        if did_insert {
                             c.last_insert_rowid = last_rowid;
                         }
                     }

@@ -84,3 +84,68 @@ async fn table_cursor_matches_scan_table() {
     // Spot-check the overflow rows decoded identically (rowid 500, 1000, ... have big values).
     assert!(got[499].1.len() > 4000, "overflow payload present");
 }
+
+/// `TableCursor::seek_rowid` must find every existing row and report a miss for an absent one,
+/// across both single-page and interior-page tables. The 3000-row fixture forces the latter.
+#[tokio::test]
+async fn table_cursor_seek_rowid_finds_and_misses() {
+    if !sqlite3_available() {
+        eprintln!("skipping: system `sqlite3` binary not found");
+        return;
+    }
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("rustsqlite_seek_{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let path_str = path.to_str().unwrap().to_string();
+
+    let sql = "CREATE TABLE t(n);               WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 3000)               INSERT INTO t SELECT n FROM c;";
+    let out = Command::new("sqlite3")
+        .arg(&path_str)
+        .arg(sql)
+        .output()
+        .expect("run sqlite3");
+    assert!(
+        out.status.success(),
+        "sqlite3 failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let vfs: Arc<dyn Vfs> = Arc::new(OsTokioVfs::new());
+    let file = vfs.open(&path_str, OpenFlags::READONLY).await.expect("open");
+    let pager = Arc::new(
+        Pager::open(vfs.clone(), path_str.clone(), file)
+            .await
+            .expect("pager"),
+    );
+    let catalog = read_catalog(&pager).await.expect("catalog");
+    let root = catalog.find_table("t").expect("table t").rootpage as u32;
+
+    let mut cursor = TableCursor::new(pager.clone(), root);
+
+    // First and last rowids in the table.
+    assert!(cursor.seek_rowid(1).await.expect("seek 1"));
+    assert_eq!(cursor.rowid().expect("rowid 1"), 1);
+
+    assert!(cursor.seek_rowid(3000).await.expect("seek 3000"));
+    assert_eq!(cursor.rowid().expect("rowid 3000"), 3000);
+
+    // A rowid in the middle (forces a descent through at least one interior page).
+    assert!(cursor.seek_rowid(1750).await.expect("seek 1750"));
+    assert_eq!(cursor.rowid().expect("rowid 1750"), 1750);
+
+    // A rowid past the end — the cursor must report not-found.
+    assert!(!cursor.seek_rowid(5000).await.expect("seek 5000"));
+    assert!(!cursor.is_valid());
+
+    // A negative rowid — never present in a rowid-keyed b-tree.
+    assert!(!cursor.seek_rowid(-1).await.expect("seek -1"));
+    assert!(!cursor.is_valid());
+
+    // Seeks must be repeatable: position, then re-seek, and the position holds.
+    assert!(cursor.seek_rowid(100).await.expect("seek 100"));
+    assert!(cursor.seek_rowid(100).await.expect("seek 100 again"));
+    assert_eq!(cursor.rowid().expect("rowid 100"), 100);
+
+    let _ = std::fs::remove_file(&path);
+}

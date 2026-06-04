@@ -110,6 +110,22 @@ fn interior_child(hdr: &PageHeader, page: &[u8], k: usize) -> Result<Option<u32>
     }
 }
 
+/// The child of an interior table page that owns the row with rowid `target`: the left child
+/// of the first cell whose rowid is `> target`, falling back to the right-most child. Mirrors
+/// the descent rule in `sqlite3BtreeMovetoUnpacked` for rowid-keyed tables.
+fn pick_child_for_rowid(page: &[u8], hdr: &PageHeader, target: i64) -> Result<u32> {
+    let n = hdr.num_cells as usize;
+    for i in 0..n {
+        let off = hdr.cell_pointer(page, i)?;
+        let cell = parse_table_interior_cell(page, off)?;
+        if target <= cell.rowid {
+            return Ok(cell.left_child);
+        }
+    }
+    hdr.right_most_pointer
+        .ok_or_else(|| Error::corrupt("interior table page has no right pointer"))
+}
+
 /// A streaming read cursor over a table b-tree — the VDBE-facing analogue of `BtCursor` that
 /// `OpenRead`/`Rewind`/`Next` drive one row at a time (mirrors the table-scan paths in
 /// `btree.c`).
@@ -225,6 +241,39 @@ impl TableCursor {
         self.leaf_pgno
     }
 
+    /// Position the cursor on the row whose rowid is `target`. Returns `true` when the row
+    /// exists (the cursor is then on it) and `false` when no such row exists (the cursor is
+    /// left invalid). Mirrors the seek portion of `OP_NotExists` / `sqlite3BtreeMovetoUnpacked`
+    /// in `btree.c` for table b-trees — descent to the leaf that should contain `target`,
+    /// then a linear scan.
+    pub async fn seek_rowid(&mut self, target: i64) -> Result<bool> {
+        self.stack.clear();
+        self.leaf = None;
+        self.leaf_hdr = None;
+        self.leaf_pgno = 0;
+        self.cell_idx = 0;
+        self.at_end = false;
+        self.pending_advance = false;
+        self.descend_to_target(self.root, target).await?;
+        if !self.is_valid() {
+            return Ok(false);
+        }
+        // Validate the position by reading the current cell's rowid (the descent used the
+        // last-cell < target vs. cell[i].rowid > target comparison to pick a leaf, so a final
+        // read here is the ground truth). On a miss, leave the cursor invalid so a follow-up
+        // `is_valid()` / `rowid()` / `payload()` call does not return the cell that the
+        // binary search happened to land on.
+        if self.current_cell()?.rowid != target {
+            self.at_end = true;
+            self.leaf = None;
+            self.leaf_hdr = None;
+            self.leaf_pgno = 0;
+            self.cell_idx = 0;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// Delete the row the cursor is currently positioned on. Removes the cell at
     /// `cell_idx` from the leaf, frees any overflow chain, and refreshes the cursor's
     /// cached leaf so subsequent reads see the post-delete state. The cursor's `cell_idx`
@@ -287,6 +336,60 @@ impl TableCursor {
                 _ => return Err(Error::corrupt("expected a table b-tree page during scan")),
             }
         }
+    }
+
+    /// Descend to the leaf that should hold the rowid `target`, then position on the cell
+    /// whose rowid is `target` (or leave the cursor at-end if no such cell exists). The
+    /// descent rule mirrors the rowid-seek in `OP_NotExists` / `sqlite3BtreeMovetoUnpacked`:
+    /// the left child of the first interior cell whose rowid is `> target`, falling back to
+    /// the right-most child.
+    async fn descend_to_target(&mut self, pgno: u32, target: i64) -> Result<()> {
+        let mut pgno = pgno;
+        loop {
+            let page = self.pager.get_page(pgno).await?;
+            let base = self.pager.btree_header_offset(pgno);
+            let hdr = PageHeader::parse(&page, base)?;
+            match hdr.page_type {
+                PageType::LeafTable => {
+                    self.leaf_pgno = pgno;
+                    self.leaf = Some(page);
+                    self.leaf_hdr = Some(hdr);
+                    self.cell_idx = self.leaf_index_for_rowid(target)?;
+                    self.pending_advance = false;
+                    return Ok(());
+                }
+                PageType::InteriorTable => {
+                    let child = pick_child_for_rowid(&page, &hdr, target)?;
+                    self.stack.push((page, hdr, 0));
+                    pgno = child;
+                }
+                _ => return Err(Error::corrupt("expected a table b-tree page during seek")),
+            }
+        }
+    }
+
+    /// On a positioned leaf, the cell index of the first cell whose rowid is `>= target`.
+    /// Returns `cell_idx == num_cells` (i.e. `is_valid() == false`) when no such cell exists.
+    fn leaf_index_for_rowid(&self, target: i64) -> Result<usize> {
+        let leaf = self
+            .leaf
+            .as_ref()
+            .expect("descend_to_target positions a leaf before this");
+        let hdr = self.leaf_hdr.expect("leaf_hdr present when leaf present");
+        let n = hdr.num_cells as usize;
+        let mut lo = 0usize;
+        let mut hi = n;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let off = hdr.cell_pointer(leaf, mid)?;
+            let cell = parse_table_leaf_cell(leaf, off, self.usable)?;
+            if cell.rowid < target {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
     }
 
     /// Pop back up the stack to the next unvisited child and descend into it. Sets `at_end`

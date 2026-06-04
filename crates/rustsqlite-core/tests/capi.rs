@@ -88,9 +88,45 @@ fn out_of_subset_sql_errors_cleanly() {
     assert!(sqlite3_prepare_v2(&mut conn, "SELECT * FROM nope;").is_err());
     assert!(sqlite3_prepare_v2(&mut conn, "SELECT zzz FROM t;").is_err());
     assert!(sqlite3_prepare_v2(&mut conn, "SELECT nosuchfn(a) FROM t;").is_err());
-    // UPDATE is still on the M4.6 milestone; the parser doesn't produce a `Stmt` for it
-    // yet, so `prepare` returns the parse error.
-    assert!(sqlite3_prepare_v2(&mut conn, "UPDATE t SET a = 1;").is_err());
+    // INSERT ... OR REPLACE is still out of subset; prepare should error.
+    assert!(sqlite3_prepare_v2(&mut conn, "INSERT OR REPLACE INTO t VALUES (1);").is_err());
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn update_changes_counting_and_last_insert_rowid_preserved() {
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("upd");
+    Command::new("sqlite3")
+        .arg(&db)
+        .arg("CREATE TABLE t(a, b); INSERT INTO t VALUES (1, 2), (3, 4), (5, 6);")
+        .output()
+        .unwrap();
+
+    let mut conn = sqlite3_open(&db).unwrap();
+    let last_before = conn.last_insert_rowid();
+
+    // UPDATE with no WHERE matches all three rows; changes() must report 3, and
+    // last_insert_rowid() must NOT be clobbered (it is set by INSERT, not UPDATE).
+    let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "UPDATE t SET a = a + 1;").unwrap();
+    assert_eq!(stmt.step(), ResultCode::Done);
+    assert_eq!(conn.changes(), 3);
+    assert_eq!(conn.last_insert_rowid(), last_before);
+
+    // A second UPDATE that matches no rows must report 0 changes.
+    let (mut stmt2, _) =
+        sqlite3_prepare_v2(&mut conn, "UPDATE t SET a = 0 WHERE a > 1000;").unwrap();
+    assert_eq!(stmt2.step(), ResultCode::Done);
+    assert_eq!(conn.changes(), 0);
+
+    // The file should reflect the update when read back.
+    let (mut read, _) =
+        sqlite3_prepare_v2(&mut conn, "SELECT a FROM t ORDER BY a;").unwrap();
+    let rows = collect(&mut read);
+    assert_eq!(rows, vec![vec![Value::Int(2)], vec![Value::Int(4)], vec![Value::Int(6)]]);
 
     let _ = std::fs::remove_file(&db);
 }

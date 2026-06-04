@@ -139,3 +139,56 @@ fn mode_insert_table_arg_matches_oracle() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// An end-to-end `UPDATE` smoke through the CLI: run the same `UPDATE` against the oracle and
+/// our binary on identical fixtures, then read the table back through both and assert the
+/// post-update rows are byte-identical.
+#[test]
+fn update_smoke_matches_oracle() {
+    let Some((dir, _db)) = make_fixture("update") else {
+        return;
+    };
+    let rustqlite = env!("CARGO_BIN_EXE_rustsqlite");
+    // Two copies so each engine sees a fresh DB (writes are not read-only).
+    let dir_a = dir.clone();
+    let dir_b = dir.join("b");
+    let _ = std::fs::create_dir_all(&dir_b);
+    let db_a = dir_a.join("a.db");
+    let db_b = dir_b.join("b.db");
+    let _ = std::fs::remove_file(&db_a);
+    let _ = std::fs::remove_file(&db_b);
+    // Build the same fixture in both copies.
+    for db_path in [&db_a, &db_b] {
+        let mut cmd = Command::new(ORACLE);
+        cmd.arg(db_path);
+        for stmt in SCHEMA {
+            cmd.arg(stmt);
+        }
+        assert!(cmd.status().expect("oracle build").success());
+    }
+    // The UPDATE under test.
+    let update = "UPDATE t SET a = a + 100, b = 'changed' WHERE c IS NULL;";
+    // Run the UPDATE through both, then read the table back.
+    for (program, db) in [(ORACLE, &db_a), (rustqlite, &db_b)] {
+        let status = Command::new(program)
+            .arg(db)
+            .arg(update)
+            .status()
+            .expect("run update");
+        assert!(status.success(), "{program} update failed");
+    }
+    let read_args = [".mode column", ".headers on", "SELECT * FROM t ORDER BY a;"];
+    let oracle = run(ORACLE, "-readonly", &db_a, &read_args);
+    let ours = run(rustqlite, "--readonly", &db_b, &read_args);
+    assert_eq!(
+        ours,
+        oracle,
+        "post-UPDATE rows differ
+ oracle={:?}
+  ours ={:?}",
+        String::from_utf8_lossy(&oracle),
+        String::from_utf8_lossy(&ours)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}

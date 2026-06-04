@@ -1,0 +1,98 @@
+# A small, hand-curated sqllogictest corpus that exercises the engine's
+# `UPDATE` statement end-to-end through the in-process harness. Avoids any
+# features the M5.0 first slice does not yet ship (CREATE INDEX, triggers,
+# UPSERT, RETURNING, multi-column row-value assignment, subqueries,
+# aggregate functions like count(*), etc.). The manifest points at this
+# file so the harness actually runs something on `cargo test`.
+#
+# The `sqllogictest` crate joins result columns with a single space when
+# validating, so multi-column queries use spaces (not `|`) between cells.
+
+statement ok
+CREATE TABLE t1(x INTEGER, y VARCHAR(8))
+
+statement ok
+INSERT INTO t1 VALUES(1, 'true')
+
+statement ok
+INSERT INTO t1 VALUES(0, 'false')
+
+statement ok
+INSERT INTO t1 VALUES(NULL, 'NULL')
+
+# EVIDENCE-OF: R-38515-45264 — UPDATE modifies a subset of the rows.
+statement ok
+UPDATE t1 SET x = 1 WHERE x > 0
+
+statement ok
+UPDATE t1 SET x = 2 WHERE x > 0
+
+# EVIDENCE-OF: R-58095-46013 — only matching rows are affected.
+statement ok
+UPDATE t1 SET x = 99 WHERE y = 'true'
+
+query IT rowsort
+SELECT x, y FROM t1 WHERE x = 99
+----
+99 true
+
+# EVIDENCE-OF: R-58129-20729 — no rows match → no rows affected, no error.
+statement ok
+UPDATE t1 SET x = 0 WHERE y = 'no-such-row'
+
+query I rowsort
+SELECT x FROM t1 WHERE y = 'no-such-row'
+----
+
+# EVIDENCE-OF: R-34751-18293 — last assignment wins on duplicate columns.
+statement ok
+UPDATE t1 SET x = 3, x = 4
+
+query I rowsort
+SELECT x FROM t1 ORDER BY x
+----
+4
+4
+4
+
+# Multi-column assignment in a single UPDATE.
+statement ok
+UPDATE t1 SET x = 7, y = 'seven' WHERE x = 4
+
+query IT rowsort
+SELECT x, y FROM t1 ORDER BY x
+----
+7 seven
+7 seven
+7 seven
+
+# EVIDENCE-OF: R-40598-36595 — column references in the SET list read the OLD
+# row's value (so `SET x = x + 1` walks every row up by one).
+statement ok
+UPDATE t1 SET x = x + 10
+
+query I rowsort
+SELECT x FROM t1 ORDER BY x
+----
+17
+17
+17
+
+# An UPDATE with no WHERE clause applies to every row.
+statement ok
+UPDATE t1 SET y = 'updated'
+
+query T rowsort
+SELECT y FROM t1 ORDER BY rowid
+----
+updated
+updated
+updated
+
+# An UPDATE on a column that does not exist is a prepare error.
+statement error
+UPDATE t1 SET z = 'foo'
+
+# An UPDATE on a table that does not exist is a prepare error.
+statement error
+UPDATE nosuch SET a = 1

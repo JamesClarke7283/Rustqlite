@@ -319,11 +319,27 @@ fn read_manifest() -> Vec<PathBuf> {
     let Ok(text) = std::fs::read_to_string(&manifest) else {
         return Vec::new();
     };
+    // Paths beginning with `our/` are relative to the in-tree `tests/slt/`
+    // directory (hand-rolled smoke files that the repo ships with the engine);
+    // everything else is relative to the corpus root (`target/slt/`, populated
+    // by `xtask/fetch-slt.sh`).
     let root = slt_dir();
+    let in_tree = std::env::var("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("tests")
+        .join("slt");
     text.lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| root.join(l))
+        .map(|l| {
+            if l.starts_with("our/") {
+                // Path is relative to the in-tree `tests/slt/` directory.
+                in_tree.join(l)
+            } else {
+                root.join(l)
+            }
+        })
         .collect()
 }
 

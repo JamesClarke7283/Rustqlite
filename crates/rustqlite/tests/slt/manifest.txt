@@ -15,9 +15,15 @@
 # here. The full upstream corpus (~5,000 .slt files in `random/` and
 # `select{2,3,4,5}.test`) is wired through `xtask/fetch-slt.sh` and the
 # test will exercise it when M5+ lands.
+#
+# In-tree files: a path beginning with `our/` is read from the repo's own
+# `crates/rustqlite/tests/slt/` directory. Use this for hand-rolled smoke
+# files that exercise what the engine ships without depending on the
+# upstream `xtask/fetch-slt.sh` corpus.
 
-# (Currently empty — every M4.6 evidence/ test either depends on a
-# feature we have not shipped (CREATE INDEX in droptable.test) or uses
-# skipif/onlyif directives that need sqllogictest parser support. The
-# harness itself is wired and ready; the manifest is filled in as the
-# missing features land.)
+# M5.0 — `UPDATE`. The upstream `evidence/slt_lang_update.test` mixes
+# `CREATE INDEX` (still on the M5+ roadmap) and `skipif`/`onlyif`
+# directives the harness's parser does not yet understand, so the hand-
+# rolled `our/update.slt` covers the same UPDATE surface against our own
+# engine. The full file lands in the manifest when both gaps close.
+our/update.slt

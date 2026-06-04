@@ -254,6 +254,40 @@ fn drop_table_roundtrip_and_c_oracle() {
 }
 
 #[test]
+fn update_roundtrip_and_c_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("update");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        for n in 1..=6 {
+            exec(
+                &mut conn,
+                &format!("INSERT INTO t VALUES ({n}, 'r{n}');"),
+            );
+        }
+        // UPDATE with WHERE — change every row whose `a` is in 2..=4.
+        exec(&mut conn, "UPDATE t SET b = 'X' WHERE a >= 2 AND a <= 4;");
+        assert_eq!(conn.changes(), 3);
+        // last_insert_rowid() must NOT be clobbered by an UPDATE.
+        assert_eq!(conn.last_insert_rowid(), 6);
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(
+        db.query("SELECT a, b FROM t ORDER BY a;"),
+        "1|r1
+2|X
+3|X
+4|X
+5|r5
+6|r6"
+    );
+}
+
+#[test]
 fn drop_table_if_exists_unknown_is_silent() {
     skip_if_no_sqlite3!();
     let db = TempDb::new("dropif");

@@ -23,7 +23,9 @@ use crate::types::{Affinity, Collation, Value};
 use super::compare::{apply_affinity, mem_compare};
 use super::cursor::VdbeCursor;
 use super::opcode::Opcode;
-use super::program::{p5_to_aff, Instruction, Program, P4, P5_JUMPIFNULL, P5_NULLEQ, P5_STOREP2};
+use super::program::{
+    p5_to_aff, Instruction, Program, P4, P5_ISUPDATE, P5_JUMPIFNULL, P5_NULLEQ, P5_STOREP2,
+};
 use super::sorter::Sorter;
 
 /// `SQLITE_MAX_LENGTH` — the default cap on the size of a string or BLOB (`sqlite3.c`). A
@@ -52,6 +54,11 @@ pub struct RuntimeCtx {
     pub total_changes: i64,
     /// `last_insert_rowid()` — rowid of the last successful insert (persists across statements).
     pub last_insert_rowid: i64,
+    /// `true` once a real `Insert` (one without `P5_ISUPDATE`) has bumped `last_insert_rowid`
+    /// in this statement. The C-API publish path uses it to decide whether to overwrite the
+    /// connection's `last_insert_rowid` — a statement that only ran the write side of an
+    /// `UPDATE` must not clobber it.
+    pub did_insert: bool,
 }
 
 impl Default for RuntimeCtx {
@@ -78,6 +85,7 @@ impl RuntimeCtx {
             changes: 0,
             total_changes: 0,
             last_insert_rowid: 0,
+            did_insert: false,
         }
     }
 
@@ -182,11 +190,12 @@ impl Vdbe {
 
     /// A snapshot of the change counters after this program ran (for `sqlite3_changes` /
     /// `sqlite3_last_insert_rowid`). `(changes, total_changes, last_insert_rowid)`.
-    pub fn change_counts(&self) -> (i64, i64, i64) {
+    pub fn change_counts(&self) -> (i64, i64, i64, bool) {
         (
             self.ctx.changes,
             self.ctx.total_changes,
             self.ctx.last_insert_rowid,
+            self.ctx.did_insert,
         )
     }
 
@@ -344,6 +353,16 @@ impl Vdbe {
                     let rowid = self.table_cursor(p1)?.rowid()?;
                     self.regs[p2 as usize] = Value::Int(rowid);
                     self.pc += 1;
+                }
+                Opcode::NotExists => {
+                    let target = self.regs[p3 as usize].as_i64();
+                    let found = self.table_cursor_mut(p1)?.seek_rowid(target).await?;
+                    self.decoded = None;
+                    if found {
+                        self.pc += 1;
+                    } else {
+                        self.pc = p2 as usize;
+                    }
                 }
                 Opcode::Column => {
                     let val = self.column(p1 as usize, p2 as usize).await?;
@@ -602,9 +621,15 @@ impl Vdbe {
                     };
                     let rowid = self.regs[p3 as usize].as_i64();
                     btree::table_insert(&pager, root, rowid, &record).await?;
+                    // `P5_ISUPDATE` means the Insert is the write side of an `UPDATE`: bump
+                    // `changes` (one row updated) but do NOT clobber `last_insert_rowid` —
+                    // SQLite only updates that for an actual `INSERT`.
+                    if p5 & P5_ISUPDATE == 0 {
+                        self.ctx.last_insert_rowid = rowid;
+                        self.ctx.did_insert = true;
+                    }
                     self.ctx.changes += 1;
                     self.ctx.total_changes += 1;
-                    self.ctx.last_insert_rowid = rowid;
                     self.decoded = None;
                     self.pc += 1;
                 }
@@ -615,9 +640,15 @@ impl Vdbe {
                     let cur = self.table_cursor_mut(p1)?;
                     let rowid_before = cur.rowid()?;
                     cur.delete_current().await?;
-                    self.ctx.changes += 1;
+                    // `P5_ISUPDATE` means this `Delete` is the read-side of an `UPDATE` (the
+                    // `Insert` that immediately follows is the one that bumps `changes`).
+                    // We still publish the rowid for `total_changes` visibility in the test
+                    // layer; `last_insert_rowid` is left untouched (matches upstream).
+                    if p5 & P5_ISUPDATE == 0 {
+                        self.ctx.changes += 1;
+                        self.ctx.last_insert_rowid = rowid_before;
+                    }
                     self.ctx.total_changes += 1;
-                    self.ctx.last_insert_rowid = rowid_before;
                     self.decoded = None;
                     self.pc += 1;
                 }

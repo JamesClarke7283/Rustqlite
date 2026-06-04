@@ -105,5 +105,13 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   `DELETE` / `DROP TABLE`. The `sqllogictest` harness is wired (`crates/rustqlite/tests/slt.rs`
   + `xtask/fetch-slt.sh`) and exercises the engine in-process; the manifest is populated
   as M4.6+ features land.
-- **M5+ — indexes, joins, aggregates, subqueries, `UPDATE`, `INSERT ... SELECT`, UPSERT,
-  compound SELECT, triggers, views, …**: pending.
+- **M5.0 — `UPDATE`** ✅: single-table `UPDATE [OR action] tbl SET col = expr [, …] [WHERE expr]`
+  via the same two-pass (sorter-as-rowset) shape that upstream's `OP_NotExists` path uses for
+  `ONEPASS_OFF` updates. Wired in the new `Opcode::NotExists` + `TableCursor::seek_rowid`,
+  the `P5_ISUPDATE` flag that suppresses the double-counting on `Delete`+`Insert`, and the
+  connection-level `did_insert` tracker that keeps `last_insert_rowid()` from being clobbered
+  by an `UPDATE`. Differential-tested vs the C oracle (`update_writes_match_oracle`),
+  file-format round-tripped through C `sqlite3` (`update_roundtrip_and_c_oracle`).
+  Still M5+: indexes, joins, aggregates, subqueries, `INSERT ... SELECT`, UPSERT,
+  compound SELECT, triggers, views, `UPDATE` of the rowid-alias column, `RETURNING`,
+  conflict resolution other than ABORT.

@@ -92,6 +92,13 @@ pub const P5_STOREP2: u8 = 0x20;
 /// NULL (used for the `IS` / `IS NOT` operators). Mirrors `SQLITE_NULLEQ`.
 pub const P5_NULLEQ: u8 = 0x80;
 
+/// Flag bit for the `Delete`/`Insert` opcodes: the row count change is part of an `UPDATE` and
+/// must not double-count (the `Delete` is a "logical" delete; the `Insert` is the single +1 to
+/// `changes()`). Mirrors `OPFLAG_ISUPDATE` from `vdbe.c`. The `Insert` additionally suppresses
+/// its `last_insert_rowid()` write so an `UPDATE` does not clobber the connection's last-insert
+/// rowid (matches upstream: only `INSERT` updates `last_insert_rowid()`).
+pub const P5_ISUPDATE: u8 = 0x04;
+
 /// Encode an [`crate::types::Affinity`] (or `None`) into the comparison `p5` affinity bits.
 pub fn aff_to_p5(aff: Option<crate::types::Affinity>) -> u8 {
     use crate::types::Affinity::*;

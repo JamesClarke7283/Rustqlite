@@ -102,6 +102,8 @@ K_ROLLBACK      = @{ ^"rollback"      ~ !ident_cont }
 K_EXPLAIN       = @{ ^"explain"       ~ !ident_cont }
 K_DELETE        = @{ ^"delete"        ~ !ident_cont }
 K_DROP          = @{ ^"drop"          ~ !ident_cont }
+K_UPDATE        = @{ ^"update"        ~ !ident_cont }
+K_SET           = @{ ^"set"           ~ !ident_cont }
 // QUERY and PLAN are matched only after EXPLAIN (in `explain_query_plan`); they are
 // deliberately NOT in the aggregate `keyword` rule below, because — unlike EXPLAIN — SQLite
 // does NOT reserve them: `query` and `plan` are valid identifiers (e.g. column names). Only
@@ -116,12 +118,12 @@ keyword = @{
     | K_UNIQUE | K_DEFAULT | K_INSERT | K_REPLACE | K_INTO | K_VALUES | K_NULL
     | K_TRUE | K_FALSE | K_AND | K_OR | K_NOT | K_IS | K_LIKE | K_GLOB | K_ESCAPE | K_IN
     | K_COLLATE | K_CAST | K_ON | K_CONFLICT | K_ABORT | K_FAIL | K_IGNORE | K_ROLLBACK
-    | K_EXPLAIN | K_DELETE | K_DROP
+    | K_EXPLAIN | K_DELETE | K_DROP | K_UPDATE | K_SET
 }
 
 // ---- Top level: a list of statements separated/terminated by ';' ----
 sql = { SOI ~ statement? ~ (";" ~ statement?)* ~ EOI }
-statement = { explain_prefix? ~ (select_stmt | create_table_stmt | insert_stmt | delete_stmt | drop_table_stmt) }
+statement = { explain_prefix? ~ (select_stmt | create_table_stmt | insert_stmt | delete_stmt | drop_table_stmt | update_stmt) }
 
 // `EXPLAIN` / `EXPLAIN QUERY PLAN` may prefix a statement. The query-plan form is tried first
 // (it is the more specific, longer match).
@@ -201,6 +203,15 @@ delete_stmt = { K_DELETE ~ K_FROM ~ qualified_name ~ where_item? }
 // ---- DROP TABLE (M4.6b) ----
 // First slice: `DROP TABLE [IF EXISTS] [tbl]`. `DROP INDEX/VIEW/TRIGGER` arrive later.
 drop_table_stmt = { K_DROP ~ K_TABLE ~ if_exists? ~ qualified_name }
+
+// ---- UPDATE (M5.0) ----
+// First slice: `UPDATE [or_action] tbl SET assignment [, assignment ...] [WHERE expr]`. Single
+// column on the LHS (no row-value form), no `ORDER BY`/`LIMIT`/`FROM`/`RETURNING`, no
+// UPSERT/triggers/FK. The `or_action` is parsed but only the default ABORT is implemented.
+update_stmt = { K_UPDATE ~ or_action? ~ qualified_name ~ K_SET ~ assignment_list ~ where_item? }
+or_action = { K_OR ~ (K_ROLLBACK | K_ABORT | K_FAIL | K_IGNORE | K_REPLACE) }
+assignment_list = { assignment ~ ("," ~ assignment)* }
+assignment = { ident ~ "=" ~ expr }
 
 
 // ---- Expressions (folded by PrattParser in expr.rs) ----

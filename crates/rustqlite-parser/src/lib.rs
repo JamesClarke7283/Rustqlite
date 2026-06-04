@@ -63,7 +63,7 @@ fn build_statement(pair: Pair<'_, Rule>) -> Stmt {
     build_inner_stmt(first)
 }
 
-/// Build the select/create/insert/delete/drop statement from its grammar pair.
+/// Build the select/create/insert/delete/drop/update statement from its grammar pair.
 fn build_inner_stmt(pair: Pair<'_, Rule>) -> Stmt {
     match pair.as_rule() {
         Rule::select_stmt => Stmt::Select(build_select(pair)),
@@ -71,6 +71,7 @@ fn build_inner_stmt(pair: Pair<'_, Rule>) -> Stmt {
         Rule::insert_stmt => Stmt::Insert(build_insert(pair)),
         Rule::delete_stmt => Stmt::Delete(build_delete(pair)),
         Rule::drop_table_stmt => Stmt::DropTable(build_drop_table(pair)),
+        Rule::update_stmt => Stmt::Update(build_update(pair)),
         other => unreachable!("unexpected statement {other:?}"),
     }
 }
@@ -439,6 +440,65 @@ fn build_drop_table(pair: Pair<'_, Rule>) -> DropTableStmt {
     stmt
 }
 
+fn build_update(pair: Pair<'_, Rule>) -> UpdateStmt {
+    let mut stmt = UpdateStmt {
+        or_action: None,
+        schema: None,
+        table: String::new(),
+        assignments: Vec::new(),
+        where_clause: None,
+    };
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::or_action => stmt.or_action = Some(build_or_action(part)),
+            Rule::qualified_name => {
+                let (s, n) = build_qualified_name(part);
+                stmt.schema = s;
+                stmt.table = n;
+            }
+            Rule::assignment_list => stmt.assignments = build_assignment_list(part),
+            Rule::where_item => stmt.where_clause = Some(build_expr_item(part)),
+            _ => {}
+        }
+    }
+    stmt
+}
+
+fn build_or_action(pair: Pair<'_, Rule>) -> ConflictAction {
+    // or_action = { K_OR ~ (K_ROLLBACK | K_ABORT | K_FAIL | K_IGNORE | K_REPLACE) }
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::K_ROLLBACK => return ConflictAction::Rollback,
+            Rule::K_ABORT => return ConflictAction::Abort,
+            Rule::K_FAIL => return ConflictAction::Fail,
+            Rule::K_IGNORE => return ConflictAction::Ignore,
+            Rule::K_REPLACE => return ConflictAction::Replace,
+            _ => {}
+        }
+    }
+    ConflictAction::Abort
+}
+
+fn build_assignment_list(pair: Pair<'_, Rule>) -> Vec<Assignment> {
+    pair.into_inner().map(build_assignment).collect()
+}
+
+fn build_assignment(pair: Pair<'_, Rule>) -> Assignment {
+    let mut column = String::new();
+    let mut value = None;
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::ident => column = part.as_str().to_string(),
+            Rule::expr => value = Some(expr::build_expr(part)),
+            _ => {}
+        }
+    }
+    Assignment {
+        column,
+        value: value.expect("assignment has a value expr"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,26 +735,40 @@ mod tests {
             ResultColumn::Expr { expr: Expr::Column { name, .. }, .. } if name == "query"
         ));
     }
-}
 
-#[cfg(test)]
-mod tmp_debug_tests {
-    use super::*;
     #[test]
-    fn tmp_create_semicolon() {
-        let v = parse("CREATE TABLE t(a, b);").unwrap();
-        assert_eq!(v.len(), 1, "parsed {} stmts", v.len());
+    fn update_simple_and_or_action() {
+        let Stmt::Update(u) = &parse("UPDATE t SET a = 1;").unwrap()[0] else {
+            panic!("expected UPDATE")
+        };
+        assert!(u.or_action.is_none());
+        assert_eq!(u.table, "t");
+        assert_eq!(u.assignments.len(), 1);
+        assert_eq!(u.assignments[0].column, "a");
+        assert_eq!(u.assignments[0].value, Expr::Literal(Literal::Integer(1)));
+        assert!(u.where_clause.is_none());
+
+        let Stmt::Update(u) =
+            &parse("UPDATE OR REPLACE main.t SET a = a + 1, b = 'x' WHERE a > 0;").unwrap()[0]
+        else {
+            panic!("expected UPDATE")
+        };
+        assert_eq!(u.or_action, Some(ConflictAction::Replace));
+        assert_eq!(u.schema.as_deref(), Some("main"));
+        assert_eq!(u.table, "t");
+        assert_eq!(u.assignments.len(), 2);
+        assert_eq!(u.assignments[0].column, "a");
+        assert_eq!(u.assignments[1].column, "b");
+        assert!(u.where_clause.is_some());
     }
-}
 
-#[cfg(test)]
-mod tmp_dbg2 {
-    use super::*;
     #[test]
-    fn dbg_create_pairs() {
-        for s in ["SELECT 1;", "CREATE TABLE t(a, b);"] {
-            let n = parse(s).map(|v| v.len());
-            eprintln!("PARSERCRATE {s:?} -> {n:?}");
-        }
+    fn update_rejects_bad_syntax() {
+        // Missing SET clause.
+        assert!(parse("UPDATE t WHERE a = 1;").is_err());
+        // Missing value on assignment.
+        assert!(parse("UPDATE t SET a;").is_err());
+        // Trailing comma.
+        assert!(parse("UPDATE t SET a = 1,;").is_err());
     }
 }

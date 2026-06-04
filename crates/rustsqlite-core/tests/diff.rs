@@ -590,3 +590,65 @@ fn random_values_vary() {
         rows.len()
     );
 }
+
+/// `UPDATE` write-path against the differential oracle. The fixture is created by the reference
+/// `sqlite3`; we then run the same `UPDATE` through both engines and compare the resulting
+/// `SELECT` rows. Covers a full-table update, a WHERE-matches-some, a WHERE-matches-none, and a
+/// multi-assignment case — each must produce rows identical to the C oracle's.
+#[test]
+fn update_writes_match_oracle() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup(
+        "CREATE TABLE t(a INT, b TEXT, c REAL);         INSERT INTO t VALUES (1, 'x', 1.5), (2, 'y', 2.5), (3, 'z', 3.5), (4, 'w', 4.5);",
+    );
+
+    // Full-table update (no WHERE).
+    run_both(&db, "UPDATE t SET a = a + 10;", "SELECT a, b, c FROM t ORDER BY a;");
+    // WHERE matching a subset.
+    run_both(
+        &db,
+        "UPDATE t SET b = 'Q' WHERE a >= 12 AND a <= 13;",
+        "SELECT a, b FROM t ORDER BY a;",
+    );
+    // WHERE matching nothing.
+    run_both(
+        &db,
+        "UPDATE t SET c = 99.0 WHERE a > 1000;",
+        "SELECT c FROM t WHERE a > 1000;",
+    );
+    // Multi-assignment using a column reference.
+    run_both(
+        &db,
+        "UPDATE t SET a = a * 2, c = a * 1.0 WHERE a < 12;",
+        "SELECT a, c FROM t WHERE a < 12 ORDER BY a;",
+    );
+}
+
+fn run_both(db: &TempDb, update_sql: &str, check_sql: &str) {
+    // Run the UPDATE on a copy of the file with the system sqlite3, then read back.
+    let copy_a = TempDb::new();
+    let copy_b = TempDb::new();
+    std::fs::copy(db.str(), copy_a.str()).unwrap();
+    std::fs::copy(db.str(), copy_b.str()).unwrap();
+    let setup = Command::new("sqlite3")
+        .arg(copy_a.str())
+        .arg(update_sql)
+        .output()
+        .expect("oracle update");
+    assert!(setup.status.success(), "oracle update failed");
+    let expected = sqlite3_rows(copy_a.str(), check_sql);
+    // Now do the same UPDATE via rustqlite on the second copy and read back.
+    let mut conn = sqlite3_open(copy_b.str()).unwrap();
+    let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, update_sql).unwrap();
+    while stmt.step() != ResultCode::Done {}
+    drop(stmt);
+    let got = match rustsqlite_rows(copy_b.str(), check_sql) {
+        Ok(v) => v,
+        Err(e) => panic!("rustsqlite update `{update_sql}` error: {e}"),
+    };
+    assert_eq!(got, expected, "mismatch after update `{update_sql}`");
+}

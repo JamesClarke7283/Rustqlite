@@ -56,6 +56,10 @@ pub enum Opcode {
     Next,
     /// `SeekGE`: seek to the first entry >= a key (index path; unimplemented in M3a).
     SeekGE,
+    /// `NotExists p1 p2 p3`: position table cursor `p1` at the row whose rowid is `r[p3]`; if
+    /// no such row exists, jump to `p2`. Mirrors `OP_NotExists` from `vdbe.c` and is the rowid-
+    /// seek used by `UPDATE`'s two-pass rewrite.
+    NotExists,
 
     // --- row access ---
     /// `Rowid p1 p2`: `r[p2]` = the integer rowid of cursor `p1`'s current row.
@@ -202,6 +206,7 @@ impl Opcode {
             Opcode::Rewind => "Rewind",
             Opcode::Next => "Next",
             Opcode::SeekGE => "SeekGE",
+            Opcode::NotExists => "NotExists",
             Opcode::Rowid => "Rowid",
             Opcode::Column => "Column",
             Opcode::ResultRow => "ResultRow",

@@ -14,12 +14,13 @@ pub mod drop;
 pub mod expr;
 pub mod insert;
 pub mod select;
+pub mod update;
 
 use crate::error::Result;
 use crate::schema::Table;
 use crate::vdbe::Program;
 
-use rustqlite_parser::{CreateTable, DeleteStmt, DropTableStmt, InsertStmt, SelectStmt};
+use rustqlite_parser::{CreateTable, DeleteStmt, DropTableStmt, InsertStmt, SelectStmt, UpdateStmt};
 
 /// Compile a single-table (or constant) `SELECT` into a VDBE program plus its result column
 /// names. `table` is the resolved table for the lone `FROM` entry, or `None` for a `SELECT`
@@ -62,4 +63,11 @@ pub fn compile_drop_table(
     resolved_table: Option<&Table>,
 ) -> Result<Program> {
     drop::compile_drop_table(drop, drop.if_exists, current_schema_cookie, resolved_table)
+}
+
+/// Compile an `UPDATE [OR action] tbl SET col = expr [, …] [WHERE expr]` into a VDBE write
+/// program against the resolved `table`. The first M5.0 slice: single-table, no triggers /
+/// FK / indexes / UPSERT, `OR action` other than ABORT errors at codegen time.
+pub fn compile_update(upd: &UpdateStmt, table: &Table) -> Result<Program> {
+    update::compile_update(upd, table)
 }

@@ -17,6 +17,7 @@ pub enum Stmt {
     Insert(InsertStmt),
     Delete(DeleteStmt),
     DropTable(DropTableStmt),
+    Update(UpdateStmt),
     /// `EXPLAIN <stmt>` / `EXPLAIN QUERY PLAN <stmt>`. The inner statement is boxed (it is the
     /// large variant). `kind` distinguishes the bytecode listing from the query-plan tree.
     Explain(Box<Stmt>, ExplainKind),
@@ -118,6 +119,26 @@ pub struct DropTableStmt {
     pub if_exists: bool,
     pub schema: Option<String>,
     pub name: String,
+}
+
+/// `UPDATE [or_action] [schema.]tbl SET col = expr [, col = expr ...] [WHERE expr]`. The first
+/// M5.0 slice: a single-table `UPDATE` with optional `WHERE`, no `ORDER BY`/`LIMIT`/`FROM`/
+/// `RETURNING`, no UPSERT/triggers/FK/indexes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateStmt {
+    pub or_action: Option<ConflictAction>,
+    pub schema: Option<String>,
+    pub table: String,
+    pub assignments: Vec<Assignment>,
+    pub where_clause: Option<Expr>,
+}
+
+/// One `col = expr` on the left of `UPDATE … SET`. Multi-column assignment (the
+/// `(a, b) = (…)` row-value form) arrives in a later slice.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Assignment {
+    pub column: String,
+    pub value: Expr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -171,23 +171,3 @@ mod tests {
         assert_eq!(sc.p3, 1);
     }
 }
-
-#[cfg(test)]
-mod tmp_parse_check {
-    #[test]
-    fn parse_create_in_core() {
-        let v = rustqlite_parser::parse("CREATE TABLE t(a, b);").unwrap();
-        assert_eq!(v.len(), 1, "core saw {} stmts", v.len());
-    }
-}
-
-#[cfg(test)]
-mod tmp_parse_check2 {
-    #[test]
-    fn parse_variants_in_core() {
-        for s in ["SELECT 1;", "CREATE TABLE t(a, b);", "CREATE TABLE t(a, b)", "INSERT INTO t VALUES(1);"] {
-            let n = rustqlite_parser::parse(s).map(|v| v.len());
-            eprintln!("COREPARSE {s:?} -> {n:?}");
-        }
-    }
-}
