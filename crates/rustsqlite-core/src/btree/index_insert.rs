@@ -1,50 +1,196 @@
-//! Single-leaf index insertion (mirrors `sqlite3BtreeInsert` for index b-trees).
+//! Index b-tree insertion with page splitting (mirrors `sqlite3BtreeInsert` for index b-trees).
 //!
-//! The first M5.1 slice accepts inserts only when the destination leaf has room. If the leaf
-//! fills, the function returns the same `page_full_error()` that the table-insert path
-//! produces — the index page-split path (`balance_shallow` for indexes, analogous to
-//! `balance::split_leaf` for tables) is a follow-up slice. The differential tests in
-//! `tests/diff.rs` and the `slt_lang_dropindex` evidence file are sized so a single-leaf
-//! index comfortably holds the fixture rows.
+//! M5.1 introduced single-leaf index insertion. M5.2 extends this with a full path-walking
+//! insert that splits an index leaf when it fills, splits a parent when it fills, and promotes
+//! a single-leaf root to an interior page (the "balance_deeper" path) when the root itself
+//! outgrows one page. The split logic is in [`super::balance`] (`split_index_leaf` and
+//! `promote_index_root_and_split`); this module provides the recursive insertion walk and the
+//! public entry point [`index_insert`].
 //!
 //! The `key_record` is the index columns followed by the table's rowid, all encoded by
-//! [`crate::format::encode_record`]. The function finds the insertion point via a binary
-//! search of the leaf's cell prefixes (the indexed columns, ignoring the trailing rowid for
-//! ordering), then delegates to [`super::page::insert_leaf_cell`] for the byte-level
-//! insertion.
+//! [`crate::format::encode_record`]. The function walks the b-tree from root to leaf, following
+//! interior-page child pointers, and inserts at the correct position. On overflow it splits and
+//! recurses — the same shape as the table-side [`super::insert::table_insert`].
 
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::error::{Error, Result};
-use crate::format::decode_record;
+use crate::format::{decode_record, TextEncoding};
 use crate::pager::Pager;
 use crate::types::{Collation, Value};
 use crate::vdbe::compare::mem_compare;
 
-use super::cell::{build_index_leaf_cell, parse_index_leaf_cell};
-use super::page::{insert_leaf_cell, PageHeader, PageType};
+use super::balance;
+use super::cell::{build_index_leaf_cell, parse_index_leaf_cell, parse_index_interior_cell};
+use super::page::{self, PageHeader, PageType};
 
-/// Insert a new index entry into the b-tree rooted at `root`. `key_record` is the encoded
-/// record (`[indexed columns..., rowid]`). Returns `Ok(())` on success or `Err(page_full_error())`
-/// when the leaf has no room.
-pub async fn index_insert(
-    pager: &Arc<Pager>,
-    root: u32,
+/// Insert a new index entry into the b-tree rooted at `root`. Walks interior pages if the tree
+/// is multi-level, splits leaves that overflow, and recurses up the ancestor path when parents
+/// overflow. `key_record` is the encoded record (`[indexed columns..., rowid]`).
+pub async fn index_insert(pager: &Pager, root: u32, key_record: &[u8]) -> Result<()> {
+    index_insert_with_splitting(pager, root, key_record, &mut Vec::new()).await
+}
+
+/// Recursive helper. `path` is the ancestor stack above the node we are descending into.
+fn index_insert_with_splitting<'a>(
+    pager: &'a Pager,
+    pgno: u32,
+    key_record: &'a [u8],
+    path: &'a mut Vec<(u32, usize)>,
+) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+        let base = pager.btree_header_offset(pgno);
+        let buf = pager.get_page(pgno).await?;
+        let hdr = PageHeader::parse(&buf, base)?;
+        match hdr.page_type {
+            PageType::LeafIndex => {
+                insert_into_index_leaf(pager, pgno, key_record, path).await
+            }
+            PageType::InteriorIndex => {
+                let child = pick_index_child(&buf, &hdr, key_record, pager.text_encoding(), pager.usable_size())?;
+                path.push((pgno, base));
+                index_insert_with_splitting(pager, child, key_record, path).await
+            }
+            _ => Err(Error::corrupt("index_insert: not an index b-tree page")),
+        }
+    })
+}
+
+/// Insert `key_record` into the leaf-index page `pgno`, splitting if the page is full.
+async fn insert_into_index_leaf(
+    pager: &Pager,
+    leaf_pgno: u32,
     key_record: &[u8],
+    path: &mut Vec<(u32, usize)>,
 ) -> Result<()> {
     let usable = pager.usable_size();
-    let base = pager.btree_header_offset(root);
-    let page = pager.get_page(root).await?;
+    let base = pager.btree_header_offset(leaf_pgno);
+    let page = pager.get_page(leaf_pgno).await?;
     let hdr = PageHeader::parse(&page, base)?;
-    if hdr.page_type != PageType::LeafIndex {
-        return Err(Error::corrupt("index_insert: not a leaf-index page"));
-    }
-    let n = hdr.num_cells as usize;
 
-    // Find the insertion point. The order is by the prefix of `key_record`'s values (all but
-    // the trailing rowid). Binary search for the lower bound; ties on the prefix are broken
-    // by the rowid (the rowid is also a Value in the decoded record).
-    let encoding = pager.text_encoding();
+    let idx = index_leaf_insert_position(&page, &hdr, key_record, usable, pager.text_encoding())?;
+
+    let cell = build_index_leaf_cell(pager, key_record, usable);
+    let mut leaf = pager.read_page_for_write(leaf_pgno).await?;
+    match page::insert_leaf_cell(&mut leaf, base, idx, &cell) {
+        Ok(()) => {
+            pager.write_page(leaf_pgno, leaf)?;
+            Ok(())
+        }
+        Err(e) if is_page_full(&e) => {
+            drop(leaf);
+            let parent = path.pop();
+            balance_index_leaf(pager, leaf_pgno, parent, path, key_record).await
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Handle a full index leaf by splitting it.
+fn balance_index_leaf<'a>(
+    pager: &'a Pager,
+    leaf_pgno: u32,
+    parent: Option<(u32, usize)>,
+    ancestor_path: &'a mut Vec<(u32, usize)>,
+    pending_key: &'a [u8],
+) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+        let parent_pgno = match parent {
+            Some((p, _)) => p,
+            None => {
+                balance::promote_index_root_and_split(pager, leaf_pgno).await?;
+                return index_insert_with_splitting(pager, leaf_pgno, pending_key, &mut Vec::new()).await;
+            }
+        };
+
+        let (new_pgno, divider_key) = match balance::split_index_leaf(pager, leaf_pgno, Some(parent_pgno)).await {
+            Ok(result) => result,
+            Err(e) if is_page_full(&e) => {
+                if let Some(grand) = ancestor_path.pop() {
+                    return balance_index_leaf(pager, parent_pgno, Some(grand), ancestor_path, pending_key).await;
+                }
+                balance::promote_index_root_and_split(pager, parent_pgno).await?;
+                return index_insert_with_splitting(pager, parent_pgno, pending_key, &mut Vec::new()).await;
+            }
+            Err(other) => return Err(other),
+        };
+
+        // Decide which child the pending key belongs to using the divider key directly.
+        // The divider key was promoted from the split point; keys < divider go left (leaf_pgno),
+        // keys >= divider go right (new_pgno). Since rowids in index keys are unique, equality
+        // means we go right.
+        let target = {
+            let encoding = pager.text_encoding();
+            let div_values = decode_record(&divider_key, encoding)?;
+            let key_values = decode_record(pending_key, encoding)?;
+            let cmp = compare_record_prefixes(
+                &div_values[..div_values.len().saturating_sub(1)],
+                &div_values[div_values.len().saturating_sub(1)],
+                &key_values[..key_values.len().saturating_sub(1)],
+                &key_values[key_values.len().saturating_sub(1)],
+                Collation::Binary,
+            );
+            if cmp == std::cmp::Ordering::Greater { leaf_pgno } else { new_pgno }
+        };
+        let mut fresh = Vec::new();
+        index_insert_with_splitting(pager, target, pending_key, &mut fresh).await
+    })
+}
+
+/// Pick the child page of an interior-index page that should contain `key_record`.
+///
+/// Interior index cells have the form `(left_child, key)`. The in-order traversal is:
+/// left_child of cell[0], cell[0].key, cell[1].left_child, cell[1].key, …, right_most.
+/// So `cell[i].left_child` holds keys ≤ `cell[i].key`, and the region between
+/// `cell[i].key` and `cell[i+1].key` (or right_most) holds keys > `cell[i].key`
+/// and ≤ the next cell's key.
+///
+/// To find which child to descend into for `key_record`: walk the cells in order; the
+/// first cell whose key is ≥ `key_record` means `key_record ≤ cell.key`, so descend
+/// into `cell.left_child`. If no cell key is ≥ the search key, descend into `right_most`.
+fn pick_index_child(
+    page: &[u8],
+    hdr: &PageHeader,
+    key_record: &[u8],
+    encoding: TextEncoding,
+    usable: usize,
+) -> Result<u32> {
+    let search = decode_record(key_record, encoding)?;
+    let search_prefix_len = search.len().saturating_sub(1);
+    let search_prefix = &search[..search_prefix_len];
+    let search_rowid = &search[search_prefix_len];
+    for i in 0..hdr.num_cells as usize {
+        let off = hdr.cell_pointer(page, i)?;
+        let cell = parse_index_interior_cell(page, off, usable)?;
+        let existing = decode_record(cell.local_payload, encoding)?;
+        let existing_prefix_len = existing.len().saturating_sub(1);
+        let existing_prefix = &existing[..existing_prefix_len.min(search_prefix_len)];
+        let cmp = compare_record_prefixes(
+            existing_prefix,
+            &existing[existing_prefix_len.min(existing.len().saturating_sub(1))],
+            search_prefix,
+            search_rowid,
+            Collation::Binary,
+        );
+        // If existing >= search, the search key belongs in this cell's left child.
+        if cmp != std::cmp::Ordering::Less {
+            return Ok(cell.left_child);
+        }
+    }
+    hdr.right_most_pointer
+        .ok_or_else(|| Error::corrupt("interior index page has no right pointer"))
+}
+
+/// Binary-search an index leaf page for the insertion position of `key_record`.
+fn index_leaf_insert_position(
+    page: &[u8],
+    hdr: &PageHeader,
+    key_record: &[u8],
+    usable: usize,
+    encoding: TextEncoding,
+) -> Result<usize> {
+    let n = hdr.num_cells as usize;
     let search_values = decode_record(key_record, encoding)?;
     let search_prefix_len = search_values.len().saturating_sub(1);
     let search_prefix = &search_values[..search_prefix_len];
@@ -52,8 +198,8 @@ pub async fn index_insert(
     let mut hi = n;
     while lo < hi {
         let mid = (lo + hi) / 2;
-        let off = hdr.cell_pointer(&page, mid)?;
-        let cell = parse_index_leaf_cell(&page, off, usable)?;
+        let off = hdr.cell_pointer(page, mid)?;
+        let cell = parse_index_leaf_cell(page, off, usable)?;
         let existing = decode_record(cell.local_payload, encoding)?;
         let existing_prefix_len = existing.len().saturating_sub(1);
         let existing_prefix = &existing[..existing_prefix_len];
@@ -70,40 +216,7 @@ pub async fn index_insert(
             hi = mid;
         }
     }
-    let idx = lo;
-
-    let cell = build_index_leaf_cell(pager, key_record, usable);
-    let mut leaf = pager.read_page_for_write(root).await?;
-    if let Err(e) = insert_leaf_cell(&mut leaf, base, idx, &cell) {
-        // Page full: drop the partial copy and surface the same error the table path does.
-        drop(leaf);
-        return Err(e);
-    }
-    pager.write_page(root, leaf)?;
-    Ok(())
-}
-
-/// A variant used by the (post-root-promotion) re-insert path: it skips the descendent search
-/// (the cell goes onto a known leaf) and just inserts at `idx`. Not used by the M5.1 first
-/// slice (we don't promote index roots) but kept here for parity with the table-side
-/// `insert_after_root_promotion` helper.
-#[allow(dead_code)]
-pub async fn index_insert_after_root_promotion(
-    pager: &Arc<Pager>,
-    leaf_pgno: u32,
-    idx: usize,
-    key_record: &[u8],
-) -> Result<()> {
-    let usable = pager.usable_size();
-    let base = pager.btree_header_offset(leaf_pgno);
-    let cell = build_index_leaf_cell(pager, key_record, usable);
-    let mut leaf = pager.read_page_for_write(leaf_pgno).await?;
-    if let Err(e) = insert_leaf_cell(&mut leaf, base, idx, &cell) {
-        drop(leaf);
-        return Err(e);
-    }
-    pager.write_page(leaf_pgno, leaf)?;
-    Ok(())
+    Ok(lo)
 }
 
 fn compare_record_prefixes(
@@ -124,5 +237,189 @@ fn compare_record_prefixes(
     match a_prefix.len().cmp(&b_prefix.len()) {
         Ordering::Equal => mem_compare(a_rowid, b_rowid, coll),
         other => other,
+    }
+}
+
+fn is_page_full(e: &Error) -> bool {
+    e.message.contains("page is full")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::btree::{create_index_btree, scan_index};
+    use crate::format::encode_record;
+    use crate::pager::Pager;
+    use crate::types::Value;
+    use crate::vfs::{MemVfs, OpenFlags, Vfs};
+
+    use super::*;
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+    }
+
+    /// Insert 200 index entries on a 512-byte page, forcing several leaf splits and root
+    /// promotions. Each key record is `[Int(rowid), Int(rowid)]` — a single-column index
+    /// where the indexed column equals the rowid.
+    #[test]
+    fn index_split_grows_beyond_one_leaf() {
+        rt().block_on(async {
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
+            let file = vfs
+                .open("isplit.db", OpenFlags::READWRITE_CREATE)
+                .await
+                .unwrap();
+            let pager = Pager::create_fresh(vfs.clone(), "isplit.db".into(), file, 512)
+                .await
+                .unwrap();
+
+            pager.begin_write().await.unwrap();
+            let idx_root = create_index_btree(&pager).await.unwrap();
+
+            for rowid in 1i64..=200 {
+                let key = encode_record(&[Value::Int(rowid), Value::Int(rowid)]);
+                index_insert(&pager, idx_root, &key).await.unwrap();
+            }
+
+            let scanned = scan_index(&pager, idx_root).await.unwrap();
+            assert_eq!(scanned.len(), 200, "all 200 index entries must be present");
+            for (i, (_, rowid)) in scanned.iter().enumerate() {
+                assert_eq!(*rowid, (i + 1) as i64, "entry at index {i} must be rowid {}", i + 1);
+            }
+
+            pager.commit().await.unwrap();
+        });
+    }
+
+    /// Insert entries with multi-column keys to test wider key records in split contexts.
+    #[test]
+    fn index_split_multi_column_keys() {
+        rt().block_on(async {
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
+            let file = vfs
+                .open("imulti.db", OpenFlags::READWRITE_CREATE)
+                .await
+                .unwrap();
+            let pager = Pager::create_fresh(vfs.clone(), "imulti.db".into(), file, 512)
+                .await
+                .unwrap();
+
+            pager.begin_write().await.unwrap();
+            let idx_root = create_index_btree(&pager).await.unwrap();
+
+            for i in 1i64..=100 {
+                let key = encode_record(&[Value::Int(i % 5), Value::Int(i), Value::Int(i)]);
+                index_insert(&pager, idx_root, &key).await.unwrap();
+            }
+
+            let scanned = scan_index(&pager, idx_root).await.unwrap();
+            assert_eq!(scanned.len(), 100, "all 100 multi-column entries must be present");
+
+            pager.commit().await.unwrap();
+        });
+    }
+
+    /// Insert in reverse order and verify the sorted order holds after splits.
+    #[test]
+    fn index_split_out_of_order_insertion() {
+        rt().block_on(async {
+            for n in [10usize, 50, 62, 63, 80, 100] {
+                let db_name = format!("iooo{n}.db");
+                let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
+                let file = vfs
+                    .open(&db_name, OpenFlags::READWRITE_CREATE)
+                    .await
+                    .unwrap();
+                let pager = Pager::create_fresh(vfs.clone(), db_name.clone(), file, 512)
+                    .await
+                    .unwrap();
+
+                pager.begin_write().await.unwrap();
+                let idx_root = create_index_btree(&pager).await.unwrap();
+
+                for i in (1i64..=n as i64).rev() {
+                    let key = encode_record(&[Value::Int(i), Value::Int(i)]);
+                    index_insert(&pager, idx_root, &key).await.unwrap();
+                }
+
+                let scanned = scan_index(&pager, idx_root).await.unwrap();
+                assert_eq!(scanned.len(), n, "n={n}: expected {n} entries, got {}", scanned.len());
+                for (i, (_, rowid)) in scanned.iter().enumerate() {
+                    assert_eq!(*rowid, (i + 1) as i64, "n={n}: entry at index {i} must be rowid {}", i + 1);
+                }
+                pager.commit().await.unwrap();
+            }
+        });
+    }
+
+    /// Insert 10 entries with 4096-byte pages (no splits expected).
+    #[test]
+    fn index_no_split_basic() {
+        rt().block_on(async {
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
+            let file = vfs
+                .open("nosplit.db", OpenFlags::READWRITE_CREATE)
+                .await
+                .unwrap();
+            let pager = Pager::create_fresh(vfs.clone(), "nosplit.db".into(), file, 4096)
+                .await
+                .unwrap();
+
+            pager.begin_write().await.unwrap();
+            let idx_root = create_index_btree(&pager).await.unwrap();
+
+            for i in 1i64..=10 {
+                let key = encode_record(&[Value::Int(i), Value::Int(i)]);
+                index_insert(&pager, idx_root, &key).await.unwrap();
+            }
+            let scanned = scan_index(&pager, idx_root).await.unwrap();
+            assert_eq!(scanned.len(), 10);
+            for (i, (_, rowid)) in scanned.iter().enumerate() {
+                assert_eq!(*rowid, (i + 1) as i64);
+            }
+            pager.commit().await.unwrap();
+        });
+    }
+
+    /// Insert just enough entries on a 512-byte page to trigger a single root promotion,
+    /// then verify the exact key count and ordering.
+    #[test]
+    fn index_split_single_root_promotion() {
+        rt().block_on(async {
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
+            let file = vfs
+                .open("isp.db", OpenFlags::READWRITE_CREATE)
+                .await
+                .unwrap();
+            let pager = Pager::create_fresh(vfs.clone(), "isp.db".into(), file, 512)
+                .await
+                .unwrap();
+
+            pager.begin_write().await.unwrap();
+            let idx_root = create_index_btree(&pager).await.unwrap();
+
+            for i in 1i64..=10 {
+                let key = encode_record(&[Value::Int(i), Value::Int(i)]);
+                index_insert(&pager, idx_root, &key).await.unwrap();
+            }
+            let scanned = scan_index(&pager, idx_root).await.unwrap();
+            assert_eq!(scanned.len(), 10, "pre-split: expected 10 entries");
+
+            for i in 11i64..=80 {
+                let key = encode_record(&[Value::Int(i), Value::Int(i)]);
+                index_insert(&pager, idx_root, &key).await.unwrap();
+            }
+            let scanned = scan_index(&pager, idx_root).await.unwrap();
+            assert_eq!(scanned.len(), 80, "post-split: expected 80 entries, got {}", scanned.len());
+            for (i, (_, rowid)) in scanned.iter().enumerate() {
+                assert_eq!(*rowid, (i + 1) as i64, "entry at index {i} must be rowid {}", i + 1);
+            }
+
+            pager.commit().await.unwrap();
+        });
     }
 }

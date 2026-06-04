@@ -12,7 +12,7 @@ use std::pin::Pin;
 use crate::error::{Error, Result};
 use crate::pager::Pager;
 
-use super::cell::{assemble_index_payload, parse_index_interior_cell, parse_index_leaf_cell};
+use super::cell::{assemble_index_interior_payload, assemble_index_payload, parse_index_interior_cell, parse_index_leaf_cell};
 use super::page::{PageHeader, PageType};
 
 /// Create a new index b-tree and return its root page number. Allocates a fresh page and
@@ -59,10 +59,14 @@ fn visit<'a>(
                 }
             }
             PageType::InteriorIndex => {
+                let usable = pager.usable_size();
                 for i in 0..hdr.num_cells as usize {
                     let cell_off = hdr.cell_pointer(&page, i)?;
-                    let cell = parse_index_interior_cell(&page, cell_off, pager.usable_size())?;
+                    let cell = parse_index_interior_cell(&page, cell_off, usable)?;
                     visit(pager, cell.left_child, out).await?;
+                    let key = assemble_index_interior_payload(pager, &cell).await?;
+                    let rowid = key_record_rowid(pager, &key)?;
+                    out.push((key, rowid));
                 }
                 if let Some(right) = hdr.right_most_pointer {
                     visit(pager, right, out).await?;

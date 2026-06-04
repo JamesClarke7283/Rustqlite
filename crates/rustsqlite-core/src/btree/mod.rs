@@ -22,9 +22,9 @@ pub mod insert;
 pub mod page;
 
 pub use cell::{
-    assemble_index_payload, build_index_interior_cell, build_index_leaf_cell,
-    build_table_leaf_cell, parse_index_interior_cell, parse_index_leaf_cell,
-    parse_table_interior_cell, parse_table_leaf_cell, table_leaf_cell_rowid,
+    assemble_index_interior_payload, assemble_index_payload, build_index_interior_cell,
+    build_index_leaf_cell, build_table_leaf_cell, parse_index_interior_cell,
+    parse_index_leaf_cell, parse_table_interior_cell, parse_table_leaf_cell, table_leaf_cell_rowid,
 };
 pub use cursor::{scan_table, TableCursor};
 pub use delete::leaf_delete_current;
@@ -32,7 +32,7 @@ pub use destroy::destroy as btree_destroy;
 pub use index::{create_index_btree, scan_index};
 pub use index_cursor::IndexCursor;
 pub use index_delete::index_leaf_delete;
-pub use index_insert::{index_insert, index_insert_after_root_promotion};
+pub use index_insert::index_insert;
 pub use insert::{max_rowid, table_insert};
 pub use page::{PageHeader, PageType};
 

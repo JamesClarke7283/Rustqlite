@@ -344,6 +344,39 @@ pub fn build_index_interior_cell(
     cell
 }
 
+/// Assemble a full index-cell payload from an interior cell (same logic as
+/// [`assemble_index_payload`] but for `IndexInteriorCell`).
+pub async fn assemble_index_interior_payload(
+    pager: &crate::pager::Pager,
+    cell: &IndexInteriorCell<'_>,
+) -> Result<Vec<u8>> {
+    let total = cell.payload_size as usize;
+    let mut payload = Vec::with_capacity(total);
+    payload.extend_from_slice(cell.local_payload);
+
+    let usable = pager.usable_size();
+    let mut next = cell.overflow_page;
+    while payload.len() < total {
+        let Some(pgno) = next.filter(|&p| p != 0) else {
+            break;
+        };
+        let page = pager.get_page(pgno).await?;
+        let next_pgno = be_u32(&page[0..4]);
+        let want = (total - payload.len()).min(usable - 4);
+        if 4 + want > page.len() {
+            return Err(Error::corrupt("overflow page shorter than expected"));
+        }
+        payload.extend_from_slice(&page[4..4 + want]);
+        next = if next_pgno == 0 { None } else { Some(next_pgno) };
+    }
+
+    if payload.len() < total {
+        return Err(Error::corrupt("payload shorter than declared size"));
+    }
+    payload.truncate(total);
+    Ok(payload)
+}
+
 /// Assemble a full index-cell payload (the key record, including its trailing rowid) from the
 /// local bytes and an optional overflow chain. Mirrors `assemble_index_payload` in
 /// `cursor.rs` — separated so the write-side test code and the cursor can share the helper.
