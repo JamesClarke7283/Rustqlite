@@ -128,10 +128,17 @@ pub struct TableCursor {
     /// The current leaf page and its parsed header (`None` before the first `rewind`).
     leaf: Option<PageRef>,
     leaf_hdr: Option<PageHeader>,
+    /// 1-based page number of the current leaf (0 if not positioned on a leaf). Tracked so
+    /// the delete-by-rowid path can address the leaf directly.
+    leaf_pgno: u32,
     /// Index of the current cell within the current leaf.
     cell_idx: usize,
     /// `true` once the scan has run off the end (or before `rewind`).
     at_end: bool,
+    /// When `true`, the next `next()` call should NOT advance — the cursor is "on" the cell
+    /// that slid into the deleted slot, and we want a subsequent `next()` to move past it.
+    /// Set by `delete_current`; cleared by the next `next()`.
+    pending_advance: bool,
 }
 
 impl TableCursor {
@@ -146,8 +153,10 @@ impl TableCursor {
             stack: Vec::new(),
             leaf: None,
             leaf_hdr: None,
+            leaf_pgno: 0,
             cell_idx: 0,
             at_end: true,
+            pending_advance: false,
         }
     }
 
@@ -167,8 +176,10 @@ impl TableCursor {
         self.stack.clear();
         self.leaf = None;
         self.leaf_hdr = None;
+        self.leaf_pgno = 0;
         self.cell_idx = 0;
         self.at_end = false;
+        self.pending_advance = false;
         self.descend_left(self.root).await?;
         // An empty leaf (e.g. an empty single-page table) means we must advance — which, with
         // an empty stack, simply marks the cursor at-end.
@@ -184,7 +195,13 @@ impl TableCursor {
         if self.at_end {
             return Ok(());
         }
-        self.cell_idx += 1;
+        // If the previous op was a delete, the cell at the current `cell_idx` is the row
+        // that just slid in; we want the next `next()` to land on the cell AFTER it.
+        if self.pending_advance {
+            self.pending_advance = false;
+        } else {
+            self.cell_idx += 1;
+        }
         if self.cell_idx < self.leaf_cells() {
             return Ok(());
         }
@@ -200,6 +217,36 @@ impl TableCursor {
     pub async fn payload(&self) -> Result<Vec<u8>> {
         let cell = self.current_cell()?;
         assemble_payload(&self.pager, &cell).await
+    }
+
+    /// The 1-based page number of the leaf the cursor is currently on (0 if not on a
+    /// leaf). Used by the write path to address the leaf directly.
+    pub fn leaf_pgno(&self) -> u32 {
+        self.leaf_pgno
+    }
+
+    /// Delete the row the cursor is currently positioned on. Removes the cell at
+    /// `cell_idx` from the leaf, frees any overflow chain, and refreshes the cursor's
+    /// cached leaf so subsequent reads see the post-delete state. The cursor's `cell_idx`
+    /// is left unchanged (the cell that just slid into the slot is now the current
+    /// cell); the next `next()` call advances past it (via the `pending_advance` flag).
+    pub async fn delete_current(&mut self) -> Result<()> {
+        if !self.is_valid() {
+            return Err(Error::msg("table cursor is not positioned on a row"));
+        }
+        let pgno = self.leaf_pgno;
+        let cell_idx = self.cell_idx;
+        super::delete::leaf_delete_current(&self.pager, pgno, cell_idx).await?;
+        // The leaf's contents are now stale in our cache. Re-read and refresh.
+        let page = self.pager.get_page(pgno).await?;
+        let base = self.pager.btree_header_offset(pgno);
+        let hdr = PageHeader::parse(&page, base)?;
+        self.leaf = Some(page);
+        self.leaf_hdr = Some(hdr);
+        // Mark the cursor so the next `next()` will advance past the cell that slid in,
+        // rather than skipping a row.
+        self.pending_advance = true;
+        Ok(())
     }
 
     /// Parse the current leaf cell.
@@ -224,9 +271,11 @@ impl TableCursor {
             let hdr = PageHeader::parse(&page, base)?;
             match hdr.page_type {
                 PageType::LeafTable => {
+                    self.leaf_pgno = pgno;
                     self.leaf = Some(page);
                     self.leaf_hdr = Some(hdr);
                     self.cell_idx = 0;
+                    self.pending_advance = false;
                     return Ok(());
                 }
                 PageType::InteriorTable => {

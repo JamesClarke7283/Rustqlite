@@ -6,9 +6,9 @@
 //! its own `db` pointer). `sqlite3_step` drives the async executor via the process-global
 //! runtime; the column accessors read the current result row out of the VDBE registers.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use rustqlite_parser::{parse, ExplainKind, SelectStmt, Stmt};
+use rustqlite_parser::{parse, DeleteStmt, ExplainKind, InsertStmt, SelectStmt, Stmt};
 
 use crate::codegen;
 use crate::error::{Error, Result, ResultCode};
@@ -17,7 +17,7 @@ use crate::schema::{read_catalog, Table};
 use crate::types::Value;
 use crate::vdbe::{explain, Program, StepResult, Vdbe};
 
-use super::connection::Sqlite3;
+use super::connection::{ChangeCounts, Sqlite3};
 use super::runtime::block_on;
 
 /// How a prepared statement produces its result rows.
@@ -43,6 +43,9 @@ pub struct Sqlite3Stmt {
     backing: Backing,
     /// `sqlite3_stmt_isexplain()`: 0 = normal, 1 = `EXPLAIN`, 2 = `EXPLAIN QUERY PLAN`.
     explain: u8,
+    /// For a write statement (`CREATE TABLE`/`INSERT`), the connection's shared change counters to
+    /// publish into when the program finishes. `None` for read-only statements.
+    counts: Option<Arc<Mutex<ChangeCounts>>>,
     last_error: Option<Error>,
 }
 
@@ -62,6 +65,7 @@ pub fn sqlite3_prepare_v2<'a>(db: &mut Sqlite3, sql: &'a str) -> Result<(Sqlite3
 
 fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
     let ast = parse(sql).map_err(|e| Error::msg(format!("near syntax error: {e}")))?;
+    eprintln!("DBG prepare sql={sql:?} nstmts={}", ast.len());
     let stmt = ast
         .into_iter()
         .next()
@@ -79,14 +83,89 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 column_names: compiled.column_names,
                 backing: Backing::Vdbe(vdbe),
                 explain: 0,
+                counts: None,
                 last_error: None,
             })
         }
         Stmt::Explain(inner, kind) => prepare_explain(db, sql, *inner, kind),
-        Stmt::CreateTable(_) | Stmt::Insert(_) => Err(Error::msg(
-            "only SELECT is executable in M3a (the write path is pending)",
-        )),
+        Stmt::CreateTable(ct) => {
+            // CREATE TABLE: ensure the database file exists (create page 1 on an empty file),
+            // then compile a write program. The verbatim CREATE text is the original SQL.
+            let pager = db.ensure_pager()?;
+            let schema_cookie = pager.header().schema_cookie;
+            let sql_text = create_table_text(sql);
+            let program = Arc::new(codegen::compile_create_table(&ct, sql_text, schema_cookie)?);
+            let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
+            Ok(Sqlite3Stmt {
+                sql: sql.to_string(),
+                program,
+                column_names: Vec::new(),
+                backing: Backing::Vdbe(vdbe),
+                explain: 0,
+                counts: Some(db.counts_handle()),
+                last_error: None,
+            })
+        }
+        Stmt::Insert(ins) => {
+            // INSERT: resolve the target table from the catalog and compile a write program.
+            let pager = db.pager_arc()?;
+            let table = resolve_insert_table(&pager, &ins)?;
+            let program = Arc::new(codegen::compile_insert(&ins, &table)?);
+            let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
+            Ok(Sqlite3Stmt {
+                sql: sql.to_string(),
+                program,
+                column_names: Vec::new(),
+                backing: Backing::Vdbe(vdbe),
+                explain: 0,
+                counts: Some(db.counts_handle()),
+                last_error: None,
+            })
+        }
+        Stmt::Delete(del) => {
+            // DELETE: resolve the target table from the catalog and compile a write program.
+            let pager = db.pager_arc()?;
+            let table = resolve_delete_table(&pager, &del)?;
+            let program = Arc::new(codegen::compile_delete(&del, &table)?);
+            let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
+            Ok(Sqlite3Stmt {
+                sql: sql.to_string(),
+                program,
+                column_names: Vec::new(),
+                backing: Backing::Vdbe(vdbe),
+                explain: 0,
+                counts: Some(db.counts_handle()),
+                last_error: None,
+            })
+        }
     }
+}
+
+/// Resolve the table a `DELETE` targets from the current catalog.
+fn resolve_delete_table(pager: &Arc<Pager>, del: &DeleteStmt) -> Result<Table> {
+    let catalog = block_on(read_catalog(pager))?;
+    let obj = catalog
+        .find_table(&del.table)
+        .ok_or_else(|| Error::msg(format!("no such table: {}", del.table)))?;
+    Table::from_schema_object(obj)
+}
+
+/// Resolve the table an `INSERT` targets from the current catalog.
+fn resolve_insert_table(pager: &Arc<Pager>, ins: &InsertStmt) -> Result<Table> {
+    let catalog = block_on(read_catalog(pager))?;
+    let obj = catalog
+        .find_table(&ins.table)
+        .ok_or_else(|| Error::msg(format!("no such table: {}", ins.table)))?;
+    Table::from_schema_object(obj)
+}
+
+/// Extract the verbatim `CREATE TABLE` text to store in `sqlite_schema.sql`. SQLite stores the
+/// user's original statement text (minus a trailing `;` and surrounding whitespace), not a
+/// canonicalized form. The first prepared statement is the whole input today (no multi-statement
+/// boundary tracking yet), so we trim the buffer and strip one trailing semicolon.
+fn create_table_text(sql: &str) -> &str {
+    let trimmed = sql.trim();
+    trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end()
 }
 
 /// Prepare an `EXPLAIN` / `EXPLAIN QUERY PLAN`. The inner statement must be a `SELECT` (the same
@@ -103,7 +182,7 @@ fn prepare_explain(
         Stmt::Select(s) => s,
         _ => {
             return Err(Error::msg(
-                "only SELECT is executable in M3a (the write path is pending)",
+                "EXPLAIN of a non-SELECT statement is not supported",
             ))
         }
     };
@@ -143,6 +222,7 @@ fn prepare_explain(
             pos: 0,
         },
         explain,
+        counts: None,
         last_error: None,
     })
 }
@@ -162,7 +242,7 @@ struct CompiledSelect {
 fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelect> {
     let (table, pager) = if let Some(table_ref) = select.from.first() {
         if select.from.len() > 1 {
-            return Err(Error::msg("joins are not supported in M3a"));
+            return Err(Error::msg("joins are not supported"));
         }
         let pager = db.pager_arc()?;
         let catalog = block_on(read_catalog(&pager))?;
@@ -190,7 +270,22 @@ impl Sqlite3Stmt {
         match &mut self.backing {
             Backing::Vdbe(vdbe) => match block_on(vdbe.step()) {
                 Ok(StepResult::Row) => ResultCode::Row,
-                Ok(StepResult::Done) => ResultCode::Done,
+                Ok(StepResult::Done) => {
+                    // A write program publishes its change counters to the connection when it
+                    // finishes (mirrors `db->nChange`/`db->lastRowid` updated at statement end).
+                    // Taken (not just read) so re-stepping a finished statement does not double the
+                    // running `total_changes`.
+                    if let Some(counts) = self.counts.take() {
+                        let (changes, _total, last_rowid) = vdbe.change_counts();
+                        let mut c = counts.lock().unwrap();
+                        c.changes = changes;
+                        c.total_changes += changes;
+                        if changes > 0 {
+                            c.last_insert_rowid = last_rowid;
+                        }
+                    }
+                    ResultCode::Done
+                }
                 Err(e) => {
                     self.last_error = Some(e);
                     ResultCode::Error

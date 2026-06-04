@@ -113,15 +113,57 @@ pub fn parse_table_leaf_cell(
     })
 }
 
-/// Build a **table-leaf** cell for the write path: `varint(payload_len) ++ varint(rowid) ++
-/// payload`. First-slice only — the payload must fit entirely on the page (overflow-page chains for
-/// large payloads arrive in M4.6, so this never appends an overflow pointer). The rowid is written
-/// as a varint over its two's-complement bit pattern (the inverse of [`read_varint_i64`]).
-pub fn build_table_leaf_cell(rowid: i64, payload: &[u8]) -> Vec<u8> {
-    let mut cell = Vec::with_capacity(9 + 9 + payload.len());
+/// Build a **table-leaf** cell for the write path. If the payload fits in the local-only
+/// window of the page, no overflow pages are used and the cell is a self-contained
+/// `varint(payload_len) ++ varint(rowid) ++ payload`. If the payload is larger, the tail is
+/// spilled to a chain of freshly allocated overflow pages (each `usable - 4` content bytes),
+/// and the cell ends with a 4-byte big-endian pointer to the first overflow page.
+///
+/// The caller passes a `&Pager` and the page's `usable` size; the function allocates each
+/// overflow page with `pager.allocate_page()` and installs the chunk with
+/// `pager.write_page()`. The cell is returned as a `Vec<u8>` ready to be written into the
+/// host page's content area.
+pub fn build_table_leaf_cell(
+    pager: &crate::pager::Pager,
+    rowid: i64,
+    payload: &[u8],
+    usable: usize,
+) -> Vec<u8> {
+    let max_local = usable - 35;
+    let (local_len, has_overflow) = local_payload_len(payload.len(), usable, max_local);
+    let mut cell = Vec::with_capacity(9 + 9 + local_len + if has_overflow { 4 } else { 0 });
     write_varint(payload.len() as u64, &mut cell);
     write_varint(rowid as u64, &mut cell);
-    cell.extend_from_slice(payload);
+    cell.extend_from_slice(&payload[..local_len]);
+
+    if has_overflow {
+        let tail = &payload[local_len..];
+        let chunk = usable - 4;
+        let first_pgno = pager.allocate_page();
+        // Walk the chain. For each chunk, fill a fresh page with `[u32 next_pgno][chunk]`
+        // and install it. The last page's `next_pgno` is 0.
+        let mut curr_pgno = first_pgno;
+        let mut offset = 0usize;
+        loop {
+            let take = (tail.len() - offset).min(chunk);
+            let is_last = offset + take == tail.len();
+            let next_pgno = if is_last {
+                0u32
+            } else {
+                pager.allocate_page()
+            };
+            let mut buf = vec![0u8; pager.page_size()];
+            buf[0..4].copy_from_slice(&next_pgno.to_be_bytes());
+            buf[4..4 + take].copy_from_slice(&tail[offset..offset + take]);
+            pager.write_page(curr_pgno, buf).expect("write overflow page");
+            offset += take;
+            if is_last {
+                break;
+            }
+            curr_pgno = next_pgno;
+        }
+        cell.extend_from_slice(&first_pgno.to_be_bytes());
+    }
     cell
 }
 
@@ -137,6 +179,17 @@ pub fn table_leaf_cell_rowid(page: &[u8], offset: usize) -> Result<i64> {
     let (rowid, _) = read_varint_i64(&page[offset + n1..])
         .ok_or_else(|| Error::corrupt("table leaf rowid varint"))?;
     Ok(rowid)
+}
+
+/// Build a **table-interior** cell: `u32(left child page) ++ varint(rowid)`. The rowid is the
+/// largest key in the left-child subtree (this is the invariant an interior-table cell stores).
+/// Used by the b-tree split path to grow the parent when a child overflows, and by the root
+/// promotion (`balance_deeper`) when a single-leaf root first turns interior.
+pub fn build_table_interior_cell(left_child: u32, rowid: i64) -> Vec<u8> {
+    let mut cell = Vec::with_capacity(4 + 9);
+    cell.extend_from_slice(&left_child.to_be_bytes());
+    write_varint(rowid as u64, &mut cell);
+    cell
 }
 
 pub fn parse_table_interior_cell(page: &[u8], offset: usize) -> Result<TableInteriorCell> {

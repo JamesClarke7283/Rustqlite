@@ -88,8 +88,9 @@ fn out_of_subset_sql_errors_cleanly() {
     assert!(sqlite3_prepare_v2(&mut conn, "SELECT * FROM nope;").is_err());
     assert!(sqlite3_prepare_v2(&mut conn, "SELECT zzz FROM t;").is_err());
     assert!(sqlite3_prepare_v2(&mut conn, "SELECT nosuchfn(a) FROM t;").is_err());
-    // A syntactically valid but unsupported statement (INSERT) is rejected.
-    assert!(sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (1,2);").is_err());
+    // UPDATE is still on the M4.6 milestone; the parser doesn't produce a `Stmt` for it
+    // yet, so `prepare` returns the parse error.
+    assert!(sqlite3_prepare_v2(&mut conn, "UPDATE t SET a = 1;").is_err());
 
     let _ = std::fs::remove_file(&db);
 }

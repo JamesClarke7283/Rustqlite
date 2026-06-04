@@ -22,9 +22,19 @@ pub enum Opcode {
     Halt,
 
     // --- transactions / schema ---
-    /// `Transaction`: begin a read (or write) transaction on the database. A no-op marker in
-    /// the read-only M3a engine.
+    /// `Transaction p1 p2`: begin a transaction on database `p1`. `p2 != 0` opens a WRITE
+    /// transaction (the rollback journal); `p2 == 0` is a read transaction (implicit in our
+    /// engine). Mirrors `OP_Transaction` in `vdbe.c`.
     Transaction,
+    /// `SetCookie p1 p2 p3`: write the value `p3` into header cookie `p2` of database `p1`. Used
+    /// after DDL to bump the schema cookie (header bytes 40-43). Mirrors `OP_SetCookie`.
+    SetCookie,
+    /// `ParseSchema p1`: reload the in-memory schema (re-read `sqlite_schema`) so later statements
+    /// see DDL committed by this one. Mirrors `OP_ParseSchema`.
+    ParseSchema,
+    /// `CreateBtree p1 p2 p3`: create a new b-tree (table when `p3 == 1`) in database `p1` and
+    /// store its root page number in `r[p2]`. Mirrors `OP_CreateBtree`.
+    CreateBtree,
 
     // --- cursors ---
     /// `OpenRead p1 p2 p3 p4`: open read cursor `p1` on the b-tree rooted at page `p2`; `p4`
@@ -56,8 +66,14 @@ pub enum Opcode {
     /// `MakeRecord p1 p2 p3`: encode registers `r[p1 .. p1+p2]` into a record and store the
     /// bytes (as a BLOB value) in `r[p3]`.
     MakeRecord,
-    /// `Insert`: insert a record into a table (write path; unimplemented in M3a).
+    /// `NewRowid p1 p2`: `r[p2]` = an unused integer rowid for the table on cursor `p1` (the
+    /// current maximum rowid + 1). Mirrors `OP_NewRowid`.
+    NewRowid,
+    /// `Insert p1 p2 p3`: insert the record blob in `r[p2]` keyed by the rowid in `r[p3]` into the
+    /// table on cursor `p1`. Mirrors `OP_Insert`.
     Insert,
+    /// `Delete p1`: remove the row at cursor `p1`'s current position. Mirrors `OP_Delete`.
+    Delete,
     /// `IdxInsert`: insert into an index/sorter b-tree (write path; unimplemented in M3a).
     IdxInsert,
 
@@ -173,6 +189,9 @@ impl Opcode {
             Opcode::Goto => "Goto",
             Opcode::Halt => "Halt",
             Opcode::Transaction => "Transaction",
+            Opcode::SetCookie => "SetCookie",
+            Opcode::ParseSchema => "ParseSchema",
+            Opcode::CreateBtree => "CreateBtree",
             Opcode::OpenRead => "OpenRead",
             Opcode::OpenWrite => "OpenWrite",
             Opcode::Close => "Close",
@@ -183,7 +202,9 @@ impl Opcode {
             Opcode::Column => "Column",
             Opcode::ResultRow => "ResultRow",
             Opcode::MakeRecord => "MakeRecord",
+            Opcode::NewRowid => "NewRowid",
             Opcode::Insert => "Insert",
+            Opcode::Delete => "Delete",
             Opcode::IdxInsert => "IdxInsert",
             Opcode::Integer => "Integer",
             Opcode::Int64 => "Int64",

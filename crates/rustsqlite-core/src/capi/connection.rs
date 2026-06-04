@@ -1,6 +1,6 @@
 //! The database connection handle — `sqlite3 *` (mirrors `main.c`).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result, ResultCode};
 use crate::pager::Pager;
@@ -9,6 +9,24 @@ use crate::types::Value;
 use crate::vfs::{MemVfs, OpenFlags, OsTokioVfs, Vfs};
 
 use super::runtime::block_on;
+
+/// The default page size for a freshly created database (`SQLITE_DEFAULT_PAGE_SIZE` is 4096 in the
+/// 3.x default build).
+const DEFAULT_PAGE_SIZE: u32 = 4096;
+
+/// The connection's change counters, shared with the in-flight statement so it can publish its
+/// results back when it finishes (mirrors `db->nChange` / `db->lastRowid`). A C `sqlite3_stmt`
+/// updates these on its parent `sqlite3` directly; we share them by `Arc` since the Rust statement
+/// does not borrow the connection.
+#[derive(Default)]
+pub(crate) struct ChangeCounts {
+    /// Rows changed by the most recently executed statement.
+    pub changes: i64,
+    /// Rows changed since the connection opened.
+    pub total_changes: i64,
+    /// Rowid of the last successful insert (persists until the next insert).
+    pub last_insert_rowid: i64,
+}
 
 /// A database connection. The Rust analogue of `sqlite3 *`.
 ///
@@ -22,8 +40,14 @@ use super::runtime::block_on;
 /// holds a pointer back to its `sqlite3`.
 pub struct Sqlite3 {
     pager: Option<Arc<Pager>>,
+    /// The VFS this connection opened through, retained so a write to a still-empty database can
+    /// lazily create the file's page 1 (header + empty `sqlite_schema` leaf) on the first DDL.
+    vfs: Arc<dyn Vfs>,
     filename: String,
     read_only: bool,
+    /// The change counters, shared by `Arc` with the in-flight statement so it can publish its
+    /// `changes`/`last_insert_rowid` back when it steps to completion.
+    counts: Arc<Mutex<ChangeCounts>>,
     last_error: Option<Error>,
 }
 
@@ -34,9 +58,9 @@ pub fn sqlite3_open(filename: &str) -> Result<Sqlite3> {
 
 /// `sqlite3_open_v2()` — open a database with explicit flags.
 ///
-/// `:memory:` and the empty string open a private in-memory database. Note: at M1 the write
-/// path does not yet exist, so an in-memory or freshly created (empty) database has no pages
-/// to read until the write path lands; reading from such a handle returns an error.
+/// `:memory:` and the empty string open a private in-memory database. A brand-new or empty file
+/// has no pages yet; the pager is created lazily on the first write (`CREATE TABLE`) — see
+/// [`Sqlite3::ensure_pager`] — so opening an empty file and immediately creating a table works.
 pub fn sqlite3_open_v2(filename: &str, flags: OpenFlags) -> Result<Sqlite3> {
     block_on(async move {
         let is_memory = filename.is_empty() || filename == ":memory:";
@@ -49,19 +73,20 @@ pub fn sqlite3_open_v2(filename: &str, flags: OpenFlags) -> Result<Sqlite3> {
         let file = vfs.open(filename, flags).await?;
         let size = file.file_size().await?;
         // An empty file has no header yet (a brand-new or in-memory database). Defer pager
-        // creation until there is something to read/write.
+        // creation until the first write (`ensure_pager`); a read of such a handle still errors.
         let pager = if size == 0 {
             None
         } else {
-            Some(Arc::new(
-                Pager::open(vfs.clone(), filename.to_string(), file).await?,
-            ))
+            let opened = Pager::open(vfs.clone(), filename.to_string(), file).await?;
+            Some(Arc::new(opened))
         };
 
         Ok(Sqlite3 {
             pager,
+            vfs: vfs.clone(),
             filename: filename.to_string(),
             read_only: flags.is_readonly(),
+            counts: Arc::new(Mutex::new(ChangeCounts::default())),
             last_error: None,
         })
     })
@@ -94,15 +119,20 @@ impl Sqlite3 {
             .map_or(ResultCode::Ok.code(), |e| e.extended_code)
     }
 
-    /// `sqlite3_changes()` — rows modified by the most recent statement. Always 0 until the
-    /// write path lands.
+    /// `sqlite3_changes()` — rows modified by the most recently executed statement.
     pub fn changes(&self) -> i64 {
-        0
+        self.counts.lock().unwrap().changes
     }
 
-    /// `sqlite3_last_insert_rowid()` — 0 until the write path lands.
+    /// `sqlite3_total_changes()` — rows modified since the connection opened.
+    pub fn total_changes(&self) -> i64 {
+        self.counts.lock().unwrap().total_changes
+    }
+
+    /// `sqlite3_last_insert_rowid()` — rowid of the last successful insert (persists across
+    /// statements until the next insert).
     pub fn last_insert_rowid(&self) -> i64 {
-        0
+        self.counts.lock().unwrap().last_insert_rowid
     }
 
     /// The filename this connection was opened with.
@@ -150,6 +180,36 @@ impl Sqlite3 {
                 self.filename
             ))
         })
+    }
+
+    /// Ensure a pager exists, creating a fresh database file (page 1 = header + an empty
+    /// `sqlite_schema` leaf) on the first write to an empty/new file. Returns an `Arc` clone of
+    /// the pager. Engine-internal (used by the write prepare path for `CREATE TABLE`).
+    ///
+    /// Mirrors how C SQLite lays down page 1 the first time a connection writes to a zero-length
+    /// file. A read-only connection cannot create the database.
+    pub(crate) fn ensure_pager(&mut self) -> Result<Arc<Pager>> {
+        if let Some(p) = &self.pager {
+            return Ok(p.clone());
+        }
+        if self.read_only {
+            return Err(Error::msg("attempt to write a readonly database"));
+        }
+        let vfs = self.vfs.clone();
+        let filename = self.filename.clone();
+        let pager = block_on(async move {
+            let file = vfs.open(&filename, OpenFlags::READWRITE_CREATE).await?;
+            Pager::create_fresh(vfs.clone(), filename.clone(), file, DEFAULT_PAGE_SIZE).await
+        })?;
+        let pager = Arc::new(pager);
+        self.pager = Some(pager.clone());
+        Ok(pager)
+    }
+
+    /// A clone of the shared change-counter handle, for a write statement to publish its results
+    /// into when it steps to completion. Engine-internal (used by [`super::stmt`]).
+    pub(crate) fn counts_handle(&self) -> Arc<Mutex<ChangeCounts>> {
+        self.counts.clone()
     }
 
     // ---- Interim engine read helpers (until the VDBE prepare/step path lands in M3) ----

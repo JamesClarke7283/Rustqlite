@@ -15,6 +15,7 @@ pub enum Stmt {
     Select(SelectStmt),
     CreateTable(CreateTable),
     Insert(InsertStmt),
+    Delete(DeleteStmt),
     /// `EXPLAIN <stmt>` / `EXPLAIN QUERY PLAN <stmt>`. The inner statement is boxed (it is the
     /// large variant). `kind` distinguishes the bytecode listing from the query-plan tree.
     Explain(Box<Stmt>, ExplainKind),
@@ -99,6 +100,15 @@ pub struct InsertStmt {
     pub table: String,
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Expr>>,
+}
+
+/// `DELETE FROM [schema.]tbl [WHERE expr]`. The first M4.6 slice omits `ORDER BY`, `LIMIT`,
+/// `RETURNING`, and the multi-table `DELETE t1, t2 FROM …` form (those are deferred).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteStmt {
+    pub schema: Option<String>,
+    pub table: String,
+    pub where_clause: Option<Expr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -132,6 +132,29 @@ pub fn init_empty_leaf(page: &mut [u8], base_offset: usize) {
     page[h + 7] = 0; // fragmented free bytes
 }
 
+/// Initialize the b-tree page region of `page` as an **empty interior-table** page (page type
+/// `0x05`), with `right_most` as the right-most child pointer. Used when the b-tree root is
+/// promoted from a leaf (a leaf becomes a full root after the first split). `base_offset` is 100
+/// on page 1, else 0. The page bytes from `base_offset` onward are zeroed (`zeroPage`).
+pub fn init_empty_interior(page: &mut [u8], base_offset: usize, right_most: u32) {
+    let page_size = page.len();
+    for b in &mut page[base_offset..] {
+        *b = 0;
+    }
+    let h = base_offset;
+    page[h] = 0x05; // interior table page
+    page[h + 1..h + 3].copy_from_slice(&0u16.to_be_bytes()); // first freeblock = 0
+    page[h + 3..h + 5].copy_from_slice(&0u16.to_be_bytes()); // num cells = 0
+    let ccs: u16 = if page_size == 65_536 {
+        0
+    } else {
+        page_size as u16
+    };
+    page[h + 5..h + 7].copy_from_slice(&ccs.to_be_bytes());
+    page[h + 7] = 0; // fragmented free bytes
+    page[h + 8..h + 12].copy_from_slice(&right_most.to_be_bytes());
+}
+
 /// The number of contiguous free bytes between the end of the cell-pointer array and the start of
 /// the cell content area on a **leaf** page — the space available for a new cell plus its 2-byte
 /// pointer. (This is the simple unallocated gap; reclaimable freeblocks inside the content area are
@@ -205,6 +228,130 @@ pub fn insert_leaf_cell(
 /// single page. The message is distinct so the caller can recognize the "needs split" condition.
 pub fn page_full_error() -> Error {
     Error::msg("b-tree leaf page is full (page split not yet implemented)")
+}
+
+/// The number of contiguous free bytes between the end of the cell-pointer array and the start of
+/// the cell content area on an **interior** page — the same accounting as
+/// [`leaf_free_space`], but interior pages carry a 4-byte larger header and a 4-byte larger cell
+/// (a child pointer, vs no pointer in a table-leaf cell).
+pub fn interior_free_space(page: &[u8], base_offset: usize) -> usize {
+    let h = base_offset;
+    let num_cells = be_u16(&page[h + 3..h + 5]) as usize;
+    let raw_ccs = be_u16(&page[h + 5..h + 7]) as usize;
+    let cell_content_start = if raw_ccs == 0 { 65_536 } else { raw_ccs };
+    let ptr_array_end = h + INTERIOR_HEADER_SIZE + num_cells * 2;
+    cell_content_start.saturating_sub(ptr_array_end)
+}
+
+/// The 12-byte header length of an interior b-tree page.
+const INTERIOR_HEADER_SIZE: usize = 12;
+
+/// Insert a **table-interior** cell at cell-pointer index `idx` on an interior-table page. The
+/// page's cell-pointer array grows downward the same way the leaf's does. Returns [`page_full_error`]
+/// if the cell does not fit (the caller will route into the split path).
+pub fn insert_interior_cell(
+    page: &mut [u8],
+    base_offset: usize,
+    idx: usize,
+    cell: &[u8],
+) -> Result<()> {
+    let h = base_offset;
+    if page[h] != 0x05 {
+        return Err(Error::corrupt("insert_interior_cell: not an interior-table page"));
+    }
+    let num_cells = be_u16(&page[h + 3..h + 5]) as usize;
+    if idx > num_cells {
+        return Err(Error::corrupt("insert_interior_cell: index past cell count"));
+    }
+    let raw_ccs = be_u16(&page[h + 5..h + 7]) as usize;
+    let cell_content_start = if raw_ccs == 0 { 65_536 } else { raw_ccs };
+    let ptr_array_end = h + INTERIOR_HEADER_SIZE + num_cells * 2;
+
+    if cell_content_start < ptr_array_end + cell.len() + 2 {
+        return Err(page_full_error());
+    }
+
+    let new_content_start = cell_content_start - cell.len();
+    page[new_content_start..new_content_start + cell.len()].copy_from_slice(cell);
+
+    let ptr_at = |i: usize| h + INTERIOR_HEADER_SIZE + i * 2;
+    if idx < num_cells {
+        page.copy_within(ptr_at(idx)..ptr_at(num_cells), ptr_at(idx + 1));
+    }
+    page[ptr_at(idx)..ptr_at(idx) + 2].copy_from_slice(&(new_content_start as u16).to_be_bytes());
+
+    page[h + 3..h + 5].copy_from_slice(&((num_cells + 1) as u16).to_be_bytes());
+    let stored_ccs: u16 = if new_content_start == 65_536 {
+        0
+    } else {
+        new_content_start as u16
+    };
+    page[h + 5..h + 7].copy_from_slice(&stored_ccs.to_be_bytes());
+    Ok(())
+}
+
+/// Reset a page's cell-pointer array to a fresh, empty list of `cells` and a free space
+/// starting at `cell_content_start` (a byte offset within the page). Both leaf-table and
+/// interior-table pages use this layout: an 8-/12-byte header, then a `2 * num_cells` pointer
+/// array, then the cell content area. Used by the split path to build a fresh sibling page
+/// out of a redistributed set of cells.
+pub fn write_page_cells(
+    page: &mut [u8],
+    base_offset: usize,
+    page_type: PageType,
+    right_most: Option<u32>,
+    cells: &[(u16, Vec<u8>)],
+) -> Result<()> {
+    let page_size = page.len();
+    for b in &mut page[base_offset..] {
+        *b = 0;
+    }
+    let h = base_offset;
+    match page_type {
+        PageType::LeafTable => page[h] = 0x0d,
+        PageType::InteriorTable => page[h] = 0x05,
+        _ => {
+            return Err(Error::msg(
+                "write_page_cells: only table b-tree pages are supported",
+            ))
+        }
+    }
+    page[h + 1..h + 3].copy_from_slice(&0u16.to_be_bytes());
+    page[h + 3..h + 5].copy_from_slice(&(cells.len() as u16).to_be_bytes());
+
+    let header_size = if page_type.is_leaf() { 8 } else { 12 };
+    let ptr_array_end = h + header_size + cells.len() * 2;
+    // Lay out cells from the end of the page downward; for each cell index `i`, record the
+    // physical offset of its cell bytes. `cells` is already in rowid-sorted order, and the
+    // pointer array is written at index `i`, so the pointer at index `i` ends up pointing
+    // at the i-th cell.
+    let mut offsets: Vec<usize> = vec![0; cells.len()];
+    let mut cell_content_start = page_size;
+    for (i, cell) in cells.iter().enumerate().rev() {
+        cell_content_start -= cell.1.len();
+        offsets[i] = cell_content_start;
+    }
+    // Sanity: content area must start at or after the pointer array.
+    if cell_content_start < ptr_array_end {
+        return Err(page_full_error());
+    }
+    for (i, (_, cell)) in cells.iter().enumerate() {
+        let off = offsets[i];
+        page[off..off + cell.len()].copy_from_slice(cell);
+        let ptr_at = h + header_size + i * 2;
+        page[ptr_at..ptr_at + 2].copy_from_slice(&(off as u16).to_be_bytes());
+    }
+    let stored_ccs: u16 = if cell_content_start == 65_536 {
+        0
+    } else {
+        cell_content_start as u16
+    };
+    page[h + 5..h + 7].copy_from_slice(&stored_ccs.to_be_bytes());
+    page[h + 7] = 0; // fragmented free bytes
+    if let Some(rm) = right_most {
+        page[h + 8..h + 12].copy_from_slice(&rm.to_be_bytes());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

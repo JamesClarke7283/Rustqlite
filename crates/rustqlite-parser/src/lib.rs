@@ -63,12 +63,13 @@ fn build_statement(pair: Pair<'_, Rule>) -> Stmt {
     build_inner_stmt(first)
 }
 
-/// Build the select/create/insert statement from its grammar pair.
+/// Build the select/create/insert/delete statement from its grammar pair.
 fn build_inner_stmt(pair: Pair<'_, Rule>) -> Stmt {
     match pair.as_rule() {
         Rule::select_stmt => Stmt::Select(build_select(pair)),
         Rule::create_table_stmt => Stmt::CreateTable(build_create_table(pair)),
         Rule::insert_stmt => Stmt::Insert(build_insert(pair)),
+        Rule::delete_stmt => Stmt::Delete(build_delete(pair)),
         other => unreachable!("unexpected statement {other:?}"),
     }
 }
@@ -397,6 +398,26 @@ fn build_insert_verb(pair: Pair<'_, Rule>) -> Option<ConflictAction> {
     None
 }
 
+fn build_delete(pair: Pair<'_, Rule>) -> DeleteStmt {
+    let mut stmt = DeleteStmt {
+        schema: None,
+        table: String::new(),
+        where_clause: None,
+    };
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::qualified_name => {
+                let (s, n) = build_qualified_name(part);
+                stmt.schema = s;
+                stmt.table = n;
+            }
+            Rule::where_item => stmt.where_clause = Some(build_expr_item(part)),
+            _ => {}
+        }
+    }
+    stmt
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,6 +599,22 @@ mod tests {
     }
 
     #[test]
+    fn delete_with_optional_where() {
+        let Stmt::Delete(d) = &parse("DELETE FROM t;").unwrap()[0] else {
+            panic!("expected DELETE")
+        };
+        assert_eq!(d.table, "t");
+        assert!(d.where_clause.is_none());
+
+        let Stmt::Delete(d) = &parse("DELETE FROM main.t WHERE x > 1;").unwrap()[0] else {
+            panic!("expected DELETE")
+        };
+        assert_eq!(d.schema.as_deref(), Some("main"));
+        assert_eq!(d.table, "t");
+        assert!(d.where_clause.is_some());
+    }
+
+    #[test]
     fn plain_select_is_not_explain() {
         // Regression: an ordinary SELECT must still parse to `Stmt::Select`, not `Explain`.
         assert!(matches!(&parse("SELECT 1;").unwrap()[0], Stmt::Select(_)));
@@ -598,5 +635,27 @@ mod tests {
             &s.columns[1],
             ResultColumn::Expr { expr: Expr::Column { name, .. }, .. } if name == "query"
         ));
+    }
+}
+
+#[cfg(test)]
+mod tmp_debug_tests {
+    use super::*;
+    #[test]
+    fn tmp_create_semicolon() {
+        let v = parse("CREATE TABLE t(a, b);").unwrap();
+        assert_eq!(v.len(), 1, "parsed {} stmts", v.len());
+    }
+}
+
+#[cfg(test)]
+mod tmp_dbg2 {
+    use super::*;
+    #[test]
+    fn dbg_create_pairs() {
+        for s in ["SELECT 1;", "CREATE TABLE t(a, b);"] {
+            let n = parse(s).map(|v| v.len());
+            eprintln!("PARSERCRATE {s:?} -> {n:?}");
+        }
     }
 }

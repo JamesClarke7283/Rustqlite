@@ -10,6 +10,7 @@
 pub mod balance;
 pub mod cell;
 pub mod cursor;
+pub mod delete;
 pub mod insert;
 pub mod page;
 
@@ -18,6 +19,7 @@ pub use cell::{
     parse_table_interior_cell, parse_table_leaf_cell, table_leaf_cell_rowid,
 };
 pub use cursor::{scan_table, TableCursor};
+pub use delete::leaf_delete_current;
 pub use insert::{max_rowid, table_insert};
 pub use page::{PageHeader, PageType};
 

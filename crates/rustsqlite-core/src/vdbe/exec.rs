@@ -10,9 +10,10 @@
 //! C-API drives it with `block_on`.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::btree::TableCursor;
+use crate::btree::{self, TableCursor};
 use crate::error::{Error, Result};
 use crate::format::{decode_record, encode_record, TextEncoding};
 use crate::func;
@@ -45,11 +46,11 @@ const SQLITE_MAX_LENGTH: i64 = 1_000_000_000;
 pub struct RuntimeCtx {
     /// splitmix64 state, advanced on each draw.
     rng_state: u64,
-    /// `changes()` — rows changed by the last write. Always 0 in M3b (no write path yet).
+    /// `changes()` — rows changed by the most recent write statement (`OP_Insert` bumps it).
     pub changes: i64,
-    /// `total_changes()` — rows changed since the connection opened. Always 0 in M3b.
+    /// `total_changes()` — rows changed since the connection opened.
     pub total_changes: i64,
-    /// `last_insert_rowid()` — rowid of the last successful insert. Always 0 in M3b.
+    /// `last_insert_rowid()` — rowid of the last successful insert (persists across statements).
     pub last_insert_rowid: i64,
 }
 
@@ -146,6 +147,13 @@ pub struct Vdbe {
     decoded: Option<(usize, i64, Vec<Value>)>,
     /// Runtime state for the volatile / connection-state functions (PRNG + change counters).
     ctx: RuntimeCtx,
+    /// The b-tree rootpage each open cursor sits on, keyed by cursor number. `OpenWrite` records
+    /// it so the write opcodes (`NewRowid`/`Insert`) can reach the b-tree by root (the write path
+    /// goes through `btree::table_insert`/`max_rowid` directly on the pager, not the read cursor).
+    cursor_root: HashMap<i32, u32>,
+    /// Set to `true` once a write `Transaction` opcode has opened a write transaction, so `Halt`
+    /// knows to commit and a step error knows to roll back. Read-only programs leave this `false`.
+    write_txn: bool,
 }
 
 impl Vdbe {
@@ -167,7 +175,19 @@ impl Vdbe {
             halted: false,
             decoded: None,
             ctx: RuntimeCtx::new(),
+            cursor_root: HashMap::new(),
+            write_txn: false,
         }
+    }
+
+    /// A snapshot of the change counters after this program ran (for `sqlite3_changes` /
+    /// `sqlite3_last_insert_rowid`). `(changes, total_changes, last_insert_rowid)`.
+    pub fn change_counts(&self) -> (i64, i64, i64) {
+        (
+            self.ctx.changes,
+            self.ctx.total_changes,
+            self.ctx.last_insert_rowid,
+        )
     }
 
     /// Reset to the start so the program can be re-run (`sqlite3_reset`).
@@ -184,6 +204,8 @@ impl Vdbe {
         self.result_count = 0;
         self.halted = false;
         self.decoded = None;
+        self.cursor_root.clear();
+        self.write_txn = false;
     }
 
     /// Number of columns in the current result row.
@@ -200,7 +222,27 @@ impl Vdbe {
     }
 
     /// Run until the next result row or completion.
+    ///
+    /// On an error inside a write transaction, the transaction is rolled back (discarding the
+    /// uncommitted changes and deleting the journal) before the error propagates — mirroring how
+    /// `sqlite3VdbeHalt` aborts a statement that errored (`OE_Abort`/`OE_Rollback`).
     pub async fn step(&mut self) -> Result<StepResult> {
+        match self.step_inner().await {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                if self.write_txn {
+                    if let Some(pager) = &self.pager {
+                        let _ = pager.rollback().await;
+                    }
+                    self.write_txn = false;
+                }
+                self.halted = true;
+                Err(e)
+            }
+        }
+    }
+
+    async fn step_inner(&mut self) -> Result<StepResult> {
         if self.halted {
             return Ok(StepResult::Done);
         }
@@ -217,10 +259,31 @@ impl Vdbe {
                 Opcode::Init => self.pc = p2 as usize,
                 Opcode::Goto => self.pc = p2 as usize,
                 Opcode::Halt => {
+                    // A successful Halt commits an open write transaction (the durable commit
+                    // point); read-only programs have no transaction to commit. Mirrors the
+                    // CommitPhase in `sqlite3VdbeHalt` for a non-erroring statement.
+                    if self.write_txn {
+                        if let Some(pager) = &self.pager {
+                            pager.commit().await?;
+                        }
+                        self.write_txn = false;
+                    }
                     self.halted = true;
                     return Ok(StepResult::Done);
                 }
-                Opcode::Transaction => self.pc += 1,
+                Opcode::Transaction => {
+                    // p2 != 0 opens a WRITE transaction (the rollback journal). A read
+                    // transaction is implicit in our engine, so p2 == 0 is a no-op marker.
+                    if p2 != 0 {
+                        let pager = self
+                            .pager
+                            .clone()
+                            .ok_or_else(|| Error::msg("no database is open"))?;
+                        pager.begin_write().await?;
+                        self.write_txn = true;
+                    }
+                    self.pc += 1;
+                }
 
                 Opcode::OpenRead => {
                     let pager = self
@@ -229,6 +292,22 @@ impl Vdbe {
                         .ok_or_else(|| Error::msg("no database is open"))?;
                     let cursor = TableCursor::new(pager, p2 as u32);
                     self.set_cursor(p1 as usize, VdbeCursor::Table(cursor));
+                    self.cursor_root.insert(p1, p2 as u32);
+                    self.pc += 1;
+                }
+                Opcode::OpenWrite => {
+                    // For the first write slice the cursor only needs to remember its rootpage:
+                    // the insert itself goes through `btree::table_insert` on the pager, and any
+                    // reads-after-write reuse the read-cursor machinery. We still open a table
+                    // cursor (so a Rewind/Column after the insert would work) and record the root
+                    // for NewRowid/Insert.
+                    let pager = self
+                        .pager
+                        .clone()
+                        .ok_or_else(|| Error::msg("no database is open"))?;
+                    let cursor = TableCursor::new(pager, p2 as u32);
+                    self.set_cursor(p1 as usize, VdbeCursor::Table(cursor));
+                    self.cursor_root.insert(p1, p2 as u32);
                     self.pc += 1;
                 }
                 Opcode::Close => {
@@ -482,6 +561,74 @@ impl Vdbe {
                     self.pc += 1;
                 }
 
+                // ---- write path ----
+                Opcode::CreateBtree => {
+                    let pager = self
+                        .pager
+                        .clone()
+                        .ok_or_else(|| Error::msg("no database is open"))?;
+                    let root = btree::create_table_btree(&pager).await?;
+                    self.regs[p2 as usize] = Value::Int(i64::from(root));
+                    self.pc += 1;
+                }
+                Opcode::NewRowid => {
+                    let pager = self
+                        .pager
+                        .clone()
+                        .ok_or_else(|| Error::msg("no database is open"))?;
+                    let root = self.cursor_root_of(p1)?;
+                    let next = btree::max_rowid(&pager, root).await?.wrapping_add(1);
+                    self.regs[p2 as usize] = Value::Int(next);
+                    self.pc += 1;
+                }
+                Opcode::Insert => {
+                    let pager = self
+                        .pager
+                        .clone()
+                        .ok_or_else(|| Error::msg("no database is open"))?;
+                    let root = self.cursor_root_of(p1)?;
+                    let record = match &self.regs[p2 as usize] {
+                        Value::Blob(b) => b.clone(),
+                        _ => return Err(Error::msg("Insert expects a record blob in p2")),
+                    };
+                    let rowid = self.regs[p3 as usize].as_i64();
+                    btree::table_insert(&pager, root, rowid, &record).await?;
+                    self.ctx.changes += 1;
+                    self.ctx.total_changes += 1;
+                    self.ctx.last_insert_rowid = rowid;
+                    self.decoded = None;
+                    self.pc += 1;
+                }
+                Opcode::Delete => {
+                    // Sanity-check the cursor exists; the actual delete goes through
+                    // `TableCursor::delete_current`, which addresses the leaf directly.
+                    self.cursor_root_of(p1)?;
+                    let cur = self.table_cursor_mut(p1)?;
+                    let rowid_before = cur.rowid()?;
+                    cur.delete_current().await?;
+                    self.ctx.changes += 1;
+                    self.ctx.total_changes += 1;
+                    self.ctx.last_insert_rowid = rowid_before;
+                    self.decoded = None;
+                    self.pc += 1;
+                }
+                Opcode::SetCookie => {
+                    // p2 selects the cookie; only the schema cookie (1) is emitted today. The
+                    // value to write is the operand p3 (the new cookie value computed at codegen).
+                    if let Some(pager) = &self.pager {
+                        let value = p3 as u32;
+                        pager.with_header_mut(|h| h.schema_cookie = value);
+                    }
+                    self.pc += 1;
+                }
+                Opcode::ParseSchema => {
+                    // Reload the in-memory catalog so later statements see the new object. In our
+                    // architecture each prepared statement re-reads `sqlite_schema` at prepare
+                    // time (the catalog is not cached on the connection), so the reload here is a
+                    // no-op marker; we keep the opcode for faithfulness and EXPLAIN parity.
+                    self.pc += 1;
+                }
+
                 // ---- sorter ----
                 Opcode::SorterOpen => {
                     let keys = match &inst.p4 {
@@ -562,6 +709,15 @@ impl Vdbe {
             self.cursors.resize_with(idx + 1, || None);
         }
         self.cursors[idx] = Some(cursor);
+    }
+
+    /// The b-tree rootpage that cursor `p1` was opened on (recorded by `OpenRead`/`OpenWrite`).
+    /// Used by the write opcodes (`NewRowid`/`Insert`), which reach the b-tree by root.
+    fn cursor_root_of(&self, p1: i32) -> Result<u32> {
+        self.cursor_root
+            .get(&p1)
+            .copied()
+            .ok_or_else(|| Error::msg("cursor has no recorded rootpage"))
     }
 
     fn table_cursor(&self, p1: i32) -> Result<&TableCursor> {
