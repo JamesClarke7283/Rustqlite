@@ -1,0 +1,23 @@
+# Sqllogictest smoke manifest — the curated list of `.slt` files that the
+# `slt_smoke` test runs by default. Paths are relative to the corpus root
+# (the `target/slt/` directory populated by `xtask/fetch-slt.sh`).
+#
+# Set `RUSTQLITE_FULL_SLT=1` to also exercise every file in this manifest
+# (today: all of them; the env var is wired for a future sub-corpus gate).
+#
+# The M4 milestone is a write-path: the most useful smoke runs are the
+# evidence/ files (small, fast, exercise DML/DDL with the engine we just
+# wrote). Files that depend on un-shipped features (CREATE INDEX, UPDATE,
+# REPLACE, REINDEX, triggers, views, CASE/WHEN expressions, subqueries)
+# are excluded; they fail today and are tracked in the M5+ roadmap.
+#
+# As each M4.6+ feature lands, the matching evidence/ test(s) is added
+# here. The full upstream corpus (~5,000 .slt files in `random/` and
+# `select{2,3,4,5}.test`) is wired through `xtask/fetch-slt.sh` and the
+# test will exercise it when M5+ lands.
+
+# (Currently empty — every M4.6 evidence/ test either depends on a
+# feature we have not shipped (CREATE INDEX in droptable.test) or uses
+# skipif/onlyif directives that need sqllogictest parser support. The
+# harness itself is wired and ready; the manifest is filled in as the
+# missing features land.)

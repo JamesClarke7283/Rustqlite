@@ -20,3 +20,14 @@ rustyline = { workspace = true }
 # Note: the async tokio runtime lives inside the `rustsqlite-core` engine (it owns a process-global
 # runtime and the C-API functions drive it via block_on), so the CLI itself stays synchronous
 # and does not depend on tokio directly.
+
+[dev-dependencies]
+# The upstream Rust port of SQLite's sqllogictest runner; used to execute the upstream
+# sqllogictest corpus against the `rustsqlite` engine in-process.
+sqllogictest = "0.29"
+# `futures::executor::block_on` is a sync runtime that does NOT depend on tokio, so it
+# can drive async DBs from a sync test thread even when a tokio runtime is already
+# live in the test's process.
+futures = "0.3"
+# Object-safe `async_trait` for the `AsyncDB` impl.
+async-trait = { workspace = true }
