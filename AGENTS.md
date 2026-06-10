@@ -129,6 +129,6 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   page-full error propagates; index page splits land in a follow-up. Differential-tested vs
   the C oracle (round-trip + indexed lookup) in `crates/rustsqlite-core/tests/write_roundtrip.rs`
   (11 tests) and the in-process slt harness (`our/index.slt` + `evidence/slt_lang_dropindex.test`).
-  M5+ continues with: index page splits, multi-column indexes, partial/expression indexes,
-  enforced `UNIQUE`, `ORDER BY` over a non-indexed column with the index used as a
-  scan-time ordering hint, joins, aggregates, subqueries.
+   M5+ continues with: index page splits (DONE — already implemented in M5.1), multi-column indexes, partial/expression indexes,
+   enforced `UNIQUE`, `ORDER BY` over a non-indexed column with the index used as a
+   scan-time ordering hint, joins, aggregates, subqueries.

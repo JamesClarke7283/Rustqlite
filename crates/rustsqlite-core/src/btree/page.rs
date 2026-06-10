@@ -271,10 +271,10 @@ pub fn insert_leaf_cell(
 }
 
 /// The error returned when a cell does not fit on its leaf page. The b-tree split that handles this
-/// arrives with balancing (M4.5); until then the first-slice writer only stores rows that fit on a
-/// single page. The message is distinct so the caller can recognize the "needs split" condition.
+/// The message is distinct so the caller can recognize the "needs split" condition and invoke
+/// balancing (split + promote).
 pub fn page_full_error() -> Error {
-    Error::msg("b-tree leaf page is full (page split not yet implemented)")
+    Error::msg("btree page is full")
 }
 
 /// The number of contiguous free bytes between the end of the cell-pointer array and the start of
