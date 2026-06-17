@@ -35,8 +35,12 @@ quoted_ident = @{
 }
 
 // Numeric literals: hex, integer, real (with optional fraction/exponent).
-number = @{ hex_int | float_or_int }
+// Decimal numeric literals may carry an explicit sign so that the minimum signed
+// 64-bit value `-9223372036854775808` is a single INTEGER literal, matching SQLite.
+// The sign must be adjacent to the digits; `- 123` is still parsed as a unary minus.
+number = @{ hex_int | signed_float_or_int }
 hex_int = @{ ^"0x" ~ ASCII_HEX_DIGIT+ }
+signed_float_or_int = @{ ("+" | "-")? ~ float_or_int }
 float_or_int = @{
       (ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT*)? ~ exponent?)
     | ("." ~ ASCII_DIGIT+ ~ exponent?)
@@ -253,8 +257,12 @@ arg_list = { K_DISTINCT? ~ expr ~ ("," ~ expr)* }
 column_ref = { ident ~ ("." ~ ident ~ ("." ~ ident)?)? }
 
 prefix = _{ neg | pos | K_NOT }
-neg = { "-" }
-pos = { "+" }
+// `neg` and `pos` are intentionally matched as a single-character `-` or `+` only when
+// whitespace separates the sign from the following primary.  This allows `number` to
+// absorb an adjacent sign (e.g. `-9223372036854775808`) as one literal token, while
+// `- 5` parses as a unary minus applied to a positive literal.
+neg = { "-" ~ (WHITESPACE+ | !ASCII_DIGIT) ~ !"." }
+pos = { "+" ~ (WHITESPACE+ | !ASCII_DIGIT) ~ !"." }
 
 // The generic infix set. The LIKE family (`op_like`/`op_not_like`) is matched ONLY via `like_clause`
 // (so an ESCAPE may follow), so they are intentionally absent here.

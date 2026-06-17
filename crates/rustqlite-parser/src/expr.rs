@@ -185,13 +185,26 @@ fn build_number(text: &str) -> Literal {
             Err(_) => Literal::Real(f64::INFINITY),
         };
     }
-    if text.contains('.') || text.contains('e') || text.contains('E') {
+
+    // Preserve the explicit sign so the minimum i64 value can be parsed directly.
+    let (sign, unsigned) = match text.as_bytes().first() {
+        Some(b'-') => (-1i64, &text[1..]),
+        Some(b'+') => (1i64, &text[1..]),
+        _ => (1i64, text),
+    };
+
+    if unsigned.contains('.') || unsigned.contains('e') || unsigned.contains('E') {
         return Literal::Real(text.parse::<f64>().unwrap_or(0.0));
     }
-    match text.parse::<i64>() {
-        Ok(v) => Literal::Integer(v),
-        // Integer literal too large for i64 becomes a real, as in SQLite.
-        Err(_) => Literal::Real(text.parse::<f64>().unwrap_or(0.0)),
+
+    match unsigned.parse::<u64>() {
+        Ok(v) if sign < 0 && v == 9223372036854775808 => {
+            // SQLite's exact minimum signed 64-bit integer literal stays INTEGER, not REAL.
+            Literal::Integer(i64::MIN)
+        }
+        Ok(v) if v <= i64::MAX as u64 => Literal::Integer(sign.wrapping_mul(v as i64)),
+        // Out of signed 64-bit range but no decimal point/exponent: SQLite treats it as REAL.
+        _ => Literal::Real(text.parse::<f64>().unwrap_or(0.0)),
     }
 }
 

@@ -845,4 +845,26 @@ mod tests {
         // Trailing comma.
         assert!(parse("UPDATE t SET a = 1,;").is_err());
     }
+
+    #[test]
+    fn bare_min_i64_literal_is_integer_not_real() {
+        // SQLite parses the literal `-9223372036854775808` as INTEGER (the minimum
+        // signed 64-bit value). Anything beyond that, including `-9223372036854775809`,
+        // overflows and becomes REAL.
+        let cases = [
+            ("SELECT -9223372036854775808;", Literal::Integer(i64::MIN)),
+            ("SELECT -9223372036854775809;", Literal::Real(-9223372036854775809.0)),
+            ("SELECT +9223372036854775807;", Literal::Integer(i64::MAX)),
+            ("SELECT 9223372036854775808;", Literal::Real(9223372036854775808.0)),
+        ];
+        for (sql, expected) in cases {
+            let Stmt::Select(s) = &parse(sql).unwrap()[0] else {
+                panic!("expected SELECT for {sql}")
+            };
+            let ResultColumn::Expr { expr, .. } = &s.columns[0] else {
+                panic!("expected expression result for {sql}")
+            };
+            assert_eq!(expr, &Expr::Literal(expected), "{sql}");
+        }
+    }
 }
