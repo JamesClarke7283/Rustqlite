@@ -35,7 +35,7 @@ list every granular item needed.
 - [x] **2.3** Literals: NULL, Integer, Real, Text, Blob, Bool, hex integers, bind parameters (?/:name/@name/$name)
 - [x] **2.4** EXPLAIN / EXPLAIN QUERY PLAN prefix
 
-- [ ] **2.5** Bare-integer-literal edge case: `−9223372036854775808` must be INTEGER, not REAL
+- [x] **2.5** Bare-integer-literal edge case: `−9223372036854775808` must be INTEGER, not REAL
 - [ ] **2.6** Expression: `BETWEEN … AND …` / `NOT BETWEEN`
 - [ ] **2.7** Expression: `IN (value_list)` / `IN (SELECT …)` / `NOT IN`
 - [ ] **2.8** Expression: `EXISTS (SELECT …)`
