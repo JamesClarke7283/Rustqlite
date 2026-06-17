@@ -36,14 +36,14 @@ list every granular item needed.
 - [x] **2.4** EXPLAIN / EXPLAIN QUERY PLAN prefix
 
 - [x] **2.5** Bare-integer-literal edge case: `−9223372036854775808` must be INTEGER, not REAL
-- [ ] **2.6** Expression: `BETWEEN … AND …` / `NOT BETWEEN`
-- [ ] **2.7** Expression: `IN (value_list)` / `IN (SELECT …)` / `NOT IN`
-- [ ] **2.8** Expression: `EXISTS (SELECT …)`
-- [ ] **2.9** Expression: `CAST(expr AS type)`
-- [ ] **2.10** Expression: `CASE … WHEN … THEN … ELSE … END`
-- [ ] **2.11** Expression: `COLLATE` clause on expressions
+- [x] **2.6** Expression: `BETWEEN … AND …` / `NOT BETWEEN`
+- [x] **2.7** Expression: `IN (value_list)` / `IN (SELECT …)` / `NOT IN`
+- [x] **2.8** Expression: `EXISTS (SELECT …)`
+- [x] **2.9** Expression: `CAST(expr AS type)`
+- [x] **2.10** Expression: `CASE … WHEN … THEN … ELSE … END`
+- [x] **2.11** Expression: `COLLATE` clause on expressions
 - [ ] **2.12** Expression: Subqueries in expressions (scalar `(SELECT …)`)
-- [ ] **2.13** Expression: `IS NOT DISTINCT FROM` / `IS DISTINCT FROM`
+- [x] **2.13** Expression: `IS NOT DISTINCT FROM` / `IS DISTINCT FROM`
 - [ ] **2.14** Bitwise operators: `&`, `|`, `<<`, `>>`, `~`
 - [ ] **2.15** JSON operators: `->`, `->>`
 - [ ] **2.16** Compound SELECT: `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`
