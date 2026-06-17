@@ -10,7 +10,7 @@ use pest::iterators::{Pair, Pairs};
 use pest::pratt_parser::{Assoc, Op, PrattParser};
 
 use crate::ast::*;
-use crate::Rule;
+use crate::{build_select, Rule};
 
 /// Operator precedence, lowest binding first, matching SQLite's documented table
 /// (<https://www.sqlite.org/lang_expr.html>): OR < AND < NOT < (= IS LIKE GLOB) <
@@ -51,10 +51,58 @@ fn pratt() -> &'static PrattParser<Rule> {
 /// Build an [`Expr`] from a `Rule::expr` pair.
 pub(crate) fn build_expr(pair: Pair<'_, Rule>) -> Expr {
     debug_assert_eq!(pair.as_rule(), Rule::expr);
-    fold(pair.into_inner())
+    fold_expr(pair.into_inner())
 }
 
-fn fold(pairs: Pairs<'_, Rule>) -> Expr {
+/// Fold the flat token stream inside an `expr`.  Because `expr` now contains suffix constructs
+/// (BETWEEN, IN, EXISTS, CAST, CASE, COLLATE, IS DISTINCT FROM) that are *not* part of the Pratt
+/// operator table, we strip them out before feeding the remaining tokens to the Pratt parser and
+/// then re-attach them as AST wrappers after the fold.
+fn fold_expr(pairs: Pairs<'_, Rule>) -> Expr {
+    let mut pairs: Vec<Pair<'_, Rule>> = pairs.collect();
+    let mut suffixes = Vec::new();
+
+    // Split suffix operators off the end of the stream, working right-to-left so chained
+    // suffixes attach in the correct (left-to-right) order.  For example `a COLLATE b COLLATE c`
+    // becomes Collate(Collate(a, b), c).
+    while let Some(last) = pairs.last() {
+        if matches!(
+            last.as_rule(),
+            Rule::between_suffix | Rule::in_suffix | Rule::collate_suffix | Rule::is_distinct_suffix
+        ) {
+            suffixes.push(pairs.pop().unwrap());
+        } else {
+            break;
+        }
+    }
+
+    if pairs.is_empty() {
+        // Suffix-only `expr` should not happen; but if it does, fall back to a null literal to
+        // avoid a panic.  The grammar always supplies a primary before a suffix.
+        return Expr::Literal(Literal::Null);
+    }
+
+    // If the *only* remaining token is a primary that itself contains an expression tree
+    // (parenthesised expression, CASE, EXISTS, CAST), we do not need the Pratt fold at all.
+    if pairs.len() == 1 {
+        let single = pairs.into_iter().next().unwrap();
+        let folded = match single.as_rule() {
+            Rule::literal | Rule::column_ref | Rule::func_call => map_primary(single),
+            Rule::expr | Rule::exists_expr | Rule::cast_expr | Rule::case_expr => {
+                map_primary(single)
+            }
+            other => unreachable!("unexpected sole expr child {other:?}"),
+        };
+        return suffixes.into_iter().rev().fold(folded, apply_suffix);
+    }
+
+    let pairs_vec: Vec<Pair<'_, Rule>> = pairs.into_iter().collect();
+    let folded = fold(pairs_vec.into_iter().peekable());
+
+    suffixes.into_iter().rev().fold(folded, apply_suffix)
+}
+
+fn fold<'a, P: Iterator<Item = Pair<'a, Rule>>>(pairs: P) -> Expr {
     pratt()
         .map_primary(map_primary)
         .map_prefix(|op, rhs| {
@@ -151,9 +199,188 @@ fn apply_like_escape(like_cmp: Expr, escape: Expr) -> Expr {
     }
 }
 
+/// Apply a non-Pratt suffix construct (BETWEEN, IN, CASE, COLLATE, IS DISTINCT FROM) returned by
+/// the grammar as a wrapper around the already-folded left-hand expression.  EXISTS/CAST are handled
+/// as `primary` and never reach here.
+fn apply_suffix(expr: Expr, suffix: Pair<'_, Rule>) -> Expr {
+    match suffix.as_rule() {
+        Rule::between_suffix => build_between(expr, suffix),
+        Rule::in_suffix => build_in(expr, suffix),
+        Rule::case_expr => {
+            // CASE is a primary, so `expr` will be a placeholder null.  Build the CASE from the
+            // suffix children directly.
+            build_case(Expr::Literal(Literal::Null), suffix)
+        }
+        Rule::collate_suffix => {
+            let name = suffix
+                .into_inner()
+                .find(|p| p.as_rule() == Rule::ident)
+                .expect("collate_suffix has an ident")
+                .as_str()
+                .to_string();
+            Expr::Collate {
+                expr: Box::new(expr),
+                collation: name,
+            }
+        }
+        Rule::is_distinct_suffix => build_is_distinct(expr, suffix),
+        other => unreachable!("unexpected suffix {other:?}"),
+    }
+}
+
+fn build_between(expr: Expr, suffix: Pair<'_, Rule>) -> Expr {
+    let mut negated = false;
+    let mut exprs: Vec<Expr> = Vec::with_capacity(2);
+    for part in suffix.into_inner() {
+        match part.as_rule() {
+            Rule::K_NOT => negated = true,
+            Rule::literal => {
+                // Literal primaries inside BETWEEN are not wrapped in `expr` by the grammar.
+                exprs.push(map_primary(part));
+            }
+            Rule::expr => exprs.push(build_expr(part)),
+            _ => {}
+        }
+    }
+    if exprs.len() != 2 {
+        unreachable!("BETWEEN suffix must contain exactly two operands");
+    }
+    Expr::Between {
+        expr: Box::new(expr),
+        low: Box::new(exprs.remove(0)),
+        high: Box::new(exprs.remove(0)),
+        negated,
+    }
+}
+
+fn build_in(expr: Expr, suffix: Pair<'_, Rule>) -> Expr {
+    let mut negated = false;
+    let mut values = Vec::new();
+    for part in suffix.into_inner() {
+        match part.as_rule() {
+            Rule::K_NOT => negated = true,
+            Rule::expr => values.push(build_expr(part)),
+            _ => {}
+        }
+    }
+    Expr::In {
+        expr: Box::new(expr),
+        values,
+        negated,
+    }
+}
+fn build_case(_base: Expr, suffix: Pair<'_, Rule>) -> Expr {
+    // The suffix is `K_CASE ~ expr? ~ (K_WHEN ~ expr ~ K_THEN ~ expr)+ ~ (K_ELSE ~ expr)? ~ K_END`.
+    // Pest returns all `expr` children in source order: optional base first, then (when, then)
+    // pairs, then optional else.  We tag the tokens structurally to disambiguate.
+    #[derive(Clone)]
+    enum Tag<'a> {
+        Expr(Pair<'a, Rule>),
+        When,
+        Then,
+        Else,
+    }
+    let mut tags: Vec<Tag<'_>> = Vec::new();
+    for part in suffix.clone().into_inner() {
+        match part.as_rule() {
+            Rule::expr => tags.push(Tag::Expr(part)),
+            Rule::K_WHEN => tags.push(Tag::When),
+            Rule::K_THEN => tags.push(Tag::Then),
+            Rule::K_ELSE => tags.push(Tag::Else),
+            _ => {}
+        }
+    }
+
+    // Build the expression list once and remember the source position of each expr.
+    let mut exprs: Vec<Expr> = Vec::new();
+    for tag in &tags {
+        if let Tag::Expr(p) = tag {
+            exprs.push(build_expr(p.clone()));
+        }
+    }
+
+    let mut base: Option<Box<Expr>> = None;
+    let mut when_then: Vec<(Expr, Expr)> = Vec::new();
+    let mut else_expr: Option<Box<Expr>> = None;
+    let mut expr_iter = exprs.into_iter();
+    let mut when_buf: Option<Expr> = None;
+    let mut after_when = false;
+    let mut else_seen = false;
+    for tag in &tags {
+        match tag {
+            Tag::When => {
+                after_when = true;
+            }
+            Tag::Expr(_) => {
+                let e = expr_iter.next().unwrap();
+                if else_seen {
+                    else_expr = Some(Box::new(e));
+                } else if !after_when && base.is_none() {
+                    // Optional base expression (only exprs before the first K_WHEN).
+                    base = Some(Box::new(e));
+                } else if when_buf.is_none() {
+                    when_buf = Some(e);
+                } else {
+                    when_then.push((when_buf.take().unwrap(), e));
+                }
+            }
+            Tag::Then => {}
+            Tag::Else => {
+                else_seen = true;
+            }
+        }
+    }
+    Expr::Case {
+        base,
+        when_then,
+        else_expr,
+    }
+}
+
+fn build_is_distinct(expr: Expr, suffix: Pair<'_, Rule>) -> Expr {
+    let mut negated = false;
+    let mut rhs = None;
+    for part in suffix.into_inner() {
+        match part.as_rule() {
+            Rule::K_NOT => negated = true,
+            Rule::literal => rhs = Some(map_primary(part)),
+            Rule::expr => rhs = Some(build_expr(part)),
+            _ => {}
+        }
+    }
+    Expr::IsDistinctFrom {
+        left: Box::new(expr),
+        right: Box::new(rhs.expect("is_distinct_suffix has rhs")),
+        negated,
+    }
+}
+
 fn map_primary(pair: Pair<'_, Rule>) -> Expr {
     match pair.as_rule() {
-        Rule::expr => fold(pair.into_inner()), // parenthesised sub-expression
+        Rule::expr => fold_expr(pair.into_inner()), // parenthesised sub-expression
+        Rule::exists_expr => {
+            let select_pair = pair
+                .into_inner()
+                .find(|p| p.as_rule() == Rule::select_stmt)
+                .expect("exists_expr has a select_stmt");
+            Expr::Exists(Box::new(build_select(select_pair)))
+        }
+        Rule::cast_expr => {
+            let mut inner = pair.into_inner();
+            let expr_pair = inner
+                .find(|p| p.as_rule() == Rule::expr)
+                .expect("cast_expr has expr");
+            let type_name = inner
+                .find(|p| p.as_rule() == Rule::type_name)
+                .expect("cast_expr has type_name")
+                .as_str()
+                .to_string();
+            Expr::Cast {
+                expr: Box::new(build_expr(expr_pair)),
+                type_name,
+            }
+        }
+        Rule::case_expr => build_case(Expr::Literal(Literal::Null), pair),
         Rule::literal => build_literal_expr(pair),
         Rule::column_ref => build_column_ref(pair),
         Rule::func_call => build_func_call(pair),

@@ -80,12 +80,10 @@ macro_rules! skip_if_no_sqlite3 {
 /// Run a non-query (CREATE/INSERT) statement to completion, asserting it reaches Done.
 fn exec(conn: &mut Sqlite3, sql: &str) {
     let (mut stmt, _) = sqlite3_prepare_v2(conn, sql).unwrap_or_else(|e| panic!("prepare {sql}: {e}"));
-    loop {
-        match stmt.step() {
-            ResultCode::Done => break,
-            ResultCode::Row => panic!("unexpected row from {sql}"),
-            other => panic!("unexpected step result {other:?} from {sql}: {}", stmt.errmsg()),
-        }
+    match stmt.step() {
+        ResultCode::Done => {}
+        ResultCode::Row => panic!("unexpected row from {sql}"),
+        other => panic!("unexpected step result {other:?} from {sql}: {}", stmt.errmsg()),
     }
 }
 

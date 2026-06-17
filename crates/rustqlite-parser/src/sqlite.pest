@@ -95,8 +95,15 @@ K_LIKE          = @{ ^"like"          ~ !ident_cont }
 K_GLOB          = @{ ^"glob"          ~ !ident_cont }
 K_ESCAPE        = @{ ^"escape"        ~ !ident_cont }
 K_IN            = @{ ^"in"            ~ !ident_cont }
+K_BETWEEN       = @{ ^"between"       ~ !ident_cont }
 K_COLLATE       = @{ ^"collate"       ~ !ident_cont }
 K_CAST          = @{ ^"cast"          ~ !ident_cont }
+K_CASE          = @{ ^"case"          ~ !ident_cont }
+K_WHEN          = @{ ^"when"          ~ !ident_cont }
+K_THEN          = @{ ^"then"          ~ !ident_cont }
+K_ELSE          = @{ ^"else"          ~ !ident_cont }
+K_END           = @{ ^"end"           ~ !ident_cont }
+
 K_ON            = @{ ^"on"            ~ !ident_cont }
 K_CONFLICT      = @{ ^"conflict"      ~ !ident_cont }
 K_ABORT         = @{ ^"abort"         ~ !ident_cont }
@@ -122,7 +129,8 @@ keyword = @{
     | K_TEMP | K_TABLE | K_IF | K_EXISTS | K_PRIMARY | K_KEY | K_AUTOINCREMENT
     | K_UNIQUE | K_DEFAULT | K_INSERT | K_REPLACE | K_INTO | K_VALUES | K_NULL
     | K_TRUE | K_FALSE | K_AND | K_OR | K_NOT | K_IS | K_LIKE | K_GLOB | K_ESCAPE | K_IN
-    | K_COLLATE | K_CAST | K_ON | K_CONFLICT | K_ABORT | K_FAIL | K_IGNORE | K_ROLLBACK
+    | K_BETWEEN | K_COLLATE | K_CAST | K_CASE | K_WHEN | K_THEN | K_ELSE | K_END | K_DISTINCT
+    | K_ON | K_CONFLICT | K_ABORT | K_FAIL | K_IGNORE | K_ROLLBACK
     | K_EXPLAIN | K_DELETE | K_DROP | K_UPDATE | K_SET | K_INDEX
 }
 
@@ -240,12 +248,47 @@ drop_index_stmt = { K_DROP ~ K_INDEX ~ if_exists? ~ qualified_name }
 // `ESCAPE Z` is grammatically valid ONLY immediately after a `<operand> LIKE/NOT-LIKE <operand>`
 // comparison — never after GLOB (where `X GLOB Y ESCAPE Z` is a syntax error in SQLite). The
 // `like_clause` alternative wires `op_escape` only into the LIKE family; every other operator uses
-// the plain `other_infix`. The flat operator stream is then folded by the PrattParser (expr.rs),
-// where `op_escape` is an infix binding LOOSER than LIKE so the comparison folds first.
-expr = { prefix* ~ primary ~ (like_clause | other_infix)* }
+// the plain `other_infix`. BETWEEN/NOT BETWEEN, IN/NOT IN, EXISTS, CAST, CASE, COLLATE and IS
+// DISTINCT FROM are parsed as expression suffixes (matching upstream's grammar) and are not part
+// of the Pratt fold — they are attached to the preceding primary directly.
+expr = { prefix* ~ primary ~ suffix* }
+suffix = _{ like_clause | infix_suffix | between_suffix | in_suffix | collate_suffix | is_distinct_suffix }
+
 like_clause = _{ (op_not_like | op_like) ~ prefix* ~ primary ~ (op_escape ~ prefix* ~ primary)? }
-other_infix = _{ infix ~ prefix* ~ primary }
-primary = _{ literal | func_call | column_ref | "(" ~ expr ~ ")" }
+
+infix_suffix = _{ infix ~ prefix* ~ primary }
+
+// `X BETWEEN Y AND Z` / `X NOT BETWEEN Y AND Z`.  The AND is part of the BETWEEN clause and is
+// parsed greedily; `NOT BETWEEN` is tried before `BETWEEN` so the leading NOT is not interpreted as
+// a prefix operator.
+between_suffix = { K_NOT? ~ K_BETWEEN ~ prefix* ~ primary ~ K_AND ~ prefix* ~ primary }
+
+// `X IN (value, ...)` / `X NOT IN (value, ...)`.  Parenthesised single-expression value lists are
+// accepted for the single-value case; this does not overlap with subqueries (which are SELECTs).
+in_suffix = { K_NOT? ~ K_IN ~ "(" ~ (expr ~ ("," ~ expr)*)? ~ ")" }
+
+// `expr COLLATE name` — postfix collation operator, low precedence (tighter than LIKE here, but
+// lowered in the AST as a post-fix wrapper; the grammar makes it a suffix so it binds looser than
+// all Pratt infix operators).
+collate_suffix = { K_COLLATE ~ ident }
+
+// `expr IS [NOT] DISTINCT FROM expr`.
+is_distinct_suffix = { K_IS ~ K_NOT? ~ K_DISTINCT ~ K_FROM ~ prefix* ~ primary }
+
+// The following constructs are grammatically primaries (they cannot be chained as infix operands
+// and must be the sole or wrapped expression in their position).  They are kept in `primary` so
+// `SELECT EXISTS(...)` / `SELECT CAST(...)` / `SELECT CASE ... END` work without a dummy prefix.
+primary = _{ literal | exists_expr | cast_expr | case_expr | func_call | column_ref | "(" ~ expr ~ ")" }
+
+// `EXISTS (SELECT ...)` — allowed as a standalone primary (so `SELECT EXISTS(...)` works) and in
+// expression position (so `WHERE EXISTS(...)` works).
+exists_expr = { K_EXISTS ~ "(" ~ select_stmt ~ ")" }
+
+// `CAST (expr AS type_name)`.  type_name is matched with the same rule used for column definitions.
+cast_expr = { K_CAST ~ "(" ~ expr ~ K_AS ~ type_name ~ ")" }
+
+// `CASE [expr] WHEN expr THEN expr ... [ELSE expr] END`.
+case_expr = { K_CASE ~ expr? ~ (K_WHEN ~ expr ~ K_THEN ~ expr)+ ~ (K_ELSE ~ expr)? ~ K_END }
 
 literal = { number | string | blob | bind_param | K_NULL | K_TRUE | K_FALSE }
 

@@ -58,6 +58,13 @@ pub fn compile_expr(b: &mut ProgramBuilder, e: &Expr, target: i32, ctx: Ctx) -> 
             b.set_p5(idx, arg_exprs.len() as u8);
         }
         Expr::BindParam(_) => return Err(Error::msg("bind parameters are not supported in M3a")),
+        Expr::Between { .. } => return Err(Error::msg("BETWEEN is not supported by the executor yet")),
+        Expr::In { .. } => return Err(Error::msg("IN is not supported by the executor yet")),
+        Expr::Exists(_) => return Err(Error::msg("EXISTS is not supported by the executor yet")),
+        Expr::Cast { .. } => return Err(Error::msg("CAST is not supported by the executor yet")),
+        Expr::Case { .. } => return Err(Error::msg("CASE is not supported by the executor yet")),
+        Expr::Collate { .. } => return Err(Error::msg("COLLATE is not supported by the executor yet")),
+        Expr::IsDistinctFrom { .. } => return Err(Error::msg("IS DISTINCT FROM is not supported by the executor yet")),
     }
     Ok(())
 }

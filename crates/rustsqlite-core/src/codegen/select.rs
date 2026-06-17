@@ -561,6 +561,13 @@ fn expr_to_text(e: &Expr) -> String {
             format!("{name}({inner})")
         }
         Expr::BindParam(s) => s.clone(),
+        Expr::Between { .. } => "between".to_string(),
+        Expr::In { .. } => "in".to_string(),
+        Expr::Exists(_) => "exists".to_string(),
+        Expr::Cast { .. } => "cast".to_string(),
+        Expr::Case { .. } => "case".to_string(),
+        Expr::Collate { .. } => "collate".to_string(),
+        Expr::IsDistinctFrom { .. } => "is_distinct".to_string(),
     }
 }
 

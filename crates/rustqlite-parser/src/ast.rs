@@ -211,6 +211,36 @@ pub enum Expr {
         args: FunctionArgs,
     },
     BindParam(String),
+    Between {
+        expr: Box<Expr>,
+        low: Box<Expr>,
+        high: Box<Expr>,
+        negated: bool,
+    },
+    In {
+        expr: Box<Expr>,
+        values: Vec<Expr>,
+        negated: bool,
+    },
+    Exists(Box<SelectStmt>),
+    Cast {
+        expr: Box<Expr>,
+        type_name: String,
+    },
+    Case {
+        base: Option<Box<Expr>>,
+        when_then: Vec<(Expr, Expr)>,
+        else_expr: Option<Box<Expr>>,
+    },
+    Collate {
+        expr: Box<Expr>,
+        collation: String,
+    },
+    IsDistinctFrom {
+        left: Box<Expr>,
+        right: Box<Expr>,
+        negated: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

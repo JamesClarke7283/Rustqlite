@@ -576,7 +576,6 @@ fn build_drop_index(pair: Pair<'_, Rule>) -> DropIndexStmt {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn parses_empty_and_semicolons() {
         assert_eq!(parse("").unwrap().len(), 0);
@@ -866,5 +865,76 @@ mod tests {
             };
             assert_eq!(expr, &Expr::Literal(expected), "{sql}");
         }
+    }
+
+    #[test]
+    fn between_and_not_between() {
+        let Stmt::Select(s) = &parse("SELECT 1 WHERE 5 BETWEEN 1 AND 10;").unwrap()[0] else { panic!() };
+        assert!(matches!(
+            s.where_clause,
+            Some(Expr::Between { ref expr, ref low, ref high, negated }) if matches!(expr.as_ref(), Expr::Literal(Literal::Integer(5))) && matches!(low.as_ref(), Expr::Literal(Literal::Integer(1))) && matches!(high.as_ref(), Expr::Literal(Literal::Integer(10))) && !negated
+        ));
+        let Stmt::Select(s) = &parse("SELECT 1 WHERE 5 NOT BETWEEN 1 AND 10;").unwrap()[0] else { panic!() };
+        assert!(matches!(s.where_clause, Some(Expr::Between { negated: true, .. })));
+    }
+
+    #[test]
+    fn in_and_not_in_value_list() {
+        let Stmt::Select(s) = &parse("SELECT 1 WHERE 5 IN (1, 2, 3);").unwrap()[0] else { panic!() };
+        assert!(matches!(
+            s.where_clause,
+            Some(Expr::In { ref expr, ref values, negated }) if values.len() == 3 && !negated && matches!(expr.as_ref(), Expr::Literal(Literal::Integer(5)))
+        ));
+        let Stmt::Select(s) = &parse("SELECT 1 WHERE 5 NOT IN (1, 2);").unwrap()[0] else { panic!() };
+        assert!(matches!(s.where_clause, Some(Expr::In { negated: true, .. })));
+    }
+
+    #[test]
+    fn exists_subquery() {
+        let Stmt::Select(s) = &parse("SELECT 1 WHERE EXISTS (SELECT 1);").unwrap()[0] else { panic!() };
+        assert!(matches!(s.where_clause, Some(Expr::Exists(_))));
+    }
+
+    #[test]
+    fn cast_expression() {
+        let Stmt::Select(s) = &parse("SELECT CAST('123' AS INTEGER);").unwrap()[0] else { panic!() };
+        assert!(matches!(
+            s.columns[0],
+            ResultColumn::Expr { ref expr, .. } if matches!(expr, Expr::Cast { type_name, .. } if type_name == "INTEGER")
+        ));
+    }
+
+    #[test]
+    fn case_expression() {
+        let Stmt::Select(s) = &parse("SELECT CASE 1 WHEN 1 THEN 'one' ELSE 'other' END;").unwrap()[0] else { panic!() };
+        let ResultColumn::Expr { expr, .. } = &s.columns[0] else { panic!() };
+        let Expr::Case { base, when_then, else_expr } = expr else { panic!() };
+        assert!(base.is_some());
+        assert_eq!(when_then.len(), 1);
+        assert!(else_expr.is_some());
+
+        let Stmt::Select(s) = &parse("SELECT CASE WHEN 1=1 THEN 'yes' ELSE 'no' END;").unwrap()[0] else { panic!() };
+        let ResultColumn::Expr { expr, .. } = &s.columns[0] else { panic!() };
+        let Expr::Case { base, when_then, else_expr } = expr else { panic!() };
+        assert!(base.is_none());
+        assert_eq!(when_then.len(), 1);
+        assert!(else_expr.is_some());
+    }
+
+    #[test]
+    fn collate_expression() {
+        let Stmt::Select(s) = &parse("SELECT 1 COLLATE NOCASE;").unwrap()[0] else { panic!() };
+        let ResultColumn::Expr { expr, .. } = &s.columns[0] else { panic!() };
+        assert!(matches!(expr, Expr::Collate { collation, .. } if collation == "NOCASE"));
+    }
+
+    #[test]
+    fn is_distinct_from() {
+        let Stmt::Select(s) = &parse("SELECT 1 IS DISTINCT FROM 2;").unwrap()[0] else { panic!() };
+        let ResultColumn::Expr { expr, .. } = &s.columns[0] else { panic!() };
+        assert!(matches!(expr, Expr::IsDistinctFrom { negated: false, .. }));
+        let Stmt::Select(s) = &parse("SELECT 1 IS NOT DISTINCT FROM 1;").unwrap()[0] else { panic!() };
+        let ResultColumn::Expr { expr, .. } = &s.columns[0] else { panic!() };
+        assert!(matches!(expr, Expr::IsDistinctFrom { negated: true, .. }));
     }
 }
