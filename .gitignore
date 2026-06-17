@@ -11,3 +11,4 @@ Cargo.lock.orig
 /*.db-wal
 /*.db-shm
 /scratch/
+.loop*
