@@ -47,6 +47,10 @@ pub struct IndexObject {
     pub rootpage: i64,
     pub columns: Vec<IndexedColumn>,
     pub unique: bool,
+    /// `true` when the index is a `UNIQUE` index and every indexed column is `NOT NULL`.
+    /// This mirrors SQLite's `Index.uniqNotNull`: uniqueness is only enforced on rows where
+    /// none of the key columns are NULL (NULL != NULL in SQL).
+    pub unique_not_null: bool,
 }
 
 /// One column entry in an `IndexObject`. The M5.2 runtime uses `name` to map the column back
@@ -193,7 +197,19 @@ impl IndexObject {
     /// Build an `IndexObject` from a `sqlite_schema` row by parsing its `CREATE INDEX` text.
     /// Returns an error when the stored SQL is missing, doesn't parse, or doesn't reduce to
     /// a `CREATE INDEX` statement.
+    ///
+    /// The optional `catalog` argument lets the loader supply the parent table so the
+    /// `unique_not_null` flag can be computed from the indexed columns' NOT NULL status.
     pub fn from_schema_object(obj: &SchemaObject) -> Result<IndexObject> {
+        IndexObject::from_schema_object_with_catalog(obj, None)
+    }
+
+    /// Build an `IndexObject` from a `sqlite_schema` row, optionally using the surrounding
+    /// catalog to resolve the parent table for NOT NULL status.
+    pub fn from_schema_object_with_catalog(
+        obj: &SchemaObject,
+        catalog: Option<&crate::schema::Catalog>,
+    ) -> Result<IndexObject> {
         let sql = obj
             .sql
             .as_deref()
@@ -213,15 +229,41 @@ impl IndexObject {
                 )))
             }
         };
+        // The table object is needed to compute `unique_not_null` (all indexed columns NOT NULL).
+        // The catalog loader already has the table resolved when it builds the index list, but
+        // standalone callers (tests) may not. Build a throwaway table from the stored CREATE TABLE
+        // SQL when available; otherwise fall back to a table with no not-null information.
+        let table = catalog
+            .as_ref()
+            .and_then(|cat| cat.find_table(&ci.table))
+            .and_then(|t| t.sql.as_deref())
+            .and_then(|sql| {
+                Table::from_schema_object(&SchemaObject {
+                    rowid: 0,
+                    obj_type: "table".to_string(),
+                    name: ci.table.clone(),
+                    tbl_name: ci.table.clone(),
+                    rootpage: 0,
+                    sql: Some(sql.to_string()),
+                })
+                .ok()
+            })
+            .unwrap_or_else(|| Table {
+                name: ci.table.clone(),
+                rootpage: 0,
+                columns: Vec::new(),
+                rowid_alias: None,
+            });
         Ok(IndexObject::from_create(
             &ci,
             obj.rootpage,
             obj.name.clone(),
+            &table,
         ))
     }
 
-    fn from_create(ci: &CreateIndex, rootpage: i64, name: String) -> IndexObject {
-        let columns = ci
+    fn from_create(ci: &CreateIndex, rootpage: i64, name: String, table: &Table) -> IndexObject {
+        let columns: Vec<IndexedColumn> = ci
             .columns
             .iter()
             .map(|c| IndexedColumn {
@@ -234,12 +276,20 @@ impl IndexObject {
                 desc: c.desc,
             })
             .collect();
+        let unique_not_null = ci.unique
+            && columns.iter().all(|ic| {
+                table
+                    .column_index(&ic.name)
+                    .map(|idx| table.columns[idx].notnull)
+                    .unwrap_or(false)
+            });
         IndexObject {
             name,
             table: ci.table.clone(),
             rootpage,
             columns,
             unique: ci.unique,
+            unique_not_null,
         }
     }
 
@@ -257,6 +307,26 @@ impl IndexObject {
             .iter()
             .zip(names.iter())
             .all(|(ic, name)| ic.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The "UNIQUE constraint failed: table.col1, col2, ..." message used by C SQLite for this
+    /// index. Returns `None` when the index is not unique.
+    pub fn unique_constraint_message(&self, table: &Table) -> Option<String> {
+        if !self.unique {
+            return None;
+        }
+        let names: Vec<String> = self
+            .columns
+            .iter()
+            .map(|ic| format!("{}.{}", table.name, ic.name))
+            .collect();
+        Some(format!("UNIQUE constraint failed: {}", names.join(", ")))
+    }
+
+    /// Build an `IndexObject` from a parsed `CREATE INDEX` and a resolved parent table.
+    /// Used by `compile_create_index` and tests when the table is already known.
+    pub fn from_create_and_table(ci: &CreateIndex, rootpage: i64, table: &Table) -> IndexObject {
+        IndexObject::from_create(ci, rootpage, ci.name.clone(), table)
     }
 }
 

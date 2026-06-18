@@ -58,7 +58,7 @@ use rustqlite_parser::{Assignment, UpdateStmt};
 use crate::error::{Error, Result};
 use crate::schema::{IndexObject, Table};
 use crate::types::Affinity;
-use crate::vdbe::program::{Program, P4, P5_ISUPDATE};
+use crate::vdbe::program::{Program, P4, P5_ISUPDATE, P5_UNIQUE};
 use crate::vdbe::{KeyField, Opcode};
 
 use super::builder::ProgramBuilder;
@@ -302,7 +302,18 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
         let new_key_rec = b.alloc_reg();
         b.emit(Opcode::MakeRecord, new_key, nkey, new_key_rec);
         let idx_ins = b.emit(Opcode::IdxInsert, ic, new_key_rec, 0);
-        b.set_p4(idx_ins, P4::Int(0));
+        let mut p5 = P5_ISUPDATE;
+        if idx.unique {
+            p5 |= P5_UNIQUE;
+            if let Some(msg) = idx.unique_constraint_message(table) {
+                b.set_p4(idx_ins, P4::Text(msg));
+            } else {
+                b.set_p4(idx_ins, P4::Int(0));
+            }
+        } else {
+            b.set_p4(idx_ins, P4::Int(0));
+        }
+        b.set_p5(idx_ins, p5);
 
         let _ = i;
     }

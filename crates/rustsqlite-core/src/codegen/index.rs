@@ -43,7 +43,7 @@ use rustqlite_parser::CreateIndex;
 use crate::error::{Error, Result};
 use crate::schema::{IndexObject, Table};
 use crate::types::Value;
-use crate::vdbe::program::{Program, P4, P5_NCHANGE};
+use crate::vdbe::program::{Program, P4, P5_NCHANGE, P5_UNIQUE};
 use crate::vdbe::{KeyField, Opcode};
 
 use super::builder::ProgramBuilder;
@@ -71,25 +71,7 @@ pub fn compile_create_index(
             "schema-qualified CREATE INDEX is not yet supported",
         ));
     }
-    let dummy = IndexObject {
-        name: String::new(),
-        table: ci.table.clone(),
-        rootpage: 0,
-        unique: ci.unique,
-        columns: ci
-            .columns
-            .iter()
-            .map(|c| crate::schema::IndexedColumn {
-                name: c.name.clone(),
-                collation: c
-                    .collation
-                    .as_deref()
-                    .and_then(crate::types::Collation::from_name)
-                    .unwrap_or(crate::types::Collation::Binary),
-                desc: c.desc,
-            })
-            .collect(),
-    };
+    let dummy = IndexObject::from_create_and_table(ci, 0, table);
     let indexed_cis = dummy.table_column_indices(table)?;
 
     let mut b = ProgramBuilder::new();
@@ -154,8 +136,18 @@ pub fn compile_create_index(
     );
     b.emit(Opcode::MakeRecord, key_start, nkey, rec_reg);
     let idx_insert = b.emit(Opcode::IdxInsert, idx_cursor, rec_reg, 0);
-    b.set_p4(idx_insert, P4::Int(0)); // nMem = 0
-    b.set_p5(idx_insert, P5_NCHANGE);
+    let mut p5 = P5_NCHANGE;
+    if dummy.unique {
+        p5 |= P5_UNIQUE;
+        if let Some(msg) = dummy.unique_constraint_message(table) {
+            b.set_p4(idx_insert, P4::Text(msg));
+        } else {
+            b.set_p4(idx_insert, P4::Int(0));
+        }
+    } else {
+        b.set_p4(idx_insert, P4::Int(0)); // nMem = 0
+    }
+    b.set_p5(idx_insert, p5);
     b.emit_jump(Opcode::Next, table_cursor, populate_top_label, 0);
 
     b.resolve(end_populate);

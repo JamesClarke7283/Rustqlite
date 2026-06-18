@@ -131,6 +131,11 @@ pub const P5_NCHANGE: u8 = 0x01;
 /// Mirrors `OPFLAG_PREFORMAT`.
 pub const P5_PREFORMAT: u8 = 0x02;
 
+/// Flag bit for `IdxInsert`: this insert is for a `UNIQUE` index; the b-tree layer must
+/// raise `SQLITE_CONSTRAINT_UNIQUE` if an entry with the same indexed-column prefix already
+/// exists (and none of the key columns are NULL). Mirrors `OPFLAG_UNIQUE` from `vdbe.c`.
+pub const P5_UNIQUE: u8 = 0x08;
+
 /// Encode an [`crate::types::Affinity`] (or `None`) into the comparison `p5` affinity bits.
 pub fn aff_to_p5(aff: Option<crate::types::Affinity>) -> u8 {
     use crate::types::Affinity::*;

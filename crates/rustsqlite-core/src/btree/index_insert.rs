@@ -14,6 +14,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::format::{decode_record, TextEncoding};
@@ -24,6 +25,7 @@ use crate::vdbe::KeyField;
 
 use super::balance;
 use super::cell::{build_index_leaf_cell, parse_index_interior_cell, parse_index_leaf_cell};
+use super::index_cursor::{IndexCursor, SeekOp};
 use super::page::{self, PageHeader, PageType};
 
 /// Insert a new index entry into the b-tree rooted at `root`. Walks interior pages if the tree
@@ -31,20 +33,83 @@ use super::page::{self, PageHeader, PageType};
 /// overflow. `key_record` is the encoded record (`[indexed columns..., rowid]`). `key_info`
 /// carries the per-column collation and DESC flag so comparisons during descent/split use the
 /// same rules as the index cursor.
+///
+/// When `unique` is true, the insert first checks whether an entry whose indexed-column prefix
+/// already exists; if so, it returns `SQLITE_CONSTRAINT_UNIQUE` before making any change.
 pub async fn index_insert(
-    pager: &Pager,
+    pager: Arc<Pager>,
     root: u32,
     key_record: &[u8],
     key_info: &[KeyField],
+    unique: bool,
 ) -> Result<()> {
+    if unique {
+        check_unique_constraint(pager.clone(), root, key_record, key_info).await?;
+    }
     loop {
-        match index_insert_with_splitting(pager, root, key_record, key_info, &mut Vec::new()).await
+        match index_insert_with_splitting(&pager, root, key_record, key_info, &mut Vec::new()).await
         {
             Ok(()) => return Ok(()),
             Err(e) if needs_restart(&e) => continue,
             Err(other) => return Err(other),
         }
     }
+}
+
+/// Check whether the unique-index prefix of `key_record` already exists in the index. Returns
+/// an error with `SQLITE_CONSTRAINT_UNIQUE` if a duplicate is found. NULL in any indexed column
+/// suppresses the check (NULL is never equal to NULL in SQL).
+async fn check_unique_constraint(
+    pager: Arc<Pager>,
+    root: u32,
+    key_record: &[u8],
+    key_info: &[KeyField],
+) -> Result<()> {
+    let encoding = pager.text_encoding();
+    let search = decode_record(key_record, encoding)?;
+    let nkey = search.len().saturating_sub(1); // exclude trailing rowid
+    if nkey == 0 {
+        return Ok(());
+    }
+    let prefix = &search[..nkey];
+    // NULL in any indexed column means no conflict.
+    if prefix.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(());
+    }
+    let mut cursor = IndexCursor::new(pager, root, key_info.to_vec());
+    if !cursor.seek(SeekOp::Ge, prefix).await? {
+        return Ok(());
+    }
+    let payload = cursor.payload();
+    let existing = decode_record(payload, encoding)?;
+    let existing_prefix_len = existing.len().saturating_sub(1);
+    if existing_prefix_len != nkey {
+        return Ok(());
+    }
+    let existing_prefix = &existing[..existing_prefix_len];
+    if prefixes_equal(existing_prefix, prefix, key_info) {
+        return Err(Error::new(
+            crate::error::ResultCode::Constraint,
+            "UNIQUE constraint failed",
+        ));
+    }
+    Ok(())
+}
+
+fn prefixes_equal(a: &[Value], b: &[Value], key_info: &[KeyField]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        let coll = key_info
+            .get(i)
+            .map(|f| f.collation)
+            .unwrap_or(Collation::Binary);
+        if mem_compare(x, y, coll) != std::cmp::Ordering::Equal {
+            return false;
+        }
+    }
+    true
 }
 
 fn needs_restart(e: &Error) -> bool {
@@ -406,12 +471,15 @@ mod tests {
                 .await
                 .unwrap();
 
+            let pager = Arc::new(pager);
             pager.begin_write().await.unwrap();
             let idx_root = create_index_btree(&pager).await.unwrap();
 
             for rowid in 1i64..=200 {
                 let key = encode_record(&[Value::Int(rowid), Value::Int(rowid)]);
-                index_insert(&pager, idx_root, &key, &[]).await.unwrap();
+                index_insert(pager.clone(), idx_root, &key, &[], false)
+                    .await
+                    .unwrap();
             }
 
             let scanned = scan_index(&pager, idx_root).await.unwrap();
@@ -442,12 +510,15 @@ mod tests {
                 .await
                 .unwrap();
 
+            let pager = Arc::new(pager);
             pager.begin_write().await.unwrap();
             let idx_root = create_index_btree(&pager).await.unwrap();
 
             for i in 1i64..=100 {
                 let key = encode_record(&[Value::Int(i % 5), Value::Int(i), Value::Int(i)]);
-                index_insert(&pager, idx_root, &key, &[]).await.unwrap();
+                index_insert(pager.clone(), idx_root, &key, &[], false)
+                    .await
+                    .unwrap();
             }
 
             let scanned = scan_index(&pager, idx_root).await.unwrap();
@@ -476,12 +547,15 @@ mod tests {
                     .await
                     .unwrap();
 
+                let pager = Arc::new(pager);
                 pager.begin_write().await.unwrap();
                 let idx_root = create_index_btree(&pager).await.unwrap();
 
                 for i in (1i64..=n as i64).rev() {
                     let key = encode_record(&[Value::Int(i), Value::Int(i)]);
-                    index_insert(&pager, idx_root, &key, &[]).await.unwrap();
+                    index_insert(pager.clone(), idx_root, &key, &[], false)
+                        .await
+                        .unwrap();
                 }
 
                 let scanned = scan_index(&pager, idx_root).await.unwrap();
@@ -517,12 +591,15 @@ mod tests {
                 .await
                 .unwrap();
 
+            let pager = Arc::new(pager);
             pager.begin_write().await.unwrap();
             let idx_root = create_index_btree(&pager).await.unwrap();
 
             for i in 1i64..=10 {
                 let key = encode_record(&[Value::Int(i), Value::Int(i)]);
-                index_insert(&pager, idx_root, &key, &[]).await.unwrap();
+                index_insert(pager.clone(), idx_root, &key, &[], false)
+                    .await
+                    .unwrap();
             }
             let scanned = scan_index(&pager, idx_root).await.unwrap();
             assert_eq!(scanned.len(), 10);
@@ -547,13 +624,16 @@ mod tests {
                 .await
                 .unwrap();
 
+            let pager = Arc::new(pager);
             pager.begin_write().await.unwrap();
             let idx_root = create_index_btree(&pager).await.unwrap();
 
             let n = 5000i64;
             for rowid in 1i64..=n {
                 let key = encode_record(&[Value::Int(rowid), Value::Int(rowid)]);
-                index_insert(&pager, idx_root, &key, &[]).await.unwrap();
+                index_insert(pager.clone(), idx_root, &key, &[], false)
+                    .await
+                    .unwrap();
             }
 
             let scanned = scan_index(&pager, idx_root).await.unwrap();
@@ -576,6 +656,67 @@ mod tests {
         });
     }
 
+    /// A UNIQUE index detects a duplicate indexed-column prefix and rejects the insert.
+    #[test]
+    fn unique_index_rejects_duplicate() {
+        rt().block_on(async {
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
+            let file = vfs
+                .open("unique.db", OpenFlags::READWRITE_CREATE)
+                .await
+                .unwrap();
+            let pager = Pager::create_fresh(vfs.clone(), "unique.db".into(), file, 512)
+                .await
+                .unwrap();
+            let pager = Arc::new(pager);
+
+            pager.begin_write().await.unwrap();
+            let idx_root = create_index_btree(&pager).await.unwrap();
+
+            let key1 = encode_record(&[Value::Text("x".into()), Value::Int(1)]);
+            let key2 = encode_record(&[Value::Text("x".into()), Value::Int(2)]);
+            index_insert(pager.clone(), idx_root, &key1, &[], true)
+                .await
+                .unwrap();
+            let err = index_insert(pager.clone(), idx_root, &key2, &[], true)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, crate::error::ResultCode::Constraint);
+
+            pager.commit().await.unwrap();
+        });
+    }
+
+    /// NULL entries never conflict in a UNIQUE index.
+    #[test]
+    fn unique_index_allows_duplicate_null() {
+        rt().block_on(async {
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
+            let file = vfs
+                .open("uniquenull.db", OpenFlags::READWRITE_CREATE)
+                .await
+                .unwrap();
+            let pager = Pager::create_fresh(vfs.clone(), "uniquenull.db".into(), file, 512)
+                .await
+                .unwrap();
+            let pager = Arc::new(pager);
+
+            pager.begin_write().await.unwrap();
+            let idx_root = create_index_btree(&pager).await.unwrap();
+
+            let key1 = encode_record(&[Value::Null, Value::Int(1)]);
+            let key2 = encode_record(&[Value::Null, Value::Int(2)]);
+            index_insert(pager.clone(), idx_root, &key1, &[], true)
+                .await
+                .unwrap();
+            index_insert(pager.clone(), idx_root, &key2, &[], true)
+                .await
+                .unwrap();
+
+            pager.commit().await.unwrap();
+        });
+    }
+
     /// Insert just enough entries on a 512-byte page to trigger a single root promotion,
     /// then verify the exact key count and ordering.
     #[test]
@@ -590,19 +731,24 @@ mod tests {
                 .await
                 .unwrap();
 
+            let pager = Arc::new(pager);
             pager.begin_write().await.unwrap();
             let idx_root = create_index_btree(&pager).await.unwrap();
 
             for i in 1i64..=10 {
                 let key = encode_record(&[Value::Int(i), Value::Int(i)]);
-                index_insert(&pager, idx_root, &key, &[]).await.unwrap();
+                index_insert(pager.clone(), idx_root, &key, &[], false)
+                    .await
+                    .unwrap();
             }
             let scanned = scan_index(&pager, idx_root).await.unwrap();
             assert_eq!(scanned.len(), 10, "pre-split: expected 10 entries");
 
             for i in 11i64..=80 {
                 let key = encode_record(&[Value::Int(i), Value::Int(i)]);
-                index_insert(&pager, idx_root, &key, &[]).await.unwrap();
+                index_insert(pager.clone(), idx_root, &key, &[], false)
+                    .await
+                    .unwrap();
             }
             let scanned = scan_index(&pager, idx_root).await.unwrap();
             assert_eq!(

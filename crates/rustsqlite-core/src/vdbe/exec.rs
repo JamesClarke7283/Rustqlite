@@ -25,7 +25,7 @@ use super::cursor::VdbeCursor;
 use super::opcode::Opcode;
 use super::program::{
     p5_to_aff, Instruction, Program, P4, P5_ISUPDATE, P5_JUMPIFNULL, P5_NCHANGE, P5_NULLEQ,
-    P5_STOREP2,
+    P5_STOREP2, P5_UNIQUE,
 };
 use super::sorter::Sorter;
 use super::KeyField;
@@ -526,7 +526,18 @@ impl Vdbe {
                         _ => return Err(Error::msg("IdxInsert expects a record blob in p2")),
                     };
                     let key_info = self.index_key_info(p1);
-                    btree::index_insert(&pager, root, &record, &key_info).await?;
+                    let unique = p5 & P5_UNIQUE != 0;
+                    match btree::index_insert(pager, root, &record, &key_info, unique).await {
+                        Ok(()) => {}
+                        Err(e) if e.code == crate::error::ResultCode::Constraint && unique => {
+                            let msg = match &inst.p4 {
+                                P4::Text(s) => s.clone(),
+                                _ => "UNIQUE constraint failed".to_string(),
+                            };
+                            return Err(Error::new(crate::error::ResultCode::Constraint, msg));
+                        }
+                        Err(other) => return Err(other),
+                    }
                     if p5 & P5_NCHANGE != 0 {
                         self.ctx.changes += 1;
                         self.ctx.total_changes += 1;

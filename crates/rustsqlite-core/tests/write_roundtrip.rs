@@ -305,6 +305,103 @@ fn drop_table_if_exists_unknown_is_silent() {
     );
 }
 
+/// M5.2.8: a `CREATE UNIQUE INDEX` rejects duplicate non-NULL keys and preserves the first
+/// inserted row. NULLs never conflict.
+#[test]
+fn unique_index_rejects_duplicate_insert() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("uniqueidx");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a TEXT, b INT);");
+        exec(&mut conn, "CREATE UNIQUE INDEX i_a ON t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES('x',1);");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES('x',2);").unwrap();
+        assert!(
+            stmt.step() != ResultCode::Done,
+            "expected unique-constraint error, got success"
+        );
+        assert!(
+            stmt.errmsg().contains("UNIQUE constraint failed: t.a"),
+            "error message: {}",
+            stmt.errmsg()
+        );
+        // NULL values are allowed to repeat in a UNIQUE index.
+        exec(&mut conn, "INSERT INTO t VALUES(NULL,3);");
+        exec(&mut conn, "INSERT INTO t VALUES(NULL,4);");
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT b FROM t WHERE a = 'x';"), "1");
+    assert_eq!(
+        db.query("SELECT b FROM t WHERE a IS NULL ORDER BY b;"),
+        "3\n4"
+    );
+}
+
+/// M5.2.8: multi-column `CREATE UNIQUE INDEX` enforces uniqueness across the indexed columns.
+#[test]
+fn multi_column_unique_index_rejects_duplicate() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("uniquemcidx");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a TEXT, b INT, c TEXT);");
+        exec(&mut conn, "CREATE UNIQUE INDEX i_ab ON t(a, b);");
+        exec(
+            &mut conn,
+            "INSERT INTO t VALUES('x',1,'r1'),('x',2,'r2'),('y',1,'r3');",
+        );
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES('x',1,'r4');").unwrap();
+        assert!(
+            stmt.step() != ResultCode::Done,
+            "expected unique-constraint error, got success"
+        );
+        assert!(
+            stmt.errmsg().contains("UNIQUE constraint failed: t.a, t.b"),
+            "error message: {}",
+            stmt.errmsg()
+        );
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT c FROM t ORDER BY c;"), "r1\nr2\nr3");
+}
+
+/// M5.2.8: an `UPDATE` that would create a duplicate key in a UNIQUE index is rejected.
+#[test]
+fn unique_index_rejects_duplicate_update() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("uniqueupd");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a TEXT, b INT);");
+        exec(&mut conn, "CREATE UNIQUE INDEX i_a ON t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES('x',1),('y',2);");
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "UPDATE t SET a = 'x' WHERE b = 2;").unwrap();
+        assert!(
+            stmt.step() != ResultCode::Done,
+            "expected unique-constraint error, got success"
+        );
+        assert!(
+            stmt.errmsg().contains("UNIQUE constraint failed: t.a"),
+            "error message: {}",
+            stmt.errmsg()
+        );
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a FROM t ORDER BY a;"), "x\ny");
+}
+
 /// M5.1: `CREATE INDEX` writes a valid index b-tree and a matching `sqlite_schema` row; the C
 /// oracle opens the file, sees the index, and returns identical indexed-lookup rows.
 #[test]

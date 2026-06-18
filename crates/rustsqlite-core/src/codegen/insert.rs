@@ -20,7 +20,7 @@ use rustqlite_parser::{Expr, InsertStmt};
 use crate::error::{Error, Result};
 use crate::schema::{IndexObject, Table};
 use crate::types::Affinity;
-use crate::vdbe::program::{Program, P4, P5_NCHANGE};
+use crate::vdbe::program::{Program, P4, P5_NCHANGE, P5_UNIQUE};
 use crate::vdbe::Opcode;
 
 use super::builder::ProgramBuilder;
@@ -179,8 +179,18 @@ pub fn compile_insert(ins: &InsertStmt, table: &Table, indexes: &[IndexObject]) 
             let key_rec = b.alloc_reg();
             b.emit(Opcode::MakeRecord, key_start, nkey, key_rec);
             let ins_idx = b.emit(Opcode::IdxInsert, ic, key_rec, 0);
-            b.set_p4(ins_idx, P4::Int(0)); // nMem = 0
-            b.set_p5(ins_idx, P5_NCHANGE);
+            let mut p5 = P5_NCHANGE;
+            if idx.unique {
+                p5 |= P5_UNIQUE;
+                if let Some(msg) = idx.unique_constraint_message(table) {
+                    b.set_p4(ins_idx, P4::Text(msg));
+                } else {
+                    b.set_p4(ins_idx, P4::Int(0));
+                }
+            } else {
+                b.set_p4(ins_idx, P4::Int(0)); // nMem = 0
+            }
+            b.set_p5(ins_idx, p5);
         }
     }
 
