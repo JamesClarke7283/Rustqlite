@@ -147,15 +147,13 @@ pub fn build_table_leaf_cell(
         loop {
             let take = (tail.len() - offset).min(chunk);
             let is_last = offset + take == tail.len();
-            let next_pgno = if is_last {
-                0u32
-            } else {
-                pager.allocate_page()
-            };
+            let next_pgno = if is_last { 0u32 } else { pager.allocate_page() };
             let mut buf = vec![0u8; pager.page_size()];
             buf[0..4].copy_from_slice(&next_pgno.to_be_bytes());
             buf[4..4 + take].copy_from_slice(&tail[offset..offset + take]);
-            pager.write_page(curr_pgno, buf).expect("write overflow page");
+            pager
+                .write_page(curr_pgno, buf)
+                .expect("write overflow page");
             offset += take;
             if is_last {
                 break;
@@ -276,15 +274,13 @@ pub fn build_index_leaf_cell(
         loop {
             let take = (tail.len() - offset).min(chunk);
             let is_last = offset + take == tail.len();
-            let next_pgno = if is_last {
-                0u32
-            } else {
-                pager.allocate_page()
-            };
+            let next_pgno = if is_last { 0u32 } else { pager.allocate_page() };
             let mut buf = vec![0u8; pager.page_size()];
             buf[0..4].copy_from_slice(&next_pgno.to_be_bytes());
             buf[4..4 + take].copy_from_slice(&tail[offset..offset + take]);
-            pager.write_page(curr_pgno, buf).expect("write overflow page");
+            pager
+                .write_page(curr_pgno, buf)
+                .expect("write overflow page");
             offset += take;
             if is_last {
                 break;
@@ -324,15 +320,13 @@ pub fn build_index_interior_cell(
         loop {
             let take = (tail.len() - offset).min(chunk);
             let is_last = offset + take == tail.len();
-            let next_pgno = if is_last {
-                0u32
-            } else {
-                pager.allocate_page()
-            };
+            let next_pgno = if is_last { 0u32 } else { pager.allocate_page() };
             let mut buf = vec![0u8; pager.page_size()];
             buf[0..4].copy_from_slice(&next_pgno.to_be_bytes());
             buf[4..4 + take].copy_from_slice(&tail[offset..offset + take]);
-            pager.write_page(curr_pgno, buf).expect("write overflow page");
+            pager
+                .write_page(curr_pgno, buf)
+                .expect("write overflow page");
             offset += take;
             if is_last {
                 break;
@@ -367,7 +361,11 @@ pub async fn assemble_index_interior_payload(
             return Err(Error::corrupt("overflow page shorter than expected"));
         }
         payload.extend_from_slice(&page[4..4 + want]);
-        next = if next_pgno == 0 { None } else { Some(next_pgno) };
+        next = if next_pgno == 0 {
+            None
+        } else {
+            Some(next_pgno)
+        };
     }
 
     if payload.len() < total {

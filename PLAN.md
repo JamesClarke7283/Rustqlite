@@ -142,11 +142,11 @@ list every granular item needed.
 ## M5.2 — Index Page Splits & Multi-Column Indexes
 
 - [x] **5.2.1** Index b-tree page split (`split_index_leaf` → propagate page-full correctly)
-- [ ] **5.2.2** Index b-tree interior-page traversal (insert into interior nodes)
-- [ ] **5.2.3** Multi-column `CREATE INDEX … ON tbl(col1, col2, …)` in parser
-- [ ] **5.2.4** Multi-column index record format (concatenated columns + rowid suffix)
-- [ ] **5.2.5** Multi-column index codegen: `IdxInsert` / `IdxDelete` with composite keys
-- [ ] **5.2.6** Multi-column index seek: prefix comparison for `WHERE col1 = ? AND col2 = ?`
+- [x] **5.2.2** Index b-tree interior-page traversal (insert into interior nodes)
+- [x] **5.2.3** Multi-column `CREATE INDEX … ON tbl(col1, col2, …)` in parser
+- [x] **5.2.4** Multi-column index record format (concatenated columns + rowid suffix)
+- [x] **5.2.5** Multi-column index codegen: `IdxInsert` / `IdxDelete` with composite keys
+- [x] **5.2.6** Multi-column index seek: prefix comparison for `WHERE col1 = ? AND col2 = ?`
 - [ ] **5.2.7** `KeyInfo` structure carrying collation sequence per column for sorter/index comparisons
 - [ ] **5.2.8** Enforce `UNIQUE` constraint at `IdxInsert` time (raise `SQLITE_CONSTRAINT_UNIQUE`)
 - [ ] **5.2.9** Partial indexes: `CREATE INDEX … WHERE expr` (parser + catalog + codegen filter)

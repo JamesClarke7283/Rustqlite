@@ -40,9 +40,7 @@ pub async fn destroy(pager: &Pager, root: u32) -> Result<u32> {
                     let usable = pager.usable_size();
                     for i in 0..hdr.num_cells as usize {
                         let off = hdr.cell_pointer(&page, i)?;
-                        if let Ok(cell) =
-                            super::cell::parse_table_leaf_cell(&page, off, usable)
-                        {
+                        if let Ok(cell) = super::cell::parse_table_leaf_cell(&page, off, usable) {
                             if let Some(first) = cell.overflow_page {
                                 free_overflow_chain(pager, first).await?;
                             }

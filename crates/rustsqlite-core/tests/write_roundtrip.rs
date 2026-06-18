@@ -79,11 +79,15 @@ macro_rules! skip_if_no_sqlite3 {
 
 /// Run a non-query (CREATE/INSERT) statement to completion, asserting it reaches Done.
 fn exec(conn: &mut Sqlite3, sql: &str) {
-    let (mut stmt, _) = sqlite3_prepare_v2(conn, sql).unwrap_or_else(|e| panic!("prepare {sql}: {e}"));
+    let (mut stmt, _) =
+        sqlite3_prepare_v2(conn, sql).unwrap_or_else(|e| panic!("prepare {sql}: {e}"));
     match stmt.step() {
         ResultCode::Done => {}
         ResultCode::Row => panic!("unexpected row from {sql}"),
-        other => panic!("unexpected step result {other:?} from {sql}: {}", stmt.errmsg()),
+        other => panic!(
+            "unexpected step result {other:?} from {sql}: {}",
+            stmt.errmsg()
+        ),
     }
 }
 
@@ -113,7 +117,11 @@ fn create_insert_select_roundtrip_and_c_oracle() {
 
         // changes() == 2 after the insert; last_insert_rowid() == 2.
         assert_eq!(conn.changes(), 2, "changes() after INSERT");
-        assert_eq!(conn.last_insert_rowid(), 2, "last_insert_rowid() after INSERT");
+        assert_eq!(
+            conn.last_insert_rowid(),
+            2,
+            "last_insert_rowid() after INSERT"
+        );
 
         // SELECT a, b FROM t returns the two rows through the engine itself.
         let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t;").unwrap();
@@ -210,10 +218,7 @@ fn delete_roundtrip_and_c_oracle() {
         exec(&mut conn, &format!("INSERT INTO t VALUES ({n}, 'r{n}');"));
     }
     exec(&mut conn, "DELETE FROM t WHERE a > 5;");
-    assert_eq!(
-        db.query("SELECT a FROM t ORDER BY a;"),
-        "1\n2\n3\n4\n5"
-    );
+    assert_eq!(db.query("SELECT a FROM t ORDER BY a;"), "1\n2\n3\n4\n5");
     assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
 }
 
@@ -260,10 +265,7 @@ fn update_roundtrip_and_c_oracle() {
         let mut conn = sqlite3_open(db.str()).expect("open");
         exec(&mut conn, "CREATE TABLE t(a, b);");
         for n in 1..=6 {
-            exec(
-                &mut conn,
-                &format!("INSERT INTO t VALUES ({n}, 'r{n}');"),
-            );
+            exec(&mut conn, &format!("INSERT INTO t VALUES ({n}, 'r{n}');"));
         }
         // UPDATE with WHERE — change every row whose `a` is in 2..=4.
         exec(&mut conn, "UPDATE t SET b = 'X' WHERE a >= 2 AND a <= 4;");
@@ -294,10 +296,7 @@ fn drop_table_if_exists_unknown_is_silent() {
     // different name.)
     let mut conn = sqlite3_open(db.str()).expect("open");
     exec(&mut conn, "CREATE TABLE real(a);");
-    exec(
-        &mut conn,
-        "DROP TABLE IF EXISTS nosuch;",
-    );
+    exec(&mut conn, "DROP TABLE IF EXISTS nosuch;");
     let _ = conn;
     assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
     assert_eq!(
@@ -425,21 +424,22 @@ fn indexed_select_where_equality() {
         exec(&mut conn, "CREATE INDEX i_a ON t(a);");
 
         // Indexed equality through the engine itself.
-        for (literal, expected) in [
-            ("3", "z"),
-            ("1", "x"),
-            ("5", "v"),
-        ] {
+        for (literal, expected) in [("3", "z"), ("1", "x"), ("5", "v")] {
             let sql = format!("SELECT b FROM t WHERE a = {literal}");
             let (mut s, _) = sqlite3_prepare_v2(&mut conn, &sql).unwrap();
             let ncol = s.column_count();
             let mut rows = Vec::new();
             loop {
                 match s.step() {
-                    ResultCode::Row => rows.push((0..ncol).map(|i| match s.column_value(i) {
-                        Value::Text(s) => s,
-                        v => format!("{:?}", v),
-                    }).collect::<Vec<_>>().join("|")),
+                    ResultCode::Row => rows.push(
+                        (0..ncol)
+                            .map(|i| match s.column_value(i) {
+                                Value::Text(s) => s,
+                                v => format!("{:?}", v),
+                            })
+                            .collect::<Vec<_>>()
+                            .join("|"),
+                    ),
                     ResultCode::Done => break,
                     other => panic!("unexpected for {literal}: {:?}", other),
                 }
@@ -447,8 +447,7 @@ fn indexed_select_where_equality() {
             assert_eq!(rows, vec![expected.to_string()], "query: {sql}");
         }
         // A non-matching value returns no rows.
-        let (mut s, _) =
-            sqlite3_prepare_v2(&mut conn, "SELECT b FROM t WHERE a = 99").unwrap();
+        let (mut s, _) = sqlite3_prepare_v2(&mut conn, "SELECT b FROM t WHERE a = 99").unwrap();
         let ncol = s.column_count();
         let mut rows: Vec<String> = Vec::new();
         loop {
@@ -461,8 +460,7 @@ fn indexed_select_where_equality() {
         assert_eq!(rows.len(), 0, "a = 99 should match no rows");
         // `WHERE col = NULL` is always UNKNOWN; the indexed path is rejected and the
         // full scan evaluates NULL = NULL as UNKNOWN, returning no rows.
-        let (mut s, _) =
-            sqlite3_prepare_v2(&mut conn, "SELECT b FROM t WHERE a = NULL").unwrap();
+        let (mut s, _) = sqlite3_prepare_v2(&mut conn, "SELECT b FROM t WHERE a = NULL").unwrap();
         let ncol = s.column_count();
         let mut rows: Vec<String> = Vec::new();
         loop {
@@ -476,6 +474,141 @@ fn indexed_select_where_equality() {
         let _ = conn;
     }
     assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+}
+
+/// M5.2: a multi-column index supports prefix-equality lookups: `WHERE a = ? AND b = ?`
+/// uses the index, and `WHERE a = ?` uses the first column of the index. The C oracle
+/// confirms the file format is valid and the rows returned match the C engine.
+#[test]
+fn multi_column_index_select() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("mcidxsel");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a INT, b INT, c TEXT);");
+        exec(
+            &mut conn,
+            "INSERT INTO t VALUES (1,1,'r11'),(1,2,'r12'),(1,3,'r13'),(2,1,'r21'),(2,2,'r22'),(3,1,'r31');",
+        );
+        exec(&mut conn, "CREATE INDEX i_ab ON t(a, b);");
+
+        // Full two-column equality.
+        let cases = [
+            ("a = 1 AND b = 2", vec!["r12"]),
+            ("a = 2 AND b = 1", vec!["r21"]),
+            ("a = 1 AND b = 3", vec!["r13"]),
+            ("a = 1 AND b = 5", Vec::<&str>::new()),
+        ];
+        for (predicate, expected) in cases {
+            let sql = format!("SELECT c FROM t WHERE {predicate} ORDER BY c");
+            let (mut s, _) = sqlite3_prepare_v2(&mut conn, &sql).unwrap();
+            let mut rows = Vec::new();
+            loop {
+                match s.step() {
+                    ResultCode::Row => rows.push(match s.column_value(0) {
+                        Value::Text(s) => s,
+                        v => format!("{:?}", v),
+                    }),
+                    ResultCode::Done => break,
+                    other => panic!("unexpected for {sql}: {:?}", other),
+                }
+            }
+            assert_eq!(rows, expected, "query: {sql}");
+        }
+
+        // Single-column prefix equality on the first indexed column.
+        let sql = "SELECT c FROM t WHERE a = 1 ORDER BY c";
+        let (mut s, _) = sqlite3_prepare_v2(&mut conn, sql).unwrap();
+        let mut rows = Vec::new();
+        loop {
+            match s.step() {
+                ResultCode::Row => rows.push(match s.column_value(0) {
+                    Value::Text(s) => s,
+                    v => format!("{:?}", v),
+                }),
+                ResultCode::Done => break,
+                other => panic!("unexpected for {sql}: {:?}", other),
+            }
+        }
+        assert_eq!(rows, vec!["r11", "r12", "r13"], "query: {sql}");
+
+        // A WHERE clause that doesn't match the index prefix falls back to the table scan.
+        let sql = "SELECT c FROM t WHERE b = 2 ORDER BY c";
+        let (mut s, _) = sqlite3_prepare_v2(&mut conn, sql).unwrap();
+        let mut rows = Vec::new();
+        loop {
+            match s.step() {
+                ResultCode::Row => rows.push(match s.column_value(0) {
+                    Value::Text(s) => s,
+                    v => format!("{:?}", v),
+                }),
+                ResultCode::Done => break,
+                other => panic!("unexpected for {sql}: {:?}", other),
+            }
+        }
+        assert_eq!(rows, vec!["r12", "r22"], "query: {sql}");
+
+        let _ = conn;
+    }
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    // Differential: the C engine sees the same rows through the same SQL.
+    assert_eq!(
+        db.query("SELECT c FROM t WHERE a = 1 AND b = 2 ORDER BY c"),
+        "r12"
+    );
+    assert_eq!(
+        db.query("SELECT c FROM t WHERE a = 1 ORDER BY c"),
+        "r11\nr12\nr13"
+    );
+}
+
+/// M5.2: multi-column index maintenance keeps the index consistent across INSERT, UPDATE,
+/// and DELETE operations. The C oracle verifies the file format and row counts.
+#[test]
+fn multi_column_index_maintained_on_writes() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("mcidxwr");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a INT, b INT, c TEXT);");
+        exec(&mut conn, "CREATE INDEX i_ab ON t(a, b);");
+        exec(
+            &mut conn,
+            "INSERT INTO t VALUES (1,1,'r11'),(1,2,'r12'),(2,1,'r21');",
+        );
+
+        // Update the second indexed column for one row.
+        exec(&mut conn, "UPDATE t SET b = 9 WHERE a = 1 AND b = 2;");
+
+        // Delete a row.
+        exec(&mut conn, "DELETE FROM t WHERE a = 2 AND b = 1;");
+
+        // Insert more rows to exercise split-path index maintenance.
+        for a in 1..=4 {
+            for b in 1..=10 {
+                exec(
+                    &mut conn,
+                    &format!("INSERT INTO t VALUES ({a},{b},'r{a}{b}');"),
+                );
+            }
+        }
+
+        let _ = conn;
+    }
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    // Confirm the index still answers lookups correctly after all writes.
+    assert_eq!(
+        db.query("SELECT c FROM t WHERE a = 1 AND b = 9 ORDER BY c"),
+        "r12\nr19"
+    );
+    // A key that was never inserted (outside the bulk loop's a=1..4, b=1..10 range)
+    // should still return zero rows.
+    assert_eq!(
+        db.query("SELECT count(*) FROM t WHERE a = 9 AND b = 9;"),
+        "0"
+    );
 }
 
 /// M5.1: `CREATE INDEX IF NOT EXISTS` is a no-op when the index already exists; otherwise it
@@ -503,4 +636,3 @@ fn create_index_if_not_exists() {
         "1"
     );
 }
-

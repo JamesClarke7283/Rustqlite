@@ -12,7 +12,10 @@ use std::pin::Pin;
 use crate::error::{Error, Result};
 use crate::pager::Pager;
 
-use super::cell::{assemble_index_interior_payload, assemble_index_payload, parse_index_interior_cell, parse_index_leaf_cell};
+use super::cell::{
+    assemble_index_interior_payload, assemble_index_payload, parse_index_interior_cell,
+    parse_index_leaf_cell,
+};
 use super::page::{PageHeader, PageType};
 
 /// Create a new index b-tree and return its root page number. Allocates a fresh page and

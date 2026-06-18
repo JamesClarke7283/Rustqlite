@@ -123,10 +123,16 @@ fn update_changes_counting_and_last_insert_rowid_preserved() {
     assert_eq!(conn.changes(), 0);
 
     // The file should reflect the update when read back.
-    let (mut read, _) =
-        sqlite3_prepare_v2(&mut conn, "SELECT a FROM t ORDER BY a;").unwrap();
+    let (mut read, _) = sqlite3_prepare_v2(&mut conn, "SELECT a FROM t ORDER BY a;").unwrap();
     let rows = collect(&mut read);
-    assert_eq!(rows, vec![vec![Value::Int(2)], vec![Value::Int(4)], vec![Value::Int(6)]]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Int(2)],
+            vec![Value::Int(4)],
+            vec![Value::Int(6)]
+        ]
+    );
 
     let _ = std::fs::remove_file(&db);
 }

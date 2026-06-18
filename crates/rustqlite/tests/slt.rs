@@ -136,11 +136,7 @@ enum LastKind {
 /// Format a `Value` as a string and accumulate its `DefaultColumnType` into `types` at index
 /// `i`. The first cell of column `i` fixes the type; subsequent cells in the same column
 /// must match (sqllogictest's `default_column_validator` treats mismatches as `?`).
-fn value_to_string(
-    v: Value,
-    types: &mut Vec<DefaultColumnType>,
-    i: usize,
-) -> String {
+fn value_to_string(v: Value, types: &mut Vec<DefaultColumnType>, i: usize) -> String {
     let t = match &v {
         Value::Null => DefaultColumnType::Any,
         Value::Int(_) => DefaultColumnType::Integer,
@@ -288,19 +284,14 @@ fn ensure_corpus() {
             .unwrap_or_else(|_| PathBuf::from("."));
         xtask.push("xtask");
         xtask.push("fetch-slt.sh");
-        let status = std::process::Command::new("bash")
-            .arg(&xtask)
-            .status();
+        let status = std::process::Command::new("bash").arg(&xtask).status();
         match status {
             Ok(s) if s.success() => {}
             Ok(s) => panic!(
                 "fetch-slt.sh exited with {s}; please run `bash {}` to diagnose",
                 xtask.display()
             ),
-            Err(e) => panic!(
-                "failed to invoke fetch-slt.sh at {}: {e}",
-                xtask.display()
-            ),
+            Err(e) => panic!("failed to invoke fetch-slt.sh at {}: {e}", xtask.display()),
         }
     });
 }

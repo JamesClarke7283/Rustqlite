@@ -139,9 +139,9 @@ pub struct UpdateStmt {
 }
 
 /// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [schema.]name ON tbl(col [COLLATE name] [ASC|DESC] …)`.
-/// The first M5.1 slice accepts a single indexed column; the `collation` and `desc` fields are
-/// recorded but the engine treats them as ASC binary for now (a structural field for the
-/// catalog/EXPLAIN, not a behavioral one).
+/// Multi-column indexes are accepted from M5.2 onward; the `collation` and `desc` fields are
+/// recorded in the AST but the runtime still treats all indexes as ASC/BINARY in this slice
+/// (they are structural fields for the catalog/EXPLAIN, not behavioral ones yet).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateIndex {
     pub unique: bool,
@@ -156,9 +156,9 @@ pub struct CreateIndex {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexedColumn {
     pub name: String,
-    /// `COLLATE name` (recorded but unused in M5.1 — always `None` in the first slice).
+    /// `COLLATE name` (recorded but unused in this slice — always `None` until collation support).
     pub collation: Option<String>,
-    /// `true` for `DESC`, `false` for `ASC` (default). Recorded but unused in M5.1.
+    /// `true` for `DESC`, `false` for `ASC` (default). Recorded but unused in this slice.
     pub desc: bool,
 }
 

@@ -23,7 +23,10 @@ use crate::error::Result;
 use crate::schema::{IndexObject, Table};
 use crate::vdbe::Program;
 
-use rustqlite_parser::{CreateIndex, CreateTable, DeleteStmt, DropIndexStmt, DropTableStmt, InsertStmt, SelectStmt, UpdateStmt};
+use rustqlite_parser::{
+    CreateIndex, CreateTable, DeleteStmt, DropIndexStmt, DropTableStmt, InsertStmt, SelectStmt,
+    UpdateStmt,
+};
 /// Compile a single-table (or constant) `SELECT` into a VDBE program plus its result column
 /// names. `table` is the resolved table for the lone `FROM` entry, or `None` for a `SELECT`
 /// with no `FROM`. `indexes` is the list of indexes attached to `table`; the M5.1 first

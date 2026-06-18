@@ -195,14 +195,17 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                     last_error: None,
                 });
             }
-            let table_obj = catalog.find_table(&ci.table).ok_or_else(|| {
-                Error::msg(format!("no such table: {}", ci.table))
-            })?;
+            let table_obj = catalog
+                .find_table(&ci.table)
+                .ok_or_else(|| Error::msg(format!("no such table: {}", ci.table)))?;
             let table = Table::from_schema_object(table_obj)?;
             let schema_cookie = schema_cookie(&pager);
             let sql_text = create_table_text(sql);
             let program = Arc::new(codegen::compile_create_index(
-                &ci, &table, sql_text, schema_cookie,
+                &ci,
+                &table,
+                sql_text,
+                schema_cookie,
             )?);
             let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
             Ok(Sqlite3Stmt {
@@ -223,7 +226,10 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             let (index, schema_rowid) = resolve_drop_index_target(&pager, &catalog, &di)?;
             let schema_cookie = schema_cookie(&pager);
             let program = Arc::new(codegen::compile_drop_index(
-                &di, index.as_ref(), schema_cookie, schema_rowid,
+                &di,
+                index.as_ref(),
+                schema_cookie,
+                schema_rowid,
             )?);
             let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
             Ok(Sqlite3Stmt {
@@ -314,10 +320,7 @@ fn resolve_sqlite_schema(pager: &Arc<Pager>) -> Result<Table> {
 /// Resolve a `DROP TABLE` target: returns the table when present in the catalog (else
 /// `None`, which the codegen turns into either an error or a no-op depending on the
 /// `IF EXISTS` flag), and the current schema cookie for the codegen to bump.
-fn resolve_drop_target(
-    pager: &Arc<Pager>,
-    drop: &DropTableStmt,
-) -> Result<(Option<Table>, u32)> {
+fn resolve_drop_target(pager: &Arc<Pager>, drop: &DropTableStmt) -> Result<(Option<Table>, u32)> {
     let catalog = block_on(read_catalog(pager))?;
     let cookie = schema_cookie(pager);
     let table = catalog

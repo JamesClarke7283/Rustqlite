@@ -227,10 +227,11 @@ assignment_list = { assignment ~ ("," ~ assignment)* }
 assignment = { ident ~ "=" ~ expr }
 
 
-// ---- CREATE INDEX (M5.1) ----
-// First slice: `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON tbl(col [COLLATE n] [ASC|DESC])`.
-// A single indexed column only. The `COLLATE` and `ASC`/`DESC` are recorded but the engine
-// treats all indexes as ASC binary in the first slice. No partial-index `WHERE` clause.
+// ---- CREATE INDEX (M5.1 / M5.2) ----
+// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON tbl(col [COLLATE n] [ASC|DESC] [, …])`.
+// Multi-column indexes are parsed here; M5.2 extends the engine to consume them. The `COLLATE`
+// and `ASC`/`DESC` are recorded in the AST but the runtime treats them as ASC/BINARY until
+// later slices. No partial-index `WHERE` clause yet.
 create_index_stmt = {
     K_CREATE ~ K_UNIQUE? ~ K_INDEX ~ if_not_exists?
     ~ qualified_name ~ K_ON ~ ident

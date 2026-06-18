@@ -1,0 +1,99 @@
+# M5.2: multi-column index smoke tests.
+#
+# Exercises:
+#   * CREATE INDEX on multiple columns,
+#   * indexed equality on a prefix (one or two columns),
+#   * INSERT / UPDATE / DELETE maintaining the composite index,
+#   * catalog round-trip.
+
+statement ok
+CREATE TABLE t2(a INTEGER, b INTEGER, c TEXT)
+
+statement ok
+INSERT INTO t2 VALUES(1, 1, 'r11')
+
+statement ok
+INSERT INTO t2 VALUES(1, 2, 'r12')
+
+statement ok
+INSERT INTO t2 VALUES(1, 3, 'r13')
+
+statement ok
+INSERT INTO t2 VALUES(2, 1, 'r21')
+
+statement ok
+INSERT INTO t2 VALUES(2, 2, 'r22')
+
+statement ok
+INSERT INTO t2 VALUES(3, 1, 'r31')
+
+# Multi-column index on (a, b).
+statement ok
+CREATE INDEX i_ab ON t2(a, b)
+
+# Full two-column equality lookup.
+query I rowsort
+SELECT c FROM t2 WHERE a = 1 AND b = 2
+----
+r12
+
+query I rowsort
+SELECT c FROM t2 WHERE a = 2 AND b = 1
+----
+r21
+
+# No match.
+query I rowsort
+SELECT c FROM t2 WHERE a = 1 AND b = 99
+----
+
+# Single-column prefix equality on the first indexed column.
+query I rowsort
+SELECT c FROM t2 WHERE a = 1 ORDER BY c
+----
+r11
+r12
+r13
+
+# A WHERE clause that doesn't match the index prefix falls back to a scan.
+query I rowsort
+SELECT c FROM t2 WHERE b = 2 ORDER BY c
+----
+r12
+r22
+
+# Updates to an indexed column maintain the composite index.
+statement ok
+UPDATE t2 SET b = 9 WHERE a = 1 AND b = 2
+
+query I rowsort
+SELECT c FROM t2 WHERE a = 1 AND b = 9
+----
+r12
+
+query I rowsort
+SELECT c FROM t2 WHERE a = 1 AND b = 2
+----
+
+# Deletes maintain the composite index.
+statement ok
+DELETE FROM t2 WHERE a = 2 AND b = 1
+
+query I rowsort
+SELECT c FROM t2 WHERE a = 2 AND b = 1
+----
+
+# Inserts after the index exists keep it in sync.
+statement ok
+INSERT INTO t2 VALUES(2, 1, 'r21-new')
+
+query I rowsort
+SELECT c FROM t2 WHERE a = 2 AND b = 1
+----
+r21-new
+
+# Catalog round-trip: the index row exists and names the right table.
+query IT rowsort
+SELECT type, name FROM sqlite_schema WHERE name = 'i_ab'
+----
+index i_ab

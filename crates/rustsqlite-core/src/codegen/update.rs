@@ -66,12 +66,10 @@ use super::expr::{compile_expr, compile_jump, Ctx};
 
 /// Compile `UPDATE [OR action] tbl SET col = expr [, …] [WHERE expr]`. `indexes` is the list
 /// of indexes attached to `table`; the codegen emits per-row `IdxDelete` + `IdxInsert`
-/// maintenance for each (single-column) index.
+/// maintenance for each index, now including multi-column composite keys (M5.2).
 pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) -> Result<Program> {
     if upd.schema.is_some() {
-        return Err(Error::msg(
-            "schema-qualified UPDATE is not yet supported",
-        ));
+        return Err(Error::msg("schema-qualified UPDATE is not yet supported"));
     }
     if let Some(action) = upd.or_action {
         return Err(Error::msg(format!(
@@ -97,9 +95,9 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
     let ncol = table.columns.len();
     let mut target_col: Vec<Option<(usize, &rustqlite_parser::Expr)>> = vec![None; ncol];
     for Assignment { column, value } in &upd.assignments {
-        let ci = table
-            .column_index(column)
-            .ok_or_else(|| Error::msg(format!("table {} has no column named {column}", table.name)))?;
+        let ci = table.column_index(column).ok_or_else(|| {
+            Error::msg(format!("table {} has no column named {column}", table.name))
+        })?;
         target_col[ci] = Some((ci, value));
     }
 
@@ -146,17 +144,12 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
     b.set_p4(open, P4::Int(ncol as i64));
 
     // (3b) Open the indexes as write cursors (cursor 2, 3, …) so the second pass can
-    // IdxDelete the OLD key and IdxInsert the NEW key for each index.
+    // IdxDelete the OLD key and IdxInsert the NEW key for each index. Multi-column indexes
+    // are supported from M5.2 onward.
     let index_cursor_base: i32 = 2;
     for (i, idx) in indexes.iter().enumerate() {
-        if idx.columns.len() != 1 {
-            return Err(Error::msg(format!(
-                "UPDATE: index {} has {} columns; only single-column indexes are supported in M5.1",
-                idx.name,
-                idx.columns.len()
-            )));
-        }
-        let ic = (index_cursor_base + i as i32) as i32;
+        let _ = idx.table_column_indices(table)?; // validate columns exist
+        let ic = index_cursor_base + i as i32;
         b.emit(Opcode::OpenWrite, ic, idx.rootpage as i32, 0);
     }
 
@@ -213,28 +206,18 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
 
     // (6b) Snapshot the OLD values for the indexed columns (if any) BEFORE the SET
     // assignments overwrite them. We need them for the per-index `IdxDelete` later in this
-    // loop body. The snapshot is one register per indexed column.
+    // loop body. The snapshot is one register per indexed table column; multiple indexes
+    // on the same column share the same snapshot.
     let mut old_value_reg: std::collections::HashMap<usize, i32> = std::collections::HashMap::new();
-    for (i, idx) in indexes.iter().enumerate() {
-        if idx.columns.len() != 1 {
-            // Validated earlier; defensive guard.
-            return Err(Error::msg(format!(
-                "UPDATE: index {} has {} columns; only single-column indexes are supported in M5.1",
-                idx.name,
-                idx.columns.len()
-            )));
+    for idx in indexes.iter() {
+        for col_name in idx.columns.iter().map(|c| &c.name) {
+            let indexed_ci = table.column_index(col_name).expect("validated earlier");
+            old_value_reg.entry(indexed_ci).or_insert_with(|| {
+                let r = b.alloc_reg();
+                b.emit(Opcode::SCopy, reg_new + indexed_ci as i32, r, 0);
+                r
+            });
         }
-        let indexed_ci = table
-            .column_index(&idx.columns[0].name)
-            .expect("validated earlier");
-        // Skip if we already snapshotted this column (multiple indexes on the same column
-        // would otherwise redundantly copy; harmless but wasteful).
-        if !old_value_reg.contains_key(&indexed_ci) {
-            let r = b.alloc_reg();
-            b.emit(Opcode::SCopy, reg_new + indexed_ci as i32, r, 0);
-            old_value_reg.insert(indexed_ci, r);
-        }
-        let _ = i; // silence: the index is keyed on (i, idx.name) but we only need the column
     }
 
     for (ci, slot) in target_col.iter().enumerate() {
@@ -258,27 +241,27 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
     let reg_new_rec = b.alloc_reg();
     b.emit(Opcode::MakeRecord, reg_new, ncol as i32, reg_new_rec);
 
-    // (9b) Index maintenance: for each single-column index, build the OLD key (using the
-    // snapshotted old value captured at (6b) above) and IdxDelete it. Then build the NEW
-    // key (using `reg_new + indexed_ci`, which holds the SET-overwritten value if the
-    // indexed column was reassigned, or the unchanged value if not) and IdxInsert it.
+    // (9b) Index maintenance: for each index, build the OLD composite key (using the
+    // snapshotted old values captured at (6b) above) and IdxDelete it. The table Delete is
+    // then performed, followed by the Insert, and finally the NEW composite key is
+    // IdxInserted.
     for (i, idx) in indexes.iter().enumerate() {
-        let ic = (index_cursor_base + i as i32) as i32;
-        let indexed_ci = table
-            .column_index(&idx.columns[0].name)
-            .expect("validated at INSERT/compile time");
-        // OLD key record: [snapshotted_old, rowid]
-        let old_val_reg = *old_value_reg
-            .get(&indexed_ci)
-            .expect("snapshot exists for every indexed column");
-        let old_key = b.alloc_regs(2);
-        b.emit(Opcode::SCopy, old_val_reg, old_key, 0);
-        b.emit(Opcode::SCopy, reg_old_rowid2, old_key + 1, 0);
-        let old_key_rec = b.alloc_reg();
-        b.emit(Opcode::MakeRecord, old_key, 2, old_key_rec);
-        b.emit(Opcode::IdxDelete, ic, old_key, 2);
-        // (the IdxDelete reads the key from r[p2..p2+p3]; the SCopy built the [old, rowid]
-        // pair into old_key/old_key+1, so p2=old_key, p3=2.)
+        let ic = index_cursor_base + i as i32;
+        let indexed_cis = idx.table_column_indices(table).expect("validated earlier");
+        let nkey = indexed_cis.len() as i32 + 1; // indexed columns + trailing rowid
+        let old_key = b.alloc_regs(nkey);
+        for (j, col_idx) in indexed_cis.iter().enumerate() {
+            let old_val_reg = *old_value_reg
+                .get(col_idx)
+                .expect("snapshot exists for every indexed column");
+            b.emit(Opcode::SCopy, old_val_reg, old_key + j as i32, 0);
+        }
+        b.emit(Opcode::SCopy, reg_old_rowid2, old_key + indexed_cis.len() as i32, 0);
+        // IdxDelete reads the key values from r[p2..p2+p3]; we pass the first register and
+        // the number of fields.
+        b.emit(Opcode::IdxDelete, ic, old_key, nkey);
+
+        let _ = i; // cursor numbers are derived from index position
     }
 
     let del_idx = b.emit(Opcode::Delete, cursor, 0, 0);
@@ -286,20 +269,23 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
     let ins_idx = b.emit(Opcode::Insert, cursor, reg_new_rec, reg_old_rowid2);
     b.set_p5(ins_idx, P5_ISUPDATE);
 
-    // (9c) New-key IdxInsert (post-Insert, so the new value is in `reg_new + indexed_ci`
-    // regardless of whether the SET overwrote it).
+    // (9c) New-key IdxInsert (post-Insert, so the new values are in `reg_new + col_idx`,
+    // whether the SET overwrote them or not).
     for (i, idx) in indexes.iter().enumerate() {
-        let ic = (index_cursor_base + i as i32) as i32;
-        let indexed_ci = table
-            .column_index(&idx.columns[0].name)
-            .expect("validated at INSERT/compile time");
-        let new_key = b.alloc_regs(2);
-        b.emit(Opcode::SCopy, reg_new + indexed_ci as i32, new_key, 0);
-        b.emit(Opcode::SCopy, reg_old_rowid2, new_key + 1, 0);
+        let ic = index_cursor_base + i as i32;
+        let indexed_cis = idx.table_column_indices(table).expect("validated earlier");
+        let nkey = indexed_cis.len() as i32 + 1;
+        let new_key = b.alloc_regs(nkey);
+        for (j, col_idx) in indexed_cis.iter().enumerate() {
+            b.emit(Opcode::SCopy, reg_new + *col_idx as i32, new_key + j as i32, 0);
+        }
+        b.emit(Opcode::SCopy, reg_old_rowid2, new_key + indexed_cis.len() as i32, 0);
         let new_key_rec = b.alloc_reg();
-        b.emit(Opcode::MakeRecord, new_key, 2, new_key_rec);
+        b.emit(Opcode::MakeRecord, new_key, nkey, new_key_rec);
         let idx_ins = b.emit(Opcode::IdxInsert, ic, new_key_rec, 0);
         b.set_p4(idx_ins, P4::Int(0));
+
+        let _ = i;
     }
 
     b.resolve(sort_next);

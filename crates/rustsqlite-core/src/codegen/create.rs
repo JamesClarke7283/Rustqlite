@@ -80,7 +80,12 @@ pub fn compile_create_table(
     b.emit(Opcode::Insert, schema_cursor, record, rowid_reg);
 
     // (5) bump the schema cookie (DDL advances it by one).
-    b.emit(Opcode::SetCookie, 0, COOKIE_SCHEMA, schema_cookie as i32 + 1);
+    b.emit(
+        Opcode::SetCookie,
+        0,
+        COOKIE_SCHEMA,
+        schema_cookie as i32 + 1,
+    );
 
     // (6) reload the schema so later statements see the new table.
     b.emit(Opcode::ParseSchema, 0, 0, 0);
@@ -139,11 +144,7 @@ mod tests {
     fn create_program_shape() {
         let ct = create_of("CREATE TABLE t(a, b)");
         let prog = compile_create_table(&ct, "CREATE TABLE t(a, b)", 0).unwrap();
-        let names: Vec<&str> = prog
-            .instructions
-            .iter()
-            .map(|i| i.opcode.name())
-            .collect();
+        let names: Vec<&str> = prog.instructions.iter().map(|i| i.opcode.name()).collect();
         // The faithful sequence: a write Transaction, CreateBtree, the record build, the schema
         // insert, SetCookie, ParseSchema, Halt.
         assert!(names.contains(&"Transaction"));

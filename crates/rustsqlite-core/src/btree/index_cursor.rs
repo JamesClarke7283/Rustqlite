@@ -196,11 +196,18 @@ impl IndexCursor {
     }
 
     /// The k-th child of an interior-index page (k is 0-based, in in-order traversal order).
-    fn interior_child(hdr: &PageHeader, page: &[u8], k: usize, usable: usize) -> Result<Option<u32>> {
+    fn interior_child(
+        hdr: &PageHeader,
+        page: &[u8],
+        k: usize,
+        usable: usize,
+    ) -> Result<Option<u32>> {
         let n = hdr.num_cells as usize;
         if k < n {
             let off = hdr.cell_pointer(page, k)?;
-            Ok(Some(parse_index_interior_cell(page, off, usable)?.left_child))
+            Ok(Some(
+                parse_index_interior_cell(page, off, usable)?.left_child,
+            ))
         } else if k == n {
             Ok(hdr.right_most_pointer)
         } else {

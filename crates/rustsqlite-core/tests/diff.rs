@@ -553,12 +553,21 @@ fn volatile_functions_shape() {
         // changes / total_changes / last_insert_rowid are 0 (no write path in M3b).
         "SELECT changes(), total_changes(), last_insert_rowid();",
         "SELECT typeof(changes()), typeof(last_insert_rowid());",
-        // sqlite_version() is a great deterministic parity check.
-        "SELECT sqlite_version();",
+        // typeof(sqlite_version()) is deterministic; the value itself is pinned to VERSION.
         "SELECT typeof(sqlite_version());",
     ] {
         assert_same(db.str(), q);
     }
+    // sqlite_version() returns the pinned SQLite version (see VERSION), not necessarily the
+    // system oracle's version, which may differ on this machine.
+    let version_file = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../VERSION"),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let our_version = rustsqlite_rows(db.str(), "SELECT sqlite_version();").unwrap();
+    assert_eq!(our_version, vec![version_file]);
 }
 
 /// `random()` must actually vary across rows of one statement (it would be a faithfulness bug to
@@ -607,7 +616,11 @@ fn update_writes_match_oracle() {
     );
 
     // Full-table update (no WHERE).
-    run_both(&db, "UPDATE t SET a = a + 10;", "SELECT a, b, c FROM t ORDER BY a;");
+    run_both(
+        &db,
+        "UPDATE t SET a = a + 10;",
+        "SELECT a, b, c FROM t ORDER BY a;",
+    );
     // WHERE matching a subset.
     run_both(
         &db,

@@ -21,7 +21,6 @@
 //!
 //! `IF EXISTS` against a missing index is a no-op (just `Halt`). Schema qualifiers other than
 /// `main`/absent are rejected at codegen time.
-
 use rustqlite_parser::DropIndexStmt;
 
 use crate::error::{Error, Result};
@@ -51,7 +50,9 @@ pub fn compile_drop_index(
     schema_rowid: i64,
 ) -> Result<Program> {
     if drop.schema.is_some() {
-        return Err(Error::msg("schema-qualified DROP INDEX is not yet supported"));
+        return Err(Error::msg(
+            "schema-qualified DROP INDEX is not yet supported",
+        ));
     }
     let mut b = ProgramBuilder::new();
 
@@ -83,7 +84,12 @@ pub fn compile_drop_index(
     b.resolve(end_delete);
 
     // (4) Bump the schema cookie.
-    b.emit(Opcode::SetCookie, 0, COOKIE_SCHEMA, current_schema_cookie as i32 + 1);
+    b.emit(
+        Opcode::SetCookie,
+        0,
+        COOKIE_SCHEMA,
+        current_schema_cookie as i32 + 1,
+    );
 
     // (5) Reload the schema (marker).
     b.emit(Opcode::ParseSchema, 0, 0, 0);

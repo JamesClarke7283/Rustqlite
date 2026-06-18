@@ -31,6 +31,9 @@ our/update.slt
 # M5.1 — single-column indexes + DROP INDEX + indexed-equality SELECT.
 our/index.slt
 
+# M5.2 — multi-column indexes + prefix equality SELECT + composite-key maintenance.
+our/multi-column-index.slt
+
 # M5.1 — `DROP INDEX` from the upstream evidence corpus. Small (~75 lines),
 # exercises CREATE/DROP INDEX without the partial-index / multi-column /
 # skipif-onlyif dependencies that the rest of the slt_lang_*.test family

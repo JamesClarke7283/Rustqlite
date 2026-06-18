@@ -166,7 +166,7 @@ pub fn init_empty_leaf(page: &mut [u8], base_offset: usize) {
     page[h] = 0x0d; // leaf table page
     page[h + 1..h + 3].copy_from_slice(&0u16.to_be_bytes()); // first freeblock = 0
     page[h + 3..h + 5].copy_from_slice(&0u16.to_be_bytes()); // num cells = 0
-    // The cell content area starts at the end of the page; 65536 is stored as 0.
+                                                             // The cell content area starts at the end of the page; 65536 is stored as 0.
     let ccs: u16 = if page_size == 65_536 {
         0
     } else {
@@ -233,7 +233,9 @@ pub fn insert_leaf_cell(
     let h = base_offset;
     let page_type = page[h];
     if page_type != 0x0d && page_type != 0x0a {
-        return Err(Error::corrupt("insert_leaf_cell: not a leaf-table or leaf-index page"));
+        return Err(Error::corrupt(
+            "insert_leaf_cell: not a leaf-table or leaf-index page",
+        ));
     }
     let num_cells = be_u16(&page[h + 3..h + 5]) as usize;
     if idx > num_cells {
@@ -307,11 +309,15 @@ pub fn insert_interior_cell(
     let h = base_offset;
     let page_type = page[h];
     if page_type != 0x05 && page_type != 0x02 {
-        return Err(Error::corrupt("insert_interior_cell: not an interior-table or interior-index page"));
+        return Err(Error::corrupt(
+            "insert_interior_cell: not an interior-table or interior-index page",
+        ));
     }
     let num_cells = be_u16(&page[h + 3..h + 5]) as usize;
     if idx > num_cells {
-        return Err(Error::corrupt("insert_interior_cell: index past cell count"));
+        return Err(Error::corrupt(
+            "insert_interior_cell: index past cell count",
+        ));
     }
     let raw_ccs = be_u16(&page[h + 5..h + 7]) as usize;
     let cell_content_start = if raw_ccs == 0 { 65_536 } else { raw_ccs };

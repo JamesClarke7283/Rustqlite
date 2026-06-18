@@ -68,7 +68,10 @@ fn fold_expr(pairs: Pairs<'_, Rule>) -> Expr {
     while let Some(last) = pairs.last() {
         if matches!(
             last.as_rule(),
-            Rule::between_suffix | Rule::in_suffix | Rule::collate_suffix | Rule::is_distinct_suffix
+            Rule::between_suffix
+                | Rule::in_suffix
+                | Rule::collate_suffix
+                | Rule::is_distinct_suffix
         ) {
             suffixes.push(pairs.pop().unwrap());
         } else {

@@ -21,11 +21,7 @@ use super::page::{self, PageType};
 /// rooted at `root`. Returns `Ok(true)` when the entry was found and removed, `Ok(false)` when
 /// the leaf has no such entry (a no-op for `IdxDelete`, matching upstream's
 /// `sqlite3BtreeIndexMoveto + sqlite3BtreeDelete` path which is silent on a miss).
-pub async fn index_leaf_delete(
-    pager: &Arc<Pager>,
-    root: u32,
-    key_record: &[u8],
-) -> Result<bool> {
+pub async fn index_leaf_delete(pager: &Arc<Pager>, root: u32, key_record: &[u8]) -> Result<bool> {
     let usable = pager.usable_size();
     let base = pager.btree_header_offset(root);
     let page = pager.get_page(root).await?;
@@ -52,7 +48,8 @@ pub async fn index_leaf_delete(
         let existing_prefix = &existing[..existing_prefix_len];
         let existing_rowid = &existing[existing_prefix_len];
         if prefixes_equal(existing_prefix, search_prefix, Collation::Binary)
-            && mem_compare(existing_rowid, search_rowid, Collation::Binary) == std::cmp::Ordering::Equal
+            && mem_compare(existing_rowid, search_rowid, Collation::Binary)
+                == std::cmp::Ordering::Equal
         {
             found = Some(i);
             break;
@@ -89,10 +86,8 @@ pub async fn index_leaf_delete(
 /// `delete.rs`; the cell layout for index leaves differs from table leaves in that there
 /// is no rowid varint between the payload-size varint and the payload.
 fn cell_on_page_size(page: &[u8], offset: usize, usable: usize) -> usize {
-    let (payload_size, n1) = crate::format::read_varint(
-        page.get(offset..).unwrap_or(&[]),
-    )
-    .unwrap_or((0, 0));
+    let (payload_size, n1) =
+        crate::format::read_varint(page.get(offset..).unwrap_or(&[])).unwrap_or((0, 0));
     let max_local = super::cell::index_max_local(usable);
     let (local_len, has_overflow) =
         super::cell::local_payload_len(payload_size as usize, usable, max_local);

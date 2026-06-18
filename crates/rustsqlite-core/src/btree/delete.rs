@@ -18,11 +18,7 @@ use super::page::{self, PageHeader, PageType};
 /// with one fewer cell. The cursor's `cell_idx` is left unchanged — the caller's loop
 /// (`Rewind`/`Next`/`Delete`) will see the row that slid into the slot, which is the
 /// next-larger rowid (the same behavior as upstream `OP_Delete`).
-pub async fn leaf_delete_current(
-    pager: &Pager,
-    leaf_pgno: u32,
-    cell_idx: usize,
-) -> Result<()> {
+pub async fn leaf_delete_current(pager: &Pager, leaf_pgno: u32, cell_idx: usize) -> Result<()> {
     let base = pager.btree_header_offset(leaf_pgno);
     let mut leaf = pager.read_page_for_write(leaf_pgno).await?;
     let hdr = PageHeader::parse(&leaf, base)?;

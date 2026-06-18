@@ -28,34 +28,34 @@ fn insert_with_splitting<'a>(
     path: &'a mut Vec<(u32, usize)>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
-    let base = pager.btree_header_offset(pgno);
-    let buf = pager.get_page(pgno).await?;
-    let hdr = PageHeader::parse(&buf, base)?;
-    match hdr.page_type {
-        PageType::LeafTable => {
-            let idx = leaf_insert_index(&buf, &hdr, rowid)?;
-            let mut leaf = pager.read_page_for_write(pgno).await?;
-            match page::insert_leaf_cell(&mut leaf, base, idx, cell) {
-                Ok(()) => {
-                    pager.write_page(pgno, leaf)?;
-                    Ok(())
+        let base = pager.btree_header_offset(pgno);
+        let buf = pager.get_page(pgno).await?;
+        let hdr = PageHeader::parse(&buf, base)?;
+        match hdr.page_type {
+            PageType::LeafTable => {
+                let idx = leaf_insert_index(&buf, &hdr, rowid)?;
+                let mut leaf = pager.read_page_for_write(pgno).await?;
+                match page::insert_leaf_cell(&mut leaf, base, idx, cell) {
+                    Ok(()) => {
+                        pager.write_page(pgno, leaf)?;
+                        Ok(())
+                    }
+                    Err(e) if is_page_full(&e) => {
+                        // The leaf is full. Drop the partial copy (never written back) and split.
+                        drop(leaf);
+                        let parent = path.pop();
+                        balance_leaf(pager, pgno, parent, path, rowid, cell).await
+                    }
+                    Err(other) => Err(other),
                 }
-                Err(e) if is_page_full(&e) => {
-                    // The leaf is full. Drop the partial copy (never written back) and split.
-                    drop(leaf);
-                    let parent = path.pop();
-                    balance_leaf(pager, pgno, parent, path, rowid, cell).await
-                }
-                Err(other) => Err(other),
             }
+            PageType::InteriorTable => {
+                let child = pick_child(&buf, &hdr, rowid)?;
+                path.push((pgno, base));
+                insert_with_splitting(pager, child, rowid, cell, path).await
+            }
+            _ => Err(Error::corrupt("table_insert: not a table b-tree page")),
         }
-        PageType::InteriorTable => {
-            let child = pick_child(&buf, &hdr, rowid)?;
-            path.push((pgno, base));
-            insert_with_splitting(pager, child, rowid, cell, path).await
-        }
-        _ => Err(Error::corrupt("table_insert: not a table b-tree page")),
-    }
     })
 }
 
@@ -72,46 +72,47 @@ fn balance_leaf<'a>(
     pending_cell: &'a [u8],
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
-    let parent_pgno = match parent {
-        Some((p, _)) => p,
-        None => {
-            balance::promote_root_and_split(pager, leaf_pgno).await?;
-            return insert_after_root_promotion(pager, leaf_pgno, pending_rowid, pending_cell).await;
-        }
-    };
+        let parent_pgno = match parent {
+            Some((p, _)) => p,
+            None => {
+                balance::promote_root_and_split(pager, leaf_pgno).await?;
+                return insert_after_root_promotion(pager, leaf_pgno, pending_rowid, pending_cell)
+                    .await;
+            }
+        };
 
-    let new_pgno = match balance::split_leaf(pager, leaf_pgno, Some(parent_pgno)).await {
-        Ok(p) => p,
-        Err(e) if is_page_full(&e) => {
-            // The parent filled during the divider install. Recurse up the path.
-            if let Some(grand) = ancestor_path.pop() {
-                return balance_leaf(
+        let new_pgno = match balance::split_leaf(pager, leaf_pgno, Some(parent_pgno)).await {
+            Ok(p) => p,
+            Err(e) if is_page_full(&e) => {
+                // The parent filled during the divider install. Recurse up the path.
+                if let Some(grand) = ancestor_path.pop() {
+                    return balance_leaf(
+                        pager,
+                        parent_pgno,
+                        Some(grand),
+                        ancestor_path,
+                        pending_rowid,
+                        pending_cell,
+                    )
+                    .await;
+                }
+                // No grandparent: the parent IS the root. Promote and split the parent.
+                balance::promote_root_and_split(pager, parent_pgno).await?;
+                return insert_after_root_promotion(
                     pager,
                     parent_pgno,
-                    Some(grand),
-                    ancestor_path,
                     pending_rowid,
                     pending_cell,
                 )
                 .await;
             }
-            // No grandparent: the parent IS the root. Promote and split the parent.
-            balance::promote_root_and_split(pager, parent_pgno).await?;
-            return insert_after_root_promotion(
-                pager,
-                parent_pgno,
-                pending_rowid,
-                pending_cell,
-            )
-            .await;
-        }
-        Err(other) => return Err(other),
-    };
+            Err(other) => return Err(other),
+        };
 
-    // Place the pending cell on the correct side of the divider.
-    let target = target_after_split(pager, parent_pgno, new_pgno, pending_rowid).await?;
-    let mut fresh = Vec::new();
-    insert_with_splitting(pager, target, pending_rowid, pending_cell, &mut fresh).await
+        // Place the pending cell on the correct side of the divider.
+        let target = target_after_split(pager, parent_pgno, new_pgno, pending_rowid).await?;
+        let mut fresh = Vec::new();
+        insert_with_splitting(pager, target, pending_rowid, pending_cell, &mut fresh).await
     })
 }
 
@@ -164,24 +165,24 @@ fn insert_after_root_promotion<'a>(
     pending_cell: &'a [u8],
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
-    let base = pager.btree_header_offset(new_root_pgno);
-    let buf = pager.get_page(new_root_pgno).await?;
-    let hdr = PageHeader::parse(&buf, base)?;
-    if hdr.num_cells == 0 {
-        return Err(Error::corrupt(
-            "insert_after_root_promotion: promoted root has no cells",
-        ));
-    }
-    let cell_off = hdr.cell_pointer(&buf, 0)?;
-    let interior = parse_table_interior_cell(&buf, cell_off)?;
-    let target = if pending_rowid <= interior.rowid {
-        interior.left_child
-    } else {
-        hdr.right_most_pointer
-            .ok_or_else(|| Error::corrupt("promoted root missing right-most child"))?
-    };
-    let mut fresh = Vec::new();
-    insert_with_splitting(pager, target, pending_rowid, pending_cell, &mut fresh).await
+        let base = pager.btree_header_offset(new_root_pgno);
+        let buf = pager.get_page(new_root_pgno).await?;
+        let hdr = PageHeader::parse(&buf, base)?;
+        if hdr.num_cells == 0 {
+            return Err(Error::corrupt(
+                "insert_after_root_promotion: promoted root has no cells",
+            ));
+        }
+        let cell_off = hdr.cell_pointer(&buf, 0)?;
+        let interior = parse_table_interior_cell(&buf, cell_off)?;
+        let target = if pending_rowid <= interior.rowid {
+            interior.left_child
+        } else {
+            hdr.right_most_pointer
+                .ok_or_else(|| Error::corrupt("promoted root missing right-most child"))?
+        };
+        let mut fresh = Vec::new();
+        insert_with_splitting(pager, target, pending_rowid, pending_cell, &mut fresh).await
     })
 }
 

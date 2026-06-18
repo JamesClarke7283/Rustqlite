@@ -94,16 +94,18 @@ impl Catalog {
     /// Find an index on `table_name` that covers `column_name` (a single-column, equality-
     /// usable index). The first match (in catalog order) is returned; multi-column indexes
     /// are skipped in the M5.1 first slice.
-    pub fn find_index_for_column(&self, table_name: &str, column_name: &str) -> Option<&SchemaObject> {
-        self.objects
-            .iter()
-            .find(|o| {
-                o.is_index()
-                    && o.tbl_name.eq_ignore_ascii_case(table_name)
-                    && o.sql
-                        .as_deref()
-                        .is_some_and(|sql| index_covers_column(sql, column_name))
-            })
+    pub fn find_index_for_column(
+        &self,
+        table_name: &str,
+        column_name: &str,
+    ) -> Option<&SchemaObject> {
+        self.objects.iter().find(|o| {
+            o.is_index()
+                && o.tbl_name.eq_ignore_ascii_case(table_name)
+                && o.sql
+                    .as_deref()
+                    .is_some_and(|sql| index_covers_column(sql, column_name))
+        })
     }
 }
 

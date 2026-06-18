@@ -24,8 +24,8 @@ use super::index_planner::{pick_index, IndexPlan};
 
 /// Compile a single-table (or constant) `SELECT`, returning the program and the result column
 /// names. `table` is the resolved table when there is exactly one `FROM` entry, else `None`.
-/// `indexes` is the list of indexes attached to `table`; when an indexed equality is
-/// present in the `WHERE`, the M5.1 planner routes through the index.
+/// `indexes` is the list of indexes attached to `table`; when an indexed equality prefix
+/// is present in the `WHERE`, the M5.2 planner routes through the index.
 pub fn compile(
     select: &SelectStmt,
     table: Option<&Table>,
@@ -57,11 +57,11 @@ pub fn compile(
 
 /// An indexed-equality codegen. Opens a read cursor on the index b-tree (with `KeyInfo`
 /// marking it as an index), opens a read cursor on the table, `SeekGE`s the index for the
-/// first entry `>=` the search key, then `IdxGT`s to verify strict equality (jumping past
-/// the body on a non-match). The body pulls the rowid from the index, seeks the table,
-/// re-checks the `WHERE` (defensive: the M5.1 first slice only emits single-equality
-/// `WHERE`s, so this re-check is a tautology), projects the result columns, and
-/// `Next`-iterates the index.
+/// first entry `>=` the search key prefix, then `IdxGT`s to verify the prefix is still equal
+/// (jumping past the body on a non-match). The body pulls the rowid from the index, seeks
+/// the table, re-checks the `WHERE` (defensive: when the WHERE is exactly the indexed
+/// equalities this is a tautology), projects the result columns, and `Next`-iterates the
+/// index.
 #[allow(clippy::too_many_arguments)]
 fn compile_indexed_select(
     _select: &SelectStmt,
@@ -74,10 +74,7 @@ fn compile_indexed_select(
     let cursor = 0i32;
     let idx_cursor = 1i32;
     let ncol = outputs.len() as i32;
-    let ctx = Ctx {
-        table,
-        cursor,
-    };
+    let ctx = Ctx { table, cursor };
     let mut b = ProgramBuilder::new();
 
     let setup = b.new_label();
@@ -103,35 +100,37 @@ fn compile_indexed_select(
     let open_table = b.emit(Opcode::OpenRead, cursor, table.rootpage as i32, 0);
     b.set_p4(open_table, P4::Int(table.columns.len() as i64));
 
-    // (2) Open the index cursor with KeyInfo (marks it as an index cursor in the executor).
-    let open_idx = b.emit(
-        Opcode::OpenRead,
-        idx_cursor,
-        plan.index.rootpage as i32,
-        0,
-    );
-    b.set_p4(
-        open_idx,
-        P4::KeyInfo(vec![KeyField {
+    // (2) Open the index cursor with KeyInfo (one field per indexed column, ASC/BINARY in
+    // this slice; the executor uses the explicit search-key registers, not this metadata).
+    let open_idx = b.emit(Opcode::OpenRead, idx_cursor, plan.index.rootpage as i32, 0);
+    let key_info: Vec<KeyField> = plan
+        .index
+        .columns
+        .iter()
+        .map(|_| KeyField {
             desc: false,
             collation: crate::types::Collation::Binary,
-        }]),
-    );
+        })
+        .collect();
+    b.set_p4(open_idx, P4::KeyInfo(key_info));
 
-    // (3) Load the constant RHS into a register; emit the SeekGE.
-    let key_reg = b.alloc_reg();
-    emit_value_load(&mut b, &plan.equality.value, key_reg);
+    // (3) Load the equality values into a contiguous register block; emit SeekGE.
+    let nkey = plan.equality.len() as i32;
+    let key_reg = b.alloc_regs(nkey);
+    for (i, ek) in plan.equality.iter().enumerate() {
+        emit_value_load(&mut b, &ek.value, key_reg + i as i32);
+    }
     let end_seek = b.new_label();
     let seek = b.emit_jump(Opcode::SeekGE, idx_cursor, end_seek, key_reg);
-    b.set_p4(seek, P4::Int(1)); // nField = 1 (the indexed column)
+    b.set_p4(seek, P4::Int(nkey as i64));
 
     // (5) Loop body: read the rowid, seek the table, project. The IdxGT boundary
-    // check is re-emitted at the top of every iteration (not just the first) so the loop
-    // terminates when the index passes the strict-equality boundary.
+    // check is re-emitted at the top of every iteration so the loop terminates when the
+    // index key prefix no longer matches.
     let loop_top = b.new_label();
     b.resolve(loop_top);
     let idx_gt = b.emit_jump(Opcode::IdxGT, idx_cursor, end_seek, key_reg);
-    b.set_p4(idx_gt, P4::Int(1));
+    b.set_p4(idx_gt, P4::Int(nkey as i64));
     let rowid_reg = b.alloc_reg();
     b.emit(Opcode::IdxRowid, idx_cursor, rowid_reg, 0);
     let idx_next = b.new_label();
@@ -666,4 +665,3 @@ mod tests {
         assert_eq!(disassemble(&prog), expected);
     }
 }
-

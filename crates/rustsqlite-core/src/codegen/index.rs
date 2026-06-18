@@ -11,9 +11,9 @@
 //!   OpenRead  table_cur, table_root, 0
 //!   Rewind    table_cur, end_populate
 //! populate_top:
-//!   Column    table_cur, col_idx, reg_col
+//!   Column    table_cur, col_idx_i, reg_col_i   ; for each indexed column
 //!   Rowid     table_cur, reg_rowid
-//!   MakeRecord reg_col, 2, reg_key
+//!   MakeRecord reg_cols..., n+1, reg_key
 //!   IdxInsert idx_cur, reg_key, 0, p4=0, p5=NCHANGE
 //! populate_next:
 //!   Next      table_cur, populate_top
@@ -30,8 +30,8 @@
 //!   Goto after_init
 //! ```
 //!
-//! The first M5.1 slice:
-//! * rejects multi-column indexes (`CREATE INDEX t(a, b)`) at codegen time,
+//! M5.2 adds multi-column index support: the populate pass emits one `Column` per indexed
+//! column, builds a composite key record, and `IdxInsert`s it. The first M5.1 slice:
 //! * records `UNIQUE` in the catalog but does **not** enforce uniqueness at `IdxInsert` time
 //!   (the page-level engine does not yet model a uniqueness check). The flag is stored in
 //!   `sqlite_schema` for fidelity, and a unit test pins the gap,
@@ -41,7 +41,7 @@
 use rustqlite_parser::CreateIndex;
 
 use crate::error::{Error, Result};
-use crate::schema::Table;
+use crate::schema::{IndexObject, Table};
 use crate::types::Value;
 use crate::vdbe::program::{Program, P4, P5_NCHANGE};
 use crate::vdbe::Opcode;
@@ -67,19 +67,26 @@ pub fn compile_create_index(
     schema_cookie: u32,
 ) -> Result<Program> {
     if ci.schema.is_some() {
-        return Err(Error::msg("schema-qualified CREATE INDEX is not yet supported"));
-    }
-    if ci.columns.len() != 1 {
         return Err(Error::msg(
-            "CREATE INDEX must have exactly one column in the M5.1 first slice",
+            "schema-qualified CREATE INDEX is not yet supported",
         ));
     }
-    let col_index = table.column_index(&ci.columns[0].name).ok_or_else(|| {
-        Error::msg(format!(
-            "table {} has no column named {}",
-            table.name, ci.columns[0].name
-        ))
-    })?;
+    let dummy = IndexObject {
+        name: String::new(),
+        table: ci.table.clone(),
+        rootpage: 0,
+        unique: ci.unique,
+        columns: ci
+            .columns
+            .iter()
+            .map(|c| crate::schema::IndexedColumn {
+                name: c.name.clone(),
+                collation: c.collation.clone(),
+                desc: c.desc,
+            })
+            .collect(),
+    };
+    let indexed_cis = dummy.table_column_indices(table)?;
 
     let mut b = ProgramBuilder::new();
 
@@ -112,11 +119,14 @@ pub fn compile_create_index(
     // is the first body instruction (the `Column`).
     let populate_top_label = b.new_label();
     b.resolve(populate_top_label);
-    let key_start = b.alloc_regs(2); // [col_value, rowid]
+    let nkey = indexed_cis.len() as i32 + 1; // indexed columns + trailing rowid
+    let key_start = b.alloc_regs(nkey);
     let rec_reg = b.alloc_reg();
-    b.emit(Opcode::Column, table_cursor, col_index as i32, key_start);
-    b.emit(Opcode::Rowid, table_cursor, key_start + 1, 0);
-    b.emit(Opcode::MakeRecord, key_start, 2, rec_reg);
+    for (i, col_idx) in indexed_cis.iter().enumerate() {
+        b.emit(Opcode::Column, table_cursor, *col_idx as i32, key_start + i as i32);
+    }
+    b.emit(Opcode::Rowid, table_cursor, key_start + indexed_cis.len() as i32, 0);
+    b.emit(Opcode::MakeRecord, key_start, nkey, rec_reg);
     let idx_insert = b.emit(Opcode::IdxInsert, idx_cursor, rec_reg, 0);
     b.set_p4(idx_insert, P4::Int(0)); // nMem = 0
     b.set_p5(idx_insert, P5_NCHANGE);
@@ -154,7 +164,12 @@ pub fn compile_create_index(
     b.emit(Opcode::Insert, schema_cursor, record, rowid_reg);
 
     // (7) Bump the schema cookie.
-    b.emit(Opcode::SetCookie, 0, COOKIE_SCHEMA, schema_cookie as i32 + 1);
+    b.emit(
+        Opcode::SetCookie,
+        0,
+        COOKIE_SCHEMA,
+        schema_cookie as i32 + 1,
+    );
 
     // (8) Reload the schema (marker — see the analogous comment in `create.rs`).
     b.emit(Opcode::ParseSchema, 0, 0, 0);

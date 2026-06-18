@@ -38,9 +38,8 @@ pub struct Table {
 }
 
 /// A resolved index: the table it indexes, the b-tree root page, the indexed columns, and
-/// whether `UNIQUE` was declared. The M5.1 first slice accepts only single-column indexes;
-/// `columns[0]` is the equality-usable column. The `unique` flag is recorded but uniqueness
-/// is not enforced yet (see the M5.1 module doc-comment).
+/// whether `UNIQUE` was declared. From M5.2 onward multi-column indexes are accepted; the
+/// `unique` flag is recorded but uniqueness is not enforced yet (see the milestone doc-comment).
 #[derive(Clone, Debug, PartialEq)]
 pub struct IndexObject {
     pub name: String,
@@ -50,14 +49,33 @@ pub struct IndexObject {
     pub unique: bool,
 }
 
-/// One column entry in an `IndexObject`. The M5.1 first slice uses only `name` (and that
-/// the indexed-column count is exactly 1); `collation` and `desc` are recorded for the
-/// catalog/EXPLAIN metadata but do not yet affect the comparison.
+/// One column entry in an `IndexObject`. The M5.2 runtime uses `name` to map the column back
+/// to the table; `collation` and `desc` are recorded for catalog/EXPLAIN metadata but still do
+/// not affect comparisons in this slice.
 #[derive(Clone, Debug, PartialEq)]
 pub struct IndexedColumn {
     pub name: String,
     pub collation: Option<String>,
     pub desc: bool,
+}
+
+impl IndexObject {
+    /// Map each indexed column name to its table column index. Returns `Ok(indices)` when all
+    /// columns exist; otherwise an error naming the missing column. This is used by the
+    /// codegen to build/seek composite index keys.
+    pub fn table_column_indices(&self, table: &Table) -> Result<Vec<usize>> {
+        let mut out = Vec::with_capacity(self.columns.len());
+        for ic in &self.columns {
+            let idx = table.column_index(&ic.name).ok_or_else(|| {
+                Error::msg(format!(
+                    "index {} references unknown column {} on table {}",
+                    self.name, ic.name, table.name
+                ))
+            })?;
+            out.push(idx);
+        }
+        Ok(out)
+    }
 }
 
 /// How a column reference resolves against a table.
@@ -176,11 +194,16 @@ impl IndexObject {
     /// Returns an error when the stored SQL is missing, doesn't parse, or doesn't reduce to
     /// a `CREATE INDEX` statement.
     pub fn from_schema_object(obj: &SchemaObject) -> Result<IndexObject> {
-        let sql = obj.sql.as_deref().ok_or_else(|| {
-            Error::msg(format!("index \"{}\" has no CREATE statement", obj.name))
+        let sql = obj
+            .sql
+            .as_deref()
+            .ok_or_else(|| Error::msg(format!("index \"{}\" has no CREATE statement", obj.name)))?;
+        let stmts = parse(sql).map_err(|e| {
+            Error::msg(format!(
+                "cannot parse schema for index \"{}\": {e}",
+                obj.name
+            ))
         })?;
-        let stmts = parse(sql)
-            .map_err(|e| Error::msg(format!("cannot parse schema for index \"{}\": {e}", obj.name)))?;
         let ci = match stmts.into_iter().next() {
             Some(Stmt::CreateIndex(ci)) => ci,
             _ => {
@@ -190,7 +213,11 @@ impl IndexObject {
                 )))
             }
         };
-        Ok(IndexObject::from_create(&ci, obj.rootpage, obj.name.clone()))
+        Ok(IndexObject::from_create(
+            &ci,
+            obj.rootpage,
+            obj.name.clone(),
+        ))
     }
 
     fn from_create(ci: &CreateIndex, rootpage: i64, name: String) -> IndexObject {
@@ -212,11 +239,20 @@ impl IndexObject {
         }
     }
 
-    /// The first indexed column (the M5.1 first slice only accepts single-column indexes, so
-    /// this is also the only one). Returns `None` for a multi-column index, which the planner
-    /// cannot currently use.
+    /// The first indexed column, if any. Multi-column indexes use `table_column_indices`.
     pub fn first_column(&self) -> Option<&IndexedColumn> {
         self.columns.first()
+    }
+
+    /// True when this index covers exactly the given columns (case-insensitive) in order.
+    pub fn covers_columns(&self, names: &[&str]) -> bool {
+        if self.columns.len() != names.len() {
+            return false;
+        }
+        self.columns
+            .iter()
+            .zip(names.iter())
+            .all(|(ic, name)| ic.name.eq_ignore_ascii_case(name))
     }
 }
 

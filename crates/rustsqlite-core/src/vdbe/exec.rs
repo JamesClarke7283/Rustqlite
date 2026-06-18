@@ -350,7 +350,8 @@ impl Vdbe {
                     self.set_cursor(p1 as usize, cursor);
                     self.cursor_root.insert(p1, root);
                     self.pc += 1;
-                }                Opcode::Close => {
+                }
+                Opcode::Close => {
                     if let Some(slot) = self.cursors.get_mut(p1 as usize) {
                         *slot = None;
                     }

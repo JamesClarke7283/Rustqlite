@@ -112,7 +112,10 @@ async fn table_cursor_seek_rowid_finds_and_misses() {
     );
 
     let vfs: Arc<dyn Vfs> = Arc::new(OsTokioVfs::new());
-    let file = vfs.open(&path_str, OpenFlags::READONLY).await.expect("open");
+    let file = vfs
+        .open(&path_str, OpenFlags::READONLY)
+        .await
+        .expect("open");
     let pager = Arc::new(
         Pager::open(vfs.clone(), path_str.clone(), file)
             .await

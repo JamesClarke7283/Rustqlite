@@ -22,14 +22,24 @@ use crate::types::{Collation, Value};
 use crate::vdbe::compare::mem_compare;
 
 use super::balance;
-use super::cell::{build_index_leaf_cell, parse_index_leaf_cell, parse_index_interior_cell};
+use super::cell::{build_index_leaf_cell, parse_index_interior_cell, parse_index_leaf_cell};
 use super::page::{self, PageHeader, PageType};
 
 /// Insert a new index entry into the b-tree rooted at `root`. Walks interior pages if the tree
 /// is multi-level, splits leaves that overflow, and recurses up the ancestor path when parents
 /// overflow. `key_record` is the encoded record (`[indexed columns..., rowid]`).
 pub async fn index_insert(pager: &Pager, root: u32, key_record: &[u8]) -> Result<()> {
-    index_insert_with_splitting(pager, root, key_record, &mut Vec::new()).await
+    loop {
+        match index_insert_with_splitting(pager, root, key_record, &mut Vec::new()).await {
+            Ok(()) => return Ok(()),
+            Err(e) if needs_restart(&e) => continue,
+            Err(other) => return Err(other),
+        }
+    }
+}
+
+fn needs_restart(e: &Error) -> bool {
+    e.message == "index insert needs restart after ancestor split"
 }
 
 /// Recursive helper. `path` is the ancestor stack above the node we are descending into.
@@ -81,16 +91,18 @@ async fn insert_into_index_leaf(
         Err(e) if is_page_full(&e) => {
             drop(leaf);
             let parent = path.pop();
-            balance_index_leaf(pager, leaf_pgno, parent, path, key_record).await
+            balance_index_page(pager, leaf_pgno, parent, path, key_record).await
         }
         Err(other) => Err(other),
     }
 }
 
-/// Handle a full index leaf by splitting it.
-fn balance_index_leaf<'a>(
+/// Handle a full index page (leaf or interior) by splitting it and reinserting
+/// `pending_key` into the correct child. Called when the original descent found
+/// a full leaf.
+fn balance_index_page<'a>(
     pager: &'a Pager,
-    leaf_pgno: u32,
+    pgno: u32,
     parent: Option<(u32, usize)>,
     ancestor_path: &'a mut Vec<(u32, usize)>,
     pending_key: &'a [u8],
@@ -99,43 +111,95 @@ fn balance_index_leaf<'a>(
         let parent_pgno = match parent {
             Some((p, _)) => p,
             None => {
-                balance::promote_index_root_and_split(pager, leaf_pgno).await?;
-                return index_insert_with_splitting(pager, leaf_pgno, pending_key, &mut Vec::new()).await;
+                let base = pager.btree_header_offset(pgno);
+                let buf = pager.get_page(pgno).await?;
+                let hdr = PageHeader::parse(&buf, base)?;
+                match hdr.page_type {
+                    PageType::LeafIndex => {
+                        balance::promote_index_root_and_split(pager, pgno).await?;
+                    }
+                    PageType::InteriorIndex => {
+                        balance::promote_index_root_interior(pager, pgno).await?;
+                    }
+                    _ => return Err(Error::corrupt("balance_index_page: root is not an index page")),
+                }
+                return index_insert_with_splitting(pager, pgno, pending_key, &mut Vec::new()).await;
             }
         };
 
-        let (new_pgno, divider_key) = match balance::split_index_leaf(pager, leaf_pgno, Some(parent_pgno)).await {
+        let split_result = balance::split_index_leaf(pager, pgno, Some(parent_pgno)).await;
+        let (new_pgno, divider_key) = match split_result {
             Ok(result) => result,
             Err(e) if is_page_full(&e) => {
-                if let Some(grand) = ancestor_path.pop() {
-                    return balance_index_leaf(pager, parent_pgno, Some(grand), ancestor_path, pending_key).await;
-                }
-                balance::promote_index_root_and_split(pager, parent_pgno).await?;
-                return index_insert_with_splitting(pager, parent_pgno, pending_key, &mut Vec::new()).await;
+                // The parent interior page is full. Split the parent to make room, then
+                // restart the whole insertion from the root so the descent uses the new tree
+                // shape. Do not insert pending_key here; it will be inserted once by the
+                // restarted descent.
+                split_ancestor_page(pager, parent_pgno, ancestor_path).await?;
+                return Err(Error::msg("index insert needs restart after ancestor split"));
             }
             Err(other) => return Err(other),
         };
 
         // Decide which child the pending key belongs to using the divider key directly.
-        // The divider key was promoted from the split point; keys < divider go left (leaf_pgno),
+        // The divider key was promoted from the split point; keys < divider go left (pgno),
         // keys >= divider go right (new_pgno). Since rowids in index keys are unique, equality
         // means we go right.
-        let target = {
-            let encoding = pager.text_encoding();
-            let div_values = decode_record(&divider_key, encoding)?;
-            let key_values = decode_record(pending_key, encoding)?;
-            let cmp = compare_record_prefixes(
-                &div_values[..div_values.len().saturating_sub(1)],
-                &div_values[div_values.len().saturating_sub(1)],
-                &key_values[..key_values.len().saturating_sub(1)],
-                &key_values[key_values.len().saturating_sub(1)],
-                Collation::Binary,
-            );
-            if cmp == std::cmp::Ordering::Greater { leaf_pgno } else { new_pgno }
-        };
+        let target = choose_index_child_after_split(pager, pgno, new_pgno, &divider_key, pending_key)?;
         let mut fresh = Vec::new();
         index_insert_with_splitting(pager, target, pending_key, &mut fresh).await
     })
+}
+
+/// Split an interior-index page that is too full to accept a new divider. This is
+/// used during the ancestor-split phase of `balance_index_page`; it does not
+/// insert the original pending key, it only reshapes the tree.
+fn split_ancestor_page<'a>(
+    pager: &'a Pager,
+    pgno: u32,
+    ancestor_path: &'a mut Vec<(u32, usize)>,
+) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+        let parent = match ancestor_path.pop() {
+            Some(p) => Some(p),
+            None => None,
+        };
+        let parent_pgno = match parent {
+            Some((p, _)) => p,
+            None => {
+                balance::promote_index_root_interior(pager, pgno).await?;
+                return Ok(());
+            }
+        };
+        match balance::split_index_interior_page(pager, pgno, Some(parent_pgno)).await {
+            Ok(_) => Ok(()),
+            Err(e) if is_page_full(&e) => {
+                split_ancestor_page(pager, parent_pgno, ancestor_path).await?;
+                Ok(())
+            }
+            Err(other) => Err(other),
+        }
+    })
+}
+
+fn choose_index_child_after_split(
+    pager: &Pager,
+    left_pgno: u32,
+    right_pgno: u32,
+    divider_key: &[u8],
+    pending_key: &[u8],
+) -> Result<u32> {
+    let encoding = pager.text_encoding();
+    let div_values = decode_record(divider_key, encoding)?;
+    let key_values = decode_record(pending_key, encoding)?;
+    let cmp = compare_record_prefixes(
+        &div_values[..div_values.len().saturating_sub(1)],
+        &div_values[div_values.len().saturating_sub(1)],
+        &key_values[..key_values.len().saturating_sub(1)],
+        &key_values[key_values.len().saturating_sub(1)],
+        Collation::Binary,
+    );
+    Ok(if cmp == std::cmp::Ordering::Greater { left_pgno } else { right_pgno })
 }
 
 /// Pick the child page of an interior-index page that should contain `key_record`.
@@ -381,6 +445,39 @@ mod tests {
             for (i, (_, rowid)) in scanned.iter().enumerate() {
                 assert_eq!(*rowid, (i + 1) as i64);
             }
+            pager.commit().await.unwrap();
+        });
+    }
+
+    /// Insert enough entries on a 512-byte page to grow the index b-tree to three levels,
+    /// forcing interior-page splits. All entries must remain findable and in sorted order.
+    #[test]
+    fn index_split_interior_pages() {
+        rt().block_on(async {
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
+            let file = vfs
+                .open("iint.db", OpenFlags::READWRITE_CREATE)
+                .await
+                .unwrap();
+            let pager = Pager::create_fresh(vfs.clone(), "iint.db".into(), file, 512)
+                .await
+                .unwrap();
+
+            pager.begin_write().await.unwrap();
+            let idx_root = create_index_btree(&pager).await.unwrap();
+
+            let n = 5000i64;
+            for rowid in 1i64..=n {
+                let key = encode_record(&[Value::Int(rowid), Value::Int(rowid)]);
+                index_insert(&pager, idx_root, &key).await.unwrap();
+            }
+
+            let scanned = scan_index(&pager, idx_root).await.unwrap();
+            assert_eq!(scanned.len() as i64, n, "expected {n} entries, got {}", scanned.len());
+            for (i, (_, rowid)) in scanned.iter().enumerate() {
+                assert_eq!(*rowid, (i + 1) as i64, "entry at index {i} must be rowid {}", i + 1);
+            }
+
             pager.commit().await.unwrap();
         });
     }

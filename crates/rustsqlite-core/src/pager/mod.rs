@@ -564,14 +564,16 @@ async fn recover_hot_journal(vfs: &dyn Vfs, path: &str, db: &dyn VfsFile) -> Res
             break; // corrupt/partial record — stop replay here
         }
         if pgno <= header.db_orig_size {
-            db.write_at((pgno as u64 - 1) * page_size as u64, data).await?;
+            db.write_at((pgno as u64 - 1) * page_size as u64, data)
+                .await?;
         }
         off += rec_len as u64;
     }
 
     // Restore the original database size and make the restoration durable before removing the
     // journal (so a crash during recovery re-runs it).
-    db.truncate(header.db_orig_size as u64 * page_size as u64).await?;
+    db.truncate(header.db_orig_size as u64 * page_size as u64)
+        .await?;
     db.sync().await?;
     let _ = vfs.delete(&jpath).await;
     Ok(())
@@ -788,10 +790,7 @@ mod tests {
             // database file has already been overwritten with the new contents (0x22).
             let preimage = vec![0x11u8; 4096];
             let jname = "hot.db-journal";
-            let jfile = vfs
-                .open(jname, OpenFlags::READWRITE_CREATE)
-                .await
-                .unwrap();
+            let jfile = vfs.open(jname, OpenFlags::READWRITE_CREATE).await.unwrap();
             let cksum_init = 0xabcd_1234u32;
             jfile
                 .write_at(0, &journal::build_header(1, cksum_init, 2, 4096))
@@ -807,13 +806,18 @@ mod tests {
             jfile.sync().await.unwrap();
 
             // Corrupt the live database page 2 (the "half-written commit").
-            let dbfile = vfs.open("hot.db", OpenFlags::READWRITE_CREATE).await.unwrap();
+            let dbfile = vfs
+                .open("hot.db", OpenFlags::READWRITE_CREATE)
+                .await
+                .unwrap();
             dbfile.write_at(4096, &vec![0x22u8; 4096]).await.unwrap();
             dbfile.sync().await.unwrap();
 
             // Opening triggers recovery: page 2 is restored to its pre-image and the journal removed.
             let file = vfs.open("hot.db", OpenFlags::READONLY).await.unwrap();
-            let reopened = Pager::open(vfs.clone(), "hot.db".into(), file).await.unwrap();
+            let reopened = Pager::open(vfs.clone(), "hot.db".into(), file)
+                .await
+                .unwrap();
             assert!(!vfs.exists(jname).await.unwrap());
             assert_eq!(reopened.get_page(2).await.unwrap()[0], 0x11);
         });

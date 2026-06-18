@@ -11,8 +11,9 @@
 //!
 //! M5.1: when the prepare path passes a non-empty `indexes` list, the program also emits one
 //! `OpenWrite` + `IdxInsert` pair per index per row, keeping the index b-trees in sync with the
-//! table. The index-key record is built from the table's record registers (a `Copy` of the
-//! indexed column value followed by an `SCopy` of the rowid), then `MakeRecord`-ed.
+//! table. The index-key record is built from the table's record registers (a `Copy` of each
+//! indexed column value followed by an `SCopy` of the rowid), then `MakeRecord`-ed. M5.2
+//! generalizes this to multi-column indexes.
 
 use rustqlite_parser::{Expr, InsertStmt};
 
@@ -43,9 +44,9 @@ pub fn compile_insert(ins: &InsertStmt, table: &Table, indexes: &[IndexObject]) 
     } else {
         let mut map = vec![None; ncol];
         for (vi, name) in ins.columns.iter().enumerate() {
-            let ci = table
-                .column_index(name)
-                .ok_or_else(|| Error::msg(format!("table {} has no column named {name}", table.name)))?;
+            let ci = table.column_index(name).ok_or_else(|| {
+                Error::msg(format!("table {} has no column named {name}", table.name))
+            })?;
             map[ci] = Some(vi);
         }
         map
@@ -144,28 +145,19 @@ pub fn compile_insert(ins: &InsertStmt, table: &Table, indexes: &[IndexObject]) 
         b.emit(Opcode::MakeRecord, rec_start, ncol as i32, record);
         b.emit(Opcode::Insert, cursor, record, rowid_reg);
 
-        // Index maintenance: for each index, build the key record (indexed columns + rowid),
-        // MakeRecord it, IdxInsert into the index cursor. Single-column indexes only (the
-        // M5.1 first slice; multi-column is the follow-up).
+        // Index maintenance: for each index, build the composite key record (indexed columns +
+        // trailing rowid), MakeRecord it, IdxInsert into the index cursor.
         for (i, idx) in indexes.iter().enumerate() {
             let ic = (index_cursor_base + i as i32) as i32;
-            // We assume the first slice's `idx.columns.len() == 1` (validated at
-            // `compile_create_index` time); a defensive error here flags a future slip.
-            if idx.columns.len() != 1 {
-                return Err(Error::msg(format!(
-                    "INSERT: index {} has {} columns; only single-column indexes are supported in M5.1",
-                    idx.name,
-                    idx.columns.len()
-                )));
+            let indexed_cis = idx.table_column_indices(table)?;
+            let nkey = indexed_cis.len() as i32 + 1;
+            let key_start = b.alloc_regs(nkey);
+            for (j, col_idx) in indexed_cis.iter().enumerate() {
+                b.emit(Opcode::SCopy, rec_start + *col_idx as i32, key_start + j as i32, 0);
             }
-            let indexed_ci = table
-                .column_index(&idx.columns[0].name)
-                .expect("validated above");
-            let key_start = b.alloc_regs(2); // [indexed_col, rowid]
-            b.emit(Opcode::SCopy, rec_start + indexed_ci as i32, key_start, 0);
-            b.emit(Opcode::SCopy, rowid_reg, key_start + 1, 0);
+            b.emit(Opcode::SCopy, rowid_reg, key_start + indexed_cis.len() as i32, 0);
             let key_rec = b.alloc_reg();
-            b.emit(Opcode::MakeRecord, key_start, 2, key_rec);
+            b.emit(Opcode::MakeRecord, key_start, nkey, key_rec);
             let ins_idx = b.emit(Opcode::IdxInsert, ic, key_rec, 0);
             b.set_p4(ins_idx, P4::Int(0)); // nMem = 0
             b.set_p5(ins_idx, P5_NCHANGE);

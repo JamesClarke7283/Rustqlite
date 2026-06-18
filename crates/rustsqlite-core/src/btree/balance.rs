@@ -15,8 +15,8 @@ use crate::pager::Pager;
 
 use super::cell::{
     assemble_index_interior_payload, build_index_interior_cell, build_table_interior_cell,
-    index_max_local, local_payload_len, parse_index_interior_cell,
-    parse_table_interior_cell, table_leaf_cell_rowid,
+    index_max_local, local_payload_len, parse_index_interior_cell, parse_table_interior_cell,
+    table_leaf_cell_rowid,
 };
 use super::page::{self, PageHeader, PageType};
 
@@ -29,11 +29,7 @@ use super::page::{self, PageHeader, PageType};
 /// so the caller can update the parent's right-most child pointer if the new child becomes
 /// the new right-most. If `parent_root` is `None`, the leaf is the b-tree's root and the
 /// caller must promote the root to an interior page (see [`promote_root_and_split`]).
-pub async fn split_leaf(
-    pager: &Pager,
-    leaf_pgno: u32,
-    parent_root: Option<u32>,
-) -> Result<u32> {
+pub async fn split_leaf(pager: &Pager, leaf_pgno: u32, parent_root: Option<u32>) -> Result<u32> {
     let usable = pager.usable_size();
     let base = pager.btree_header_offset(leaf_pgno);
     let leaf_buf = pager.read_page_for_write(leaf_pgno).await?;
@@ -88,7 +84,13 @@ pub async fn split_leaf(
         .collect();
 
     let mut new_leaf = vec![0u8; pager.page_size()];
-    page::write_page_cells(&mut new_leaf, pager.btree_header_offset(new_pgno), PageType::LeafTable, None, &right_cells)?;
+    page::write_page_cells(
+        &mut new_leaf,
+        pager.btree_header_offset(new_pgno),
+        PageType::LeafTable,
+        None,
+        &right_cells,
+    )?;
     pager.write_page(new_pgno, new_leaf)?;
 
     let mut new_left = vec![0u8; pager.page_size()];
@@ -158,9 +160,7 @@ pub async fn promote_root_and_split(pager: &Pager, root_pgno: u32) -> Result<()>
     let leaf_buf = pager.read_page_for_write(root_pgno).await?;
     let hdr = PageHeader::parse(&leaf_buf, base)?;
     if hdr.page_type != PageType::LeafTable {
-        return Err(Error::corrupt(
-            "promote_root_and_split: root is not a leaf",
-        ));
+        return Err(Error::corrupt("promote_root_and_split: root is not a leaf"));
     }
     let n = hdr.num_cells as usize;
     if n == 0 {
@@ -282,7 +282,8 @@ fn cell_total_size(
             .ok_or_else(|| Error::corrupt("rowid bytes"))?,
     )
     .ok_or_else(|| Error::corrupt("table leaf rowid varint"))?;
-    let local_payload_size = super::cell::local_payload_len(payload_size as usize, usable, usable - 35).0;
+    let local_payload_size =
+        super::cell::local_payload_len(payload_size as usize, usable, usable - 35).0;
     let overflow = if local_payload_size < payload_size as usize {
         4
     } else {
@@ -295,17 +296,16 @@ fn cell_total_size(
 /// [`build_table_leaf_cell`]). Cheap — no overflow read, since `build_table_leaf_cell`
 /// produces cells without the overflow page reference until M4.5b lands.
 fn max_rowid_of_cell(cell: &[u8]) -> Result<i64> {
-    table_leaf_cell_rowid(cell, 0)
-        .or_else(|_| {
-            // Fallback: decode the full cell (the slice passed here is just the cell bytes,
-            // not a page; `table_leaf_cell_rowid` walks by absolute page-relative offset, so
-            // fall back to a manual read).
-            let (_, n1) = crate::format::read_varint(cell)
-                .ok_or_else(|| Error::corrupt("payload varint"))?;
-            let (rowid, _) = crate::format::read_varint_i64(&cell[n1..])
-                .ok_or_else(|| Error::corrupt("rowid varint"))?;
-            Ok(rowid)
-        })
+    table_leaf_cell_rowid(cell, 0).or_else(|_| {
+        // Fallback: decode the full cell (the slice passed here is just the cell bytes,
+        // not a page; `table_leaf_cell_rowid` walks by absolute page-relative offset, so
+        // fall back to a manual read).
+        let (_, n1) =
+            crate::format::read_varint(cell).ok_or_else(|| Error::corrupt("payload varint"))?;
+        let (rowid, _) = crate::format::read_varint_i64(&cell[n1..])
+            .ok_or_else(|| Error::corrupt("rowid varint"))?;
+        Ok(rowid)
+    })
 }
 
 /// A throwaway helper used by tests: split a cell-list (vec of `(rowid, payload)` pairs) into
@@ -313,7 +313,10 @@ fn max_rowid_of_cell(cell: &[u8]) -> Result<i64> {
 /// split boundary without spinning up a pager. Builds the cells directly (without overflow)
 /// since the test inputs are small enough to fit inline.
 #[doc(hidden)]
-pub fn split_cells_for_test(usable: usize, cells: &[(i64, Vec<u8>)]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+pub fn split_cells_for_test(
+    usable: usize,
+    cells: &[(i64, Vec<u8>)],
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let mut built: Vec<Vec<u8>> = cells
         .iter()
         .map(|(rid, payload)| {
@@ -380,6 +383,11 @@ fn index_leaf_cell_on_page_size(page: &[u8], offset: usize, usable: usize) -> Re
 ///
 /// Returns the page number of the newly allocated right sibling **and** the divider key
 /// (the promoted cell's full index record, extracted from the leaf cell).
+/// Split a **full index-leaf** page into two halves. For index b-trees, the divider key is
+/// the **first key on the right side** (the cell at `split_at`), which is **promoted** into the
+/// parent and removed from both child pages. This mirrors SQLite's `balance_nonroot` where index
+/// b-trees use `leafData==0` and the divider cell is extracted from the cell array rather than
+/// being a copy of an existing row (as it is for table b-trees).
 pub async fn split_index_leaf(
     pager: &Pager,
     leaf_pgno: u32,
@@ -437,6 +445,14 @@ pub async fn split_index_leaf(
 
     let new_pgno = pager.allocate_page();
 
+    // Defer writing the child pages until the parent divider is successfully
+    // installed. If the parent is full, install_index_divider will fail before
+    // we have mutated the child pages, so a restart/retry can safely recompute
+    // the split instead of leaving a half-written sibling page unreachable.
+    if let Some(parent_pgno) = parent_root {
+        install_index_divider(pager, parent_pgno, leaf_pgno, new_pgno, &divider_key).await?;
+    }
+
     let mut new_right = vec![0u8; pager.page_size()];
     page::write_page_cells(
         &mut new_right,
@@ -451,119 +467,117 @@ pub async fn split_index_leaf(
     page::write_page_cells(&mut new_left, base, PageType::LeafIndex, None, &left_cells)?;
     pager.write_page(leaf_pgno, new_left)?;
 
-    if let Some(parent_pgno) = parent_root {
-        let pbase = pager.btree_header_offset(parent_pgno);
-        let mut pbuf = pager.read_page_for_write(parent_pgno).await?;
-        let phdr = PageHeader::parse(&pbuf, pbase)?;
-        if phdr.page_type != PageType::InteriorIndex {
-            return Err(Error::corrupt(
-                "split_index_leaf: declared parent is not an interior-index page",
-            ));
-        }
-        let is_rightmost = phdr.right_most_pointer == Some(leaf_pgno);
-
-        if is_rightmost {
-            // The old right-most (`leaf_pgno`) is split into leaf_pgno (smaller half) and
-            // new_pgno (larger half). Insert a new cell at the end:
-            //   (left=leaf_pgno, key=divider_key) and update right_most = new_pgno.
-            let insert_idx = phdr.num_cells as usize;
-            let cell = build_index_interior_cell(leaf_pgno, &divider_key, pager, usable);
-            if let Err(e) = page::insert_interior_cell(&mut pbuf, pbase, insert_idx, &cell) {
-                return Err(e);
-            }
-            pbuf[pbase + 8..pbase + 12].copy_from_slice(&new_pgno.to_be_bytes());
-        } else {
-            // The split leaf was a non-rightmost child. We must restructure the parent cell
-            // that pointed at leaf_pgno. Before the split:
-            //   cell[idx] = (left=leaf_pgno, key=old_key)
-            // where old_key partitions the range above leaf_pgno. After the split:
-            //   cell[idx]   = (left=leaf_pgno, key=divider_key) — smaller half
-            //   cell[idx+1] = (left=new_pgno, key=old_key)      — larger half
-            // This preserves the in-order traversal:
-            //   visit leaf_pgno (≤divider), yield divider, visit new_pgno (>divider, ≤old_key), yield old_key
-            // Implementation: parse the old cell to extract old_key and its left_child, then
-            // delete the old cell, insert the two new cells.
-            let child_idx = find_child_cell_index(&pbuf, &phdr, leaf_pgno)?;
-            let cell_off = phdr.cell_pointer(&pbuf, child_idx)?;
-            let old_cell = parse_index_interior_cell(&pbuf, cell_off, usable)?;
-            let old_key = assemble_index_interior_payload(pager, &old_cell).await?;
-            let old_left_child = old_cell.left_child;
-            debug_assert_eq!(old_left_child, leaf_pgno);
-
-            // Build the two replacement cells:
-            // cell_old replaces the old parent cell (left=leaf_pgno, key=divider_key)
-            // cell_new is inserted after it (left=new_pgno, key=old_key)
-            let cell_old = build_index_interior_cell(leaf_pgno, &divider_key, pager, usable);
-            let cell_new = build_index_interior_cell(new_pgno, &old_key, pager, usable);
-
-            // Rewrite the parent page: collect all cells in order, replacing cell[child_idx]
-            // with two cells (cell_old, cell_new), preserving the rest.
-            let mut new_cells: Vec<(usize, Vec<u8>)> = Vec::with_capacity(phdr.num_cells as usize + 1);
-            for i in 0..phdr.num_cells as usize {
-                if i == child_idx {
-                    new_cells.push((i, cell_old.clone()));
-                    new_cells.push((i + 1, cell_new.clone()));
-                } else {
-                    let off = phdr.cell_pointer(&pbuf, i)?;
-                    // Calculate size by re-parsing
-                    let (ps, vn) = read_varint(&pbuf[off + 4..])
-                        .ok_or_else(|| Error::corrupt("payload varint in parent cell"))?;
-                    let (ll, ho) = local_payload_len(ps as usize, usable, index_max_local(usable));
-                    let op = if ho { 4 } else { 0 };
-                    let sz = 4 + vn + ll + op;
-                    let mut c = vec![0u8; sz];
-                    c.copy_from_slice(&pbuf[off..off + sz]);
-                    new_cells.push((i, c));
-                }
-            }
-
-            // Rewrite the parent page with the new cell set.
-            let right_most = phdr.right_most_pointer;
-            let cells_with_idx: Vec<(u16, Vec<u8>)> = new_cells
-                .iter()
-                .enumerate()
-                .map(|(i, (_, c))| (i as u16, c.clone()))
-                .collect();
-            page::write_page_cells(&mut pbuf, pbase, PageType::InteriorIndex, right_most, &cells_with_idx)?;
-        }
-        pager.write_page(parent_pgno, pbuf)?;
-    }
-
     Ok((new_pgno, divider_key))
 }
 
-/// Promote a single-leaf index root to a two-level tree. For index b-trees the divider key is
-/// the **first key on the right side** (promoted from the child, not a copy of the last left
-/// key as in table b-trees).
+/// Install a divider into an interior-index parent after a child split. The divider cell is
+/// `(left=old_child, key=divider_key)` and the parent's right-most pointer (or the next cell's
+/// left_child) is updated to point at `new_child`.
 ///
-/// After the promotion:
-/// - Left child (left_pgno) holds `cells[0..split_at]`
-/// - Right child (right_pgno) holds `cells[split_at+1..]`
-/// - The root (root_pgno) becomes an interior page with one cell
-///   `(left=left_pgno, key=cells[split_at].key)` and `right_most = right_pgno`
-pub async fn promote_index_root_and_split(pager: &Pager, root_pgno: u32) -> Result<()> {
+/// For a non-rightmost child, the old parent cell `cell[idx] = (left=old_child, key=old_key)`
+/// is replaced by two cells:
+///   * `cell[idx]   = (left=old_child, key=divider_key)` — covers keys ≤ divider_key
+///   * `cell[idx+1] = (left=new_child,  key=old_key)`      — covers keys > divider_key and ≤ old_key
+/// This preserves the in-order traversal: visit old_child, yield divider_key, visit new_child,
+/// yield old_key, continue.
+///
+async fn install_index_divider(
+    pager: &Pager,
+    parent_pgno: u32,
+    old_child: u32,
+    new_child: u32,
+    divider_key: &[u8],
+) -> Result<()> {
     let usable = pager.usable_size();
-    let base = pager.btree_header_offset(root_pgno);
-    let leaf_buf = pager.read_page_for_write(root_pgno).await?;
-    let hdr = PageHeader::parse(&leaf_buf, base)?;
-    if hdr.page_type != PageType::LeafIndex {
+    let pbase = pager.btree_header_offset(parent_pgno);
+    let mut pbuf = pager.read_page_for_write(parent_pgno).await?;
+    let phdr = PageHeader::parse(&pbuf, pbase)?;
+    if phdr.page_type != PageType::InteriorIndex {
         return Err(Error::corrupt(
-            "promote_index_root_and_split: root is not a leaf-index",
+            "install_index_divider: declared parent is not an interior-index page",
         ));
     }
-    let n = hdr.num_cells as usize;
-    if n == 0 {
-        return Err(Error::corrupt(
-            "promote_index_root_and_split called on an empty leaf",
-        ));
-    }
+    let is_rightmost = phdr.right_most_pointer == Some(old_child);
 
-    let mut cells: Vec<Vec<u8>> = Vec::with_capacity(n);
-    for i in 0..n {
-        let off = hdr.cell_pointer(&leaf_buf, i)?;
-        let size = index_leaf_cell_on_page_size(&leaf_buf, off, usable)?;
+    if is_rightmost {
+        let insert_idx = phdr.num_cells as usize;
+        let cell = build_index_interior_cell(old_child, divider_key, pager, usable);
+        if let Err(e) = page::insert_interior_cell(&mut pbuf, pbase, insert_idx, &cell) {
+            return Err(e);
+        }
+        pbuf[pbase + 8..pbase + 12].copy_from_slice(&new_child.to_be_bytes());
+    } else {
+        let child_idx = find_child_cell_index(&pbuf, &phdr, old_child)?;
+        let cell_off = phdr.cell_pointer(&pbuf, child_idx)?;
+        let old_cell = parse_index_interior_cell(&pbuf, cell_off, usable)?;
+        let old_key = assemble_index_interior_payload(pager, &old_cell).await?;
+        debug_assert_eq!(old_cell.left_child, old_child);
+
+        let cell_old = build_index_interior_cell(old_child, divider_key, pager, usable);
+        let cell_new = build_index_interior_cell(new_child, &old_key, pager, usable);
+
+        let mut new_cells: Vec<(usize, Vec<u8>)> = Vec::with_capacity(phdr.num_cells as usize + 1);
+        for i in 0..phdr.num_cells as usize {
+            if i == child_idx {
+                new_cells.push((i, cell_old.clone()));
+                new_cells.push((i + 1, cell_new.clone()));
+            } else {
+                let off = phdr.cell_pointer(&pbuf, i)?;
+                let (ps, vn) = read_varint(&pbuf[off + 4..])
+                    .ok_or_else(|| Error::corrupt("payload varint in parent cell"))?;
+                let (ll, ho) = local_payload_len(ps as usize, usable, index_max_local(usable));
+                let op = if ho { 4 } else { 0 };
+                let sz = 4 + vn + ll + op;
+                let mut c = vec![0u8; sz];
+                c.copy_from_slice(&pbuf[off..off + sz]);
+                new_cells.push((i, c));
+            }
+        }
+
+        let right_most = phdr.right_most_pointer;
+        let cells_with_idx: Vec<(u16, Vec<u8>)> = new_cells
+            .iter()
+            .enumerate()
+            .map(|(i, (_, c))| (i as u16, c.clone()))
+            .collect();
+        page::write_page_cells(
+            &mut pbuf,
+            pbase,
+            PageType::InteriorIndex,
+            right_most,
+            &cells_with_idx,
+        )?;
+    }
+    pager.write_page(parent_pgno, pbuf)?;
+    Ok(())
+}
+
+/// Split a **full index-interior** page into two halves. The divider key is the **first key on
+/// the right side** (promoted from the cell at `split_at`), removed from both children, and
+/// installed in the parent. Interior cells keep their `left_child` prefix on the children; only
+/// the divider that goes to the parent has the prefix stripped.
+pub async fn split_index_interior_page(
+    pager: &Pager,
+    interior_pgno: u32,
+    parent_root: Option<u32>,
+) -> Result<(u32, Vec<u8>)> {
+    let usable = pager.usable_size();
+    let base = pager.btree_header_offset(interior_pgno);
+    let buf = pager.read_page_for_write(interior_pgno).await?;
+    let hdr = PageHeader::parse(&buf, base)?;
+    if hdr.page_type != PageType::InteriorIndex {
+        return Err(Error::corrupt(
+            "split_index_interior_page called on a non-index-interior page",
+        ));
+    }
+    let right_most = hdr.right_most_pointer;
+
+    let mut cells: Vec<Vec<u8>> = Vec::with_capacity(hdr.num_cells as usize);
+    for i in 0..hdr.num_cells as usize {
+        let off = hdr.cell_pointer(&buf, i)?;
+        let size = index_interior_cell_on_page_size(&buf, off, usable)?;
         let mut cell = vec![0u8; size];
-        cell.copy_from_slice(&leaf_buf[off..off + size]);
+        cell.copy_from_slice(&buf[off..off + size]);
         cells.push(cell);
     }
 
@@ -580,11 +594,177 @@ pub async fn promote_index_root_and_split(pager: &Pager, root_pgno: u32) -> Resu
     }
     if split_at >= cells.len() {
         return Err(Error::corrupt(
-            "promote_index_root_and_split: cannot split (single cell bigger than half the page)",
+            "split_index_interior_page: cannot find a split point",
+        ));
+    }
+    let divider_key = index_key_from_interior_cell(&cells[split_at], usable)?;
+    // The cell at split_at is promoted to the parent. Its left-child pointer
+    // becomes the new right-most pointer of the left half, because every key
+    // between the previous right-most boundary and the divider key now lives in
+    // that subtree.
+    let left_right_most = u32::from_be_bytes([
+        cells[split_at][0],
+        cells[split_at][1],
+        cells[split_at][2],
+        cells[split_at][3],
+    ]);
+
+    let left_cells: Vec<(u16, Vec<u8>)> = cells[..split_at]
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i as u16, c.clone()))
+        .collect();
+    let right_cells: Vec<(u16, Vec<u8>)> = cells[split_at + 1..]
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i as u16, c.clone()))
+        .collect();
+
+    let new_pgno = pager.allocate_page();
+
+    // Defer writing the child pages until the parent divider is successfully
+    // installed, matching the index-leaf split.
+    if let Some(parent_pgno) = parent_root {
+        install_index_divider(pager, parent_pgno, interior_pgno, new_pgno, &divider_key).await?;
+    }
+
+    let mut new_right = vec![0u8; pager.page_size()];
+    page::write_page_cells(
+        &mut new_right,
+        pager.btree_header_offset(new_pgno),
+        PageType::InteriorIndex,
+        right_most,
+        &right_cells,
+    )?;
+    pager.write_page(new_pgno, new_right)?;
+
+    let mut new_left = vec![0u8; pager.page_size()];
+    page::write_page_cells(
+        &mut new_left,
+        base,
+        PageType::InteriorIndex,
+        Some(left_right_most),
+        &left_cells,
+    )?;
+    pager.write_page(interior_pgno, new_left)?;
+
+    Ok((new_pgno, divider_key))
+}
+
+/// The on-page size of an index-interior cell: `u32(left_child) ++ varint(payload_size) ++
+/// local_payload ++ [4-byte overflow pointer]`.
+fn index_interior_cell_on_page_size(page: &[u8], offset: usize, usable: usize) -> Result<usize> {
+    let (payload_size, n1) = read_varint(&page[offset + 4..])
+        .ok_or_else(|| Error::corrupt("index interior payload-size varint"))?;
+    let n1 = n1 + 4;
+    let max_local = index_max_local(usable);
+    let (local_len, has_overflow) = local_payload_len(payload_size as usize, usable, max_local);
+    let overflow = if has_overflow { 4 } else { 0 };
+    Ok(n1 + local_len + overflow)
+}
+
+/// Extract the key record from an index-interior cell's on-page bytes. Interior cells start
+/// with a 4-byte left-child pointer before the payload-size varint.
+fn index_key_from_interior_cell(cell: &[u8], usable: usize) -> Result<Vec<u8>> {
+    let (payload_size, n1) = read_varint(&cell[4..])
+        .ok_or_else(|| Error::corrupt("index interior payload-size varint in divider key"))?;
+    let n1 = n1 + 4;
+    let max_local = index_max_local(usable);
+    let (local_len, has_overflow) = local_payload_len(payload_size as usize, usable, max_local);
+    let key_len = if has_overflow {
+        local_len
+    } else {
+        payload_size as usize
+    };
+    Ok(cell[n1..n1 + key_len].to_vec())
+}
+
+/// Promote a single-leaf index root to a two-level tree. For index b-trees the divider key is
+/// the **first key on the right side** (promoted from the child, not a copy of the last left
+/// key as in table b-trees).
+///
+/// After the promotion:
+/// - Left child (left_pgno) holds `cells[0..split_at]`
+/// - Right child (right_pgno) holds `cells[split_at+1..]`
+/// - The root (root_pgno) becomes an interior page with one cell
+///   `(left=left_pgno, key=cells[split_at].key)` and `right_most = right_pgno`
+pub async fn promote_index_root_and_split(pager: &Pager, root_pgno: u32) -> Result<()> {
+    promote_index_root(pager, root_pgno, PageType::LeafIndex).await
+}
+
+/// Promote a single-interior index root to a two-level tree when the interior root page
+/// overflows. The root's cells are split across two new interior pages, and the old root is
+/// rewritten as an interior-index page pointing at them.
+pub async fn promote_index_root_interior(pager: &Pager, root_pgno: u32) -> Result<()> {
+    promote_index_root(pager, root_pgno, PageType::InteriorIndex).await
+}
+
+async fn promote_index_root(pager: &Pager, root_pgno: u32, child_type: PageType) -> Result<()> {
+    let usable = pager.usable_size();
+    let base = pager.btree_header_offset(root_pgno);
+    let root_buf = pager.read_page_for_write(root_pgno).await?;
+    let hdr = PageHeader::parse(&root_buf, base)?;
+    if hdr.page_type != child_type {
+        return Err(Error::corrupt(format!(
+            "promote_index_root: root is not a {child_type:?} page"
+        )));
+    }
+    let is_interior = child_type == PageType::InteriorIndex;
+    let n = hdr.num_cells as usize;
+    if n == 0 {
+        return Err(Error::corrupt("promote_index_root called on an empty page"));
+    }
+
+    let mut cells: Vec<Vec<u8>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = hdr.cell_pointer(&root_buf, i)?;
+        let size = if is_interior {
+            index_interior_cell_on_page_size(&root_buf, off, usable)?
+        } else {
+            index_leaf_cell_on_page_size(&root_buf, off, usable)?
+        };
+        let mut cell = vec![0u8; size];
+        cell.copy_from_slice(&root_buf[off..off + size]);
+        cells.push(cell);
+    }
+
+    let target = usable / 2;
+    let mut left_size = 0usize;
+    let mut split_at = cells.len();
+    for (i, c) in cells.iter().enumerate() {
+        let projected = left_size + c.len() + 2;
+        if projected > target && i > 0 {
+            split_at = i;
+            break;
+        }
+        left_size = projected;
+    }
+    if split_at >= cells.len() {
+        return Err(Error::corrupt(
+            "promote_index_root: cannot split (single cell bigger than half the page)",
         ));
     }
 
-    let divider_key = index_key_from_leaf_cell(&cells[split_at], usable)?;
+    let right_most = if is_interior {
+        hdr.right_most_pointer
+    } else {
+        None
+    };
+    let (divider_key, left_right_most) = if is_interior {
+        let key = index_key_from_interior_cell(&cells[split_at], usable)?;
+        let left_ptr = u32::from_be_bytes([
+            cells[split_at][0],
+            cells[split_at][1],
+            cells[split_at][2],
+            cells[split_at][3],
+        ]);
+        (key, Some(left_ptr))
+    } else {
+        (
+            index_key_from_leaf_cell(&cells[split_at], usable)?,
+            right_most,
+        )
+    };
 
     let left_cells: Vec<(u16, Vec<u8>)> = cells[..split_at]
         .iter()
@@ -598,34 +778,44 @@ pub async fn promote_index_root_and_split(pager: &Pager, root_pgno: u32) -> Resu
         .collect();
 
     let left_pgno = pager.allocate_page();
-    let mut left_leaf = vec![0u8; pager.page_size()];
+    let mut left_child = vec![0u8; pager.page_size()];
     page::write_page_cells(
-        &mut left_leaf,
+        &mut left_child,
         pager.btree_header_offset(left_pgno),
-        PageType::LeafIndex,
-        None,
+        child_type,
+        if is_interior {
+            left_right_most
+        } else {
+            right_most
+        },
         &left_cells,
     )?;
-    pager.write_page(left_pgno, left_leaf)?;
+    pager.write_page(left_pgno, left_child)?;
 
     let right_pgno = pager.allocate_page();
-    let mut right_leaf = vec![0u8; pager.page_size()];
+    let mut right_child = vec![0u8; pager.page_size()];
     page::write_page_cells(
-        &mut right_leaf,
+        &mut right_child,
         pager.btree_header_offset(right_pgno),
-        PageType::LeafIndex,
-        None,
+        child_type,
+        right_most,
         &right_cells,
     )?;
-    pager.write_page(right_pgno, right_leaf)?;
+    pager.write_page(right_pgno, right_child)?;
 
+    // The old root becomes an interior-index page. Its single cell points at the left child
+    // with the divider key, and its right-most pointer is the right child. The divider key
+    // itself is promoted from the split point and does not live on either child page.
     let mut root_buf = vec![0u8; pager.page_size()];
     page::write_page_cells(
         &mut root_buf,
         base,
         PageType::InteriorIndex,
         Some(right_pgno),
-        &[(0, build_index_interior_cell(left_pgno, &divider_key, pager, usable))],
+        &[(
+            0,
+            build_index_interior_cell(left_pgno, &divider_key, pager, usable),
+        )],
     )?;
     pager.write_page(root_pgno, root_buf)?;
     Ok(())
@@ -676,7 +866,8 @@ fn find_child_cell_index(page: &[u8], hdr: &PageHeader, target: u32) -> Result<u
             for i in 0..hdr.num_cells as usize {
                 let off = hdr.cell_pointer(page, i)?;
                 // Interior-index cells start with a 4-byte left_child pointer.
-                let left_child = u32::from_be_bytes([page[off], page[off + 1], page[off + 2], page[off + 3]]);
+                let left_child =
+                    u32::from_be_bytes([page[off], page[off + 1], page[off + 2], page[off + 3]]);
                 if left_child == target {
                     return Ok(i);
                 }
@@ -702,11 +893,12 @@ mod tests {
     fn split_keeps_each_half_under_target() {
         // 10 small cells on a 4096-byte page must split roughly in half.
         let usable = 4096;
-        let cells: Vec<(i64, Vec<u8>)> = (1..=10)
-            .map(|i| (i as i64, vec![0u8; 100]))
-            .collect();
+        let cells: Vec<(i64, Vec<u8>)> = (1..=10).map(|i| (i as i64, vec![0u8; 100])).collect();
         let (left, right) = split_cells_for_test(usable, &cells);
-        assert!(!left.is_empty() && !right.is_empty(), "split must give both sides cells");
+        assert!(
+            !left.is_empty() && !right.is_empty(),
+            "split must give both sides cells"
+        );
         let left_size: usize = left.iter().map(|c| c.len() + 2).sum();
         let right_size: usize = right.iter().map(|c| c.len() + 2).sum();
         // Both halves should be under `usable / 2 + one_cell` (the split aims for half).

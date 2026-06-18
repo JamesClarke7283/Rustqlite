@@ -23,7 +23,10 @@ Rustqlite is a **full, faithful reimplementation of SQLite3 in Rust**. It is not
 - The on-disk **file format is stable across all of SQLite 3.x**, so format compatibility is not tied to the
   exact point release — but behavior/quirks are pinned to the target above.
 - Reference oracle on this machine: the system `sqlite3` binary at `/usr/bin/sqlite3`
-  (`3.53.1 2026-05-05`). Differential and round-trip tests compare against it.
+  (`3.53.2 2026-06-03` at the time of writing). Differential and round-trip tests compare
+  against it. Because the project pins behavior to SQLite **3.53.1**, only
+  `sqlite_version()` is expected to differ when the oracle drifts; see
+  `@docs/version-oracle-drift.md`.
 
 ## Workspace
 - `crates/rustqlite-parser` — SQL text → AST. **pest** PEG grammar ported from upstream `parse.y`;
@@ -64,6 +67,11 @@ runtime (e.g. a `#[tokio::test]`); engine-internal async fns are tested directly
 | `rustqlite` (CLI) | `rustyline` | line editing + history for interactive mode |
 
 Error types in the core are hand-rolled (no `thiserror`) to keep the dependency surface minimal.
+
+## Research
+
+Check these before web searching (load with Read tool as needed):
+- @docs/version-oracle-drift.md - system `sqlite3` version drift vs. the pinned `VERSION` target
 
 ## Build / run / test
 - Build: `cargo build`
@@ -119,7 +127,7 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   (single-column, `UNIQUE` recorded in the catalog but not enforced at `IdxInsert` time — the
   page-level engine does not yet model uniqueness), `DROP INDEX [IF EXISTS] name`, indexed
   equality `WHERE col = <const>` (uses the new `SeekGE` / `IdxGT` boundary-check opcodes over an
-  `IndexCursor`; `IdхGT` jumps when the entry is `>` the boundary, so the equality range
+  `IndexCursor`; `IdxGT` jumps when the entry is `>` the boundary, so the equality range
   terminates at the first strictly-greater key), indexed equality + `ORDER BY` (the indexed
   `SELECT` path emits a seek-and-walk, no sorter), and per-row index maintenance from
   `INSERT` / `UPDATE` / `DELETE` (the index `Delete` runs *after* the WHERE check so
@@ -128,7 +136,12 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   `Delete`/`Insert` + `IdxInsert` of the new key). Population is single-leaf only — the
   page-full error propagates; index page splits land in a follow-up. Differential-tested vs
   the C oracle (round-trip + indexed lookup) in `crates/rustsqlite-core/tests/write_roundtrip.rs`
-  (11 tests) and the in-process slt harness (`our/index.slt` + `evidence/slt_lang_dropindex.test`).
-   M5+ continues with: index page splits (DONE — already implemented in M5.1), multi-column indexes, partial/expression indexes,
-   enforced `UNIQUE`, `ORDER BY` over a non-indexed column with the index used as a
-   scan-time ordering hint, joins, aggregates, subqueries.
+  and the in-process slt harness (`our/index.slt` + `evidence/slt_lang_dropindex.test`).
+- **M5.2 — multi-column indexes** ✅: `CREATE [UNIQUE] INDEX … ON tbl(col1, col2, …)`, composite
+  index keys (concatenated indexed columns + trailing rowid), per-row `IdxInsert`/`IdxDelete`
+  maintenance from `INSERT`/`UPDATE`/`DELETE`, and indexed prefix-equality `SELECT`
+  (`WHERE col1 = ? AND col2 = ? …`). Index b-tree page splits and interior-page traversal
+  were already in place from the M5.1 follow-up work. Differential-tested vs the C oracle
+  (`multi_column_index_select`, `multi_column_index_maintained_on_writes`) and the in-process
+  slt harness (`our/multi-column-index.slt`). Still M5+: `KeyInfo` per-column collation,
+  enforced `UNIQUE`, partial/expression indexes, `ORDER BY` via index ordering hints.

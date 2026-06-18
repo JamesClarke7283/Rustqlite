@@ -10,7 +10,7 @@
 //! M5.1: when the prepare path passes a non-empty `indexes` list, the program also emits one
 //! `OpenWrite` + `IdxDelete` per index per row, keeping the indexes in sync. The OLD key
 //! record is built from the row's column values (read via `Column` opcodes) followed by the
-//! rowid.
+//! rowid. M5.2 generalizes this to multi-column composite keys.
 
 use rustqlite_parser::{DeleteStmt, Expr};
 
@@ -27,9 +27,7 @@ use super::expr::{compile_jump, Ctx};
 /// default) means "no indexes to maintain".
 pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) -> Result<Program> {
     if del.schema.is_some() {
-        return Err(Error::msg(
-            "schema-qualified DELETE is not yet supported",
-        ));
+        return Err(Error::msg("schema-qualified DELETE is not yet supported"));
     }
     let cursor = 0i32;
     let ctx = Ctx { table, cursor };
@@ -74,22 +72,14 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
         b.emit(Opcode::Rowid, cursor, rowid_reg, 0);
         for (i, idx) in indexes.iter().enumerate() {
             let ic = (index_cursor_base + i as i32) as i32;
-            if idx.columns.len() != 1 {
-                return Err(Error::msg(format!(
-                    "DELETE: index {} has {} columns; only single-column indexes are supported in M5.1",
-                    idx.name,
-                    idx.columns.len()
-                )));
+            let indexed_cis = idx.table_column_indices(table)?;
+            let nkey = indexed_cis.len() as i32 + 1;
+            let key_start = b.alloc_regs(nkey);
+            for (j, col_idx) in indexed_cis.iter().enumerate() {
+                b.emit(Opcode::Column, cursor, *col_idx as i32, key_start + j as i32);
             }
-            let indexed_ci = table
-                .column_index(&idx.columns[0].name)
-                .expect("validated at INSERT time");
-            let key_start = b.alloc_regs(2);
-            b.emit(Opcode::Column, cursor, indexed_ci as i32, key_start);
-            b.emit(Opcode::SCopy, rowid_reg, key_start + 1, 0);
-            let key_rec = b.alloc_reg();
-            b.emit(Opcode::MakeRecord, key_start, 2, key_rec);
-            b.emit(Opcode::IdxDelete, ic, key_start, 2);
+            b.emit(Opcode::SCopy, rowid_reg, key_start + indexed_cis.len() as i32, 0);
+            b.emit(Opcode::IdxDelete, ic, key_start, nkey);
         }
         b.emit(Opcode::Delete, cursor, 0, 0);
         b.resolve(end_of_body);
@@ -100,22 +90,14 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
         b.emit(Opcode::Rowid, cursor, rowid_reg, 0);
         for (i, idx) in indexes.iter().enumerate() {
             let ic = (index_cursor_base + i as i32) as i32;
-            if idx.columns.len() != 1 {
-                return Err(Error::msg(format!(
-                    "DELETE: index {} has {} columns; only single-column indexes are supported in M5.1",
-                    idx.name,
-                    idx.columns.len()
-                )));
+            let indexed_cis = idx.table_column_indices(table)?;
+            let nkey = indexed_cis.len() as i32 + 1;
+            let key_start = b.alloc_regs(nkey);
+            for (j, col_idx) in indexed_cis.iter().enumerate() {
+                b.emit(Opcode::Column, cursor, *col_idx as i32, key_start + j as i32);
             }
-            let indexed_ci = table
-                .column_index(&idx.columns[0].name)
-                .expect("validated at INSERT time");
-            let key_start = b.alloc_regs(2);
-            b.emit(Opcode::Column, cursor, indexed_ci as i32, key_start);
-            b.emit(Opcode::SCopy, rowid_reg, key_start + 1, 0);
-            let key_rec = b.alloc_reg();
-            b.emit(Opcode::MakeRecord, key_start, 2, key_rec);
-            b.emit(Opcode::IdxDelete, ic, key_start, 2);
+            b.emit(Opcode::SCopy, rowid_reg, key_start + indexed_cis.len() as i32, 0);
+            b.emit(Opcode::IdxDelete, ic, key_start, nkey);
         }
         b.emit(Opcode::Delete, cursor, 0, 0);
     }
@@ -130,8 +112,6 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
     b.emit_jump(Opcode::Goto, 0, after_init, 0);
     Ok(b.finish())
 }
-
-
 
 /// Compile the WHERE clause: jump to `end_of_body` (which sits after the Delete, just
 /// before the next `Next`) when the predicate is FALSE. NULL rows also skip the Delete,
@@ -154,7 +134,9 @@ mod tests {
 
     fn table_of(sql: &str) -> Table {
         let ast = parse(sql).unwrap().into_iter().next().unwrap();
-        let Stmt::CreateTable(ct) = ast else { panic!("expected CREATE TABLE") };
+        let Stmt::CreateTable(ct) = ast else {
+            panic!("expected CREATE TABLE")
+        };
         Table::from_schema_object(&SchemaObject {
             rowid: 1,
             obj_type: "table".into(),
