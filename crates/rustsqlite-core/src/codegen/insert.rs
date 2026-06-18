@@ -17,6 +17,7 @@
 
 use rustqlite_parser::{Expr, InsertStmt};
 
+use crate::codegen::update::compile_pred_jump;
 use crate::error::{Error, Result};
 use crate::schema::{IndexObject, Table};
 use crate::types::Affinity;
@@ -72,7 +73,7 @@ pub fn compile_insert(ins: &InsertStmt, table: &Table, indexes: &[IndexObject]) 
     }
 
     let cursor = 0i32;
-    let ctx = Ctx { table, cursor };
+    let ctx = Ctx { table, cursor, register_base: None };
     let mut b = ProgramBuilder::new();
 
     let setup = b.new_label();
@@ -161,6 +162,20 @@ pub fn compile_insert(ins: &InsertStmt, table: &Table, indexes: &[IndexObject]) 
             let ic = (index_cursor_base + i as i32) as i32;
             let indexed_cis = idx.table_column_indices(table)?;
             let nkey = indexed_cis.len() as i32 + 1;
+
+            // Partial-index predicate: only maintain this index when the new row satisfies it.
+            // The predicate is evaluated against the table row registers (rec_start..rec_start+ncol).
+            let skip_label = if let Some(pred) = &idx.where_clause {
+                let skip = b.new_label();
+                let pred_ctx = Ctx { table, cursor, register_base: None };
+                compile_pred_jump(
+                    &mut b, pred, skip, table, rec_start, indexed_cis.as_slice(), pred_ctx,
+                )?;
+                Some(skip)
+            } else {
+                None
+            };
+
             let key_start = b.alloc_regs(nkey);
             for (j, col_idx) in indexed_cis.iter().enumerate() {
                 b.emit(
@@ -191,6 +206,10 @@ pub fn compile_insert(ins: &InsertStmt, table: &Table, indexes: &[IndexObject]) 
                 b.set_p4(ins_idx, P4::Int(0)); // nMem = 0
             }
             b.set_p5(ins_idx, p5);
+
+            if let Some(skip) = skip_label {
+                b.resolve(skip);
+            }
         }
     }
 

@@ -117,6 +117,19 @@ pub fn compile_create_index(
     // is the first body instruction (the `Column`).
     let populate_top_label = b.new_label();
     b.resolve(populate_top_label);
+
+    // Partial-index predicate: skip rows that don't satisfy the WHERE clause. Evaluate the
+    // predicate directly from the table cursor (Column opcodes work here because the table cursor
+    // is positioned for each row in the populate loop).
+    let ctx = super::expr::Ctx { table, cursor: table_cursor, register_base: None };
+    let skip_label = if let Some(pred) = &dummy.where_clause {
+        let skip = b.new_label();
+        super::expr::compile_jump(&mut b, pred, skip, false, true, ctx)?;
+        Some(skip)
+    } else {
+        None
+    };
+
     let nkey = indexed_cis.len() as i32 + 1; // indexed columns + trailing rowid
     let key_start = b.alloc_regs(nkey);
     let rec_reg = b.alloc_reg();
@@ -148,6 +161,11 @@ pub fn compile_create_index(
         b.set_p4(idx_insert, P4::Int(0)); // nMem = 0
     }
     b.set_p5(idx_insert, p5);
+
+    if let Some(skip) = skip_label {
+        b.resolve(skip);
+    }
+
     b.emit_jump(Opcode::Next, table_cursor, populate_top_label, 0);
 
     b.resolve(end_populate);

@@ -77,6 +77,15 @@ pub(crate) fn pick_index(
     let mut best: Option<IndexPlan> = None;
     let mut best_len = 0usize;
     for idx in indexes {
+        // Partial indexes can only be used when the query's WHERE implies the index predicate.
+        // A safe, conservative rule that matches SQLite for simple cases: the index predicate
+        // must appear verbatim (or tautologically) in the query WHERE. Until we have a real
+        // theorem prover, we accept the index only when the query WHERE literally contains the
+        // same expression tree as the index predicate, so `WHERE a=1 AND predicate` uses a
+        // partial index defined with `WHERE predicate`, while `WHERE a=1` does not.
+        if !partial_index_usable(idx, select) {
+            continue;
+        }
         let prefix = match find_index_prefix_equalities(idx, &table_columns, &where_equalities) {
             Some(p) if !p.is_empty() => p,
             _ => continue,
@@ -93,6 +102,40 @@ pub(crate) fn pick_index(
     // If we have a usable prefix but no ORDER BY benefit, we still use the index when the
     // prefix has at least one equality. (M5.1 already did this for single-column indexes.)
     best
+}
+
+/// True when a partial index's predicate is satisfied by the query's WHERE clause.
+/// The conservative check looks for the exact predicate expression as a conjunct of the
+/// WHERE clause (flattened by AND). This handles the common `WHERE a = ? AND b = ?` query
+/// against an index `WHERE b = ?` — the literal equality term `b = ?` must be present.
+fn partial_index_usable(index: &IndexObject, select: &SelectStmt) -> bool {
+    let Some(pred) = &index.where_clause else {
+        return true; // non-partial indexes are always usable
+    };
+    let Some(w) = &select.where_clause else {
+        return false;
+    };
+    let mut conjuncts = Vec::new();
+    flatten_and(w, &mut conjuncts);
+    conjuncts.iter().any(|c| exprs_equal(c, pred))
+}
+
+fn flatten_and(expr: &Expr, out: &mut Vec<Expr>) {
+    if let Expr::Binary {
+        op: BinaryOp::And,
+        left,
+        right,
+    } = expr
+    {
+        flatten_and(left, out);
+        flatten_and(right, out);
+    } else {
+        out.push(expr.clone());
+    }
+}
+
+fn exprs_equal(a: &Expr, b: &Expr) -> bool {
+    a == b
 }
 
 /// Collect all equality predicates from the WHERE clause as a flat list. The M3a/M5.2

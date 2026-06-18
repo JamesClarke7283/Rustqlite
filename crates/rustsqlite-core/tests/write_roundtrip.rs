@@ -773,3 +773,69 @@ fn create_index_if_not_exists() {
         "1"
     );
 }
+
+/// M5.2.9: partial indexes. `CREATE INDEX ... WHERE expr` only indexes rows that satisfy the
+/// predicate; the index is used only when the query WHERE contains the predicate; and
+/// INSERT/UPDATE/DELETE maintain the index accordingly.
+#[test]
+fn partial_index_create_populate_select_and_maintain() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("partialidx");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a INT, b TEXT, c TEXT);");
+        exec(&mut conn, "INSERT INTO t VALUES (1,'x','r1'), (2,'x','r2'), (3,'y','r3'), (4,'x','r4');");
+        // Partial index: only rows where b = 'x' are indexed.
+        exec(&mut conn, "CREATE INDEX i_partial ON t(a) WHERE b = 'x';");
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    // The index answers lookups for matching predicate rows.
+    assert_eq!(db.query("SELECT c FROM t WHERE a = 2 AND b = 'x';"), "r2");
+    assert_eq!(db.query("SELECT c FROM t WHERE a = 4 AND b = 'x';"), "r4");
+    // Non-matching predicate rows are not in the index (and the planner won't use it here).
+    assert_eq!(db.query("SELECT c FROM t WHERE a = 3 AND b = 'y';"), "r3");
+    // The schema row preserves the WHERE clause verbatim.
+    assert_eq!(
+        db.query("SELECT sql FROM sqlite_schema WHERE name = 'i_partial';"),
+        "CREATE INDEX i_partial ON t(a) WHERE b = 'x'"
+    );
+
+    // Maintenance: insert a matching and a non-matching row.
+    let mut conn = sqlite3_open(db.str()).expect("open");
+    exec(&mut conn, "INSERT INTO t VALUES (5,'x','r5'), (6,'y','r6');");
+    // Delete a matching row.
+    exec(&mut conn, "DELETE FROM t WHERE a = 1 AND b = 'x';");
+    let _ = conn;
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT c FROM t WHERE a = 5 AND b = 'x';"), "r5");
+    assert_eq!(db.query("SELECT c FROM t WHERE a = 6 AND b = 'y';"), "r6");
+    assert_eq!(db.query("SELECT c FROM t WHERE a = 1 AND b = 'x';"), "");
+    assert_eq!(db.query("SELECT c FROM t WHERE a = 2 AND b = 'x';"), "r2");
+    assert_eq!(db.query("SELECT c FROM t WHERE a = 4 AND b = 'x';"), "r4");
+
+    // Updating a column that appears in the partial-index predicate is not supported in
+    // this slice (the OLD/NEW predicate evaluation would need separate value snapshots).
+    let mut conn = sqlite3_open(db.str()).expect("open");
+    let result = sqlite3_prepare_v2(
+        &mut conn,
+        "UPDATE t SET b = 'z' WHERE a = 2;"
+    );
+    assert!(
+        result.is_err(),
+        "expected an error for partial-index predicate referencing updated column"
+    );
+    match result {
+        Err(e) => assert!(e.to_string().contains("partial-index predicate")),
+        Ok(_) => panic!("expected error"),
+    }
+
+    // Updating a column NOT in the predicate while the predicate references another column
+    // is fine and keeps the index in sync.
+    let mut conn = sqlite3_open(db.str()).expect("open");
+    exec(&mut conn, "UPDATE t SET c = 'updated' WHERE a = 2 AND b = 'x';");
+    assert_eq!(db.query("SELECT c FROM t WHERE a = 2 AND b = 'x';"), "updated");
+}

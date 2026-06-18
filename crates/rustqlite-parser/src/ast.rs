@@ -138,10 +138,12 @@ pub struct UpdateStmt {
     pub where_clause: Option<Expr>,
 }
 
-/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [schema.]name ON tbl(col [COLLATE name] [ASC|DESC] …)`.
+/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [schema.]name ON tbl(col [COLLATE name] [ASC|DESC] …)
+/// [WHERE expr]`.
 /// Multi-column indexes are accepted from M5.2 onward; the `collation` and `desc` fields are
 /// recorded in the AST but the runtime still treats all indexes as ASC/BINARY in this slice
 /// (they are structural fields for the catalog/EXPLAIN, not behavioral ones yet).
+/// The optional `where_clause` is the partial-index predicate (M5.2.9).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateIndex {
     pub unique: bool,
@@ -150,6 +152,7 @@ pub struct CreateIndex {
     pub name: String,
     pub table: String,
     pub columns: Vec<IndexedColumn>,
+    pub where_clause: Option<Expr>,
 }
 
 /// One column entry in a `CREATE INDEX` column list.

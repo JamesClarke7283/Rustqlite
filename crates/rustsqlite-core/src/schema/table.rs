@@ -51,6 +51,8 @@ pub struct IndexObject {
     /// This mirrors SQLite's `Index.uniqNotNull`: uniqueness is only enforced on rows where
     /// none of the key columns are NULL (NULL != NULL in SQL).
     pub unique_not_null: bool,
+    /// Optional partial-index predicate (`WHERE expr`). From M5.2.9 onward.
+    pub where_clause: Option<rustqlite_parser::Expr>,
 }
 
 /// One column entry in an `IndexObject`. The M5.2 runtime uses `name` to map the column back
@@ -290,6 +292,7 @@ impl IndexObject {
             columns,
             unique: ci.unique,
             unique_not_null,
+            where_clause: ci.where_clause.clone(),
         }
     }
 

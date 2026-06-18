@@ -23,6 +23,10 @@ pub struct Ctx<'a> {
     pub table: &'a Table,
     /// The cursor number the table is open on.
     pub cursor: i32,
+    /// When set, column references read from this register base instead of the table cursor.
+    /// Used for partial-index predicate evaluation during INSERT/UPDATE index maintenance,
+    /// where the row values already sit in a contiguous register block.
+    pub register_base: Option<i32>,
 }
 
 /// Emit code computing `e` into register `target`.
@@ -118,10 +122,18 @@ fn compile_column(
 ) -> Result<()> {
     match ctx.table.resolve_column(name) {
         Some(ColumnRef::Rowid) => {
-            b.emit(Opcode::Rowid, ctx.cursor, target, 0);
+            if let Some(base) = ctx.register_base {
+                b.emit(Opcode::SCopy, base, target, 0);
+            } else {
+                b.emit(Opcode::Rowid, ctx.cursor, target, 0);
+            }
         }
         Some(ColumnRef::Index(i)) => {
-            b.emit(Opcode::Column, ctx.cursor, i as i32, target);
+            if let Some(base) = ctx.register_base {
+                b.emit(Opcode::SCopy, base + i as i32, target, 0);
+            } else {
+                b.emit(Opcode::Column, ctx.cursor, i as i32, target);
+            }
             // A REAL-affinity column may store integer-valued rows as integers on disk; realify
             // so they read back as REAL (matches upstream's OP_RealAffinity after OP_Column).
             if ctx.table.columns[i].affinity == Affinity::Real {

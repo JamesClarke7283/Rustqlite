@@ -74,7 +74,7 @@ fn compile_indexed_select(
     let cursor = 0i32;
     let idx_cursor = 1i32;
     let ncol = outputs.len() as i32;
-    let ctx = Ctx { table, cursor };
+    let ctx = Ctx { table, cursor, register_base: None };
     let mut b = ProgramBuilder::new();
 
     let setup = b.new_label();
@@ -214,7 +214,7 @@ fn compile_scan(
 ) -> Result<Program> {
     let cursor = 0i32;
     let ncol = outputs.len() as i32;
-    let ctx = Ctx { table, cursor };
+    let ctx = Ctx { table, cursor, register_base: None };
     let mut b = ProgramBuilder::new();
 
     let setup = b.new_label();
@@ -382,6 +382,7 @@ fn compile_constant(
     let ctx = Ctx {
         table: &empty,
         cursor: -1,
+        register_base: None,
     };
     let ncol = outputs.len() as i32;
     let mut b = ProgramBuilder::new();

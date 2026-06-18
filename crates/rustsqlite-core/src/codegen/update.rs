@@ -55,6 +55,8 @@
 
 use rustqlite_parser::{Assignment, UpdateStmt};
 
+use crate::codegen::builder::Label;
+
 use crate::error::{Error, Result};
 use crate::schema::{IndexObject, Table};
 use crate::types::Affinity;
@@ -118,7 +120,7 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
 
     let cursor = 0i32;
     let sorter = 1i32;
-    let ctx = Ctx { table, cursor };
+    let ctx = Ctx { table, cursor, register_base: None };
     let mut b = ProgramBuilder::new();
 
     let setup = b.new_label();
@@ -249,10 +251,29 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
     // snapshotted old values captured at (6b) above) and IdxDelete it. The table Delete is
     // then performed, followed by the Insert, and finally the NEW composite key is
     // IdxInserted.
+    //
+    // Partial-index predicate: the OLD row had an index entry only if it satisfied the
+    // predicate, so we conditionally skip the IdxDelete. We evaluate the predicate against
+    // the NEW row values in `reg_new`: for columns that are not being assigned, `reg_new`
+    // still holds the OLD value (we copied it at (6) above); for assigned columns the value
+    // changed, but the OLD key must still be deleted, and the predicate's truth value is the
+    // same regardless of the NEW value when it references only non-updated columns. Predicates
+    // that reference an assigned column are not supported in this slice.
     for (i, idx) in indexes.iter().enumerate() {
         let ic = index_cursor_base + i as i32;
         let indexed_cis = idx.table_column_indices(table).expect("validated earlier");
         let nkey = indexed_cis.len() as i32 + 1; // indexed columns + trailing rowid
+
+        let skip_delete_label = if let Some(pred) = &idx.where_clause {
+            validate_partial_pred_on_update(pred, table, &target_col)?;
+            let skip = b.new_label();
+                let pred_ctx = Ctx { table, cursor, register_base: None };
+            compile_pred_jump(&mut b, pred, skip, table, reg_new, indexed_cis.as_slice(), pred_ctx)?;
+            Some(skip)
+        } else {
+            None
+        };
+
         let old_key = b.alloc_regs(nkey);
         for (j, col_idx) in indexed_cis.iter().enumerate() {
             let old_val_reg = *old_value_reg
@@ -270,6 +291,10 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
         // the number of fields.
         b.emit(Opcode::IdxDelete, ic, old_key, nkey);
 
+        if let Some(skip) = skip_delete_label {
+            b.resolve(skip);
+        }
+
         let _ = i; // cursor numbers are derived from index position
     }
 
@@ -284,6 +309,18 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
         let ic = index_cursor_base + i as i32;
         let indexed_cis = idx.table_column_indices(table).expect("validated earlier");
         let nkey = indexed_cis.len() as i32 + 1;
+
+        // Partial-index predicate: only insert the NEW row if it satisfies the predicate.
+        let skip_insert_label = if let Some(pred) = &idx.where_clause {
+            validate_partial_pred_on_update(pred, table, &target_col)?;
+            let skip = b.new_label();
+                let pred_ctx = Ctx { table, cursor, register_base: None };
+            compile_pred_jump(&mut b, pred, skip, table, reg_new, indexed_cis.as_slice(), pred_ctx)?;
+            Some(skip)
+        } else {
+            None
+        };
+
         let new_key = b.alloc_regs(nkey);
         for (j, col_idx) in indexed_cis.iter().enumerate() {
             b.emit(
@@ -315,6 +352,10 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
         }
         b.set_p5(idx_ins, p5);
 
+        if let Some(skip) = skip_insert_label {
+            b.resolve(skip);
+        }
+
         let _ = i;
     }
 
@@ -338,6 +379,58 @@ fn affinity_char(a: Affinity) -> u8 {
         Affinity::Integer => b'D',
         Affinity::Real => b'E',
     }
+}
+
+/// Compile a partial-index predicate as a conditional jump over the row values in a
+/// contiguous register block starting at `reg_base`. `compile_jump` is run with a context
+/// whose `register_base` is set, so column references read directly from the row registers
+/// rather than from a positioned table cursor.
+pub(crate) fn compile_pred_jump(
+    b: &mut ProgramBuilder,
+    pred: &rustqlite_parser::Expr,
+    skip: Label,
+    _table: &Table,
+    reg_base: i32,
+    _indexed_cis: &[usize],
+    mut ctx: Ctx,
+) -> Result<()> {
+    ctx.register_base = Some(reg_base);
+    compile_jump(b, pred, skip, false, true, ctx)
+}
+
+/// Reject partial-index predicates that reference a column being updated. The current
+/// maintenance code evaluates the predicate against the NEW row values, which is correct
+/// for the old-key deletion only when the predicate does not involve an assigned column.
+fn validate_partial_pred_on_update(
+    pred: &rustqlite_parser::Expr,
+    table: &Table,
+    target_col: &[Option<(usize, &rustqlite_parser::Expr)>],
+) -> Result<()> {
+    let mut stack = vec![pred];
+    while let Some(e) = stack.pop() {
+        match e {
+            rustqlite_parser::Expr::Column { name, .. } => {
+                let ci = table.column_index(name).ok_or_else(|| {
+                    Error::msg(format!(
+                        "partial-index predicate references unknown column: {name}"
+                    ))
+                })?;
+                if target_col[ci].is_some() {
+                    return Err(Error::msg(format!(
+                        "partial-index predicate referencing updated column '{name} is not supported in this slice"
+                    )));
+                }
+            }
+            rustqlite_parser::Expr::Unary { expr, .. } => stack.push(expr),
+            rustqlite_parser::Expr::Binary { left, right, .. } => {
+                stack.push(left);
+                stack.push(right);
+            }
+            rustqlite_parser::Expr::Collate { expr, .. } => stack.push(expr),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

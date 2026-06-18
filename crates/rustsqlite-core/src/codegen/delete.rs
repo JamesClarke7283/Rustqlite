@@ -30,7 +30,7 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
         return Err(Error::msg("schema-qualified DELETE is not yet supported"));
     }
     let cursor = 0i32;
-    let ctx = Ctx { table, cursor };
+    let ctx = Ctx { table, cursor, register_base: None };
     let mut b = ProgramBuilder::new();
 
     // Standard VDBE preamble: `Init 0, setup` at addr 0 jumps to the trailing `Goto after_init`
@@ -82,6 +82,17 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
         b.emit(Opcode::Rowid, cursor, rowid_reg, 0);
         for (i, idx) in indexes.iter().enumerate() {
             let ic = (index_cursor_base + i as i32) as i32;
+
+            // Partial-index predicate: only maintain this index when the row satisfied it.
+            // Evaluate on the OLD values (before the table Delete).
+            let skip_label = if let Some(pred) = &idx.where_clause {
+                let skip = b.new_label();
+                compile_where(&mut b, pred, skip, ctx)?;
+                Some(skip)
+            } else {
+                None
+            };
+
             let indexed_cis = idx.table_column_indices(table)?;
             let nkey = indexed_cis.len() as i32 + 1;
             let key_start = b.alloc_regs(nkey);
@@ -100,6 +111,10 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
                 0,
             );
             b.emit(Opcode::IdxDelete, ic, key_start, nkey);
+
+            if let Some(skip) = skip_label {
+                b.resolve(skip);
+            }
         }
         b.emit(Opcode::Delete, cursor, 0, 0);
         b.resolve(end_of_body);
@@ -110,6 +125,15 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
         b.emit(Opcode::Rowid, cursor, rowid_reg, 0);
         for (i, idx) in indexes.iter().enumerate() {
             let ic = (index_cursor_base + i as i32) as i32;
+
+            let skip_label = if let Some(pred) = &idx.where_clause {
+                let skip = b.new_label();
+                compile_where(&mut b, pred, skip, ctx)?;
+                Some(skip)
+            } else {
+                None
+            };
+
             let indexed_cis = idx.table_column_indices(table)?;
             let nkey = indexed_cis.len() as i32 + 1;
             let key_start = b.alloc_regs(nkey);
@@ -128,6 +152,10 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
                 0,
             );
             b.emit(Opcode::IdxDelete, ic, key_start, nkey);
+
+            if let Some(skip) = skip_label {
+                b.resolve(skip);
+            }
         }
         b.emit(Opcode::Delete, cursor, 0, 0);
     }

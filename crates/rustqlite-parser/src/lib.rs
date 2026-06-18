@@ -509,6 +509,7 @@ fn build_create_index(pair: Pair<'_, Rule>) -> CreateIndex {
         name: String::new(),
         table: String::new(),
         columns: Vec::new(),
+        where_clause: None,
     };
     for part in pair.into_inner() {
         match part.as_rule() {
@@ -525,6 +526,7 @@ fn build_create_index(pair: Pair<'_, Rule>) -> CreateIndex {
                 ci.table = part.as_str().to_string();
             }
             Rule::indexed_column => ci.columns.push(build_indexed_column(part)),
+            Rule::where_item => ci.where_clause = Some(build_expr_item(part)),
             _ => {}
         }
     }
