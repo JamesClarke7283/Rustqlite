@@ -13,6 +13,7 @@ use crate::format::decode_record;
 use crate::pager::Pager;
 use crate::types::{Collation, Value};
 use crate::vdbe::compare::mem_compare;
+use crate::vdbe::KeyField;
 
 use super::cell::parse_index_leaf_cell;
 use super::page::{self, PageType};
@@ -21,7 +22,14 @@ use super::page::{self, PageType};
 /// rooted at `root`. Returns `Ok(true)` when the entry was found and removed, `Ok(false)` when
 /// the leaf has no such entry (a no-op for `IdxDelete`, matching upstream's
 /// `sqlite3BtreeIndexMoveto + sqlite3BtreeDelete` path which is silent on a miss).
-pub async fn index_leaf_delete(pager: &Arc<Pager>, root: u32, key_record: &[u8]) -> Result<bool> {
+/// `key_info` carries the per-column collation so the lookup uses the same comparison rule as
+/// the cursor.
+pub async fn index_leaf_delete(
+    pager: &Arc<Pager>,
+    root: u32,
+    key_record: &[u8],
+    key_info: &[crate::vdbe::KeyField],
+) -> Result<bool> {
     let usable = pager.usable_size();
     let base = pager.btree_header_offset(root);
     let page = pager.get_page(root).await?;
@@ -47,7 +55,7 @@ pub async fn index_leaf_delete(pager: &Arc<Pager>, root: u32, key_record: &[u8])
         let existing_prefix_len = existing.len().saturating_sub(1);
         let existing_prefix = &existing[..existing_prefix_len];
         let existing_rowid = &existing[existing_prefix_len];
-        if prefixes_equal(existing_prefix, search_prefix, Collation::Binary)
+        if prefixes_equal(existing_prefix, search_prefix, key_info)
             && mem_compare(existing_rowid, search_rowid, Collation::Binary)
                 == std::cmp::Ordering::Equal
         {
@@ -95,11 +103,15 @@ fn cell_on_page_size(page: &[u8], offset: usize, usable: usize) -> usize {
     n1 + local_len + overflow
 }
 
-fn prefixes_equal(a: &[Value], b: &[Value], coll: Collation) -> bool {
+fn prefixes_equal(a: &[Value], b: &[Value], key_info: &[KeyField]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    for (x, y) in a.iter().zip(b.iter()) {
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        let coll = key_info
+            .get(i)
+            .map(|f| f.collation)
+            .unwrap_or(Collation::Binary);
         if mem_compare(x, y, coll) != std::cmp::Ordering::Equal {
             return false;
         }

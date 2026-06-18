@@ -44,7 +44,7 @@ use crate::error::{Error, Result};
 use crate::schema::{IndexObject, Table};
 use crate::types::Value;
 use crate::vdbe::program::{Program, P4, P5_NCHANGE};
-use crate::vdbe::Opcode;
+use crate::vdbe::{KeyField, Opcode};
 
 use super::builder::ProgramBuilder;
 
@@ -81,7 +81,11 @@ pub fn compile_create_index(
             .iter()
             .map(|c| crate::schema::IndexedColumn {
                 name: c.name.clone(),
-                collation: c.collation.clone(),
+                collation: c
+                    .collation
+                    .as_deref()
+                    .and_then(crate::types::Collation::from_name)
+                    .unwrap_or(crate::types::Collation::Binary),
                 desc: c.desc,
             })
             .collect(),
@@ -104,7 +108,19 @@ pub fn compile_create_index(
 
     // (3) Open a write cursor on the just-created index b-tree (root read from `root_reg`).
     let idx_cursor = 1i32;
-    b.emit(Opcode::OpenWriteReg, idx_cursor, root_reg, 0);
+    let open_idx = b.emit(Opcode::OpenWriteReg, idx_cursor, root_reg, 0);
+
+    // The index cursor used during population needs the same per-column comparison rules so
+    // insertions land in the correct leaf position when a non-BINARY collation is in use.
+    let populate_key_info: Vec<KeyField> = dummy
+        .columns
+        .iter()
+        .map(|ic| KeyField {
+            desc: ic.desc,
+            collation: ic.collation,
+        })
+        .collect();
+    b.set_p4(open_idx, P4::KeyInfo(populate_key_info));
 
     // (4) Scan the table and populate the index.
     let table_cursor = 2i32;
@@ -123,9 +139,19 @@ pub fn compile_create_index(
     let key_start = b.alloc_regs(nkey);
     let rec_reg = b.alloc_reg();
     for (i, col_idx) in indexed_cis.iter().enumerate() {
-        b.emit(Opcode::Column, table_cursor, *col_idx as i32, key_start + i as i32);
+        b.emit(
+            Opcode::Column,
+            table_cursor,
+            *col_idx as i32,
+            key_start + i as i32,
+        );
     }
-    b.emit(Opcode::Rowid, table_cursor, key_start + indexed_cis.len() as i32, 0);
+    b.emit(
+        Opcode::Rowid,
+        table_cursor,
+        key_start + indexed_cis.len() as i32,
+        0,
+    );
     b.emit(Opcode::MakeRecord, key_start, nkey, rec_reg);
     let idx_insert = b.emit(Opcode::IdxInsert, idx_cursor, rec_reg, 0);
     b.set_p4(idx_insert, P4::Int(0)); // nMem = 0

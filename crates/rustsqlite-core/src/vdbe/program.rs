@@ -14,8 +14,19 @@ use super::opcode::Opcode;
 pub struct KeyField {
     /// `true` for DESC (the comparison for this key is reversed).
     pub desc: bool,
-    /// Collation used to compare TEXT values for this key.
+    /// Collation used to compare TEXT values for this key. The `KeyInfo` structure now
+    /// carries this per-key so both sorter and index-cursor comparisons honor it.
     pub collation: Collation,
+}
+
+impl KeyField {
+    /// A convenience constructor matching the historical default: ASC, BINARY.
+    pub fn asc_binary() -> KeyField {
+        KeyField {
+            desc: false,
+            collation: Collation::Binary,
+        }
+    }
 }
 
 /// The typed P4 operand of an instruction.

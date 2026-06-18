@@ -23,6 +23,7 @@ use crate::format::{decode_record, TextEncoding};
 use crate::pager::{PageRef, Pager};
 use crate::types::{Collation, Value};
 use crate::vdbe::compare::mem_compare;
+use crate::vdbe::KeyField;
 
 use super::cell::{parse_index_interior_cell, parse_index_leaf_cell};
 use super::page::{PageHeader, PageType};
@@ -45,6 +46,10 @@ pub struct IndexCursor {
     pager: Arc<Pager>,
     root: u32,
     usable: usize,
+    /// Per-key comparison rules. For a single-column index this is one field; for a
+    /// multi-column index it is one field per indexed column. The final rowid tiebreaker
+    /// always uses `BINARY`.
+    key_info: Vec<KeyField>,
     /// Stack of interior pages currently being descended: `(page, header, index of the next
     /// child to visit)`. The leaf itself is not on the stack.
     stack: Vec<(PageRef, PageHeader, usize)>,
@@ -69,12 +74,16 @@ pub struct IndexCursor {
 impl IndexCursor {
     /// Create a cursor over the index b-tree rooted at `root`. Does no I/O until
     /// [`rewind`](Self::rewind) or [`seek`](Self::seek).
-    pub fn new(pager: Arc<Pager>, root: u32) -> IndexCursor {
+    ///
+    /// `key_info` carries the per-column collation and DESC flag; comparisons inside the
+    /// cursor use this instead of hard-coded `BINARY`.
+    pub fn new(pager: Arc<Pager>, root: u32, key_info: Vec<KeyField>) -> IndexCursor {
         let usable = pager.usable_size();
         IndexCursor {
             pager,
             root,
             usable,
+            key_info,
             stack: Vec::new(),
             leaf: None,
             leaf_hdr: None,
@@ -156,6 +165,12 @@ impl IndexCursor {
     /// to address the leaf directly.
     pub fn leaf_pgno(&self) -> u32 {
         self.leaf_pgno
+    }
+
+    /// The per-column key-info this cursor was opened with. The executor passes a copy of this
+    /// to the insert/delete helpers so they compare with the same collation sequence.
+    pub fn key_info(&self) -> &[KeyField] {
+        &self.key_info
     }
 
     /// Seek the cursor to the first entry whose key is in the direction implied by `op`
@@ -261,7 +276,9 @@ impl IndexCursor {
                     return Ok(());
                 }
                 PageType::InteriorIndex => {
-                    let child = pick_child_for_key(&page, &hdr, key, op, self.usable).await?;
+                    let child =
+                        pick_child_for_key(&self.key_info, &page, &hdr, key, op, self.usable)
+                            .await?;
                     self.stack.push((page, hdr, 0));
                     pgno = child;
                 }
@@ -290,7 +307,7 @@ impl IndexCursor {
             let values = decode_record(&payload, encoding)?;
             let prefix_len = values.len().saturating_sub(1).min(key.len());
             let prefix = &values[..prefix_len];
-            let cmp = compare_prefix(prefix, key, Collation::Binary);
+            let cmp = compare_prefix(prefix, key, &self.key_info);
             let pos = match op {
                 SeekOp::Ge => matches!(cmp, Ordering::Less),
                 SeekOp::Gt => matches!(cmp, Ordering::Less | Ordering::Equal),
@@ -340,6 +357,7 @@ impl IndexCursor {
 /// The interior-page child that should hold the entry in the direction of `op` relative to
 /// `key`. Mirrors `pick_child_for_rowid` in the table-cursor but on key comparison.
 async fn pick_child_for_key(
+    key_info: &[KeyField],
     page: &[u8],
     hdr: &PageHeader,
     key: &[Value],
@@ -357,7 +375,7 @@ async fn pick_child_for_key(
         let values = decode_record(cell.local_payload, encoding)?;
         let prefix_len = values.len().saturating_sub(1).min(key.len());
         let prefix = &values[..prefix_len];
-        let cmp = compare_prefix(prefix, key, Collation::Binary);
+        let cmp = compare_prefix(prefix, key, key_info);
         // The divider key in an interior-index cell is the LARGEST key in the left-child
         // subtree. For `Ge`/`Gt`, we go left when our search key `<=` the divider (i.e. the
         // target is in or to the left of the left subtree); otherwise we go right.
@@ -374,11 +392,17 @@ async fn pick_child_for_key(
         .ok_or_else(|| Error::corrupt("interior index page has no right pointer"))
 }
 
-/// Compare two key prefixes field-by-field under the BINARY collation. `prefix` is a slice of
-/// `Value` taken from the on-disk key record; `key` is the unpacked register vector.
-fn compare_prefix(prefix: &[Value], key: &[Value], coll: Collation) -> Ordering {
+/// Compare two key prefixes field-by-field using the per-column collation in `key_info`.
+/// `prefix` is a slice of `Value` taken from the on-disk key record; `key` is the unpacked
+/// register vector. If one vector is shorter than the other, the shorter one is considered less
+/// — matching the prefix-vs-full comparison used by `index_insert`.
+fn compare_prefix(prefix: &[Value], key: &[Value], key_info: &[KeyField]) -> Ordering {
     let n = prefix.len().min(key.len());
     for i in 0..n {
+        let coll = key_info
+            .get(i)
+            .map(|f| f.collation)
+            .unwrap_or(Collation::Binary);
         match mem_compare(&prefix[i], &key[i], coll) {
             Ordering::Equal => {}
             non_eq => return non_eq,

@@ -168,10 +168,15 @@ fn find_index_prefix_equalities(
     for ic in &index.columns {
         // Sanity check: the indexed column must exist on the table. If it doesn't, the
         // index is corrupt/inconsistent; we simply can't use it.
-        if !table_columns.iter().any(|c| c.eq_ignore_ascii_case(&ic.name)) {
+        if !table_columns
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&ic.name))
+        {
             return None;
         }
-        let ek = equalities.iter().find(|e| e.column.eq_ignore_ascii_case(&ic.name))?;
+        let ek = equalities
+            .iter()
+            .find(|e| e.column.eq_ignore_ascii_case(&ic.name))?;
         prefix.push(ek.clone());
     }
     Some(prefix)

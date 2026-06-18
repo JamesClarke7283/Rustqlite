@@ -28,6 +28,7 @@ use super::program::{
     P5_STOREP2,
 };
 use super::sorter::Sorter;
+use super::KeyField;
 
 /// `SQLITE_MAX_LENGTH` — the default cap on the size of a string or BLOB (`sqlite3.c`). A
 /// `randomblob(N)` request larger than this is rejected exactly as SQLite does (`SQLITE_TOOBIG`,
@@ -302,8 +303,8 @@ impl Vdbe {
                         .ok_or_else(|| Error::msg("no database is open"))?;
                     // An `OpenRead` with `P4::KeyInfo` opens an index b-tree; a bare
                     // `OpenRead` (no KeyInfo) opens a table b-tree — same as M3a.
-                    if matches!(&inst.p4, P4::KeyInfo(_)) {
-                        let cursor = IndexCursor::new(pager, p2 as u32);
+                    if let P4::KeyInfo(ki) = &inst.p4 {
+                        let cursor = IndexCursor::new(pager, p2 as u32, ki.clone());
                         self.set_cursor(p1 as usize, VdbeCursor::Index(cursor));
                     } else {
                         let cursor = TableCursor::new(pager, p2 as u32);
@@ -322,8 +323,8 @@ impl Vdbe {
                         .pager
                         .clone()
                         .ok_or_else(|| Error::msg("no database is open"))?;
-                    if matches!(&inst.p4, P4::KeyInfo(_)) {
-                        let cursor = IndexCursor::new(pager, p2 as u32);
+                    if let P4::KeyInfo(ki) = &inst.p4 {
+                        let cursor = IndexCursor::new(pager, p2 as u32, ki.clone());
                         self.set_cursor(p1 as usize, VdbeCursor::Index(cursor));
                     } else {
                         let cursor = TableCursor::new(pager, p2 as u32);
@@ -345,7 +346,7 @@ impl Vdbe {
                     let cursor = if p3 == 1 {
                         VdbeCursor::Table(TableCursor::new(pager, root))
                     } else {
-                        VdbeCursor::Index(IndexCursor::new(pager, root))
+                        VdbeCursor::Index(IndexCursor::new(pager, root, Vec::new()))
                     };
                     self.set_cursor(p1 as usize, cursor);
                     self.cursor_root.insert(p1, root);
@@ -479,13 +480,14 @@ impl Vdbe {
                     // SeekGE+IdxGT where the `IdxGT` jumps when entry `>` key (i.e., NOT
                     // matching). Note the inverted semantics: the post-seek opcode is named
                     // for the boundary direction we *don't* want, not the one we do.
+                    let key_info = self.index_key_info(p1);
                     let n = p4_len(&inst.p4);
                     let search_key: Vec<Value> = self.regs[p3 as usize..p3 as usize + n].to_vec();
                     let cursor = self.index_cursor(p1)?;
                     let payload = cursor.payload();
                     let values = decode_record(payload, self.encoding)?;
                     let prefix = &values[..values.len().saturating_sub(1).min(n)];
-                    let ord = compare_prefix(prefix, &search_key, Collation::Binary);
+                    let ord = compare_prefix(prefix, &search_key, &key_info);
                     let jump = match inst.opcode {
                         // The "GE"/"GT"/"LE"/"LT" suffixes name the "leave the loop" direction
                         // — the boundary beyond which the entry is no longer in range.
@@ -523,7 +525,8 @@ impl Vdbe {
                         Value::Blob(b) => b.clone(),
                         _ => return Err(Error::msg("IdxInsert expects a record blob in p2")),
                     };
-                    btree::index_insert(&pager, root, &record).await?;
+                    let key_info = self.index_key_info(p1);
+                    btree::index_insert(&pager, root, &record, &key_info).await?;
                     if p5 & P5_NCHANGE != 0 {
                         self.ctx.changes += 1;
                         self.ctx.total_changes += 1;
@@ -539,7 +542,8 @@ impl Vdbe {
                     let n = p3 as usize;
                     let key: Vec<Value> = self.regs[p2 as usize..p2 as usize + n].to_vec();
                     let key_record = encode_record(&key);
-                    btree::index_leaf_delete(&pager, root, &key_record).await?;
+                    let key_info = self.index_key_info(p1);
+                    btree::index_leaf_delete(&pager, root, &key_record, &key_info).await?;
                     if let Some(cur) = self.cursors.get_mut(p1 as usize).and_then(|c| c.as_mut()) {
                         if let VdbeCursor::Index(c) = cur {
                             c.mark_deleted();
@@ -977,6 +981,18 @@ impl Vdbe {
             .ok_or_else(|| Error::msg("cursor is not an open index cursor"))
     }
 
+    /// The per-column `KeyInfo` for the open index cursor at `p1`, if any. Used by the
+    /// `IdxInsert`/`IdxDelete` opcodes so the page-level index insertion/deletion compares
+    /// keys with the same collation as the cursor used for seek.
+    fn index_key_info(&self, p1: i32) -> Vec<KeyField> {
+        self.cursors
+            .get(p1 as usize)
+            .and_then(|c| c.as_ref())
+            .and_then(|c| c.as_index())
+            .map(|c| c.key_info().to_vec())
+            .unwrap_or_default()
+    }
+
     /// Mutably borrow any cursor by index (table, index, or sorter). Used by the
     /// `Rewind` / `Next` opcodes which need to work across all three cursor kinds.
     fn cursor_mut(&mut self, p1: i32) -> Result<&mut VdbeCursor> {
@@ -1107,10 +1123,17 @@ fn p4_len(p4: &P4) -> usize {
     }
 }
 
-/// Compare two key prefixes field-by-field under the BINARY collation.
-fn compare_prefix(prefix: &[Value], key: &[Value], coll: Collation) -> Ordering {
+/// Compare two key prefixes field-by-field using the per-column collation in `key_info`.
+/// `prefix` is a slice of `Value` taken from the on-disk key record; `key` is the unpacked
+/// register vector. If one vector is shorter than the other, the shorter one is considered less
+/// — matching the prefix-vs-full comparison used by `index_insert`.
+fn compare_prefix(prefix: &[Value], key: &[Value], key_info: &[KeyField]) -> Ordering {
     let n = prefix.len().min(key.len());
     for i in 0..n {
+        let coll = key_info
+            .get(i)
+            .map(|f| f.collation)
+            .unwrap_or(Collation::Binary);
         match mem_compare(&prefix[i], &key[i], coll) {
             Ordering::Equal => {}
             non_eq => return non_eq,

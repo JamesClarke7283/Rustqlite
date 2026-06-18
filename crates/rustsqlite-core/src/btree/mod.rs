@@ -23,8 +23,8 @@ pub mod page;
 
 pub use cell::{
     assemble_index_interior_payload, assemble_index_payload, build_index_interior_cell,
-    build_index_leaf_cell, build_table_leaf_cell, parse_index_interior_cell,
-    parse_index_leaf_cell, parse_table_interior_cell, parse_table_leaf_cell, table_leaf_cell_rowid,
+    build_index_leaf_cell, build_table_leaf_cell, parse_index_interior_cell, parse_index_leaf_cell,
+    parse_table_interior_cell, parse_table_leaf_cell, table_leaf_cell_rowid,
 };
 pub use cursor::{scan_table, TableCursor};
 pub use delete::leaf_delete_current;

@@ -82,11 +82,21 @@ pub fn compile_insert(ins: &InsertStmt, table: &Table, indexes: &[IndexObject]) 
     b.emit(Opcode::Transaction, 0, 1, 0); // open the write transaction
     b.emit(Opcode::OpenWrite, cursor, table.rootpage as i32, 0);
 
-    // Reserve cursor numbers for the indexes (1, 2, …). The table cursor is 0.
+    // Reserve cursor numbers for the indexes (1, 2, …). The table cursor is 0. Each index
+    // cursor carries the index's KeyInfo so inserts compare under the correct collation.
     let index_cursor_base: i32 = 1;
     for (i, idx) in indexes.iter().enumerate() {
         let ic = (index_cursor_base + i as i32) as i32;
-        b.emit(Opcode::OpenWrite, ic, idx.rootpage as i32, 0);
+        let open = b.emit(Opcode::OpenWrite, ic, idx.rootpage as i32, 0);
+        let key_info: Vec<crate::vdbe::KeyField> = idx
+            .columns
+            .iter()
+            .map(|ic| crate::vdbe::KeyField {
+                desc: ic.desc,
+                collation: ic.collation,
+            })
+            .collect();
+        b.set_p4(open, P4::KeyInfo(key_info));
     }
 
     for row in &ins.rows {
@@ -153,9 +163,19 @@ pub fn compile_insert(ins: &InsertStmt, table: &Table, indexes: &[IndexObject]) 
             let nkey = indexed_cis.len() as i32 + 1;
             let key_start = b.alloc_regs(nkey);
             for (j, col_idx) in indexed_cis.iter().enumerate() {
-                b.emit(Opcode::SCopy, rec_start + *col_idx as i32, key_start + j as i32, 0);
+                b.emit(
+                    Opcode::SCopy,
+                    rec_start + *col_idx as i32,
+                    key_start + j as i32,
+                    0,
+                );
             }
-            b.emit(Opcode::SCopy, rowid_reg, key_start + indexed_cis.len() as i32, 0);
+            b.emit(
+                Opcode::SCopy,
+                rowid_reg,
+                key_start + indexed_cis.len() as i32,
+                0,
+            );
             let key_rec = b.alloc_reg();
             b.emit(Opcode::MakeRecord, key_start, nkey, key_rec);
             let ins_idx = b.emit(Opcode::IdxInsert, ic, key_rec, 0);

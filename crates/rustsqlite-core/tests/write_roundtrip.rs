@@ -346,6 +346,46 @@ fn create_index_roundtrip_and_c_oracle() {
     );
 }
 
+/// M5.2.7: a multi-column index with NOCASE on the first column still resolves prefix
+/// equality and keeps the index consistent through writes.
+#[test]
+fn multi_column_index_with_collation_roundtrip_and_c_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("mcidxcollation");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a TEXT, b INT, c TEXT);");
+        exec(
+            &mut conn,
+            "INSERT INTO t VALUES ('A',1,'rA1'),('a',2,'ra2'),('B',1,'rB1'),('b',2,'rb2');",
+        );
+        exec(&mut conn, "CREATE INDEX i_ab ON t(a COLLATE NOCASE, b);");
+        // Update one row's indexed column and re-insert another.
+        exec(&mut conn, "UPDATE t SET b = 9 WHERE c = 'ra2';");
+        exec(&mut conn, "DELETE FROM t WHERE c = 'rB1';");
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    // Prefix equality on the NOCASE column: when the WHERE comparison uses the same
+    // NOCASE collation, 'a' matches 'A' and 'a'.
+    assert_eq!(
+        db.query("SELECT c FROM t WHERE a = 'a' COLLATE NOCASE ORDER BY c;"),
+        "rA1\nra2"
+    );
+    // Full two-column lookup with case-insensitive first key.
+    assert_eq!(
+        db.query("SELECT c FROM t WHERE a = 'A' COLLATE NOCASE AND b = 9 ORDER BY c;"),
+        "ra2"
+    );
+    // The key that was deleted stays gone.
+    assert_eq!(
+        db.query("SELECT count(*) FROM t WHERE a = 'B' COLLATE NOCASE AND b = 1;"),
+        "0"
+    );
+}
+
 /// M5.1: `DROP INDEX` removes the b-tree and the `sqlite_schema` row; `IF EXISTS` against a
 /// missing index is a silent no-op.
 #[test]

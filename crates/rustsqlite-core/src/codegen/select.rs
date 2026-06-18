@@ -100,16 +100,16 @@ fn compile_indexed_select(
     let open_table = b.emit(Opcode::OpenRead, cursor, table.rootpage as i32, 0);
     b.set_p4(open_table, P4::Int(table.columns.len() as i64));
 
-    // (2) Open the index cursor with KeyInfo (one field per indexed column, ASC/BINARY in
-    // this slice; the executor uses the explicit search-key registers, not this metadata).
+    // (2) Open the index cursor with KeyInfo (one field per indexed column, carrying the
+    // per-column collation and DESC flag so the index cursor compares correctly).
     let open_idx = b.emit(Opcode::OpenRead, idx_cursor, plan.index.rootpage as i32, 0);
     let key_info: Vec<KeyField> = plan
         .index
         .columns
         .iter()
-        .map(|_| KeyField {
-            desc: false,
-            collation: crate::types::Collation::Binary,
+        .map(|ic| KeyField {
+            desc: ic.desc,
+            collation: ic.collation,
         })
         .collect();
     b.set_p4(open_idx, P4::KeyInfo(key_info));

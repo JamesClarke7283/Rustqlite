@@ -16,8 +16,8 @@ use rustqlite_parser::{DeleteStmt, Expr};
 
 use crate::error::{Error, Result};
 use crate::schema::{IndexObject, Table};
-use crate::vdbe::program::Program;
-use crate::vdbe::Opcode;
+use crate::vdbe::program::{Program, P4};
+use crate::vdbe::{KeyField, Opcode};
 
 use super::builder::ProgramBuilder;
 use super::expr::{compile_jump, Ctx};
@@ -45,11 +45,21 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
     b.emit(Opcode::Transaction, 0, 1, 0);
     b.emit(Opcode::OpenWrite, cursor, table.rootpage as i32, 0);
 
-    // Reserve cursor numbers for the indexes (1, 2, …). The table cursor is 0.
+    // Reserve cursor numbers for the indexes (1, 2, …). The table cursor is 0. Each cursor
+    // carries the index's KeyInfo so deletes compare under the correct collation.
     let index_cursor_base: i32 = 1;
     for (i, idx) in indexes.iter().enumerate() {
         let ic = (index_cursor_base + i as i32) as i32;
-        b.emit(Opcode::OpenWrite, ic, idx.rootpage as i32, 0);
+        let open = b.emit(Opcode::OpenWrite, ic, idx.rootpage as i32, 0);
+        let key_info: Vec<KeyField> = idx
+            .columns
+            .iter()
+            .map(|ic| KeyField {
+                desc: ic.desc,
+                collation: ic.collation,
+            })
+            .collect();
+        b.set_p4(open, P4::KeyInfo(key_info));
     }
 
     // Top of the loop. `Rewind` jumps to `end_loop` when the table is empty. The body of
@@ -76,9 +86,19 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
             let nkey = indexed_cis.len() as i32 + 1;
             let key_start = b.alloc_regs(nkey);
             for (j, col_idx) in indexed_cis.iter().enumerate() {
-                b.emit(Opcode::Column, cursor, *col_idx as i32, key_start + j as i32);
+                b.emit(
+                    Opcode::Column,
+                    cursor,
+                    *col_idx as i32,
+                    key_start + j as i32,
+                );
             }
-            b.emit(Opcode::SCopy, rowid_reg, key_start + indexed_cis.len() as i32, 0);
+            b.emit(
+                Opcode::SCopy,
+                rowid_reg,
+                key_start + indexed_cis.len() as i32,
+                0,
+            );
             b.emit(Opcode::IdxDelete, ic, key_start, nkey);
         }
         b.emit(Opcode::Delete, cursor, 0, 0);
@@ -94,9 +114,19 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
             let nkey = indexed_cis.len() as i32 + 1;
             let key_start = b.alloc_regs(nkey);
             for (j, col_idx) in indexed_cis.iter().enumerate() {
-                b.emit(Opcode::Column, cursor, *col_idx as i32, key_start + j as i32);
+                b.emit(
+                    Opcode::Column,
+                    cursor,
+                    *col_idx as i32,
+                    key_start + j as i32,
+                );
             }
-            b.emit(Opcode::SCopy, rowid_reg, key_start + indexed_cis.len() as i32, 0);
+            b.emit(
+                Opcode::SCopy,
+                rowid_reg,
+                key_start + indexed_cis.len() as i32,
+                0,
+            );
             b.emit(Opcode::IdxDelete, ic, key_start, nkey);
         }
         b.emit(Opcode::Delete, cursor, 0, 0);

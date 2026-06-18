@@ -59,7 +59,7 @@ use crate::error::{Error, Result};
 use crate::schema::{IndexObject, Table};
 use crate::types::Affinity;
 use crate::vdbe::program::{Program, P4, P5_ISUPDATE};
-use crate::vdbe::Opcode;
+use crate::vdbe::{KeyField, Opcode};
 
 use super::builder::ProgramBuilder;
 use super::expr::{compile_expr, compile_jump, Ctx};
@@ -131,13 +131,7 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
 
     // (2) Open the rowid-set sorter with one key field (the rowid, ASC, BINARY).
     let so = b.emit(Opcode::SorterOpen, sorter, 1, 0);
-    b.set_p4(
-        so,
-        P4::KeyInfo(vec![crate::vdbe::KeyField {
-            desc: false,
-            collation: crate::types::Collation::Binary,
-        }]),
-    );
+    b.set_p4(so, P4::KeyInfo(vec![crate::vdbe::KeyField::asc_binary()]));
 
     // (3) Open the table b-tree for read+write.
     let open = b.emit(Opcode::OpenWrite, cursor, table.rootpage as i32, 0);
@@ -145,12 +139,22 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
 
     // (3b) Open the indexes as write cursors (cursor 2, 3, …) so the second pass can
     // IdxDelete the OLD key and IdxInsert the NEW key for each index. Multi-column indexes
-    // are supported from M5.2 onward.
+    // are supported from M5.2 onward. Each cursor carries the index's KeyInfo so the
+    // underlying index cursor compares keys under the correct per-column collation.
     let index_cursor_base: i32 = 2;
     for (i, idx) in indexes.iter().enumerate() {
         let _ = idx.table_column_indices(table)?; // validate columns exist
         let ic = index_cursor_base + i as i32;
-        b.emit(Opcode::OpenWrite, ic, idx.rootpage as i32, 0);
+        let open = b.emit(Opcode::OpenWrite, ic, idx.rootpage as i32, 0);
+        let key_info: Vec<KeyField> = idx
+            .columns
+            .iter()
+            .map(|ic| KeyField {
+                desc: ic.desc,
+                collation: ic.collation,
+            })
+            .collect();
+        b.set_p4(open, P4::KeyInfo(key_info));
     }
 
     // (4) First pass: scan, evaluate WHERE, capture matching rowids into the sorter.
@@ -256,7 +260,12 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
                 .expect("snapshot exists for every indexed column");
             b.emit(Opcode::SCopy, old_val_reg, old_key + j as i32, 0);
         }
-        b.emit(Opcode::SCopy, reg_old_rowid2, old_key + indexed_cis.len() as i32, 0);
+        b.emit(
+            Opcode::SCopy,
+            reg_old_rowid2,
+            old_key + indexed_cis.len() as i32,
+            0,
+        );
         // IdxDelete reads the key values from r[p2..p2+p3]; we pass the first register and
         // the number of fields.
         b.emit(Opcode::IdxDelete, ic, old_key, nkey);
@@ -277,9 +286,19 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
         let nkey = indexed_cis.len() as i32 + 1;
         let new_key = b.alloc_regs(nkey);
         for (j, col_idx) in indexed_cis.iter().enumerate() {
-            b.emit(Opcode::SCopy, reg_new + *col_idx as i32, new_key + j as i32, 0);
+            b.emit(
+                Opcode::SCopy,
+                reg_new + *col_idx as i32,
+                new_key + j as i32,
+                0,
+            );
         }
-        b.emit(Opcode::SCopy, reg_old_rowid2, new_key + indexed_cis.len() as i32, 0);
+        b.emit(
+            Opcode::SCopy,
+            reg_old_rowid2,
+            new_key + indexed_cis.len() as i32,
+            0,
+        );
         let new_key_rec = b.alloc_reg();
         b.emit(Opcode::MakeRecord, new_key, nkey, new_key_rec);
         let idx_ins = b.emit(Opcode::IdxInsert, ic, new_key_rec, 0);

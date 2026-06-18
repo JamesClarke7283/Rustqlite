@@ -392,6 +392,7 @@ pub async fn split_index_leaf(
     pager: &Pager,
     leaf_pgno: u32,
     parent_root: Option<u32>,
+    _key_info: &[crate::vdbe::KeyField],
 ) -> Result<(u32, Vec<u8>)> {
     let usable = pager.usable_size();
     let base = pager.btree_header_offset(leaf_pgno);
@@ -560,6 +561,7 @@ pub async fn split_index_interior_page(
     pager: &Pager,
     interior_pgno: u32,
     parent_root: Option<u32>,
+    _key_info: &[crate::vdbe::KeyField],
 ) -> Result<(u32, Vec<u8>)> {
     let usable = pager.usable_size();
     let base = pager.btree_header_offset(interior_pgno);

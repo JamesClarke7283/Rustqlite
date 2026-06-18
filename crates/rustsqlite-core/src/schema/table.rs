@@ -50,12 +50,12 @@ pub struct IndexObject {
 }
 
 /// One column entry in an `IndexObject`. The M5.2 runtime uses `name` to map the column back
-/// to the table; `collation` and `desc` are recorded for catalog/EXPLAIN metadata but still do
-/// not affect comparisons in this slice.
+/// to the table; `desc` is recorded for catalog/EXPLAIN metadata but the per-column
+/// `collation` is now the resolved comparison rule used by the index cursor.
 #[derive(Clone, Debug, PartialEq)]
 pub struct IndexedColumn {
     pub name: String,
-    pub collation: Option<String>,
+    pub collation: Collation,
     pub desc: bool,
 }
 
@@ -226,7 +226,11 @@ impl IndexObject {
             .iter()
             .map(|c| IndexedColumn {
                 name: c.name.clone(),
-                collation: c.collation.clone(),
+                collation: c
+                    .collation
+                    .as_deref()
+                    .and_then(Collation::from_name)
+                    .unwrap_or(Collation::Binary),
                 desc: c.desc,
             })
             .collect();
