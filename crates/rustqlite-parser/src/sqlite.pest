@@ -60,6 +60,9 @@ K_ALL           = @{ ^"all"           ~ !ident_cont }
 K_DISTINCT      = @{ ^"distinct"      ~ !ident_cont }
 K_FROM          = @{ ^"from"          ~ !ident_cont }
 K_WHERE         = @{ ^"where"         ~ !ident_cont }
+K_UNION         = @{ ^"union"         ~ !ident_cont }
+K_INTERSECT     = @{ ^"intersect"     ~ !ident_cont }
+K_EXCEPT        = @{ ^"except"        ~ !ident_cont }
 K_GROUP         = @{ ^"group"         ~ !ident_cont }
 K_BY            = @{ ^"by"            ~ !ident_cont }
 K_HAVING        = @{ ^"having"        ~ !ident_cont }
@@ -132,6 +135,7 @@ keyword = @{
     | K_BETWEEN | K_COLLATE | K_CAST | K_CASE | K_WHEN | K_THEN | K_ELSE | K_END | K_DISTINCT
     | K_ON | K_CONFLICT | K_ABORT | K_FAIL | K_IGNORE | K_ROLLBACK
     | K_EXPLAIN | K_DELETE | K_DROP | K_UPDATE | K_SET | K_INDEX
+    | K_UNION | K_INTERSECT | K_EXCEPT
 }
 
 // ---- Top level: a list of statements separated/terminated by ';' ----
@@ -147,15 +151,22 @@ explain_prefix = { explain_query_plan | explain_plain }
 qualified_name = { ident ~ ("." ~ ident)? }
 
 // ---- SELECT ----
-select_stmt = {
+// A compound SELECT: one or more cores joined by UNION/UNION ALL/INTERSECT/EXCEPT, with a
+// single trailing ORDER BY / LIMIT that binds to the whole compound (not the last arm).
+select_stmt = { select_core ~ (compound_op ~ select_core)* ~ order_item? ~ limit_item? }
+select_core = {
     K_SELECT ~ (K_DISTINCT | K_ALL)? ~ result_columns
     ~ from_item?
     ~ where_item?
     ~ group_item?
     ~ having_item?
-    ~ order_item?
-    ~ limit_item?
 }
+// `union_all` is tried before `union` so `UNION ALL` is not parsed as `UNION` + a stray core.
+compound_op = { union_all | union | intersect | except }
+union_all = { K_UNION ~ K_ALL }
+union = { K_UNION }
+intersect = { K_INTERSECT }
+except = { K_EXCEPT }
 result_columns = { result_column ~ ("," ~ result_column)* }
 result_column = { table_star | result_star | (expr ~ as_alias?) }
 result_star = { "*" }

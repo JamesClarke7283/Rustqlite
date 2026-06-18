@@ -46,7 +46,7 @@ list every granular item needed.
 - [x] **2.13** Expression: `IS NOT DISTINCT FROM` / `IS DISTINCT FROM`
 - [x] **2.14** Bitwise operators: `&`, `|`, `<<`, `>>`, `~`
 - [x] **2.15** JSON operators: `->`, `->>`
-- [ ] **2.16** Compound SELECT: `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`
+- [x] **2.16** Compound SELECT: `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`
 - [ ] **2.17** JOIN syntax: `[INNER|CROSS|LEFT|RIGHT|FULL] [NATURAL] JOIN … ON/USING`
 - [ ] **2.18** CTEs: `WITH [RECURSIVE] name AS (…) SELECT …`
 - [ ] **2.19** `SELECT … FROM (subquery) AS alias`

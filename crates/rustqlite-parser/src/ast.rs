@@ -37,6 +37,15 @@ pub enum ExplainKind {
     QueryPlan,
 }
 
+/// A compound-SELECT operator joining two query cores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompoundOperator {
+    Union,
+    UnionAll,
+    Intersect,
+    Except,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
     pub distinct: bool,
@@ -45,6 +54,10 @@ pub struct SelectStmt {
     pub where_clause: Option<Expr>,
     pub group_by: Vec<Expr>,
     pub having: Option<Expr>,
+    /// Additional compound arms: each `(op, core)` is appended to the leading core.  The arms
+    /// carry only their own core clauses (distinct/columns/from/where/group/having); the trailing
+    /// `order_by`/`limit`/`offset` on *this* struct bind to the whole compound.
+    pub compound: Vec<(CompoundOperator, SelectStmt)>,
     pub order_by: Vec<OrderingTerm>,
     pub limit: Option<Expr>,
     pub offset: Option<Expr>,

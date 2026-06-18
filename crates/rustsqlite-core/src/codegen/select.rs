@@ -195,6 +195,11 @@ fn emit_value_load(b: &mut ProgramBuilder, v: &Value, target: i32) {
 
 /// Reject M3a-out-of-scope features with a clear message.
 fn reject_unsupported(select: &SelectStmt) -> Result<()> {
+    if !select.compound.is_empty() {
+        return Err(Error::msg(
+            "compound SELECT (UNION/INTERSECT/EXCEPT) is not supported by the executor yet",
+        ));
+    }
     if select.distinct {
         return Err(Error::msg("SELECT DISTINCT is not supported in M3a"));
     }

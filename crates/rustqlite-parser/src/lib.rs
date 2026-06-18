@@ -93,6 +93,39 @@ fn explain_kind(prefix: &Pair<'_, Rule>) -> ExplainKind {
 }
 
 fn build_select(pair: Pair<'_, Rule>) -> SelectStmt {
+    // select_stmt = select_core ~ (compound_op ~ select_core)* ~ order_item? ~ limit_item?
+    let mut stmt: Option<SelectStmt> = None;
+    let mut pending_op: Option<CompoundOperator> = None;
+
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::select_core => {
+                let core = build_select_core(part);
+                match stmt {
+                    None => stmt = Some(core),
+                    Some(ref mut base) => {
+                        let op = pending_op
+                            .take()
+                            .expect("compound_op precedes a non-leading core");
+                        base.compound.push((op, core));
+                    }
+                }
+            }
+            Rule::compound_op => pending_op = Some(build_compound_op(part)),
+            // ORDER BY / LIMIT bind to the whole compound, so they live on the leading core.
+            Rule::order_item => {
+                stmt.as_mut().expect("order_item follows a core").order_by = build_order_item(part)
+            }
+            Rule::limit_item => {
+                build_limit_item(part, stmt.as_mut().expect("limit follows a core"))
+            }
+            _ => {}
+        }
+    }
+    stmt.expect("select_stmt has at least one select_core")
+}
+
+fn build_select_core(pair: Pair<'_, Rule>) -> SelectStmt {
     let mut stmt = SelectStmt {
         distinct: false,
         columns: Vec::new(),
@@ -100,6 +133,7 @@ fn build_select(pair: Pair<'_, Rule>) -> SelectStmt {
         where_clause: None,
         group_by: Vec::new(),
         having: None,
+        compound: Vec::new(),
         order_by: Vec::new(),
         limit: None,
         offset: None,
@@ -113,12 +147,25 @@ fn build_select(pair: Pair<'_, Rule>) -> SelectStmt {
             Rule::where_item => stmt.where_clause = Some(build_expr_item(part)),
             Rule::group_item => stmt.group_by = build_group_item(part),
             Rule::having_item => stmt.having = Some(build_expr_item(part)),
-            Rule::order_item => stmt.order_by = build_order_item(part),
-            Rule::limit_item => build_limit_item(part, &mut stmt),
             _ => {} // K_SELECT, K_ALL
         }
     }
     stmt
+}
+
+fn build_compound_op(pair: Pair<'_, Rule>) -> CompoundOperator {
+    // compound_op = { union_all | union | intersect | except }
+    let inner = pair
+        .into_inner()
+        .next()
+        .expect("compound_op wraps a specific operator");
+    match inner.as_rule() {
+        Rule::union_all => CompoundOperator::UnionAll,
+        Rule::union => CompoundOperator::Union,
+        Rule::intersect => CompoundOperator::Intersect,
+        Rule::except => CompoundOperator::Except,
+        other => unreachable!("unexpected compound_op child {other:?}"),
+    }
 }
 
 fn build_result_columns(pair: Pair<'_, Rule>) -> Vec<ResultColumn> {
@@ -1165,5 +1212,40 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn compound_select_operators_parse() {
+        // UNION ALL must beat the plain UNION alternative.
+        let Stmt::Select(s) = &parse("SELECT 1 UNION ALL SELECT 2;").unwrap()[0] else {
+            panic!()
+        };
+        assert_eq!(s.compound.len(), 1);
+        assert_eq!(s.compound[0].0, CompoundOperator::UnionAll);
+
+        let Stmt::Select(s) = &parse("SELECT 1 UNION SELECT 2;").unwrap()[0] else {
+            panic!()
+        };
+        assert_eq!(s.compound[0].0, CompoundOperator::Union);
+
+        // Three cores chained with INTERSECT then EXCEPT; ORDER BY binds to the whole compound.
+        let Stmt::Select(s) =
+            &parse("SELECT a FROM t INTERSECT SELECT a FROM u EXCEPT SELECT a FROM v ORDER BY 1;")
+                .unwrap()[0]
+        else {
+            panic!()
+        };
+        assert_eq!(s.compound.len(), 2);
+        assert_eq!(s.compound[0].0, CompoundOperator::Intersect);
+        assert_eq!(s.compound[1].0, CompoundOperator::Except);
+        // The trailing ORDER BY lives on the leading core, not on any arm.
+        assert_eq!(s.order_by.len(), 1);
+        assert!(s.compound[0].1.order_by.is_empty());
+        assert!(s.compound[1].1.order_by.is_empty());
+        // Each arm carries its own FROM.
+        assert_eq!(s.compound[1].1.from.len(), 1);
+
+        // UNION/INTERSECT/EXCEPT are reserved: they cannot be used as bare identifiers.
+        assert!(parse("SELECT 1 AS union;").is_err());
     }
 }
