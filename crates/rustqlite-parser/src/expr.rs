@@ -14,7 +14,7 @@ use crate::{build_select, Rule};
 
 /// Operator precedence, lowest binding first, matching SQLite's documented table
 /// (<https://www.sqlite.org/lang_expr.html>): OR < AND < NOT < (= IS LIKE GLOB) <
-/// (< <= > >=) < (+ -) < (* / %) < `||` < unary (- +).
+/// (< <= > >=) < (& | << >>) < (+ -) < (* / %) < `||` < unary (~ - +).
 fn pratt() -> &'static PrattParser<Rule> {
     static PRATT: OnceLock<PrattParser<Rule>> = OnceLock::new();
     PRATT.get_or_init(|| {
@@ -39,12 +39,25 @@ fn pratt() -> &'static PrattParser<Rule> {
                 | Op::infix(Rule::op_le, Assoc::Left)
                 | Op::infix(Rule::op_gt, Assoc::Left)
                 | Op::infix(Rule::op_ge, Assoc::Left))
+            // Bitwise tier — `& | << >>` share ONE precedence level (left-assoc), looser than
+            // `+`/`-` and tighter than the comparison operators, per SQLite's table at
+            // <https://www.sqlite.org/lang_expr.html>.  pest's PrattParser registers the LOWEST
+            // precedence FIRST, so this row sits just above the comparisons and below `+`/`-`,
+            // and the rows below get progressively tighter: + - < * / % < `||` < unary.
+            //
+            // Oracle-verified (C sqlite3 3.53):
+            //   `1+2*3`=7, `1&2|4`=4, `1|2<<4`=48, `1+2<<4`=48, `1+2&4`=0,
+            //   `2+3*4<<1`=28, `1<<2|4<<8`=1024, `1|2<<4|8`=56, `1<<2+1`=8.
+            .op(Op::infix(Rule::op_bitand, Assoc::Left)
+                | Op::infix(Rule::op_bitor, Assoc::Left)
+                | Op::infix(Rule::op_shiftleft, Assoc::Left)
+                | Op::infix(Rule::op_shiftright, Assoc::Left))
             .op(Op::infix(Rule::op_add, Assoc::Left) | Op::infix(Rule::op_sub, Assoc::Left))
             .op(Op::infix(Rule::op_mul, Assoc::Left)
                 | Op::infix(Rule::op_div, Assoc::Left)
                 | Op::infix(Rule::op_mod, Assoc::Left))
             .op(Op::infix(Rule::op_concat, Assoc::Left))
-            .op(Op::prefix(Rule::neg) | Op::prefix(Rule::pos))
+            .op(Op::prefix(Rule::neg) | Op::prefix(Rule::pos) | Op::prefix(Rule::bitnot))
     })
 }
 
@@ -113,6 +126,7 @@ fn fold<'a, P: Iterator<Item = Pair<'a, Rule>>>(pairs: P) -> Expr {
                 Rule::neg => UnaryOp::Negate,
                 Rule::pos => UnaryOp::Positive,
                 Rule::K_NOT => UnaryOp::Not,
+                Rule::bitnot => UnaryOp::BitNot,
                 other => unreachable!("unexpected prefix operator {other:?}"),
             };
             Expr::Unary {
@@ -136,6 +150,10 @@ fn fold<'a, P: Iterator<Item = Pair<'a, Rule>>>(pairs: P) -> Expr {
                 Rule::op_div => BinaryOp::Div,
                 Rule::op_mod => BinaryOp::Mod,
                 Rule::op_concat => BinaryOp::Concat,
+                Rule::op_bitand => BinaryOp::BitAnd,
+                Rule::op_bitor => BinaryOp::BitOr,
+                Rule::op_shiftleft => BinaryOp::ShiftLeft,
+                Rule::op_shiftright => BinaryOp::ShiftRight,
                 Rule::op_is => BinaryOp::Is,
                 Rule::op_isnot => BinaryOp::IsNot,
                 Rule::op_like => BinaryOp::Like,

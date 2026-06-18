@@ -177,6 +177,11 @@ fn compile_unary(
             compile_expr(b, expr, tmp, ctx)?;
             b.emit(Opcode::Not, tmp, target, 0);
         }
+        UnaryOp::BitNot => {
+            let tmp = b.alloc_reg();
+            compile_expr(b, expr, tmp, ctx)?;
+            b.emit(Opcode::BitNot, tmp, target, 0);
+        }
     }
     Ok(())
 }
@@ -359,6 +364,10 @@ fn arith_opcode(op: BinaryOp) -> Option<Opcode> {
         BinaryOp::Div => Opcode::Divide,
         BinaryOp::Mod => Opcode::Remainder,
         BinaryOp::Concat => Opcode::Concat,
+        BinaryOp::BitAnd => Opcode::BitAnd,
+        BinaryOp::BitOr => Opcode::BitOr,
+        BinaryOp::ShiftLeft => Opcode::ShiftLeft,
+        BinaryOp::ShiftRight => Opcode::ShiftRight,
         _ => return None,
     })
 }

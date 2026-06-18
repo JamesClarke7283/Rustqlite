@@ -301,26 +301,35 @@ arg_list = { K_DISTINCT? ~ expr ~ ("," ~ expr)* }
 
 column_ref = { ident ~ ("." ~ ident ~ ("." ~ ident)?)? }
 
-prefix = _{ neg | pos | K_NOT }
+prefix = _{ neg | pos | bitnot | K_NOT }
 // `neg` and `pos` are intentionally matched as a single-character `-` or `+` only when
 // whitespace separates the sign from the following primary.  This allows `number` to
 // absorb an adjacent sign (e.g. `-9223372036854775808`) as one literal token, while
 // `- 5` parses as a unary minus applied to a positive literal.
 neg = { "-" ~ (WHITESPACE+ | !ASCII_DIGIT) ~ !"." }
 pos = { "+" ~ (WHITESPACE+ | !ASCII_DIGIT) ~ !"." }
+// `~` is the unary bitwise-NOT operator.  It must not overlap with the `~` used in pest
+// quantifiers, so it is matched as the literal character here.
+bitnot = { "~" }
 
 // The generic infix set. The LIKE family (`op_like`/`op_not_like`) is matched ONLY via `like_clause`
-// (so an ESCAPE may follow), so they are intentionally absent here.
+// (so an ESCAPE may follow), so they are intentionally absent here.  Shift operators are declared
+// before the single-char `op_lt`/`op_gt` lexemes so pest's longest-match rule prefers `<<`/`>>`
+// over two consecutive comparisons.
 infix = _{
-      op_or | op_and | op_concat | op_eq | op_ne | op_le | op_ge | op_lt | op_gt
-    | op_add | op_sub | op_mul | op_div | op_mod | op_isnot | op_is
+      op_or | op_and | op_concat | op_bitand | op_bitor | op_eq | op_ne | op_shiftleft | op_shiftright
+    | op_le | op_ge | op_lt | op_gt | op_add | op_sub | op_mul | op_div | op_mod | op_isnot | op_is
     | op_not_glob | op_glob
 }
 op_or = { K_OR }
 op_and = { K_AND }
 op_concat = { "||" }
+op_bitand = { "&" }
+op_bitor = { "|" }
 op_eq = { "==" | "=" }
 op_ne = { "!=" | "<>" }
+op_shiftleft = { "<<" }
+op_shiftright = { ">>" }
 op_le = { "<=" }
 op_ge = { ">=" }
 op_lt = { "<" }

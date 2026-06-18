@@ -44,7 +44,7 @@ list every granular item needed.
 - [x] **2.11** Expression: `COLLATE` clause on expressions
 - [ ] **2.12** Expression: Subqueries in expressions (scalar `(SELECT …)`)
 - [x] **2.13** Expression: `IS NOT DISTINCT FROM` / `IS DISTINCT FROM`
-- [ ] **2.14** Bitwise operators: `&`, `|`, `<<`, `>>`, `~`
+- [x] **2.14** Bitwise operators: `&`, `|`, `<<`, `>>`, `~`
 - [ ] **2.15** JSON operators: `->`, `->>`
 - [ ] **2.16** Compound SELECT: `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`
 - [ ] **2.17** JOIN syntax: `[INNER|CROSS|LEFT|RIGHT|FULL] [NATURAL] JOIN … ON/USING`
@@ -556,7 +556,7 @@ list every granular item needed.
 - [ ] **28.18** `ColumnCopy` — copy column value between cursors
 - [ ] **28.19** `Offset` — get column offset
 - [ ] **28.20** `ColumnsUsed` — set column-use mask
-- [ ] **28.21** `BitAnd` / `BitOr` / `ShiftLeft` / `ShiftRight` / `BitNot` — bitwise operations
+- [x] **28.21** `BitAnd` / `BitOr` / `ShiftLeft` / `ShiftRight` / `BitNot` — bitwise operations
 - [ ] **28.22** `IsTrue` / `IsType` / `ZeroOrNull` — type/boolean checks
 - [ ] **28.23** `SoftNull` — set register to soft NULL
 - [ ] **28.24** `Cast` / `MustBeInt` — type coercion

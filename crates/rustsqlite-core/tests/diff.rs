@@ -177,6 +177,12 @@ fn arithmetic_and_affinity() {
         "SELECT 1 AND 0, 1 AND 1, 0 OR 0, NULL AND 0, NULL AND 1, NULL OR 1;",
         "SELECT NOT 0, NOT 1, NOT NULL;",
         "SELECT 10 < '9', '10' < '9', 10 < 9;",
+        // Bitwise operators: precedence, unary/complement, NULL handling, and edge shifts.
+        "SELECT 5 & 3, 5 | 3, 5 << 1, 5 >> 1, ~5;",
+        "SELECT 1 & 2 | 4, 1 | 2 << 4, 1 + 2 << 4, 1 + 2 & 4, 2 + 3 * 4 << 1;",
+        "SELECT 5 & NULL, NULL | 3, 5 << NULL, ~NULL;",
+        "SELECT -1 >> 1, -1 >> 63, -1 >> 64, 1 << 64, 8 >> -1, 1 << -1;",
+        "SELECT typeof(5&3), typeof(5|3), typeof(5<<1), typeof(5>>1), typeof(~5);",
     ] {
         assert_same(db.str(), q);
     }

@@ -623,6 +623,23 @@ impl Vdbe {
                     self.pc += 1;
                 }
 
+                // ---- bitwise: r[p3] = r[p2] OP r[p1] ----
+                Opcode::BitAnd | Opcode::BitOr | Opcode::ShiftLeft | Opcode::ShiftRight => {
+                    self.regs[p3 as usize] = bitwise(
+                        inst.opcode,
+                        &self.regs[p2 as usize],
+                        &self.regs[p1 as usize],
+                    );
+                    self.pc += 1;
+                }
+                Opcode::BitNot => {
+                    self.regs[p2 as usize] = match &self.regs[p1 as usize] {
+                        Value::Null => Value::Null,
+                        v => Value::Int(!v.as_i64()),
+                    };
+                    self.pc += 1;
+                }
+
                 // ---- comparisons: test r[p3] OP r[p1]; jump to p2, or store the boolean in p2 ----
                 Opcode::Eq | Opcode::Ne | Opcode::Lt | Opcode::Le | Opcode::Gt | Opcode::Ge => {
                     let res = self.compare(inst.opcode, p1, p3, p5, &inst.p4);
@@ -1308,6 +1325,58 @@ fn arith(op: Opcode, b: &Value, a: &Value) -> Value {
         Value::Null
     } else {
         Value::Real(r)
+    }
+}
+
+/// SQLite bitwise operators: operands are coerced to integers via `sqlite3VdbeIntValue`
+/// semantics, any NULL operand yields NULL, and shifts follow the upstream rules (negative
+/// counts reverse direction; counts `>= 64` saturate to 0/-1).
+fn bitwise(op: Opcode, b: &Value, a: &Value) -> Value {
+    if b.is_null() || a.is_null() {
+        return Value::Null;
+    }
+    let mut ia = b.as_i64();
+    let mut ib = a.as_i64();
+    let mut opcode = op;
+
+    // SQLite treats ShiftRight as ShiftLeft+1 in opcode space and flips op/count when negative.
+    // We mirror the same logic literally: negative count reverses direction.
+    if ib != 0 && matches!(op, Opcode::ShiftLeft | Opcode::ShiftRight) {
+        if ib < 0 {
+            // `assert( OP_ShiftRight==OP_ShiftLeft+1 )` in upstream; our enum order matches.
+            opcode = if op == Opcode::ShiftLeft {
+                Opcode::ShiftRight
+            } else {
+                Opcode::ShiftLeft
+            };
+            ib = if ib > -64 { -ib } else { 64 };
+        }
+        if ib >= 64 {
+            ia = if ia >= 0 || opcode == Opcode::ShiftLeft {
+                0
+            } else {
+                -1
+            };
+        } else {
+            let mut ua = ia as u64;
+            if opcode == Opcode::ShiftLeft {
+                ua <<= ib;
+            } else {
+                ua >>= ib;
+                // Sign-extend on right shift of a negative number.
+                if ia < 0 {
+                    ua |= u64::MAX << (64 - ib);
+                }
+            }
+            ia = ua as i64;
+        }
+    }
+
+    match op {
+        Opcode::BitAnd => Value::Int(ia & ib),
+        Opcode::BitOr => Value::Int(ia | ib),
+        Opcode::ShiftLeft | Opcode::ShiftRight => Value::Int(ia),
+        _ => unreachable!(),
     }
 }
 

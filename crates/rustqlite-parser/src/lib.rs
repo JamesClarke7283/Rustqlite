@@ -998,4 +998,86 @@ mod tests {
         };
         assert!(matches!(expr, Expr::IsDistinctFrom { negated: true, .. }));
     }
+
+    #[test]
+    fn bitwise_operators_parse() {
+        // Each operator is parsed at the precedence level expected by SQLite.
+        let Stmt::Select(s) = &parse("SELECT 5 & 3;").unwrap()[0] else {
+            panic!()
+        };
+        let ResultColumn::Expr { expr, .. } = &s.columns[0] else {
+            panic!()
+        };
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::BitAnd,
+                ..
+            }
+        ));
+
+        let Stmt::Select(s) = &parse("SELECT 5 | 3;").unwrap()[0] else {
+            panic!()
+        };
+        let ResultColumn::Expr { expr, .. } = &s.columns[0] else {
+            panic!()
+        };
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::BitOr,
+                ..
+            }
+        ));
+
+        let Stmt::Select(s) = &parse("SELECT 5 << 1;").unwrap()[0] else {
+            panic!()
+        };
+        let ResultColumn::Expr { expr, .. } = &s.columns[0] else {
+            panic!()
+        };
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::ShiftLeft,
+                ..
+            }
+        ));
+
+        let Stmt::Select(s) = &parse("SELECT 5 >> 1;").unwrap()[0] else {
+            panic!()
+        };
+        let ResultColumn::Expr { expr, .. } = &s.columns[0] else {
+            panic!()
+        };
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::ShiftRight,
+                ..
+            }
+        ));
+
+        let Stmt::Select(s) = &parse("SELECT ~5;").unwrap()[0] else {
+            panic!()
+        };
+        let ResultColumn::Expr { expr, .. } = &s.columns[0] else {
+            panic!()
+        };
+        assert!(matches!(
+            expr,
+            Expr::Unary {
+                op: UnaryOp::BitNot,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bitwise_shift_not_confused_with_comparison() {
+        // Regression: `<<` and `>>` must not be tokenised as two `<`/`>` comparisons.
+        assert!(parse("SELECT 5 << 1;").is_ok());
+        assert!(parse("SELECT 5 >> 1;").is_ok());
+        assert!(parse("SELECT 5 <> 1;").is_ok());
+    }
 }

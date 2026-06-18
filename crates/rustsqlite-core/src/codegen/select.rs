@@ -547,6 +547,7 @@ fn expr_to_text(e: &Expr) -> String {
                 UnaryOp::Negate => format!("-{s}"),
                 UnaryOp::Positive => format!("+{s}"),
                 UnaryOp::Not => format!("NOT {s}"),
+                UnaryOp::BitNot => format!("~{s}"),
             }
         }
         Expr::Binary { op, left, right } => {
@@ -592,6 +593,10 @@ fn binary_symbol(op: rustqlite_parser::BinaryOp) -> &'static str {
         IsNot => " IS NOT ",
         Like => " LIKE ",
         Glob => " GLOB ",
+        BitAnd => " & ",
+        BitOr => " | ",
+        ShiftLeft => " << ",
+        ShiftRight => " >> ",
     }
 }
 

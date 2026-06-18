@@ -268,6 +268,7 @@ pub enum UnaryOp {
     Negate,
     Positive,
     Not,
+    BitNot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,4 +291,8 @@ pub enum BinaryOp {
     IsNot,
     Like,
     Glob,
+    BitAnd,
+    BitOr,
+    ShiftLeft,
+    ShiftRight,
 }

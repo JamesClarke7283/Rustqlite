@@ -156,6 +156,16 @@ pub enum Opcode {
     Remainder,
     /// `Concat p1 p2 p3`: `r[p3] = r[p2] || r[p1]` (text concatenation).
     Concat,
+    /// `BitAnd p1 p2 p3`: `r[p3] = r[p2] & r[p1]`.
+    BitAnd,
+    /// `BitOr p1 p2 p3`: `r[p3] = r[p2] | r[p1]`.
+    BitOr,
+    /// `ShiftLeft p1 p2 p3`: `r[p3] = r[p2] << r[p1]`.
+    ShiftLeft,
+    /// `ShiftRight p1 p2 p3`: `r[p3] = r[p2] >> r[p1]` (arithmetic right shift).
+    ShiftRight,
+    /// `BitNot p1 p2`: `r[p2] = ~r[p1]`.
+    BitNot,
 
     // --- comparisons as jumps (test r[p3] OP r[p1], jump to p2; see program.rs p5 flags) ---
     /// `Eq p1 p2 p3`: if `r[p3] == r[p1]` jump to `p2`.
@@ -282,6 +292,11 @@ impl Opcode {
             Opcode::Divide => "Divide",
             Opcode::Remainder => "Remainder",
             Opcode::Concat => "Concat",
+            Opcode::BitAnd => "BitAnd",
+            Opcode::BitOr => "BitOr",
+            Opcode::ShiftLeft => "ShiftLeft",
+            Opcode::ShiftRight => "ShiftRight",
+            Opcode::BitNot => "BitNot",
             Opcode::Eq => "Eq",
             Opcode::Ne => "Ne",
             Opcode::Lt => "Lt",
