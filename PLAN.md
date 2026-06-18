@@ -148,7 +148,7 @@ list every granular item needed.
 - [x] **5.2.5** Multi-column index codegen: `IdxInsert` / `IdxDelete` with composite keys
 - [x] **5.2.6** Multi-column index seek: prefix comparison for `WHERE col1 = ? AND col2 = ?`
 - [x] **5.2.7** `KeyInfo` structure carrying collation sequence per column for sorter/index comparisons
-- [ ] **5.2.8** Enforce `UNIQUE` constraint at `IdxInsert` time (raise `SQLITE_CONSTRAINT_UNIQUE`)
+- [x] **5.2.8** Enforce `UNIQUE` constraint at `IdxInsert` time (raise `SQLITE_CONSTRAINT_UNIQUE`)
 - [ ] **5.2.9** Partial indexes: `CREATE INDEX … WHERE expr` (parser + catalog + codegen filter)
 - [ ] **5.2.10** Expression indexes: `CREATE INDEX … ON tbl(expr)` (parser + catalog + codegen)
 - [ ] **5.2.11** `COLLATE` on index columns affects comparison in `IndexCursor`
