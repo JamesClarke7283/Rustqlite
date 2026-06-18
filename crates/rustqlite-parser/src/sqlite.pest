@@ -280,11 +280,16 @@ is_distinct_suffix = { K_IS ~ K_NOT? ~ K_DISTINCT ~ K_FROM ~ prefix* ~ primary }
 // The following constructs are grammatically primaries (they cannot be chained as infix operands
 // and must be the sole or wrapped expression in their position).  They are kept in `primary` so
 // `SELECT EXISTS(...)` / `SELECT CAST(...)` / `SELECT CASE ... END` work without a dummy prefix.
-primary = _{ literal | exists_expr | cast_expr | case_expr | func_call | column_ref | "(" ~ expr ~ ")" }
+primary = _{ literal | exists_expr | cast_expr | case_expr | func_call | column_ref | subquery | "(" ~ expr ~ ")" }
 
 // `EXISTS (SELECT ...)` — allowed as a standalone primary (so `SELECT EXISTS(...)` works) and in
 // expression position (so `WHERE EXISTS(...)` works).
 exists_expr = { K_EXISTS ~ "(" ~ select_stmt ~ ")" }
+
+// Scalar subquery `(SELECT ...)` in expression position.  Declared before the generic
+// `"(" ~ expr ~ ")"` alternative so a parenthesised SELECT is recognised as a subquery; a
+// parenthesised ordinary expression (e.g. `(1+2)`) fails the `select_stmt` match and backtracks.
+subquery = { "(" ~ select_stmt ~ ")" }
 
 // `CAST (expr AS type_name)`.  type_name is matched with the same rule used for column definitions.
 cast_expr = { K_CAST ~ "(" ~ expr ~ K_AS ~ type_name ~ ")" }

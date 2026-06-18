@@ -226,6 +226,9 @@ pub enum Expr {
         negated: bool,
     },
     Exists(Box<SelectStmt>),
+    /// A scalar subquery used as an expression: `(SELECT …)`.  Evaluates to the first column of
+    /// the first row (NULL if the subquery returns no rows).  Parsed here; execution is deferred.
+    Subquery(Box<SelectStmt>),
     Cast {
         expr: Box<Expr>,
         type_name: String,

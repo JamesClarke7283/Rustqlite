@@ -42,7 +42,7 @@ list every granular item needed.
 - [x] **2.9** Expression: `CAST(expr AS type)`
 - [x] **2.10** Expression: `CASE … WHEN … THEN … ELSE … END`
 - [x] **2.11** Expression: `COLLATE` clause on expressions
-- [ ] **2.12** Expression: Subqueries in expressions (scalar `(SELECT …)`)
+- [x] **2.12** Expression: Subqueries in expressions (scalar `(SELECT …)`)
 - [x] **2.13** Expression: `IS NOT DISTINCT FROM` / `IS DISTINCT FROM`
 - [x] **2.14** Bitwise operators: `&`, `|`, `<<`, `>>`, `~`
 - [ ] **2.15** JSON operators: `->`, `->>`

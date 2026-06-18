@@ -67,6 +67,11 @@ pub fn compile_expr(b: &mut ProgramBuilder, e: &Expr, target: i32, ctx: Ctx) -> 
         }
         Expr::In { .. } => return Err(Error::msg("IN is not supported by the executor yet")),
         Expr::Exists(_) => return Err(Error::msg("EXISTS is not supported by the executor yet")),
+        Expr::Subquery(_) => {
+            return Err(Error::msg(
+                "subqueries are not supported by the executor yet",
+            ))
+        }
         Expr::Cast { .. } => return Err(Error::msg("CAST is not supported by the executor yet")),
         Expr::Case { .. } => return Err(Error::msg("CASE is not supported by the executor yet")),
         Expr::Collate { .. } => {

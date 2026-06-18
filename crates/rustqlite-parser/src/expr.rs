@@ -104,7 +104,7 @@ fn fold_expr(pairs: Pairs<'_, Rule>) -> Expr {
         let single = pairs.into_iter().next().unwrap();
         let folded = match single.as_rule() {
             Rule::literal | Rule::column_ref | Rule::func_call => map_primary(single),
-            Rule::expr | Rule::exists_expr | Rule::cast_expr | Rule::case_expr => {
+            Rule::expr | Rule::exists_expr | Rule::subquery | Rule::cast_expr | Rule::case_expr => {
                 map_primary(single)
             }
             other => unreachable!("unexpected sole expr child {other:?}"),
@@ -385,6 +385,13 @@ fn map_primary(pair: Pair<'_, Rule>) -> Expr {
                 .find(|p| p.as_rule() == Rule::select_stmt)
                 .expect("exists_expr has a select_stmt");
             Expr::Exists(Box::new(build_select(select_pair)))
+        }
+        Rule::subquery => {
+            let select_pair = pair
+                .into_inner()
+                .find(|p| p.as_rule() == Rule::select_stmt)
+                .expect("subquery has a select_stmt");
+            Expr::Subquery(Box::new(build_select(select_pair)))
         }
         Rule::cast_expr => {
             let mut inner = pair.into_inner();

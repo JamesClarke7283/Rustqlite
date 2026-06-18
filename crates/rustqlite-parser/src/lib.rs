@@ -918,6 +918,37 @@ mod tests {
     }
 
     #[test]
+    fn scalar_subquery_in_expression() {
+        // Subquery as a result column.
+        let Stmt::Select(s) = &parse("SELECT (SELECT 1);").unwrap()[0] else {
+            panic!()
+        };
+        let ResultColumn::Expr { expr, .. } = &s.columns[0] else {
+            panic!()
+        };
+        assert!(matches!(expr, Expr::Subquery(_)));
+
+        // Subquery on the right of a comparison, in a WHERE clause.
+        let Stmt::Select(s) = &parse("SELECT 1 WHERE x = (SELECT max(y) FROM t);").unwrap()[0]
+        else {
+            panic!()
+        };
+        let Some(Expr::Binary { right, .. }) = &s.where_clause else {
+            panic!()
+        };
+        assert!(matches!(**right, Expr::Subquery(_)));
+
+        // A parenthesised ordinary expression must NOT be parsed as a subquery (backtracking).
+        let Stmt::Select(s) = &parse("SELECT (1 + 2);").unwrap()[0] else {
+            panic!()
+        };
+        let ResultColumn::Expr { expr, .. } = &s.columns[0] else {
+            panic!()
+        };
+        assert!(matches!(expr, Expr::Binary { .. }));
+    }
+
+    #[test]
     fn cast_expression() {
         let Stmt::Select(s) = &parse("SELECT CAST('123' AS INTEGER);").unwrap()[0] else {
             panic!()

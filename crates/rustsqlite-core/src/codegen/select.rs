@@ -565,6 +565,7 @@ fn expr_to_text(e: &Expr) -> String {
         Expr::Between { .. } => "between".to_string(),
         Expr::In { .. } => "in".to_string(),
         Expr::Exists(_) => "exists".to_string(),
+        Expr::Subquery(_) => "subquery".to_string(),
         Expr::Cast { .. } => "cast".to_string(),
         Expr::Case { .. } => "case".to_string(),
         Expr::Collate { .. } => "collate".to_string(),
