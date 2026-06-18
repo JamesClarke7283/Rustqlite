@@ -151,7 +151,7 @@ list every granular item needed.
 - [x] **5.2.8** Enforce `UNIQUE` constraint at `IdxInsert` time (raise `SQLITE_CONSTRAINT_UNIQUE`)
 - [ ] **5.2.9** Partial indexes: `CREATE INDEX … WHERE expr` (parser + catalog + codegen filter)
 - [ ] **5.2.10** Expression indexes: `CREATE INDEX … ON tbl(expr)` (parser + catalog + codegen)
-- [ ] **5.2.11** `COLLATE` on index columns affects comparison in `IndexCursor`
+- [x] **5.2.11** `COLLATE` on index columns affects comparison in `IndexCursor`
 
 ---
 
