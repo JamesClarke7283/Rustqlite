@@ -320,15 +320,22 @@ bitnot = { "~" }
 // The generic infix set. The LIKE family (`op_like`/`op_not_like`) is matched ONLY via `like_clause`
 // (so an ESCAPE may follow), so they are intentionally absent here.  Shift operators are declared
 // before the single-char `op_lt`/`op_gt` lexemes so pest's longest-match rule prefers `<<`/`>>`
-// over two consecutive comparisons.
+// over two consecutive comparisons.  Likewise the JSON `->>`/`->` operators are declared before
+// `op_sub` (`-`) and `op_gt` (`>`) so a leading `-` is not consumed as subtraction, and `->>`
+// (longest) is tried before `->`.
 infix = _{
-      op_or | op_and | op_concat | op_bitand | op_bitor | op_eq | op_ne | op_shiftleft | op_shiftright
-    | op_le | op_ge | op_lt | op_gt | op_add | op_sub | op_mul | op_div | op_mod | op_isnot | op_is
+      op_or | op_and | op_concat | op_jsonextracttext | op_jsonextract | op_bitand | op_bitor
+    | op_eq | op_ne | op_shiftleft | op_shiftright | op_le | op_ge | op_lt | op_gt
+    | op_add | op_sub | op_mul | op_div | op_mod | op_isnot | op_is
     | op_not_glob | op_glob
 }
 op_or = { K_OR }
 op_and = { K_AND }
 op_concat = { "||" }
+// JSON extraction: `->` yields a JSON representation, `->>` yields a SQL text/numeric value.
+// Same precedence as `||` (see expr.rs), left-associative.  `->>` before `->` (longest match).
+op_jsonextracttext = { "->>" }
+op_jsonextract = { "->" }
 op_bitand = { "&" }
 op_bitor = { "|" }
 op_eq = { "==" | "=" }

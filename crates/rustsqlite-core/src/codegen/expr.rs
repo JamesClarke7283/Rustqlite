@@ -265,6 +265,9 @@ fn compile_binary(
             b.set_p5(idx, 2);
             Ok(())
         }
+        BinaryOp::JsonExtract | BinaryOp::JsonExtractText => Err(Error::msg(
+            "JSON -> / ->> operators are not supported by the executor yet",
+        )),
         _ => unreachable!("binary op already handled"),
     }
 }

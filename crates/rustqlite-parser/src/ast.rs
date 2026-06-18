@@ -298,4 +298,8 @@ pub enum BinaryOp {
     BitOr,
     ShiftLeft,
     ShiftRight,
+    /// `->` — JSON extraction returning a JSON representation.
+    JsonExtract,
+    /// `->>` — JSON extraction returning a SQL text/numeric value.
+    JsonExtractText,
 }

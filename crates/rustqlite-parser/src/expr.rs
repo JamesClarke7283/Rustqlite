@@ -14,7 +14,7 @@ use crate::{build_select, Rule};
 
 /// Operator precedence, lowest binding first, matching SQLite's documented table
 /// (<https://www.sqlite.org/lang_expr.html>): OR < AND < NOT < (= IS LIKE GLOB) <
-/// (< <= > >=) < (& | << >>) < (+ -) < (* / %) < `||` < unary (~ - +).
+/// (< <= > >=) < (& | << >>) < (+ -) < (* / %) < (`||` `->` `->>`) < unary (~ - +).
 fn pratt() -> &'static PrattParser<Rule> {
     static PRATT: OnceLock<PrattParser<Rule>> = OnceLock::new();
     PRATT.get_or_init(|| {
@@ -56,7 +56,10 @@ fn pratt() -> &'static PrattParser<Rule> {
             .op(Op::infix(Rule::op_mul, Assoc::Left)
                 | Op::infix(Rule::op_div, Assoc::Left)
                 | Op::infix(Rule::op_mod, Assoc::Left))
-            .op(Op::infix(Rule::op_concat, Assoc::Left))
+            // `||`, `->`, `->>` share one left-associative precedence level (SQLite's table).
+            .op(Op::infix(Rule::op_concat, Assoc::Left)
+                | Op::infix(Rule::op_jsonextract, Assoc::Left)
+                | Op::infix(Rule::op_jsonextracttext, Assoc::Left))
             .op(Op::prefix(Rule::neg) | Op::prefix(Rule::pos) | Op::prefix(Rule::bitnot))
     })
 }
@@ -150,6 +153,8 @@ fn fold<'a, P: Iterator<Item = Pair<'a, Rule>>>(pairs: P) -> Expr {
                 Rule::op_div => BinaryOp::Div,
                 Rule::op_mod => BinaryOp::Mod,
                 Rule::op_concat => BinaryOp::Concat,
+                Rule::op_jsonextract => BinaryOp::JsonExtract,
+                Rule::op_jsonextracttext => BinaryOp::JsonExtractText,
                 Rule::op_bitand => BinaryOp::BitAnd,
                 Rule::op_bitor => BinaryOp::BitOr,
                 Rule::op_shiftleft => BinaryOp::ShiftLeft,

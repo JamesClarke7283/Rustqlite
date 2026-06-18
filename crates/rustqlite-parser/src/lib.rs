@@ -1111,4 +1111,59 @@ mod tests {
         assert!(parse("SELECT 5 >> 1;").is_ok());
         assert!(parse("SELECT 5 <> 1;").is_ok());
     }
+
+    #[test]
+    fn json_extract_operators_parse() {
+        // `->` extracts JSON; `->>` extracts a SQL value.  `->>` must win the longest match.
+        let Stmt::Select(s) = &parse("SELECT a -> 'b';").unwrap()[0] else {
+            panic!()
+        };
+        let ResultColumn::Expr { expr, .. } = &s.columns[0] else {
+            panic!()
+        };
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::JsonExtract,
+                ..
+            }
+        ));
+
+        let Stmt::Select(s) = &parse("SELECT a ->> 'b';").unwrap()[0] else {
+            panic!()
+        };
+        let ResultColumn::Expr { expr, .. } = &s.columns[0] else {
+            panic!()
+        };
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::JsonExtractText,
+                ..
+            }
+        ));
+
+        // Left-associative chaining: `a -> 'b' ->> 'c'` => ((a -> 'b') ->> 'c').
+        let Stmt::Select(s) = &parse("SELECT a -> 'b' ->> 'c';").unwrap()[0] else {
+            panic!()
+        };
+        let ResultColumn::Expr { expr, .. } = &s.columns[0] else {
+            panic!()
+        };
+        let Expr::Binary {
+            op: BinaryOp::JsonExtractText,
+            left,
+            ..
+        } = expr
+        else {
+            panic!("outermost op should be ->>")
+        };
+        assert!(matches!(
+            **left,
+            Expr::Binary {
+                op: BinaryOp::JsonExtract,
+                ..
+            }
+        ));
+    }
 }

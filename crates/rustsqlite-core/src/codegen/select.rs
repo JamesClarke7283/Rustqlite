@@ -598,6 +598,8 @@ fn binary_symbol(op: rustqlite_parser::BinaryOp) -> &'static str {
         BitOr => " | ",
         ShiftLeft => " << ",
         ShiftRight => " >> ",
+        JsonExtract => " -> ",
+        JsonExtractText => " ->> ",
     }
 }
 
