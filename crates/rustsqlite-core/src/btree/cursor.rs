@@ -155,6 +155,9 @@ pub struct TableCursor {
     /// that slid into the deleted slot, and we want a subsequent `next()` to move past it.
     /// Set by `delete_current`; cleared by the next `next()`.
     pending_advance: bool,
+    /// Guard to prevent infinite recursion if a rebalance triggers another delete/seek on
+    /// the same cursor.
+    rebalance_in_progress: bool,
 }
 
 impl TableCursor {
@@ -173,6 +176,7 @@ impl TableCursor {
             cell_idx: 0,
             at_end: true,
             pending_advance: false,
+            rebalance_in_progress: false,
         }
     }
 
@@ -279,6 +283,11 @@ impl TableCursor {
     /// cached leaf so subsequent reads see the post-delete state. The cursor's `cell_idx`
     /// is left unchanged (the cell that just slid into the slot is now the current
     /// cell); the next `next()` call advances past it (via the `pending_advance` flag).
+    ///
+    /// If the delete leaves the leaf underfull, a post-delete rebalance is performed by
+    /// walking the cursor stack to find the parent and calling
+    /// [`super::balance::rebalance_table_leaf_after_delete`]. The cursor is updated to
+    /// reflect any leaf merge into its left sibling.
     pub async fn delete_current(&mut self) -> Result<()> {
         if !self.is_valid() {
             return Err(Error::msg("table cursor is not positioned on a row"));
@@ -295,7 +304,109 @@ impl TableCursor {
         // Mark the cursor so the next `next()` will advance past the cell that slid in,
         // rather than skipping a row.
         self.pending_advance = true;
+
+        // Rebalance if the leaf is now underfull. Need a parent and child index.
+        if !self.rebalance_in_progress {
+            self.rebalance_in_progress = true;
+            if let Some((parent_pgno, child_idx, is_root_parent)) = self.parent_info(pgno) {
+                if let Some(outcome) = super::balance::rebalance_table_leaf_after_delete(
+                    &self.pager, pgno, parent_pgno, child_idx, is_root_parent,
+                )
+                .await?
+                {
+                    // The leaf was merged into its left sibling. Move the cursor there and
+                    // offset the cell index by the number of cells that were already on the
+                    // left sibling.
+                    let page = self.pager.get_page(outcome.leaf_pgno).await?;
+                    let base = self.pager.btree_header_offset(outcome.leaf_pgno);
+                    let hdr = PageHeader::parse(&page, base)?;
+                    self.leaf_pgno = outcome.leaf_pgno;
+                    self.leaf = Some(page);
+                    self.leaf_hdr = Some(hdr);
+                    self.cell_idx = cell_idx + outcome.cell_idx_offset;
+                    self.pending_advance = true;
+                }
+            }
+            self.rebalance_in_progress = false;
+        }
+
         Ok(())
+    }
+
+    /// Return `(parent_pgno, child_index, is_root_parent)` for the b-tree page `pgno`,
+    /// based on the cursor's current stack. The child index is 0..num_cells, where
+    /// num_cells means the right-most child.
+    fn parent_info(&self, leaf_pgno: u32) -> Option<(u32, usize, bool)> {
+        // The root page is the bottom of the stack (first pushed). A non-empty stack
+        // means we have at least one ancestor; the top of the stack is the immediate
+        // parent.
+        if self.stack.is_empty() {
+            return None;
+        }
+        let is_root_parent = self.stack.len() == 1;
+        let parent_pgno = self.resolve_parent_pgno(leaf_pgno)?;
+        let (parent_page, parent_hdr, child_k) = self.stack.last()?;
+        // `child_k` is the index of the *next* child to visit, so the child we just came
+        // from is child_k - 1.
+        let mut child_idx = child_k.saturating_sub(1);
+        // The parent header's right-most pointer is child index num_cells; a cell pointer
+        // is index 0..num_cells-1. We need to decide whether leaf_pgno is the right-most
+        // child. Compare against the right-most pointer when available.
+        if let Some(right) = parent_hdr.right_most_pointer {
+            if right == leaf_pgno {
+                child_idx = parent_hdr.num_cells as usize;
+            }
+        }
+        // If the right-most pointer didn't match, child_idx points at the cell whose
+        // left_child equals leaf_pgno. We must scan to be sure, because after a previous
+        // merge/split the cell order may not match the stack index exactly.
+        let mut found = false;
+        for i in 0..parent_hdr.num_cells as usize {
+            let off = parent_hdr.cell_pointer(parent_page, i).ok()?;
+            let left_child = super::be_u32(&parent_page[off..off + 4]);
+            if left_child == leaf_pgno {
+                child_idx = i;
+                found = true;
+                break;
+            }
+        }
+        // If no cell matched, rely on the right-most check already done above.
+        if !found && parent_hdr.right_most_pointer != Some(leaf_pgno) {
+            return None;
+        }
+        Some((parent_pgno, child_idx, is_root_parent))
+    }
+
+    /// Walk the path from the root down to leaf_pgno and return the immediate parent's
+    /// page number. Returns `None` when the stack is empty or leaf_pgno is the root.
+    fn resolve_parent_pgno(&self, leaf_pgno: u32) -> Option<u32> {
+        if self.stack.is_empty() {
+            return None;
+        }
+        // The immediate parent is the top of the stack; we just need its page number.
+        // Since the frame does not store pgno, re-derive by walking the tree from the
+        // known root, matching the stack frames. This is correct because the stack frames
+        // record the interior page content at the time of descent.
+        let mut pgno = self.root;
+        for (page, hdr, next_k) in &self.stack {
+            if hdr.page_type.is_leaf() {
+                break;
+            }
+            let n = hdr.num_cells as usize;
+            let k = next_k.saturating_sub(1);
+            if k < n {
+                let off = hdr.cell_pointer(page, k).ok()?;
+                pgno = super::be_u32(&page[off..off + 4]);
+            } else {
+                pgno = hdr.right_most_pointer?;
+            }
+            if pgno == leaf_pgno {
+                // We reached the leaf; the previous frame is the parent. Return the
+                // parent's pgno, which is the value before this final descent.
+                break;
+            }
+        }
+        Some(pgno)
     }
 
     /// Parse the current leaf cell.

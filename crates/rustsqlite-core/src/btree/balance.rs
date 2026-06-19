@@ -887,6 +887,375 @@ fn find_child_cell_index(page: &[u8], hdr: &PageHeader, target: u32) -> Result<u
     )))
 }
 
+/// Outcome of rebalancing a table leaf after a delete. When the leaf was merged
+/// into its left sibling, the caller must move the cursor to the surviving page
+/// and offset `cell_idx` by `cell_idx_offset` so the scan continues from the same
+/// logical row.
+#[derive(Debug)]
+pub struct RebalanceOutcome {
+    pub leaf_pgno: u32,
+    pub cell_idx_offset: usize,
+}
+
+/// Rebalance a table-leaf page after a delete has left it underfull.
+///
+/// SQLite rebalances when a leaf's free space exceeds 2/3 of the usable area.
+/// The leaf may be merged with a sibling (if the combined cells fit on one page),
+/// or cells may be redistributed so both pages are adequately full. When the
+/// parent is the root and the merge leaves it with a single right-most child, the
+/// tree height is collapsed by copying the child into the root.
+///
+/// `parent_pgno` is the immediate interior-table parent and `child_idx` is the
+/// index of `leaf_pgno` among the parent's children (0..=num_cells, where
+/// num_cells means the right-most child). `is_root_parent` is true when the
+/// parent is the root of this b-tree.
+///
+/// Returns `None` when no rebalance was needed or when the leaf stayed in place.
+/// Returns `Some(RebalanceOutcome)` when the leaf was merged into its left
+/// sibling and the cursor must be repositioned.
+pub async fn rebalance_table_leaf_after_delete(
+    pager: &Pager,
+    leaf_pgno: u32,
+    parent_pgno: u32,
+    child_idx: usize,
+    is_root_parent: bool,
+) -> Result<Option<RebalanceOutcome>> {
+    let usable = pager.usable_size();
+    let base = pager.btree_header_offset(leaf_pgno);
+    let leaf_buf = pager.get_page(leaf_pgno).await?;
+    let hdr = PageHeader::parse(&leaf_buf, base)?;
+    if hdr.page_type != PageType::LeafTable {
+        return Err(Error::corrupt(
+            "rebalance_table_leaf_after_delete: not a leaf-table page",
+        ));
+    }
+
+    // Free space on a freshly rebuilt leaf is just the unallocated gap.
+    let free_space = page::leaf_free_space(&leaf_buf, base);
+    // Rebalance if free space is greater than 2/3 of the usable area. Also skip
+    // rebalancing if the leaf is now empty: an empty table b-tree is valid as a
+    // single empty leaf page (the M4 full-table-delete path already collapses to
+    // this case).
+    if free_space * 3 <= usable * 2 || hdr.num_cells == 0 {
+        return Ok(None);
+    }
+
+    let pbase = pager.btree_header_offset(parent_pgno);
+    let pbuf = pager.get_page(parent_pgno).await?;
+    let phdr = PageHeader::parse(&pbuf, pbase)?;
+    // The parent may have already been collapsed into a leaf by a prior rebalance
+    // in the same DELETE scan. In that case there is nothing left to do.
+    if phdr.page_type == PageType::LeafTable {
+        return Ok(None);
+    }
+    if phdr.page_type != PageType::InteriorTable {
+        return Err(Error::corrupt(
+            "rebalance_table_leaf_after_delete: parent is not an interior table",
+        ));
+    }
+    let n = phdr.num_cells as usize;
+
+    // Locate immediate siblings in the parent's child order.
+    let right_sibling = if child_idx < n {
+        Some(
+            parse_table_interior_cell(&pbuf, phdr.cell_pointer(&pbuf, child_idx)?)?
+                .left_child,
+        )
+    } else {
+        None
+    };
+    let left_sibling = if child_idx > 0 {
+        Some(
+            parse_table_interior_cell(&pbuf, phdr.cell_pointer(&pbuf, child_idx - 1)?)?
+                .left_child,
+        )
+    } else {
+        None
+    };
+
+    let leaf_cells = read_table_leaf_cells(&leaf_buf, base, usable)?;
+
+    // Prefer merging with the right sibling; this keeps the cursor's leaf in place.
+    if let Some(right_pgno) = right_sibling {
+        let right_base = pager.btree_header_offset(right_pgno);
+        let right_buf = pager.get_page(right_pgno).await?;
+        let right_cells = read_table_leaf_cells(&right_buf, right_base, usable)?;
+        let combined_layout = table_cells_layout_size(&leaf_cells) + right_cells.iter().map(|c| c.len()).sum::<usize>() + right_cells.len() * 2;
+        if combined_layout + 8 <= usable {
+            // Merge right sibling into the current leaf.
+            let mut combined = leaf_cells;
+            combined.extend(right_cells);
+            write_table_leaf(pager, leaf_pgno, base, &combined).await?;
+            pager.free_page(right_pgno).await?;
+            rebuild_parent_without_divider(pager, parent_pgno, child_idx, is_root_parent)
+                .await?;
+            return Ok(None);
+        }
+
+        // Redistribute cells between the leaf and the right sibling.
+        let (left_cells, right_cells) = redistribute_table_cells(usable, leaf_cells, right_cells)?;
+        let divider_rowid = max_rowid_of_cells(&left_cells)?;
+        write_table_leaf(pager, leaf_pgno, base, &left_cells).await?;
+        write_table_leaf(pager, right_pgno, right_base, &right_cells).await?;
+        rebuild_parent_with_divider(pager, parent_pgno, child_idx, divider_rowid).await?;
+        return Ok(None);
+    }
+
+    // No right sibling: try the left sibling.
+    if let Some(left_pgno) = left_sibling {
+        let left_base = pager.btree_header_offset(left_pgno);
+        let left_buf = pager.get_page(left_pgno).await?;
+        let left_cells = read_table_leaf_cells(&left_buf, left_base, usable)?;
+        let combined_layout = table_cells_layout_size(&left_cells) + leaf_cells.iter().map(|c| c.len()).sum::<usize>() + leaf_cells.len() * 2;
+        if combined_layout + 8 <= usable {
+            // Merge the current leaf into the left sibling. The cursor must move.
+            let offset = left_cells.len();
+            let mut combined = left_cells.clone();
+            combined.extend(leaf_cells);
+            write_table_leaf(pager, left_pgno, left_base, &combined).await?;
+            pager.free_page(leaf_pgno).await?;
+            rebuild_parent_without_divider(pager, parent_pgno, child_idx - 1, is_root_parent)
+                .await?;
+            return Ok(Some(RebalanceOutcome {
+                leaf_pgno: left_pgno,
+                cell_idx_offset: offset,
+            }));
+        }
+
+        // Redistribute cells between the left sibling and the leaf.
+        let (left_cells, right_cells) = redistribute_table_cells(usable, left_cells, leaf_cells)?;
+        let divider_rowid = max_rowid_of_cells(&left_cells)?;
+        write_table_leaf(pager, left_pgno, left_base, &left_cells).await?;
+        write_table_leaf(pager, leaf_pgno, base, &right_cells).await?;
+        rebuild_parent_with_divider(pager, parent_pgno, child_idx - 1, divider_rowid).await?;
+        return Ok(None);
+    }
+
+    Ok(None)
+}
+
+/// Read every table-leaf cell from `page` as a freshly allocated byte vector.
+fn read_table_leaf_cells(page: &[u8], base: usize, usable: usize) -> Result<Vec<Vec<u8>>> {
+    let hdr = PageHeader::parse(page, base)?;
+    if hdr.page_type != PageType::LeafTable {
+        return Err(Error::corrupt("read_table_leaf_cells: not a table leaf"));
+    }
+    let mut cells = Vec::with_capacity(hdr.num_cells as usize);
+    for i in 0..hdr.num_cells as usize {
+        let off = hdr.cell_pointer(page, i)?;
+        let (_payload_size, n1) = read_payload_size(page, off)?;
+        let size = cell_total_size(page, off, n1, usable)?;
+        cells.push(page[off..off + size].to_vec());
+    }
+    Ok(cells)
+}
+
+/// The on-page layout size of a list of table-leaf cells if they were placed on
+/// a single page: 8-byte header + 2 bytes per pointer + sum of cell sizes.
+fn table_cells_layout_size(cells: &[Vec<u8>]) -> usize {
+    8 + cells.len() * 2 + cells.iter().map(|c| c.len()).sum::<usize>()
+}
+
+/// The largest rowid among a nonempty list of table-leaf cells.
+fn max_rowid_of_cells(cells: &[Vec<u8>]) -> Result<i64> {
+    cells
+        .last()
+        .map(|c| max_rowid_of_cell(c))
+        .unwrap_or_else(|| Ok(0))
+}
+
+/// Rewrite a table-leaf page with the given cells.
+async fn write_table_leaf(
+    pager: &Pager,
+    pgno: u32,
+    base: usize,
+    cells: &[Vec<u8>],
+) -> Result<()> {
+    let cells_with_idx: Vec<(u16, Vec<u8>)> = cells
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i as u16, c.clone()))
+        .collect();
+    let mut buf = pager.read_page_for_write(pgno).await?;
+    page::write_page_cells(&mut buf, base, PageType::LeafTable, None, &cells_with_idx)?;
+    pager.write_page(pgno, buf)?;
+    Ok(())
+}
+
+/// Redistribute two lists of table-leaf cells across two pages so each page fits.
+/// The combined cells are kept in ascending order. The first returned list is the
+/// left (smaller-rowid) half, the second is the right half.
+fn redistribute_table_cells(
+    usable: usize,
+    left_cells: Vec<Vec<u8>>,
+    right_cells: Vec<Vec<u8>>,
+) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+    let mut combined = left_cells;
+    combined.extend(right_cells);
+    let n = combined.len();
+    if n < 2 {
+        return Err(Error::corrupt(
+            "redistribute_table_cells: need at least two cells",
+        ));
+    }
+
+    // Fill the left page as full as possible without overflowing, then assign
+    // the remainder to the right page. Because each original page fit on its
+    // own, the right remainder also fits in the common case. Guard against
+    // degenerate huge cells by ensuring the right page gets at least one cell.
+    let mut k = 0usize;
+    let mut left_layout = 8usize;
+    while k < n - 1 {
+        let next_layout = left_layout + combined[k].len() + 2;
+        if next_layout > usable {
+            break;
+        }
+        left_layout = next_layout;
+        k += 1;
+    }
+    if k == 0 {
+        // Even a single cell overflows; keep at least one cell on each side.
+        k = 1;
+    }
+    let right_cells = combined.split_off(k);
+    Ok((combined, right_cells))
+}
+
+/// Rebuild a parent interior-table page with the divider at `divider_idx` removed.
+/// If `is_root_parent` is true and the removal leaves the root with no cells and a
+/// single right-most child, the tree is collapsed by copying the child into the root.
+async fn rebuild_parent_without_divider(
+    pager: &Pager,
+    parent_pgno: u32,
+    divider_idx: usize,
+    is_root_parent: bool,
+) -> Result<()> {
+    let pbase = pager.btree_header_offset(parent_pgno);
+    let pbuf = pager.get_page(parent_pgno).await?;
+    let phdr = PageHeader::parse(&pbuf, pbase)?;
+    if phdr.page_type != PageType::InteriorTable {
+        return Err(Error::corrupt("rebuild_parent_without_divider: not interior"));
+    }
+    let n = phdr.num_cells as usize;
+    if divider_idx >= n {
+        return Err(Error::corrupt("rebuild_parent_without_divider: bad idx"));
+    }
+
+    let mut cells: Vec<Vec<u8>> = Vec::with_capacity(n.saturating_sub(1));
+    for i in 0..n {
+        if i == divider_idx {
+            continue;
+        }
+        let off = phdr.cell_pointer(&pbuf, i)?;
+        let left_child = super::be_u32(&pbuf[off..off + 4]);
+        let (rowid, rowid_size) = crate::format::read_varint_i64(&pbuf[off + 4..])
+            .ok_or_else(|| Error::corrupt("parent rowid varint"))?;
+        let mut cell = Vec::with_capacity(4 + rowid_size);
+        cell.extend_from_slice(&left_child.to_be_bytes());
+        crate::format::write_varint(rowid as u64, &mut cell);
+        cells.push(cell);
+    }
+
+    let right_most = if divider_idx == n - 1 {
+        // The removed divider sat just before the old right-most child. The
+        // combined child (formerly the left child of that divider) becomes the
+        // new right-most child.
+        let off = phdr.cell_pointer(&pbuf, n - 1)?;
+        Some(super::be_u32(&pbuf[off..off + 4]))
+    } else {
+        phdr.right_most_pointer
+    };
+
+    let cells_with_idx: Vec<(u16, Vec<u8>)> = cells
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i as u16, c.clone()))
+        .collect();
+    let mut new_parent = pager.read_page_for_write(parent_pgno).await?;
+    page::write_page_cells(
+        &mut new_parent,
+        pbase,
+        PageType::InteriorTable,
+        right_most,
+        &cells_with_idx,
+    )?;
+    pager.write_page(parent_pgno, new_parent)?;
+
+    if is_root_parent && cells_with_idx.is_empty() {
+        if let Some(child) = right_most {
+            collapse_root_into_child(pager, parent_pgno, child).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Rebuild a parent interior-table page, updating the rowid of the divider at
+/// `divider_idx` to `new_rowid`. The left_child pointer of every cell is preserved.
+async fn rebuild_parent_with_divider(
+    pager: &Pager,
+    parent_pgno: u32,
+    divider_idx: usize,
+    new_rowid: i64,
+) -> Result<()> {
+    let pbase = pager.btree_header_offset(parent_pgno);
+    let pbuf = pager.get_page(parent_pgno).await?;
+    let phdr = PageHeader::parse(&pbuf, pbase)?;
+    if phdr.page_type != PageType::InteriorTable {
+        return Err(Error::corrupt("rebuild_parent_with_divider: not interior"));
+    }
+    let n = phdr.num_cells as usize;
+    if divider_idx >= n {
+        return Err(Error::corrupt("rebuild_parent_with_divider: bad idx"));
+    }
+
+    let mut cells: Vec<Vec<u8>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = phdr.cell_pointer(&pbuf, i)?;
+        let left_child = super::be_u32(&pbuf[off..off + 4]);
+        let rowid = if i == divider_idx {
+            new_rowid
+        } else {
+            crate::format::read_varint_i64(&pbuf[off + 4..])
+                .map(|(r, _)| r)
+                .ok_or_else(|| Error::corrupt("parent rowid varint"))?
+        };
+        let mut cell = Vec::with_capacity(4 + 9);
+        cell.extend_from_slice(&left_child.to_be_bytes());
+        crate::format::write_varint(rowid as u64, &mut cell);
+        cells.push(cell);
+    }
+
+    let cells_with_idx: Vec<(u16, Vec<u8>)> = cells
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i as u16, c.clone()))
+        .collect();
+    let mut new_parent = pager.read_page_for_write(parent_pgno).await?;
+    page::write_page_cells(
+        &mut new_parent,
+        pbase,
+        PageType::InteriorTable,
+        phdr.right_most_pointer,
+        &cells_with_idx,
+    )?;
+    pager.write_page(parent_pgno, new_parent)?;
+    Ok(())
+}
+
+/// Collapse a single-interior root page into its only child. The root page is
+/// rewritten as a leaf-table page holding the child's cells, and the child is
+/// added to the freelist.
+async fn collapse_root_into_child(pager: &Pager, root_pgno: u32, child_pgno: u32) -> Result<()> {
+    let usable = pager.usable_size();
+    let base = pager.btree_header_offset(root_pgno);
+    let cbase = pager.btree_header_offset(child_pgno);
+    let child_buf = pager.get_page(child_pgno).await?;
+    let cells = read_table_leaf_cells(&child_buf, cbase, usable)?;
+    write_table_leaf(pager, root_pgno, base, &cells).await?;
+    pager.free_page(child_pgno).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,5 +1275,16 @@ mod tests {
         // Both halves should be under `usable / 2 + one_cell` (the split aims for half).
         assert!(left_size <= usable / 2 + 200);
         assert!(right_size <= usable / 2 + 200);
+    }
+
+    #[test]
+    fn redistribute_keeps_both_pages_within_budget() {
+        let usable = 1024;
+        let left: Vec<Vec<u8>> = (0..10).map(|_| vec![0u8; 40]).collect();
+        let right: Vec<Vec<u8>> = (0..10).map(|_| vec![0u8; 40]).collect();
+        let (l, r) = redistribute_table_cells(usable, left, right).unwrap();
+        assert!(!l.is_empty() && !r.is_empty());
+        assert!(table_cells_layout_size(&l) <= usable);
+        assert!(table_cells_layout_size(&r) <= usable);
     }
 }

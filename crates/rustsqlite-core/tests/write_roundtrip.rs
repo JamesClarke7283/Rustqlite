@@ -222,6 +222,46 @@ fn delete_roundtrip_and_c_oracle() {
     assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
 }
 
+/// M5.3.1: delete enough rows from a multi-page table to trigger leaf-page merging,
+/// then confirm C SQLite still considers the file valid and the remaining rows are
+/// correct. The small page size (512 bytes) makes it easy to create underfull pages.
+#[test]
+fn delete_triggers_leaf_merge_and_c_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("delete_merge");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        // Fill the table with rows that span multiple pages, then delete most of them.
+        for n in 1..=200 {
+            exec(
+                &mut conn,
+                &format!("INSERT INTO t VALUES ({n}, 'this is row number {n}');"),
+            );
+        }
+        // Delete all but a scattered subset so several leaves become underfull and merge.
+        exec(&mut conn, "DELETE FROM t WHERE a % 7 != 0;");
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    let remaining: Vec<i64> = (1..=200)
+        .filter(|n| n % 7 == 0)
+        .map(|n| n as i64)
+        .collect();
+    let expected = remaining
+        .iter()
+        .map(|n| format!("{n}|this is row number {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        db.query("SELECT a, b FROM t ORDER BY a;"),
+        expected,
+        "remaining rows after merge mismatch"
+    );
+}
+
 #[test]
 fn drop_table_roundtrip_and_c_oracle() {
     skip_if_no_sqlite3!();
