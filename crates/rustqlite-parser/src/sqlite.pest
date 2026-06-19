@@ -294,7 +294,8 @@ insert_stmt = {
 insert_verb = { (K_INSERT ~ (K_OR ~ conflict_action)?) | K_REPLACE }
 conflict_action = { K_ROLLBACK | K_ABORT | K_FAIL | K_IGNORE | K_REPLACE }
 column_list = { "(" ~ ident ~ ("," ~ ident)* ~ ")" }
-insert_source = { select_stmt | values_clause }
+insert_source = { select_stmt | values_clause | default_values_clause }
+default_values_clause = { K_DEFAULT ~ K_VALUES }
 values_clause = { K_VALUES ~ value_row ~ ("," ~ value_row)* }
 value_row = { "(" ~ expr ~ ("," ~ expr)* ~ ")" }
 

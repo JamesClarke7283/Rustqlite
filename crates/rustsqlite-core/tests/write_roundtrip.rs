@@ -246,10 +246,7 @@ fn delete_triggers_leaf_merge_and_c_oracle() {
     }
 
     assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
-    let remaining: Vec<i64> = (1..=200)
-        .filter(|n| n % 7 == 0)
-        .map(|n| n as i64)
-        .collect();
+    let remaining: Vec<i64> = (1..=200).filter(|n| n % 7 == 0).map(|n| n as i64).collect();
     let expected = remaining
         .iter()
         .map(|n| format!("{n}|this is row number {n}"))
@@ -825,7 +822,10 @@ fn partial_index_create_populate_select_and_maintain() {
     {
         let mut conn = sqlite3_open(db.str()).expect("open");
         exec(&mut conn, "CREATE TABLE t(a INT, b TEXT, c TEXT);");
-        exec(&mut conn, "INSERT INTO t VALUES (1,'x','r1'), (2,'x','r2'), (3,'y','r3'), (4,'x','r4');");
+        exec(
+            &mut conn,
+            "INSERT INTO t VALUES (1,'x','r1'), (2,'x','r2'), (3,'y','r3'), (4,'x','r4');",
+        );
         // Partial index: only rows where b = 'x' are indexed.
         exec(&mut conn, "CREATE INDEX i_partial ON t(a) WHERE b = 'x';");
         let _ = conn;
@@ -845,7 +845,10 @@ fn partial_index_create_populate_select_and_maintain() {
 
     // Maintenance: insert a matching and a non-matching row.
     let mut conn = sqlite3_open(db.str()).expect("open");
-    exec(&mut conn, "INSERT INTO t VALUES (5,'x','r5'), (6,'y','r6');");
+    exec(
+        &mut conn,
+        "INSERT INTO t VALUES (5,'x','r5'), (6,'y','r6');",
+    );
     // Delete a matching row.
     exec(&mut conn, "DELETE FROM t WHERE a = 1 AND b = 'x';");
     let _ = conn;
@@ -860,10 +863,7 @@ fn partial_index_create_populate_select_and_maintain() {
     // Updating a column that appears in the partial-index predicate is not supported in
     // this slice (the OLD/NEW predicate evaluation would need separate value snapshots).
     let mut conn = sqlite3_open(db.str()).expect("open");
-    let result = sqlite3_prepare_v2(
-        &mut conn,
-        "UPDATE t SET b = 'z' WHERE a = 2;"
-    );
+    let result = sqlite3_prepare_v2(&mut conn, "UPDATE t SET b = 'z' WHERE a = 2;");
     assert!(
         result.is_err(),
         "expected an error for partial-index predicate referencing updated column"
@@ -876,6 +876,75 @@ fn partial_index_create_populate_select_and_maintain() {
     // Updating a column NOT in the predicate while the predicate references another column
     // is fine and keeps the index in sync.
     let mut conn = sqlite3_open(db.str()).expect("open");
-    exec(&mut conn, "UPDATE t SET c = 'updated' WHERE a = 2 AND b = 'x';");
-    assert_eq!(db.query("SELECT c FROM t WHERE a = 2 AND b = 'x';"), "updated");
+    exec(
+        &mut conn,
+        "UPDATE t SET c = 'updated' WHERE a = 2 AND b = 'x';",
+    );
+    assert_eq!(
+        db.query("SELECT c FROM t WHERE a = 2 AND b = 'x';"),
+        "updated"
+    );
+}
+
+/// M2.22 / M4: `INSERT ... DEFAULT VALUES` uses each column's default (or NULL) and works
+/// end-to-end through the C-API. The C oracle validates the file format and the row content.
+#[test]
+fn insert_default_values_roundtrip_and_c_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("default_values");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(
+            &mut conn,
+            "CREATE TABLE t(a INT DEFAULT 42, b TEXT DEFAULT 'hello', c);",
+        );
+        exec(&mut conn, "INSERT INTO t DEFAULT VALUES;");
+        assert_eq!(conn.changes(), 1);
+        assert_eq!(conn.last_insert_rowid(), 1);
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b, c FROM t;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::Int(42),
+                Value::Text("hello".into()),
+                Value::Null,
+            ]]
+        );
+
+        // Rowid-alias table with a default on the stored column only: auto-assign rowid.
+        exec(
+            &mut conn,
+            "CREATE TABLE u(id INTEGER PRIMARY KEY, v INT DEFAULT 99);",
+        );
+        exec(&mut conn, "INSERT INTO u DEFAULT VALUES;");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT rowid, id, v FROM u;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(
+            rows,
+            vec![vec![Value::Int(1), Value::Int(1), Value::Int(99)]]
+        );
+
+        // Rowid-alias table with an explicit default on the alias column: that value becomes rowid.
+        exec(
+            &mut conn,
+            "CREATE TABLE w(id INTEGER PRIMARY KEY DEFAULT 123, v);",
+        );
+        exec(&mut conn, "INSERT INTO w DEFAULT VALUES;");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT rowid, id, v FROM w;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(
+            rows,
+            vec![vec![Value::Int(123), Value::Int(123), Value::Null]]
+        );
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b, c FROM t;"), "42|hello|");
+    assert_eq!(db.query("SELECT rowid, id, v FROM u;"), "1|1|99");
+    assert_eq!(db.query("SELECT rowid, id, v FROM w;"), "123|123|");
 }

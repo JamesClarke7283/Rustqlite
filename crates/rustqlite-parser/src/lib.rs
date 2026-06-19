@@ -127,7 +127,8 @@ fn build_select(pair: Pair<'_, Rule>) -> Result<SelectStmt, ParseError> {
             _ => {}
         }
     }
-    let mut stmt = stmt.ok_or_else(|| ParseError::new("select_stmt has at least one select_core"))?;
+    let mut stmt =
+        stmt.ok_or_else(|| ParseError::new("select_stmt has at least one select_core"))?;
     stmt.with_clause = with_clause;
     Ok(stmt)
 }
@@ -322,9 +323,7 @@ fn build_table_ref_with_joins(pair: Pair<'_, Rule>) -> Result<TableOrJoin, Parse
 
 /// Build the leading element of a `table_ref_with_joins`: a plain table reference, a subquery
 /// with alias, or a parenthesised join.
-fn build_table_or_join_source(
-    pair: Pair<'_, Rule>,
-) -> Result<TableOrJoin, ParseError> {
+fn build_table_or_join_source(pair: Pair<'_, Rule>) -> Result<TableOrJoin, ParseError> {
     match pair.as_rule() {
         Rule::table_ref => Ok(TableOrJoin::Table(build_table_ref(pair))),
         Rule::table_subquery => Ok(build_table_subquery(pair)?),
@@ -370,9 +369,7 @@ fn build_values_select(pair: Pair<'_, Rule>) -> SelectStmt {
     }
 }
 
-fn build_parenthesised_join(
-    pair: Pair<'_, Rule>,
-) -> Result<TableOrJoin, ParseError> {
+fn build_parenthesised_join(pair: Pair<'_, Rule>) -> Result<TableOrJoin, ParseError> {
     let from_clause = pair
         .into_inner()
         .find(|p| p.as_rule() == Rule::from_clause)
@@ -390,7 +387,9 @@ fn build_parenthesised_join(
         let mut acc = refs.remove(0);
         for right in refs {
             let right_table = right.table().ok_or_else(|| {
-                ParseError::new("expected plain table reference in parenthesised join list".to_string())
+                ParseError::new(
+                    "expected plain table reference in parenthesised join list".to_string(),
+                )
             })?;
             acc = TableOrJoin::Join(Join {
                 op: JoinOp::Inner,
@@ -621,12 +620,15 @@ fn build_column_constraint(pair: Pair<'_, Rule>) -> ColumnConstraint {
         Rule::c_not_null => ColumnConstraint::NotNull,
         Rule::c_unique => ColumnConstraint::Unique,
         Rule::c_default => {
-            let expr_pair = inner
-                .into_inner()
-                .find(|p| p.as_rule() == Rule::expr || p.as_rule() == Rule::literal);
-            let e = match expr_pair {
-                Some(p) if p.as_rule() == Rule::expr => expr::build_expr(p),
-                _ => Expr::Literal(Literal::Null),
+            let mut children = inner.into_inner();
+            let kind = children.next().expect("c_default has K_DEFAULT");
+            assert_eq!(kind.as_rule(), Rule::K_DEFAULT);
+            let value = children.next().expect("c_default has a value child");
+            let e = match value.as_rule() {
+                Rule::expr => expr::build_expr(value),
+                Rule::literal => expr::build_literal_expr(value),
+                Rule::signed_number => Expr::Literal(expr::build_number(value.as_str())),
+                other => unreachable!("unexpected c_default child {other:?}"),
             };
             ColumnConstraint::Default(e)
         }
@@ -669,13 +671,16 @@ fn build_insert(pair: Pair<'_, Rule>) -> InsertStmt {
 }
 
 fn build_insert_source(pair: Pair<'_, Rule>) -> Result<InsertSource, ParseError> {
-    // The grammar rule is `insert_source = { select_stmt | values_clause }`. Because `select_stmt`
-    // itself includes a `values_core` alternative, a VALUES source may parse as a `select_stmt`
-    // (specifically a select_core containing values). Distinguish them by inspecting the parsed
-    // children directly: if there is a `values_clause` child, use it; otherwise treat the whole
-    // thing as a SELECT.
+    // The grammar rule is `insert_source = { select_stmt | values_clause | default_values_clause }`.
+    // Because `select_stmt` itself includes a `values_core` alternative, a VALUES source may parse
+    // as a `select_stmt` (specifically a select_core containing values). Distinguish them by
+    // inspecting the parsed children directly: if there is a `values_clause` child, use it; if
+    // there is a `default_values_clause` child, use it; otherwise treat the whole thing as SELECT.
     for part in pair.clone().into_inner() {
         match part.as_rule() {
+            Rule::default_values_clause => {
+                return Ok(InsertSource::DefaultValues);
+            }
             Rule::values_clause => {
                 let rows = part
                     .into_inner()
@@ -1058,6 +1063,10 @@ mod tests {
             ct.columns[1].constraints[0],
             ColumnConstraint::NotNull
         ));
+        assert_eq!(
+            ct.columns[2].constraints[0],
+            ColumnConstraint::Default(Expr::Literal(Literal::Integer(0)))
+        );
     }
 
     #[test]
@@ -1069,7 +1078,9 @@ mod tests {
         };
         assert_eq!(ins.table, "t");
         assert_eq!(ins.columns, vec!["a", "b"]);
-        let InsertSource::Values(rows) = &ins.source else { panic!("expected VALUES source") };
+        let InsertSource::Values(rows) = &ins.source else {
+            panic!("expected VALUES source")
+        };
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], Expr::Literal(Literal::Integer(1)));
 
@@ -1089,6 +1100,24 @@ mod tests {
         assert_eq!(ins.table, "t");
         assert_eq!(ins.columns, vec!["a"]);
         assert!(matches!(ins.source, InsertSource::Select(_)));
+    }
+
+    #[test]
+    fn insert_default_values_parses() {
+        let Stmt::Insert(ins) = &parse("INSERT INTO t DEFAULT VALUES;").unwrap()[0] else {
+            panic!()
+        };
+        assert_eq!(ins.table, "t");
+        assert!(ins.columns.is_empty());
+        assert_eq!(ins.source, InsertSource::DefaultValues);
+
+        // An explicit column list is syntactically accepted and ignored by DEFAULT VALUES.
+        let Stmt::Insert(ins) = &parse("INSERT INTO t (a, b) DEFAULT VALUES;").unwrap()[0] else {
+            panic!()
+        };
+        assert_eq!(ins.table, "t");
+        assert_eq!(ins.columns, vec!["a", "b"]);
+        assert_eq!(ins.source, InsertSource::DefaultValues);
     }
 
     #[test]
@@ -1647,8 +1676,7 @@ mod tests {
 
         // Parenthesised joins can be mixed with subqueries.
         let Stmt::Select(s) =
-            &parse("SELECT * FROM (t1 JOIN t2 ON t1.a = t2.b) JOIN t3 ON t2.c = t3.c;")
-                .unwrap()[0]
+            &parse("SELECT * FROM (t1 JOIN t2 ON t1.a = t2.b) JOIN t3 ON t2.c = t3.c;").unwrap()[0]
         else {
             panic!("expected SELECT")
         };
@@ -1694,10 +1722,9 @@ mod tests {
         assert_eq!(s.values[1].len(), 2);
 
         // VALUES can appear as the left side of a compound.
-        let Stmt::Select(s) =
-            &parse("VALUES (1, 2) UNION ALL SELECT 3, 4;").unwrap()[0] else {
-                panic!("expected SELECT")
-            };
+        let Stmt::Select(s) = &parse("VALUES (1, 2) UNION ALL SELECT 3, 4;").unwrap()[0] else {
+            panic!("expected SELECT")
+        };
         assert!(!s.values.is_empty());
         assert_eq!(s.compound.len(), 1);
     }
@@ -1733,10 +1760,8 @@ mod tests {
         assert_eq!(wc.ctes[0].columns, vec!["n".to_string()]);
         assert_eq!(wc.ctes[0].query.compound.len(), 1);
 
-        let Stmt::Select(s) = &parse(
-            "WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a, b;",
-        )
-        .unwrap()[0]
+        let Stmt::Select(s) =
+            &parse("WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a, b;").unwrap()[0]
         else {
             panic!("expected SELECT")
         };

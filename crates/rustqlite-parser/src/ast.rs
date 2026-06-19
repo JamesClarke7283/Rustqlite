@@ -281,6 +281,8 @@ pub enum InsertSource {
     Values(Vec<Vec<Expr>>),
     /// `SELECT ...` — a query whose result rows become the inserted rows.
     Select(SelectStmt),
+    /// `DEFAULT VALUES` — insert a single row using each column's default value (or NULL).
+    DefaultValues,
 }
 
 /// `DELETE FROM [schema.]tbl [WHERE expr]`. The first M4.6 slice omits `ORDER BY`, `LIMIT`,

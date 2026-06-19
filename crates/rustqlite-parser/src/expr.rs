@@ -427,7 +427,7 @@ fn map_primary(pair: Pair<'_, Rule>) -> Expr {
 
 /// The grammar's `literal` rule also carries bind parameters (`?`, `:name`, …), which are a
 /// distinct [`Expr`] variant rather than a [`Literal`]; split them out here.
-fn build_literal_expr(pair: Pair<'_, Rule>) -> Expr {
+pub(crate) fn build_literal_expr(pair: Pair<'_, Rule>) -> Expr {
     let inner = pair.into_inner().next().expect("literal has one child");
     match inner.as_rule() {
         Rule::bind_param => Expr::BindParam(inner.as_str().to_string()),
@@ -441,7 +441,7 @@ fn build_literal_expr(pair: Pair<'_, Rule>) -> Expr {
     }
 }
 
-fn build_number(text: &str) -> Literal {
+pub(crate) fn build_number(text: &str) -> Literal {
     if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
         return match u64::from_str_radix(hex, 16) {
             Ok(v) => Literal::Integer(v as i64),

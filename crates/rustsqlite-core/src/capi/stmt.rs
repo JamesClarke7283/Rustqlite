@@ -8,7 +8,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use rustqlite_parser::{parse, DropIndexStmt, DropTableStmt, ExplainKind, InsertSource, SelectStmt, Stmt};
+use rustqlite_parser::{
+    parse, DropIndexStmt, DropTableStmt, ExplainKind, InsertSource, SelectStmt, Stmt,
+};
 
 use crate::codegen;
 use crate::error::{Error, Result, ResultCode};
@@ -263,7 +265,7 @@ fn resolve_insert_source(
     source: &InsertSource,
 ) -> Result<Option<(Table, Vec<IndexObject>)>> {
     let select = match source {
-        InsertSource::Values(_) => return Ok(None),
+        InsertSource::Values(_) | InsertSource::DefaultValues => return Ok(None),
         InsertSource::Select(s) => s,
     };
     // A constant SELECT has no FROM clause.
@@ -276,7 +278,11 @@ fn resolve_insert_source(
     }
     let table_ref = match first.table() {
         Some(t) => t,
-        None => return Err(Error::msg("subqueries are not supported in INSERT ... SELECT")),
+        None => {
+            return Err(Error::msg(
+                "subqueries are not supported in INSERT ... SELECT",
+            ))
+        }
     };
     let catalog = block_on(read_catalog(pager))?;
     let table_obj = catalog
@@ -330,6 +336,7 @@ fn resolve_sqlite_schema(pager: &Arc<Pager>) -> Result<Table> {
                 collation: crate::types::Collation::Binary,
                 notnull: false,
                 pk: false,
+                default: None,
             },
             crate::schema::Column {
                 name: "name".to_string(),
@@ -337,6 +344,7 @@ fn resolve_sqlite_schema(pager: &Arc<Pager>) -> Result<Table> {
                 collation: crate::types::Collation::Binary,
                 notnull: false,
                 pk: false,
+                default: None,
             },
             crate::schema::Column {
                 name: "tbl_name".to_string(),
@@ -344,6 +352,7 @@ fn resolve_sqlite_schema(pager: &Arc<Pager>) -> Result<Table> {
                 collation: crate::types::Collation::Binary,
                 notnull: false,
                 pk: false,
+                default: None,
             },
             crate::schema::Column {
                 name: "rootpage".to_string(),
@@ -351,6 +360,7 @@ fn resolve_sqlite_schema(pager: &Arc<Pager>) -> Result<Table> {
                 collation: crate::types::Collation::Binary,
                 notnull: false,
                 pk: false,
+                default: None,
             },
             crate::schema::Column {
                 name: "sql".to_string(),
@@ -358,6 +368,7 @@ fn resolve_sqlite_schema(pager: &Arc<Pager>) -> Result<Table> {
                 collation: crate::types::Collation::Binary,
                 notnull: false,
                 pk: false,
+                default: None,
             },
         ],
         rowid_alias: None,

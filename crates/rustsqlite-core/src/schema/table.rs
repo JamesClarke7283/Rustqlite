@@ -24,6 +24,8 @@ pub struct Column {
     pub collation: Collation,
     pub notnull: bool,
     pub pk: bool,
+    /// The column's `DEFAULT` expression, if any. `None` means the default is NULL.
+    pub default: Option<rustqlite_parser::Expr>,
 }
 
 /// A resolved table: its name, root b-tree page, columns, and (if any) the column that aliases
@@ -170,12 +172,16 @@ impl Table {
             let affinity = affinity_of(cd.type_name.as_deref());
             let mut notnull = false;
             let mut pk = false;
+            let mut default: Option<rustqlite_parser::Expr> = None;
             for c in &cd.constraints {
                 match c {
                     ColumnConstraint::NotNull => notnull = true,
                     ColumnConstraint::PrimaryKey { desc, .. } => {
                         pk = true;
                         pk_cols.push((i, *desc));
+                    }
+                    ColumnConstraint::Default(e) => {
+                        default = Some(e.clone());
                     }
                     _ => {}
                 }
@@ -186,6 +192,7 @@ impl Table {
                 collation: Collation::Binary,
                 notnull,
                 pk,
+                default,
             });
         }
 
