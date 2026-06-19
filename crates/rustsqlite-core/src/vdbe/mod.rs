@@ -8,6 +8,7 @@
 
 pub mod compare;
 pub mod cursor;
+pub mod ephemeral;
 pub mod exec;
 pub mod explain;
 pub mod mem;

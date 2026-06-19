@@ -16,6 +16,7 @@ pub mod expr;
 pub mod index;
 pub mod index_planner;
 pub mod insert;
+pub mod returning;
 pub mod select;
 pub mod update;
 

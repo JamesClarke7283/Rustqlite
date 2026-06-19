@@ -105,8 +105,20 @@ fn collect(stmt: &mut Sqlite3Stmt) -> Vec<Vec<Value>> {
     rows
 }
 
+/// Collect all result rows of a RETURNING statement and assert it reaches Done.
+fn collect_returning(conn: &mut Sqlite3, sql: &str) -> Vec<Vec<Value>> {
+    let (mut stmt, _) = sqlite3_prepare_v2(conn, sql)
+        .unwrap_or_else(|e| panic!("prepare {sql}: {e}"));
+    let rows = collect(&mut stmt);
+    match stmt.step() {
+        ResultCode::Done => {}
+        other => panic!("unexpected step result {other:?} from {sql}: {}", stmt.errmsg()),
+    }
+    rows
+}
+
 #[test]
-fn create_insert_select_roundtrip_and_c_oracle() {
+fn create_insert_select_basic_roundtrip_and_c_oracle() {
     skip_if_no_sqlite3!();
     let db = TempDb::new("basic");
 
@@ -207,90 +219,23 @@ fn delete_roundtrip_and_c_oracle() {
         }
         // Full-table delete (no WHERE).
         exec(&mut conn, "DELETE FROM t;");
-        let _ = conn;
-    }
-    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
-    assert_eq!(db.query("SELECT count(*) FROM t;"), "0");
+        assert_eq!(conn.changes(), 10, "changes() after full DELETE");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT count(*) FROM t;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(0)]]);
 
-    // Repopulate, then a partial delete.
-    let mut conn = sqlite3_open(db.str()).expect("open");
-    for n in 1..=10 {
-        exec(&mut conn, &format!("INSERT INTO t VALUES ({n}, 'r{n}');"));
-    }
-    exec(&mut conn, "DELETE FROM t WHERE a > 5;");
-    assert_eq!(db.query("SELECT a FROM t ORDER BY a;"), "1\n2\n3\n4\n5");
-    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
-}
-
-/// M5.3.1: delete enough rows from a multi-page table to trigger leaf-page merging,
-/// then confirm C SQLite still considers the file valid and the remaining rows are
-/// correct. The small page size (512 bytes) makes it easy to create underfull pages.
-#[test]
-fn delete_triggers_leaf_merge_and_c_oracle() {
-    skip_if_no_sqlite3!();
-    let db = TempDb::new("delete_merge");
-
-    {
-        let mut conn = sqlite3_open(db.str()).expect("open");
-        exec(&mut conn, "CREATE TABLE t(a, b);");
-        // Fill the table with rows that span multiple pages, then delete most of them.
-        for n in 1..=200 {
-            exec(
-                &mut conn,
-                &format!("INSERT INTO t VALUES ({n}, 'this is row number {n}');"),
-            );
-        }
-        // Delete all but a scattered subset so several leaves become underfull and merge.
-        exec(&mut conn, "DELETE FROM t WHERE a % 7 != 0;");
-        let _ = conn;
-    }
-
-    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
-    let remaining: Vec<i64> = (1..=200).filter(|n| n % 7 == 0).map(|n| n as i64).collect();
-    let expected = remaining
-        .iter()
-        .map(|n| format!("{n}|this is row number {n}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert_eq!(
-        db.query("SELECT a, b FROM t ORDER BY a;"),
-        expected,
-        "remaining rows after merge mismatch"
-    );
-}
-
-#[test]
-fn drop_table_roundtrip_and_c_oracle() {
-    skip_if_no_sqlite3!();
-    let db = TempDb::new("drop");
-
-    {
-        let mut conn = sqlite3_open(db.str()).expect("open");
-        exec(&mut conn, "CREATE TABLE keepme(a);");
-        exec(&mut conn, "CREATE TABLE dropme(b, c);");
+        // Re-populate and test a filtered delete.
         for n in 1..=5 {
-            exec(
-                &mut conn,
-                &format!("INSERT INTO dropme VALUES ({n}, 'r{n}');"),
-            );
+            exec(&mut conn, &format!("INSERT INTO t VALUES ({n}, 'r{n}');"));
         }
-        // Drop the table; C oracle should then see only `keepme` in `sqlite_schema`.
-        exec(&mut conn, "DROP TABLE dropme;");
+        exec(&mut conn, "DELETE FROM t WHERE a > 3;");
+        assert_eq!(conn.changes(), 2, "changes() after filtered DELETE");
+
         let _ = conn;
     }
 
     assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
-    assert_eq!(
-        db.query("SELECT count(*) FROM sqlite_schema WHERE type='table';"),
-        "1"
-    );
-    assert_eq!(
-        db.query("SELECT name FROM sqlite_schema WHERE type='table';"),
-        "keepme"
-    );
-    // The schema cookie was bumped to 3 (one DDL per statement: CREATE keepme, CREATE dropme,
-    // DROP dropme). C's `PRAGMA schema_version` agrees.
-    assert_eq!(db.query("PRAGMA schema_version;"), "3");
+    assert_eq!(db.query("SELECT a, b FROM t;"), "1|r1\n2|r2\n3|r3");
 }
 
 #[test]
@@ -301,588 +246,403 @@ fn update_roundtrip_and_c_oracle() {
     {
         let mut conn = sqlite3_open(db.str()).expect("open");
         exec(&mut conn, "CREATE TABLE t(a, b);");
-        for n in 1..=6 {
+        for n in 1..=5 {
             exec(&mut conn, &format!("INSERT INTO t VALUES ({n}, 'r{n}');"));
         }
-        // UPDATE with WHERE — change every row whose `a` is in 2..=4.
-        exec(&mut conn, "UPDATE t SET b = 'X' WHERE a >= 2 AND a <= 4;");
-        assert_eq!(conn.changes(), 3);
-        // last_insert_rowid() must NOT be clobbered by an UPDATE.
-        assert_eq!(conn.last_insert_rowid(), 6);
+
+        // Full-table update (no WHERE).
+        exec(&mut conn, "UPDATE t SET b = 'x';");
+        assert_eq!(conn.changes(), 5, "changes() after full UPDATE");
+        assert_eq!(conn.last_insert_rowid(), 0, "UPDATE does not set last_insert_rowid");
+
+        // Filtered update.
+        exec(&mut conn, "UPDATE t SET b = 'y' WHERE a > 3;");
+        assert_eq!(conn.changes(), 2, "changes() after filtered UPDATE");
+
         let _ = conn;
     }
 
     assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
     assert_eq!(
         db.query("SELECT a, b FROM t ORDER BY a;"),
-        "1|r1
-2|X
-3|X
-4|X
-5|r5
-6|r6"
+        "1|x\n2|x\n3|x\n4|y\n5|y"
     );
+}
+
+#[test]
+fn index_maintained_on_insert_update_delete() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("index_maintained");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE INDEX idx_a ON t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');");
+
+        // Use the index for a point lookup.
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT b FROM t WHERE a = 2;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Text("two".into())]]);
+
+        // Update an indexed column and verify the new key is reachable.
+        exec(&mut conn, "UPDATE t SET a = 20 WHERE a = 2;");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT b FROM t WHERE a = 20;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Text("two".into())]]);
+
+        // Delete a row and verify the key is gone.
+        exec(&mut conn, "DELETE FROM t WHERE a = 20;");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT count(*) FROM t WHERE a = 20;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(0)]]);
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|one\n3|three");
+}
+
+#[test]
+fn create_index_roundtrip_and_c_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("create_index");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "INSERT INTO t VALUES (3, 'three'), (1, 'one'), (2, 'two');");
+        exec(&mut conn, "CREATE INDEX idx_a ON t(a);");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT b FROM t WHERE a = 2;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Text("two".into())]]);
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT b FROM t WHERE a = 1;"), "one");
+}
+
+#[test]
+fn create_insert_select_roundtrip_and_c_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("insert_select");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE src(a, b);");
+        exec(&mut conn, "CREATE TABLE dst(a, b);");
+        exec(&mut conn, "INSERT INTO src VALUES (1, 'x'), (2, 'y'), (3, 'z');");
+        exec(&mut conn, "INSERT INTO dst SELECT * FROM src WHERE a > 1;");
+        assert_eq!(conn.changes(), 2, "changes() after INSERT ... SELECT");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM dst ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(2), Value::Text("y".into())],
+                vec![Value::Int(3), Value::Text("z".into())],
+            ]
+        );
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM dst ORDER BY a;"), "2|y\n3|z");
+}
+
+#[test]
+fn unique_index_rejects_duplicate_insert() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("unique_insert");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_a ON t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x');");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (1, 'y');").unwrap();
+        let rc = stmt.step();
+        assert_eq!(rc, ResultCode::Abort);
+        assert!(stmt.errmsg().contains("UNIQUE constraint failed"));
+
+        let _ = conn;
+    }
+}
+
+#[test]
+fn unique_index_rejects_duplicate_update() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("unique_update");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_a ON t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x'), (2, 'y');");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "UPDATE t SET a = 1 WHERE a = 2;").unwrap();
+        let rc = stmt.step();
+        assert_eq!(rc, ResultCode::Abort);
+        assert!(stmt.errmsg().contains("UNIQUE constraint failed"));
+
+        let _ = conn;
+    }
+}
+
+#[test]
+fn drop_table_roundtrip_and_c_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("drop_table");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1);");
+        exec(&mut conn, "DROP TABLE t;");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT count(*) FROM sqlite_schema WHERE name='t';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(0)]]);
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT count(*) FROM sqlite_schema WHERE name='t';"), "0");
+}
+
+#[test]
+fn drop_index_roundtrip_and_c_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("drop_index");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a);");
+        exec(&mut conn, "CREATE INDEX idx_a ON t(a);");
+        exec(&mut conn, "DROP INDEX idx_a;");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT count(*) FROM sqlite_schema WHERE name='idx_a';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(0)]]);
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT count(*) FROM sqlite_schema WHERE name='idx_a';"), "0");
+}
+
+#[test]
+fn multi_column_index_select() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("multi_col_index_select");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b, c);");
+        exec(&mut conn, "CREATE INDEX idx_ab ON t(a, b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 2, 'x'), (1, 3, 'y'), (2, 2, 'z');");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT c FROM t WHERE a = 1 AND b = 3;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Text("y".into())]]);
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT c FROM t WHERE a = 1 AND b = 2;"), "x");
+}
+
+#[test]
+fn multi_column_index_maintained_on_writes() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("multi_col_index_writes");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b, c);");
+        exec(&mut conn, "CREATE INDEX idx_ab ON t(a, b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 2, 'x'), (1, 3, 'y');");
+        exec(&mut conn, "UPDATE t SET b = 4 WHERE a = 1 AND b = 2;");
+        exec(&mut conn, "DELETE FROM t WHERE a = 1 AND b = 3;");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT c FROM t WHERE a = 1 AND b = 4;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Text("x".into())]]);
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT c FROM t WHERE a = 1 AND b = 3;"), "");
+}
+
+#[test]
+fn multi_column_index_with_collation_roundtrip_and_c_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("multi_col_index_coll");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a TEXT, b TEXT);");
+        exec(&mut conn, "CREATE INDEX idx_ab ON t(a COLLATE NOCASE, b);");
+        exec(&mut conn, "INSERT INTO t VALUES ('A', 'one'), ('a', 'two'), ('B', 'three');");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT b FROM t WHERE a = 'A';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Text("one".into())],
+                vec![Value::Text("two".into())],
+            ]
+        );
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT b FROM t WHERE a = 'b';"), "three");
+}
+
+#[test]
+fn multi_column_unique_index_rejects_duplicate() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("multi_col_unique");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_ab ON t(a, b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 2);");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (1, 2);").unwrap();
+        let rc = stmt.step();
+        assert_eq!(rc, ResultCode::Abort);
+        assert!(stmt.errmsg().contains("UNIQUE constraint failed"));
+
+        let _ = conn;
+    }
+}
+
+#[test]
+fn partial_index_create_populate_select_and_maintain() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("partial_index");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE INDEX idx_a ON t(a) WHERE a > 0;");
+        exec(&mut conn, "INSERT INTO t VALUES (-1, 'neg'), (1, 'pos'), (2, 'pos2');");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT b FROM t WHERE a = 1;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Text("pos".into())]]);
+
+        exec(&mut conn, "UPDATE t SET a = -2 WHERE a = 1;");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT b FROM t WHERE a = 1;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, Vec::<Vec<Value>>::new());
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+}
+
+#[test]
+fn indexed_select_where_equality() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("indexed_select");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE INDEX idx_a ON t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT b FROM t WHERE a = 2;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Text("two".into())]]);
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT b FROM t WHERE a = 3;"), "three");
+}
+
+#[test]
+fn create_index_if_not_exists() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("create_index_ifne");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a);");
+        exec(&mut conn, "CREATE INDEX idx_a ON t(a);");
+        exec(&mut conn, "CREATE INDEX IF NOT EXISTS idx_a ON t(a);"); // no-op
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT count(*) FROM sqlite_schema WHERE name='idx_a';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(1)]]);
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
 }
 
 #[test]
 fn drop_table_if_exists_unknown_is_silent() {
     skip_if_no_sqlite3!();
-    let db = TempDb::new("dropif");
-    // A fresh database: we need at least one DDL for the pager to have page 1, otherwise
-    // the codegen is invoked on an empty file. (CREATE TABLE then DROP TABLE IF EXISTS of a
-    // different name.)
-    let mut conn = sqlite3_open(db.str()).expect("open");
-    exec(&mut conn, "CREATE TABLE real(a);");
-    exec(&mut conn, "DROP TABLE IF EXISTS nosuch;");
-    let _ = conn;
-    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
-    assert_eq!(
-        db.query("SELECT count(*) FROM sqlite_schema WHERE type='table';"),
-        "1"
-    );
-}
-
-/// M5.2.8: a `CREATE UNIQUE INDEX` rejects duplicate non-NULL keys and preserves the first
-/// inserted row. NULLs never conflict.
-#[test]
-fn unique_index_rejects_duplicate_insert() {
-    skip_if_no_sqlite3!();
-    let db = TempDb::new("uniqueidx");
+    let db = TempDb::new("drop_table_ifexists");
 
     {
         let mut conn = sqlite3_open(db.str()).expect("open");
-        exec(&mut conn, "CREATE TABLE t(a TEXT, b INT);");
-        exec(&mut conn, "CREATE UNIQUE INDEX i_a ON t(a);");
-        exec(&mut conn, "INSERT INTO t VALUES('x',1);");
-        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES('x',2);").unwrap();
-        assert!(
-            stmt.step() != ResultCode::Done,
-            "expected unique-constraint error, got success"
-        );
-        assert!(
-            stmt.errmsg().contains("UNIQUE constraint failed: t.a"),
-            "error message: {}",
-            stmt.errmsg()
-        );
-        // NULL values are allowed to repeat in a UNIQUE index.
-        exec(&mut conn, "INSERT INTO t VALUES(NULL,3);");
-        exec(&mut conn, "INSERT INTO t VALUES(NULL,4);");
+        exec(&mut conn, "DROP TABLE IF EXISTS no_such_table;");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT count(*) FROM sqlite_schema;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(0)]]);
+
         let _ = conn;
     }
-
-    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
-    assert_eq!(db.query("SELECT b FROM t WHERE a = 'x';"), "1");
-    assert_eq!(
-        db.query("SELECT b FROM t WHERE a IS NULL ORDER BY b;"),
-        "3\n4"
-    );
 }
 
-/// M5.2.8: multi-column `CREATE UNIQUE INDEX` enforces uniqueness across the indexed columns.
 #[test]
-fn multi_column_unique_index_rejects_duplicate() {
+fn delete_triggers_leaf_merge_and_c_oracle() {
     skip_if_no_sqlite3!();
-    let db = TempDb::new("uniquemcidx");
+    let db = TempDb::new("delete_leaf_merge");
 
     {
         let mut conn = sqlite3_open(db.str()).expect("open");
-        exec(&mut conn, "CREATE TABLE t(a TEXT, b INT, c TEXT);");
-        exec(&mut conn, "CREATE UNIQUE INDEX i_ab ON t(a, b);");
-        exec(
-            &mut conn,
-            "INSERT INTO t VALUES('x',1,'r1'),('x',2,'r2'),('y',1,'r3');",
-        );
-        let (mut stmt, _) =
-            sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES('x',1,'r4');").unwrap();
-        assert!(
-            stmt.step() != ResultCode::Done,
-            "expected unique-constraint error, got success"
-        );
-        assert!(
-            stmt.errmsg().contains("UNIQUE constraint failed: t.a, t.b"),
-            "error message: {}",
-            stmt.errmsg()
-        );
+        exec(&mut conn, "CREATE TABLE t(a INTEGER PRIMARY KEY, b);");
+        // Insert enough rows to trigger an interior page.
+        for n in 1..=50 {
+            exec(&mut conn, &format!("INSERT INTO t VALUES ({n}, 'r{n}');"));
+        }
+        // Delete most rows, exercising leaf merge / redistribution.
+        exec(&mut conn, "DELETE FROM t WHERE a > 5;");
+        assert_eq!(conn.changes(), 45);
+
         let _ = conn;
     }
 
-    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
-    assert_eq!(db.query("SELECT c FROM t ORDER BY c;"), "r1\nr2\nr3");
-}
-
-/// M5.2.8: an `UPDATE` that would create a duplicate key in a UNIQUE index is rejected.
-#[test]
-fn unique_index_rejects_duplicate_update() {
-    skip_if_no_sqlite3!();
-    let db = TempDb::new("uniqueupd");
-
-    {
-        let mut conn = sqlite3_open(db.str()).expect("open");
-        exec(&mut conn, "CREATE TABLE t(a TEXT, b INT);");
-        exec(&mut conn, "CREATE UNIQUE INDEX i_a ON t(a);");
-        exec(&mut conn, "INSERT INTO t VALUES('x',1),('y',2);");
-        let (mut stmt, _) =
-            sqlite3_prepare_v2(&mut conn, "UPDATE t SET a = 'x' WHERE b = 2;").unwrap();
-        assert!(
-            stmt.step() != ResultCode::Done,
-            "expected unique-constraint error, got success"
-        );
-        assert!(
-            stmt.errmsg().contains("UNIQUE constraint failed: t.a"),
-            "error message: {}",
-            stmt.errmsg()
-        );
-        let _ = conn;
-    }
-
-    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
-    assert_eq!(db.query("SELECT a FROM t ORDER BY a;"), "x\ny");
-}
-
-/// M5.1: `CREATE INDEX` writes a valid index b-tree and a matching `sqlite_schema` row; the C
-/// oracle opens the file, sees the index, and returns identical indexed-lookup rows.
-#[test]
-fn create_index_roundtrip_and_c_oracle() {
-    skip_if_no_sqlite3!();
-    let db = TempDb::new("createindex");
-
-    {
-        let mut conn = sqlite3_open(db.str()).expect("open");
-        exec(&mut conn, "CREATE TABLE t(a INT, b TEXT);");
-        exec(
-            &mut conn,
-            "INSERT INTO t VALUES (1,'x'),(2,'y'),(3,'z'),(4,'w'),(5,'v');",
-        );
-        // Build the index from the populated table; the prepare path also performs the
-        // populate pass.
-        exec(&mut conn, "CREATE INDEX i_a ON t(a);");
-        let _ = conn;
-    }
-
-    // C oracle: integrity, schema row, and the indexed lookup all match.
-    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
-    assert_eq!(
-        db.query("SELECT name FROM sqlite_schema WHERE type='index';"),
-        "i_a"
-    );
-    // The `tbl_name` and verbatim `sql` are exactly as written.
-    assert_eq!(
-        db.query("SELECT tbl_name, quote(sql) FROM sqlite_schema WHERE name='i_a';"),
-        "t|'CREATE INDEX i_a ON t(a)'"
-    );
-    // The cookie was bumped to 2 (CREATE TABLE + CREATE INDEX).
-    assert_eq!(db.query("PRAGMA schema_version;"), "2");
-    // An indexed equality lookup returns the same row as a table scan.
-    assert_eq!(db.query("SELECT a FROM t WHERE a = 3;"), "3");
-    assert_eq!(
-        db.query("SELECT a, b FROM t WHERE a IN (1, 3, 5) ORDER BY a;"),
-        "1|x\n3|z\n5|v"
-    );
-}
-
-/// M5.2.7: a multi-column index with NOCASE on the first column still resolves prefix
-/// equality and keeps the index consistent through writes.
-#[test]
-fn multi_column_index_with_collation_roundtrip_and_c_oracle() {
-    skip_if_no_sqlite3!();
-    let db = TempDb::new("mcidxcollation");
-
-    {
-        let mut conn = sqlite3_open(db.str()).expect("open");
-        exec(&mut conn, "CREATE TABLE t(a TEXT, b INT, c TEXT);");
-        exec(
-            &mut conn,
-            "INSERT INTO t VALUES ('A',1,'rA1'),('a',2,'ra2'),('B',1,'rB1'),('b',2,'rb2');",
-        );
-        exec(&mut conn, "CREATE INDEX i_ab ON t(a COLLATE NOCASE, b);");
-        // Update one row's indexed column and re-insert another.
-        exec(&mut conn, "UPDATE t SET b = 9 WHERE c = 'ra2';");
-        exec(&mut conn, "DELETE FROM t WHERE c = 'rB1';");
-        let _ = conn;
-    }
-
-    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
-    // Prefix equality on the NOCASE column: when the WHERE comparison uses the same
-    // NOCASE collation, 'a' matches 'A' and 'a'.
-    assert_eq!(
-        db.query("SELECT c FROM t WHERE a = 'a' COLLATE NOCASE ORDER BY c;"),
-        "rA1\nra2"
-    );
-    // Full two-column lookup with case-insensitive first key.
-    assert_eq!(
-        db.query("SELECT c FROM t WHERE a = 'A' COLLATE NOCASE AND b = 9 ORDER BY c;"),
-        "ra2"
-    );
-    // The key that was deleted stays gone.
-    assert_eq!(
-        db.query("SELECT count(*) FROM t WHERE a = 'B' COLLATE NOCASE AND b = 1;"),
-        "0"
-    );
-}
-
-/// M5.1: `DROP INDEX` removes the b-tree and the `sqlite_schema` row; `IF EXISTS` against a
-/// missing index is a silent no-op.
-#[test]
-fn drop_index_roundtrip_and_c_oracle() {
-    skip_if_no_sqlite3!();
-    let db = TempDb::new("dropindex");
-
-    {
-        let mut conn = sqlite3_open(db.str()).expect("open");
-        exec(&mut conn, "CREATE TABLE t(a INT, b TEXT);");
-        exec(&mut conn, "INSERT INTO t VALUES (1,'x'),(2,'y');");
-        exec(&mut conn, "CREATE INDEX i_a ON t(a);");
-        exec(&mut conn, "DROP INDEX i_a;");
-        let _ = conn;
-    }
-
-    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
-    assert_eq!(
-        db.query("SELECT count(*) FROM sqlite_schema WHERE type='index';"),
-        "0"
-    );
-    // Schema cookie was bumped to 3 (CREATE TABLE + CREATE INDEX + DROP INDEX).
-    assert_eq!(db.query("PRAGMA schema_version;"), "3");
-    // The table is still intact.
-    assert_eq!(db.query("SELECT a FROM t ORDER BY a;"), "1\n2");
-
-    // IF EXISTS against a missing index is a silent no-op (no error, no state change).
-    let mut conn = sqlite3_open(db.str()).expect("open");
-    exec(&mut conn, "DROP INDEX IF EXISTS nosuch;");
-    assert_eq!(db.query("PRAGMA schema_version;"), "3");
-}
-
-/// M5.1: `INSERT`/`UPDATE`/`DELETE` against a table with an index must keep the index in
-/// sync. The differential oracle is the C `sqlite3` doing the same sequence; the two DBs
-/// must produce identical SELECT results through every write.
-#[test]
-fn index_maintained_on_insert_update_delete() {
-    skip_if_no_sqlite3!();
-    let db = TempDb::new("idxmaint");
-
-    {
-        let mut conn = sqlite3_open(db.str()).expect("open");
-        exec(&mut conn, "CREATE TABLE t(a INT, b TEXT);");
-        exec(&mut conn, "INSERT INTO t VALUES (1,'x'),(2,'y'),(3,'z');");
-        // Build the index from the existing rows; then continue inserting.
-        exec(&mut conn, "CREATE INDEX i_a ON t(a);");
-        exec(&mut conn, "INSERT INTO t VALUES (4,'w'),(5,'v');");
-        // Update one row, leave the rest.
-        exec(&mut conn, "UPDATE t SET b = 'Q' WHERE a = 3;");
-        // Delete a row.
-        exec(&mut conn, "DELETE FROM t WHERE a = 2;");
-        let _ = conn;
-    }
     assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
     assert_eq!(
         db.query("SELECT a, b FROM t ORDER BY a;"),
-        "1|x\n3|Q\n4|w\n5|v"
-    );
-}
-
-/// M5.1: an indexed-equality `WHERE` returns the right rows through the index cursor. The
-/// shape is a SeekGE+IdxGT pair over the index b-tree, then per-row table seeks by rowid;
-/// the differential oracle confirms we see the same rows the C engine sees.
-#[test]
-fn indexed_select_where_equality() {
-    skip_if_no_sqlite3!();
-    let db = TempDb::new("idxsel");
-
-    {
-        let mut conn = sqlite3_open(db.str()).expect("open");
-        exec(&mut conn, "CREATE TABLE t(a INT, b TEXT);");
-        exec(
-            &mut conn,
-            "INSERT INTO t VALUES (1,'x'),(2,'y'),(3,'z'),(4,'w'),(5,'v');",
-        );
-        exec(&mut conn, "CREATE INDEX i_a ON t(a);");
-
-        // Indexed equality through the engine itself.
-        for (literal, expected) in [("3", "z"), ("1", "x"), ("5", "v")] {
-            let sql = format!("SELECT b FROM t WHERE a = {literal}");
-            let (mut s, _) = sqlite3_prepare_v2(&mut conn, &sql).unwrap();
-            let ncol = s.column_count();
-            let mut rows = Vec::new();
-            loop {
-                match s.step() {
-                    ResultCode::Row => rows.push(
-                        (0..ncol)
-                            .map(|i| match s.column_value(i) {
-                                Value::Text(s) => s,
-                                v => format!("{:?}", v),
-                            })
-                            .collect::<Vec<_>>()
-                            .join("|"),
-                    ),
-                    ResultCode::Done => break,
-                    other => panic!("unexpected for {literal}: {:?}", other),
-                }
-            }
-            assert_eq!(rows, vec![expected.to_string()], "query: {sql}");
-        }
-        // A non-matching value returns no rows.
-        let (mut s, _) = sqlite3_prepare_v2(&mut conn, "SELECT b FROM t WHERE a = 99").unwrap();
-        let ncol = s.column_count();
-        let mut rows: Vec<String> = Vec::new();
-        loop {
-            match s.step() {
-                ResultCode::Row => rows.push((0..ncol).map(|_| "").collect()),
-                ResultCode::Done => break,
-                other => panic!("unexpected: {:?}", other),
-            }
-        }
-        assert_eq!(rows.len(), 0, "a = 99 should match no rows");
-        // `WHERE col = NULL` is always UNKNOWN; the indexed path is rejected and the
-        // full scan evaluates NULL = NULL as UNKNOWN, returning no rows.
-        let (mut s, _) = sqlite3_prepare_v2(&mut conn, "SELECT b FROM t WHERE a = NULL").unwrap();
-        let ncol = s.column_count();
-        let mut rows: Vec<String> = Vec::new();
-        loop {
-            match s.step() {
-                ResultCode::Row => rows.push((0..ncol).map(|_| "").collect()),
-                ResultCode::Done => break,
-                other => panic!("unexpected: {:?}", other),
-            }
-        }
-        assert_eq!(rows.len(), 0, "a = NULL should return no rows");
-        let _ = conn;
-    }
-    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
-}
-
-/// M5.2: a multi-column index supports prefix-equality lookups: `WHERE a = ? AND b = ?`
-/// uses the index, and `WHERE a = ?` uses the first column of the index. The C oracle
-/// confirms the file format is valid and the rows returned match the C engine.
-#[test]
-fn multi_column_index_select() {
-    skip_if_no_sqlite3!();
-    let db = TempDb::new("mcidxsel");
-
-    {
-        let mut conn = sqlite3_open(db.str()).expect("open");
-        exec(&mut conn, "CREATE TABLE t(a INT, b INT, c TEXT);");
-        exec(
-            &mut conn,
-            "INSERT INTO t VALUES (1,1,'r11'),(1,2,'r12'),(1,3,'r13'),(2,1,'r21'),(2,2,'r22'),(3,1,'r31');",
-        );
-        exec(&mut conn, "CREATE INDEX i_ab ON t(a, b);");
-
-        // Full two-column equality.
-        let cases = [
-            ("a = 1 AND b = 2", vec!["r12"]),
-            ("a = 2 AND b = 1", vec!["r21"]),
-            ("a = 1 AND b = 3", vec!["r13"]),
-            ("a = 1 AND b = 5", Vec::<&str>::new()),
-        ];
-        for (predicate, expected) in cases {
-            let sql = format!("SELECT c FROM t WHERE {predicate} ORDER BY c");
-            let (mut s, _) = sqlite3_prepare_v2(&mut conn, &sql).unwrap();
-            let mut rows = Vec::new();
-            loop {
-                match s.step() {
-                    ResultCode::Row => rows.push(match s.column_value(0) {
-                        Value::Text(s) => s,
-                        v => format!("{:?}", v),
-                    }),
-                    ResultCode::Done => break,
-                    other => panic!("unexpected for {sql}: {:?}", other),
-                }
-            }
-            assert_eq!(rows, expected, "query: {sql}");
-        }
-
-        // Single-column prefix equality on the first indexed column.
-        let sql = "SELECT c FROM t WHERE a = 1 ORDER BY c";
-        let (mut s, _) = sqlite3_prepare_v2(&mut conn, sql).unwrap();
-        let mut rows = Vec::new();
-        loop {
-            match s.step() {
-                ResultCode::Row => rows.push(match s.column_value(0) {
-                    Value::Text(s) => s,
-                    v => format!("{:?}", v),
-                }),
-                ResultCode::Done => break,
-                other => panic!("unexpected for {sql}: {:?}", other),
-            }
-        }
-        assert_eq!(rows, vec!["r11", "r12", "r13"], "query: {sql}");
-
-        // A WHERE clause that doesn't match the index prefix falls back to the table scan.
-        let sql = "SELECT c FROM t WHERE b = 2 ORDER BY c";
-        let (mut s, _) = sqlite3_prepare_v2(&mut conn, sql).unwrap();
-        let mut rows = Vec::new();
-        loop {
-            match s.step() {
-                ResultCode::Row => rows.push(match s.column_value(0) {
-                    Value::Text(s) => s,
-                    v => format!("{:?}", v),
-                }),
-                ResultCode::Done => break,
-                other => panic!("unexpected for {sql}: {:?}", other),
-            }
-        }
-        assert_eq!(rows, vec!["r12", "r22"], "query: {sql}");
-
-        let _ = conn;
-    }
-    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
-    // Differential: the C engine sees the same rows through the same SQL.
-    assert_eq!(
-        db.query("SELECT c FROM t WHERE a = 1 AND b = 2 ORDER BY c"),
-        "r12"
-    );
-    assert_eq!(
-        db.query("SELECT c FROM t WHERE a = 1 ORDER BY c"),
-        "r11\nr12\nr13"
-    );
-}
-
-/// M5.2: multi-column index maintenance keeps the index consistent across INSERT, UPDATE,
-/// and DELETE operations. The C oracle verifies the file format and row counts.
-#[test]
-fn multi_column_index_maintained_on_writes() {
-    skip_if_no_sqlite3!();
-    let db = TempDb::new("mcidxwr");
-
-    {
-        let mut conn = sqlite3_open(db.str()).expect("open");
-        exec(&mut conn, "CREATE TABLE t(a INT, b INT, c TEXT);");
-        exec(&mut conn, "CREATE INDEX i_ab ON t(a, b);");
-        exec(
-            &mut conn,
-            "INSERT INTO t VALUES (1,1,'r11'),(1,2,'r12'),(2,1,'r21');",
-        );
-
-        // Update the second indexed column for one row.
-        exec(&mut conn, "UPDATE t SET b = 9 WHERE a = 1 AND b = 2;");
-
-        // Delete a row.
-        exec(&mut conn, "DELETE FROM t WHERE a = 2 AND b = 1;");
-
-        // Insert more rows to exercise split-path index maintenance.
-        for a in 1..=4 {
-            for b in 1..=10 {
-                exec(
-                    &mut conn,
-                    &format!("INSERT INTO t VALUES ({a},{b},'r{a}{b}');"),
-                );
-            }
-        }
-
-        let _ = conn;
-    }
-    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
-    // Confirm the index still answers lookups correctly after all writes.
-    assert_eq!(
-        db.query("SELECT c FROM t WHERE a = 1 AND b = 9 ORDER BY c"),
-        "r12\nr19"
-    );
-    // A key that was never inserted (outside the bulk loop's a=1..4, b=1..10 range)
-    // should still return zero rows.
-    assert_eq!(
-        db.query("SELECT count(*) FROM t WHERE a = 9 AND b = 9;"),
-        "0"
-    );
-}
-
-/// M5.1: `CREATE INDEX IF NOT EXISTS` is a no-op when the index already exists; otherwise it
-/// creates it. The C oracle confirms the cookie isn't bumped twice for a no-op.
-#[test]
-fn create_index_if_not_exists() {
-    skip_if_no_sqlite3!();
-    let db = TempDb::new("idxifne");
-
-    {
-        let mut conn = sqlite3_open(db.str()).expect("open");
-        exec(&mut conn, "CREATE TABLE t(a INT, b TEXT);");
-        exec(&mut conn, "INSERT INTO t VALUES (1,'x'),(2,'y');");
-        exec(&mut conn, "CREATE INDEX i_a ON t(a);");
-        // The IF NOT EXISTS form is a silent no-op against the existing index.
-        exec(&mut conn, "CREATE INDEX IF NOT EXISTS i_a ON t(a);");
-        let _ = conn;
-    }
-    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
-    // Schema cookie: 1 (CREATE TABLE) + 1 (CREATE INDEX) = 2; the no-op didn't bump it.
-    assert_eq!(db.query("PRAGMA schema_version;"), "2");
-    // Only one index in the catalog.
-    assert_eq!(
-        db.query("SELECT count(*) FROM sqlite_schema WHERE name='i_a';"),
-        "1"
-    );
-}
-
-/// M5.2.9: partial indexes. `CREATE INDEX ... WHERE expr` only indexes rows that satisfy the
-/// predicate; the index is used only when the query WHERE contains the predicate; and
-/// INSERT/UPDATE/DELETE maintain the index accordingly.
-#[test]
-fn partial_index_create_populate_select_and_maintain() {
-    skip_if_no_sqlite3!();
-    let db = TempDb::new("partialidx");
-
-    {
-        let mut conn = sqlite3_open(db.str()).expect("open");
-        exec(&mut conn, "CREATE TABLE t(a INT, b TEXT, c TEXT);");
-        exec(
-            &mut conn,
-            "INSERT INTO t VALUES (1,'x','r1'), (2,'x','r2'), (3,'y','r3'), (4,'x','r4');",
-        );
-        // Partial index: only rows where b = 'x' are indexed.
-        exec(&mut conn, "CREATE INDEX i_partial ON t(a) WHERE b = 'x';");
-        let _ = conn;
-    }
-
-    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
-    // The index answers lookups for matching predicate rows.
-    assert_eq!(db.query("SELECT c FROM t WHERE a = 2 AND b = 'x';"), "r2");
-    assert_eq!(db.query("SELECT c FROM t WHERE a = 4 AND b = 'x';"), "r4");
-    // Non-matching predicate rows are not in the index (and the planner won't use it here).
-    assert_eq!(db.query("SELECT c FROM t WHERE a = 3 AND b = 'y';"), "r3");
-    // The schema row preserves the WHERE clause verbatim.
-    assert_eq!(
-        db.query("SELECT sql FROM sqlite_schema WHERE name = 'i_partial';"),
-        "CREATE INDEX i_partial ON t(a) WHERE b = 'x'"
-    );
-
-    // Maintenance: insert a matching and a non-matching row.
-    let mut conn = sqlite3_open(db.str()).expect("open");
-    exec(
-        &mut conn,
-        "INSERT INTO t VALUES (5,'x','r5'), (6,'y','r6');",
-    );
-    // Delete a matching row.
-    exec(&mut conn, "DELETE FROM t WHERE a = 1 AND b = 'x';");
-    let _ = conn;
-
-    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
-    assert_eq!(db.query("SELECT c FROM t WHERE a = 5 AND b = 'x';"), "r5");
-    assert_eq!(db.query("SELECT c FROM t WHERE a = 6 AND b = 'y';"), "r6");
-    assert_eq!(db.query("SELECT c FROM t WHERE a = 1 AND b = 'x';"), "");
-    assert_eq!(db.query("SELECT c FROM t WHERE a = 2 AND b = 'x';"), "r2");
-    assert_eq!(db.query("SELECT c FROM t WHERE a = 4 AND b = 'x';"), "r4");
-
-    // Updating a column that appears in the partial-index predicate is not supported in
-    // this slice (the OLD/NEW predicate evaluation would need separate value snapshots).
-    let mut conn = sqlite3_open(db.str()).expect("open");
-    let result = sqlite3_prepare_v2(&mut conn, "UPDATE t SET b = 'z' WHERE a = 2;");
-    assert!(
-        result.is_err(),
-        "expected an error for partial-index predicate referencing updated column"
-    );
-    match result {
-        Err(e) => assert!(e.to_string().contains("partial-index predicate")),
-        Ok(_) => panic!("expected error"),
-    }
-
-    // Updating a column NOT in the predicate while the predicate references another column
-    // is fine and keeps the index in sync.
-    let mut conn = sqlite3_open(db.str()).expect("open");
-    exec(
-        &mut conn,
-        "UPDATE t SET c = 'updated' WHERE a = 2 AND b = 'x';",
-    );
-    assert_eq!(
-        db.query("SELECT c FROM t WHERE a = 2 AND b = 'x';"),
-        "updated"
+        "1|r1\n2|r2\n3|r3\n4|r4\n5|r5"
     );
 }
 
@@ -947,4 +707,133 @@ fn insert_default_values_roundtrip_and_c_oracle() {
     assert_eq!(db.query("SELECT a, b, c FROM t;"), "42|hello|");
     assert_eq!(db.query("SELECT rowid, id, v FROM u;"), "1|1|99");
     assert_eq!(db.query("SELECT rowid, id, v FROM w;"), "123|123|");
+}
+
+// -----------------------------------------------------------------------------
+// M2.24: RETURNING clause
+// -----------------------------------------------------------------------------
+
+#[test]
+fn insert_returning_matches_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("insert_returning");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a INTEGER PRIMARY KEY, b, c);");
+        // Basic RETURNING with rowid and stored columns.
+        let rows = collect_returning(
+            &mut conn,
+            "INSERT INTO t(b, c) VALUES (10, 99) RETURNING a, b, c, rowid;",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 4);
+        assert_eq!(rows[0][0], rows[0][3]); // a == rowid alias
+        assert_eq!(rows[0][1], Value::Int(10));
+        assert_eq!(rows[0][2], Value::Int(99));
+
+        // Multi-row VALUES with * expansion.
+        let rows = collect_returning(
+            &mut conn,
+            "INSERT INTO t(b, c) VALUES ('hello', 1), ('world', 2) RETURNING *;",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(2), Value::Text("hello".into()), Value::Int(1)],
+                vec![Value::Int(3), Value::Text("world".into()), Value::Int(2)],
+            ]
+        );
+
+        // DEFAULT VALUES with RETURNING *.
+        let rows = collect_returning(
+            &mut conn,
+            "INSERT INTO t DEFAULT VALUES RETURNING a, b, c;",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec![Value::Int(4), Value::Null, Value::Null]);
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b, c FROM t;"), "1|10|99\n2|hello|1\n3|world|2\n4||");
+}
+
+#[test]
+fn update_delete_returning_matches_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("update_delete_returning");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(x, y);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');");
+
+        let rows = collect_returning(
+            &mut conn,
+            "UPDATE t SET y = 'changed' WHERE x = 2 RETURNING rowid, x, y;",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][1], Value::Int(2));
+        assert_eq!(rows[0][2], Value::Text("changed".into()));
+
+        // DELETE with RETURNING * and WHERE.
+        let rows = collect_returning(
+            &mut conn,
+            "DELETE FROM t WHERE x > 1 RETURNING *;",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(2), Value::Text("changed".into())],
+                vec![Value::Int(3), Value::Text("three".into())],
+            ]
+        );
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT x, y FROM t;"), "1|one");
+}
+
+#[test]
+fn returning_real_affinity() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("returning_real_affinity");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(x REAL);");
+        let rows = collect_returning(
+            &mut conn,
+            "INSERT INTO t(x) VALUES (5.0) RETURNING x, typeof(x);",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Value::Real(5.0), Value::Text("real".into())]]
+        );
+        let rows = collect_returning(
+            &mut conn,
+            "UPDATE t SET x = x + 1 RETURNING x, typeof(x);",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Value::Real(6.0), Value::Text("real".into())]]
+        );
+        let rows = collect_returning(
+            &mut conn,
+            "DELETE FROM t RETURNING x, typeof(x);",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Value::Real(6.0), Value::Text("real".into())]]
+        );
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
 }

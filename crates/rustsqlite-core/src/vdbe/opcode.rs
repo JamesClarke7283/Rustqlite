@@ -233,6 +233,13 @@ pub enum Opcode {
     /// `SorterNext p1 p2`: advance sorter cursor `p1`; if a record remains jump to `p2`.
     SorterNext,
 
+    // --- ephemeral table (RETURNING) ---
+    /// `OpenEphemeral p1 p2`: open an in-memory, rowid-keyed ephemeral table cursor `p1` that
+    /// holds records with `p2` fields. Used by `RETURNING` to buffer one result row per modified
+    /// row, then rewind and emit them after the write transaction completes. `NewRowid` allocates
+    /// a unique key and `Insert` stores the buffered record.
+    OpenEphemeral,
+
     // --- LIMIT / OFFSET ---
     /// `DecrJumpZero p1 p2`: decrement `r[p1]`; if it becomes 0, jump to `p2` (LIMIT).
     DecrJumpZero,
@@ -325,6 +332,7 @@ impl Opcode {
             Opcode::SorterSort => "SorterSort",
             Opcode::SorterData => "SorterData",
             Opcode::SorterNext => "SorterNext",
+            Opcode::OpenEphemeral => "OpenEphemeral",
             Opcode::DecrJumpZero => "DecrJumpZero",
             Opcode::IfPos => "IfPos",
             Opcode::AggStep => "AggStep",

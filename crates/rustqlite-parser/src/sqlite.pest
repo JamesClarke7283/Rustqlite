@@ -120,6 +120,7 @@ K_DELETE        = @{ ^"delete"        ~ !ident_cont }
 K_DROP          = @{ ^"drop"          ~ !ident_cont }
 K_UPDATE        = @{ ^"update"        ~ !ident_cont }
 K_SET           = @{ ^"set"           ~ !ident_cont }
+K_RETURNING     = @{ ^"returning"     ~ !ident_cont }
 K_INDEX         = @{ ^"index"         ~ !ident_cont }
 K_WITH          = @{ ^"with"          ~ !ident_cont }
 K_RECURSIVE     = @{ ^"recursive"     ~ !ident_cont }
@@ -160,7 +161,7 @@ keyword = @{
     | K_EXPLAIN | K_DELETE | K_DROP | K_UPDATE | K_SET | K_INDEX
     | K_UNION | K_INTERSECT | K_EXCEPT
     | K_JOIN | K_USING | K_WITH | K_RECURSIVE
-    | K_DO | K_NOTHING
+    | K_DO | K_NOTHING | K_RETURNING
 }
 
 // ---- Top level: a list of statements separated/terminated by ';' ----
@@ -292,12 +293,15 @@ signed_number = @{ ("+" | "-")? ~ (hex_int | float_or_int) }
 
 // ---- INSERT ----
 insert_stmt = {
-    insert_verb ~ K_INTO ~ qualified_name ~ column_list? ~ insert_source ~ upsert_clause*
+    insert_verb ~ K_INTO ~ qualified_name ~ column_list? ~ insert_source ~ upsert_clause* ~ returning_clause?
 }
 insert_verb = { (K_INSERT ~ (K_OR ~ conflict_action)?) | K_REPLACE }
 conflict_action = { K_ROLLBACK | K_ABORT | K_FAIL | K_IGNORE | K_REPLACE }
+upsert_clause = { K_ON ~ K_CONFLICT ~ upsert_target? ~ upsert_action ~ returning_clause? }
 
-upsert_clause = { K_ON ~ K_CONFLICT ~ upsert_target? ~ upsert_action }
+// `RETURNING selcollist` — appended to INSERT/UPDATE/DELETE statements.
+returning_clause = { K_RETURNING ~ result_columns }
+
 upsert_target = { "(" ~ upsert_target_column ~ ("," ~ upsert_target_column)* ~ ")" ~ where_item? }
 upsert_target_column = { ident ~ (K_COLLATE ~ ident)? ~ (K_ASC | K_DESC)? | expr }
 upsert_action = { K_DO ~ (K_NOTHING | (K_UPDATE ~ K_SET ~ assignment_list ~ where_item?)) }
@@ -307,19 +311,17 @@ default_values_clause = { K_DEFAULT ~ K_VALUES }
 values_clause = { K_VALUES ~ value_row ~ ("," ~ value_row)* }
 value_row = { "(" ~ expr ~ ("," ~ expr)* ~ ")" }
 
-// ---- DELETE (M4.6) ----
-// First slice: `DELETE FROM [tbl] [WHERE expr]`. The `LIMIT` and `RETURNING` clauses arrive later.
-delete_stmt = { K_DELETE ~ K_FROM ~ qualified_name ~ where_item? }
+// ---- DELETE (M4.6 / M2.24) ----
+// `DELETE FROM [tbl] [WHERE expr] [RETURNING ...]`.
+delete_stmt = { K_DELETE ~ K_FROM ~ qualified_name ~ where_item? ~ returning_clause? }
 
 // ---- DROP TABLE (M4.6b) ----
 // First slice: `DROP TABLE [IF EXISTS] [tbl]`. `DROP INDEX/VIEW/TRIGGER` arrive later.
 drop_table_stmt = { K_DROP ~ K_TABLE ~ if_exists? ~ qualified_name }
 
-// ---- UPDATE (M5.0) ----
-// First slice: `UPDATE [or_action] tbl SET assignment [, assignment ...] [WHERE expr]`. Single
-// column on the LHS (no row-value form), no `ORDER BY`/`LIMIT`/`FROM`/`RETURNING`, no
-// UPSERT/triggers/FK. The `or_action` is parsed but only the default ABORT is implemented.
-update_stmt = { K_UPDATE ~ or_action? ~ qualified_name ~ K_SET ~ assignment_list ~ where_item? }
+// ---- UPDATE (M5.0 / M2.24) ----
+// `UPDATE [or_action] tbl SET assignment [, assignment ...] [WHERE expr] [RETURNING ...]`.
+update_stmt = { K_UPDATE ~ or_action? ~ qualified_name ~ K_SET ~ assignment_list ~ where_item? ~ returning_clause? }
 or_action = { K_OR ~ (K_ROLLBACK | K_ABORT | K_FAIL | K_IGNORE | K_REPLACE) }
 assignment_list = { assignment ~ ("," ~ assignment)* }
 assignment = { ident ~ "=" ~ expr }

@@ -17,6 +17,7 @@
 
 use rustqlite_parser::{Expr, InsertSource, InsertStmt, SelectStmt};
 
+use crate::codegen::returning::Returning;
 use crate::codegen::select;
 use crate::codegen::update::compile_pred_jump;
 use crate::error::{Error, Result};
@@ -94,6 +95,12 @@ fn compile_insert_values(
     };
     let mut b = ProgramBuilder::new();
 
+    let returning = ins
+        .returning
+        .as_deref()
+        .map(|r| Returning::new(r, table))
+        .transpose()?;
+
     let setup = b.new_label();
     b.emit_jump(Opcode::Init, 0, setup, 0); // addr 0
     let after_init = b.cur_addr();
@@ -104,6 +111,14 @@ fn compile_insert_values(
     // Reserve cursor numbers for the indexes (1, 2, …). The table cursor is 0. Each index
     // cursor carries the index's KeyInfo so inserts compare under the correct collation.
     let index_cursor_base: i32 = open_index_cursors(&mut b, indexes)?;
+
+    // RETURNING: open an ephemeral table to buffer result rows. Pick a cursor number safely
+    // above the table/index cursors.
+    let eph_cursor = index_cursor_base + indexes.len() as i32;
+    let mut returning = returning;
+    if let Some(ref mut ret) = returning {
+        ret.emit_open(&mut b, eph_cursor);
+    }
 
     for row in rows {
         if row.len() != expected {
@@ -169,6 +184,17 @@ fn compile_insert_values(
             rowid_reg,
             index_cursor_base,
         )?;
+
+        if let Some(ref ret) = returning {
+            if let Some(alias_idx) = table.rowid_alias {
+                b.emit(Opcode::SCopy, rowid_reg, rec_start + alias_idx as i32, 0);
+            }
+            ret.emit_buffer_row(&mut b, table, cursor, rec_start)?;
+        }
+    }
+
+    if let Some(ref ret) = returning {
+        ret.emit_output_loop(&mut b);
     }
 
     b.emit(Opcode::Halt, 0, 0, 0); // commits the write transaction
@@ -189,6 +215,11 @@ fn compile_insert_default_values(
     let _ = &ins.columns;
 
     validate_indexes(table, indexes)?;
+    let returning = ins
+        .returning
+        .as_deref()
+        .map(|r| Returning::new(r, table))
+        .transpose()?;
 
     let cursor = 0i32;
     let ctx = Ctx {
@@ -206,6 +237,12 @@ fn compile_insert_default_values(
     b.emit(Opcode::OpenWrite, cursor, table.rootpage as i32, 0);
 
     let index_cursor_base: i32 = open_index_cursors(&mut b, indexes)?;
+
+    let eph_cursor = index_cursor_base + indexes.len() as i32;
+    let mut returning = returning;
+    if let Some(ref mut ret) = returning {
+        ret.emit_open(&mut b, eph_cursor);
+    }
 
     let ncol = table.columns.len();
     let rec_start = b.alloc_regs(ncol as i32);
@@ -256,6 +293,14 @@ fn compile_insert_default_values(
         rowid_reg,
         index_cursor_base,
     )?;
+
+    if let Some(ref ret) = returning {
+        if let Some(alias_idx) = table.rowid_alias {
+            b.emit(Opcode::SCopy, rowid_reg, rec_start + alias_idx as i32, 0);
+        }
+        ret.emit_buffer_row(&mut b, table, cursor, rec_start)?;
+        ret.emit_output_loop(&mut b);
+    }
 
     b.emit(Opcode::Halt, 0, 0, 0);
 

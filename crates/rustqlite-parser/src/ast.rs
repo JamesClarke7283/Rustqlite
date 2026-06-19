@@ -273,6 +273,8 @@ pub struct InsertStmt {
     pub source: InsertSource,
     /// Optional UPSERT clause(s) at the end of the INSERT.
     pub upsert: Vec<UpsertClause>,
+    /// Optional `RETURNING` clause: expressions to evaluate and yield per inserted row.
+    pub returning: Option<Vec<ResultColumn>>,
 }
 
 /// Data source for an `INSERT` statement.
@@ -287,13 +289,16 @@ pub enum InsertSource {
     DefaultValues,
 }
 
-/// `DELETE FROM [schema.]tbl [WHERE expr]`. The first M4.6 slice omits `ORDER BY`, `LIMIT`,
-/// `RETURNING`, and the multi-table `DELETE t1, t2 FROM …` form (those are deferred).
+/// `DELETE FROM [schema.]tbl [WHERE expr] [RETURNING ...]`. The first M4.6 slice omits
+/// `ORDER BY`, `LIMIT`, and the multi-table `DELETE t1, t2 FROM …` form (those are deferred).
+/// `RETURNING` is added in M2.24.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeleteStmt {
     pub schema: Option<String>,
     pub table: String,
     pub where_clause: Option<Expr>,
+    /// Optional `RETURNING` clause: expressions to evaluate and yield per deleted row.
+    pub returning: Option<Vec<ResultColumn>>,
 }
 
 /// `DROP TABLE [IF EXISTS] [schema.]tbl`. The first M4.6 slice omits `DROP INDEX/VIEW/TRIGGER`.
@@ -304,9 +309,9 @@ pub struct DropTableStmt {
     pub name: String,
 }
 
-/// `UPDATE [or_action] [schema.]tbl SET col = expr [, col = expr ...] [WHERE expr]`. The first
-/// M5.0 slice: a single-table `UPDATE` with optional `WHERE`, no `ORDER BY`/`LIMIT`/`FROM`/
-/// `RETURNING`, no UPSERT/triggers/FK/indexes.
+/// `UPDATE [or_action] [schema.]tbl SET col = expr [, col = expr ...] [WHERE expr]
+/// [RETURNING ...]`. The first M5.0 slice: a single-table `UPDATE` with optional `WHERE`, no
+/// `ORDER BY`/`LIMIT`/`FROM`, no UPSERT/triggers/FK/indexes. `RETURNING` is added in M2.24.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateStmt {
     pub or_action: Option<ConflictAction>,
@@ -314,6 +319,8 @@ pub struct UpdateStmt {
     pub table: String,
     pub assignments: Vec<Assignment>,
     pub where_clause: Option<Expr>,
+    /// Optional `RETURNING` clause: expressions to evaluate and yield per updated row.
+    pub returning: Option<Vec<ResultColumn>>,
 }
 
 /// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [schema.]name ON tbl(col_or_expr [COLLATE name] [ASC|DESC] …)

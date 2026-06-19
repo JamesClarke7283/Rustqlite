@@ -151,7 +151,14 @@ fn compile_column(
     match ctx.table.resolve_column(name) {
         Some(ColumnRef::Rowid) => {
             if let Some(base) = ctx.register_base {
-                b.emit(Opcode::SCopy, base, target, 0);
+                // When the rowid is staged in a register block (RETURNING path), there is no
+                // dedicated rowid register in the block. Instead, look up the rowid alias column
+                // and copy its value; a non-alias table gets the rowid via Rowid.
+                if let Some(alias_idx) = ctx.table.rowid_alias {
+                    b.emit(Opcode::SCopy, base + alias_idx as i32, target, 0);
+                } else {
+                    b.emit(Opcode::Rowid, ctx.cursor, target, 0);
+                }
             } else {
                 b.emit(Opcode::Rowid, ctx.cursor, target, 0);
             }

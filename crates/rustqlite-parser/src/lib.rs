@@ -644,6 +644,7 @@ fn build_insert(pair: Pair<'_, Rule>) -> InsertStmt {
         columns: Vec::new(),
         source: InsertSource::Values(Vec::new()),
         upsert: Vec::new(),
+        returning: None,
     };
     for part in pair.into_inner() {
         match part.as_rule() {
@@ -665,16 +666,24 @@ fn build_insert(pair: Pair<'_, Rule>) -> InsertStmt {
                     panic!("insert source parse error: {e}");
                 });
             }
-            Rule::upsert_clause => stmt.upsert.push(build_upsert_clause(part)),
+            Rule::upsert_clause => {
+                let (upsert, returning) = build_upsert_clause(part);
+                stmt.upsert.push(upsert);
+                if returning.is_some() {
+                    stmt.returning = returning;
+                }
+            }
+            Rule::returning_clause => stmt.returning = Some(build_returning(part)),
             _ => {}
         }
     }
     stmt
 }
 
-fn build_upsert_clause(pair: Pair<'_, Rule>) -> UpsertClause {
+fn build_upsert_clause(pair: Pair<'_, Rule>) -> (UpsertClause, Option<Vec<ResultColumn>>) {
     let mut target = None;
     let mut action = None;
+    let mut returning = None;
     for part in pair.into_inner() {
         match part.as_rule() {
             Rule::upsert_target => {
@@ -683,13 +692,17 @@ fn build_upsert_clause(pair: Pair<'_, Rule>) -> UpsertClause {
             Rule::upsert_action => {
                 action = Some(build_upsert_action(part));
             }
+            Rule::returning_clause => returning = Some(build_returning(part)),
             _ => {}
         }
     }
-    UpsertClause {
-        target,
-        action: action.expect("upsert action present"),
-    }
+    (
+        UpsertClause {
+            target,
+            action: action.expect("upsert action present"),
+        },
+        returning,
+    )
 }
 
 fn build_upsert_target(pair: Pair<'_, Rule>) -> UpsertTarget {
@@ -860,6 +873,7 @@ fn build_delete(pair: Pair<'_, Rule>) -> DeleteStmt {
         schema: None,
         table: String::new(),
         where_clause: None,
+        returning: None,
     };
     for part in pair.into_inner() {
         match part.as_rule() {
@@ -869,6 +883,7 @@ fn build_delete(pair: Pair<'_, Rule>) -> DeleteStmt {
                 stmt.table = n;
             }
             Rule::where_item => stmt.where_clause = Some(build_expr_item(part)),
+            Rule::returning_clause => stmt.returning = Some(build_returning(part)),
             _ => {}
         }
     }
@@ -902,6 +917,7 @@ fn build_update(pair: Pair<'_, Rule>) -> UpdateStmt {
         table: String::new(),
         assignments: Vec::new(),
         where_clause: None,
+        returning: None,
     };
     for part in pair.into_inner() {
         match part.as_rule() {
@@ -913,10 +929,19 @@ fn build_update(pair: Pair<'_, Rule>) -> UpdateStmt {
             }
             Rule::assignment_list => stmt.assignments = build_assignment_list(part),
             Rule::where_item => stmt.where_clause = Some(build_expr_item(part)),
+            Rule::returning_clause => stmt.returning = Some(build_returning(part)),
             _ => {}
         }
     }
     stmt
+}
+
+/// Build the result-column list inside a `RETURNING` clause.
+fn build_returning(pair: Pair<'_, Rule>) -> Vec<ResultColumn> {
+    pair.into_inner()
+        .find(|p| p.as_rule() == Rule::result_columns)
+        .map(build_result_columns)
+        .unwrap_or_default()
 }
 
 fn build_or_action(pair: Pair<'_, Rule>) -> ConflictAction {
@@ -1244,6 +1269,7 @@ mod tests {
         assert_eq!(ins.upsert.len(), 1);
         assert!(ins.upsert[0].target.is_none());
         assert_eq!(ins.upsert[0].action, UpsertAction::Nothing);
+        assert!(ins.returning.is_none());
 
         let Stmt::Insert(ins) =
             &parse("INSERT INTO t (a) VALUES (1) ON CONFLICT(a) DO UPDATE SET a = excluded.a;").unwrap()[0]
@@ -1306,6 +1332,37 @@ mod tests {
             panic!("expected DO UPDATE")
         };
         assert_eq!(assignments.len(), 1);
+
+        // RETURNING after an upsert clause.
+        let Stmt::Insert(ins) =
+            &parse("INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING RETURNING a;").unwrap()[0]
+        else {
+            panic!()
+        };
+        assert_eq!(ins.upsert.len(), 1);
+        let ret = ins.returning.as_ref().expect("returning present");
+        assert_eq!(ret.len(), 1);
+        assert!(matches!(
+            &ret[0], ResultColumn::Expr { expr: Expr::Column { name, .. }, .. } if name == "a"
+        ));
+    }
+
+    #[test]
+    fn insert_returning_parses() {
+        let Stmt::Insert(ins) =
+            &parse("INSERT INTO t (a) VALUES (1) RETURNING a, rowid;").unwrap()[0]
+        else {
+            panic!()
+        };
+        assert_eq!(ins.table, "t");
+        let ret = ins.returning.as_ref().expect("returning present");
+        assert_eq!(ret.len(), 2);
+        assert!(matches!(
+            &ret[0], ResultColumn::Expr { expr: Expr::Column { name, .. }, .. } if name == "a"
+        ));
+        assert!(matches!(
+            &ret[1], ResultColumn::Expr { expr: Expr::Column { name, .. }, .. } if name == "rowid"
+        ));
     }
 
     #[test]
@@ -1347,6 +1404,7 @@ mod tests {
         };
         assert_eq!(d.table, "t");
         assert!(d.where_clause.is_none());
+        assert!(d.returning.is_none());
 
         let Stmt::Delete(d) = &parse("DELETE FROM main.t WHERE x > 1;").unwrap()[0] else {
             panic!("expected DELETE")
@@ -1354,6 +1412,16 @@ mod tests {
         assert_eq!(d.schema.as_deref(), Some("main"));
         assert_eq!(d.table, "t");
         assert!(d.where_clause.is_some());
+        assert!(d.returning.is_none());
+
+        let Stmt::Delete(d) = &parse("DELETE FROM t WHERE a = 1 RETURNING b;").unwrap()[0] else {
+            panic!("expected DELETE")
+        };
+        assert_eq!(d.table, "t");
+        assert!(d.where_clause.is_some());
+        let ret = d.returning.as_ref().expect("returning present");
+        assert_eq!(ret.len(), 1);
+        assert!(matches!(&ret[0], ResultColumn::Expr { expr: Expr::Column { name, .. }, .. } if name == "b"));
     }
 
     #[test]
@@ -1406,9 +1474,10 @@ mod tests {
         assert_eq!(u.assignments[0].column, "a");
         assert_eq!(u.assignments[0].value, Expr::Literal(Literal::Integer(1)));
         assert!(u.where_clause.is_none());
+        assert!(u.returning.is_none());
 
         let Stmt::Update(u) =
-            &parse("UPDATE OR REPLACE main.t SET a = a + 1, b = 'x' WHERE a > 0;").unwrap()[0]
+            &parse("UPDATE OR REPLACE main.t SET a = a + 1, b = 'x' WHERE a > 0 RETURNING rowid, b;").unwrap()[0]
         else {
             panic!("expected UPDATE")
         };
@@ -1419,6 +1488,10 @@ mod tests {
         assert_eq!(u.assignments[0].column, "a");
         assert_eq!(u.assignments[1].column, "b");
         assert!(u.where_clause.is_some());
+        let ret = u.returning.as_ref().expect("returning present");
+        assert_eq!(ret.len(), 2);
+        assert!(matches!(&ret[0], ResultColumn::Expr { expr: Expr::Column { name, .. }, .. } if name == "rowid"));
+        assert!(matches!(&ret[1], ResultColumn::Expr { expr: Expr::Column { name, .. }, .. } if name == "b"));
     }
 
     #[test]

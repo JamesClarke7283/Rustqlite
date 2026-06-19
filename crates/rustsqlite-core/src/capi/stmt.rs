@@ -13,6 +13,7 @@ use rustqlite_parser::{
 };
 
 use crate::codegen;
+use crate::codegen::returning::Returning;
 use crate::error::{Error, Result, ResultCode};
 use crate::pager::Pager;
 use crate::schema::{read_catalog, schema_cookie, IndexObject, Table};
@@ -115,6 +116,13 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             let (source_table, source_indexes) =
                 resolve_insert_source(&pager, &ins.source)?.unwrap_or_default();
             let source_table_ref = (!source_table.name.is_empty()).then_some(&source_table);
+            let column_names = ins
+                .returning
+                .as_deref()
+                .map(|r| Returning::new(r, &table))
+                .transpose()?
+                .map(|ret| ret.column_names())
+                .unwrap_or_default();
             let program = Arc::new(codegen::compile_insert(
                 &ins,
                 &table,
@@ -126,7 +134,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
                 program,
-                column_names: Vec::new(),
+                column_names,
                 backing: Backing::Vdbe(vdbe),
                 explain: 0,
                 counts: Some(db.counts_handle()),
@@ -137,12 +145,19 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             // DELETE: resolve the target table from the catalog and compile a write program.
             let pager = db.pager_arc()?;
             let (table, indexes) = resolve_table_and_indexes(&pager, &del.table)?;
+            let column_names = del
+                .returning
+                .as_deref()
+                .map(|r| Returning::new(r, &table))
+                .transpose()?
+                .map(|ret| ret.column_names())
+                .unwrap_or_default();
             let program = Arc::new(codegen::compile_delete(&del, &table, &indexes)?);
             let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
                 program,
-                column_names: Vec::new(),
+                column_names,
                 backing: Backing::Vdbe(vdbe),
                 explain: 0,
                 counts: Some(db.counts_handle()),
@@ -177,12 +192,19 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             // the rowid-alias column.
             let pager = db.pager_arc()?;
             let (table, indexes) = resolve_table_and_indexes(&pager, &upd.table)?;
+            let column_names = upd
+                .returning
+                .as_deref()
+                .map(|r| Returning::new(r, &table))
+                .transpose()?
+                .map(|ret| ret.column_names())
+                .unwrap_or_default();
             let program = Arc::new(codegen::compile_update(&upd, &table, &indexes)?);
             let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
                 program,
-                column_names: Vec::new(),
+                column_names,
                 backing: Backing::Vdbe(vdbe),
                 explain: 0,
                 counts: Some(db.counts_handle()),

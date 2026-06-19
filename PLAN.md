@@ -53,7 +53,7 @@ list every granular item needed.
 - [x] **2.20** `VALUES (expr_list) [, …]` as a select body
 - [x] **2.21** `INSERT … SELECT` (read-path INSERT from query)
 - [x] **2.22** `INSERT … DEFAULT VALUES`
-- [ ] **2.23** UPSERT: `ON CONFLICT [(cols)] DO UPDATE SET … / DO NOTHING`
+- [x] **2.23** UPSERT: `ON CONFLICT [(cols)] DO UPDATE SET … / DO NOTHING`
 - [ ] **2.24** `RETURNING` clause (INSERT / UPDATE / DELETE)
 - [ ] **2.25** `ALTER TABLE … RENAME TO …`
 - [ ] **2.26** `ALTER TABLE … ADD [COLUMN] …`

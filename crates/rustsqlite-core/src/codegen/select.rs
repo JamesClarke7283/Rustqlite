@@ -674,7 +674,7 @@ fn emit_int(b: &mut ProgramBuilder, n: i64) -> i32 {
 /// A best-effort default column name for an unaliased non-column expression. SQLite uses the
 /// expression's source text; without spans we reconstruct an approximation (only used for
 /// header display — the result *rows* are unaffected).
-fn default_col_name(expr: &Expr) -> String {
+pub(crate) fn default_col_name(expr: &Expr) -> String {
     match expr {
         Expr::Column { name, .. } => name.clone(),
         other => expr_to_text(other),

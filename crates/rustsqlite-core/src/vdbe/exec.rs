@@ -22,6 +22,7 @@ use crate::types::{Affinity, Collation, Value};
 
 use super::compare::{apply_affinity, mem_compare};
 use super::cursor::VdbeCursor;
+use super::ephemeral::Ephemeral;
 use super::opcode::Opcode;
 use super::program::{
     p5_to_aff, Instruction, Program, P4, P5_ISUPDATE, P5_JUMPIFNULL, P5_NCHANGE, P5_NULLEQ,
@@ -360,9 +361,8 @@ impl Vdbe {
                 }
 
                 Opcode::Rewind => {
-                    // Rewind the cursor and jump to `p2` if it is empty. Works on both
-                    // table and index cursors (M5.1: a single rewind on the chosen cursor
-                    // type, dispatching through the VdbeCursor enum).
+                    // Rewind the cursor and jump to `p2` if it is empty. Works on
+                    // table/index cursors and ephemeral/sorter cursors.
                     let cur = self.cursor_mut(p1)?;
                     match cur {
                         VdbeCursor::Table(c) => {
@@ -386,6 +386,13 @@ impl Vdbe {
                         }
                         VdbeCursor::Sorter(_) => {
                             return Err(Error::msg("Rewind is not valid on a sorter cursor"))
+                        }
+                        VdbeCursor::Ephemeral(e) => {
+                            if e.rewind() {
+                                self.pc += 1;
+                            } else {
+                                self.pc = p2 as usize;
+                            }
                         }
                     }
                 }
@@ -416,6 +423,14 @@ impl Vdbe {
                         VdbeCursor::Sorter(s) => {
                             s.next();
                             if s.is_valid() {
+                                self.pc = p2 as usize;
+                            } else {
+                                self.pc += 1;
+                            }
+                        }
+                        VdbeCursor::Ephemeral(e) => {
+                            e.next();
+                            if e.is_valid() {
                                 self.pc = p2 as usize;
                             } else {
                                 self.pc += 1;
@@ -830,38 +845,70 @@ impl Vdbe {
                     self.pc += 1;
                 }
                 Opcode::NewRowid => {
-                    let pager = self
-                        .pager
-                        .clone()
-                        .ok_or_else(|| Error::msg("no database is open"))?;
-                    let root = self.cursor_root_of(p1)?;
-                    let next = btree::max_rowid(&pager, root).await?.wrapping_add(1);
-                    self.regs[p2 as usize] = Value::Int(next);
-                    self.pc += 1;
+                    // For an ephemeral cursor (RETURNING buffer), allocate the next integer key
+                    // from the cursor itself. For real b-tree cursors, ask the pager.
+                    if self
+                        .cursors
+                        .get(p1 as usize)
+                        .and_then(|c| c.as_ref())
+                        .is_some_and(VdbeCursor::is_ephemeral)
+                    {
+                        let slot = self.cursors.get_mut(p1 as usize).unwrap().as_mut().unwrap();
+                        let rowid = slot.as_ephemeral_mut().unwrap().next_rowid();
+                        self.regs[p2 as usize] = Value::Int(rowid);
+                        self.pc += 1;
+                    } else {
+                        let pager = self
+                            .pager
+                            .clone()
+                            .ok_or_else(|| Error::msg("no database is open"))?;
+                        let root = self.cursor_root_of(p1)?;
+                        let next = btree::max_rowid(&pager, root).await?.wrapping_add(1);
+                        self.regs[p2 as usize] = Value::Int(next);
+                        self.pc += 1;
+                    }
                 }
                 Opcode::Insert => {
-                    let pager = self
-                        .pager
-                        .clone()
-                        .ok_or_else(|| Error::msg("no database is open"))?;
-                    let root = self.cursor_root_of(p1)?;
-                    let record = match &self.regs[p2 as usize] {
-                        Value::Blob(b) => b.clone(),
-                        _ => return Err(Error::msg("Insert expects a record blob in p2")),
-                    };
-                    let rowid = self.regs[p3 as usize].as_i64();
-                    btree::table_insert(&pager, root, rowid, &record).await?;
-                    // `P5_ISUPDATE` means the Insert is the write side of an `UPDATE`: bump
-                    // `changes` (one row updated) but do NOT clobber `last_insert_rowid` —
-                    // SQLite only updates that for an actual `INSERT`.
-                    if p5 & P5_ISUPDATE == 0 {
-                        self.ctx.last_insert_rowid = rowid;
-                        self.ctx.did_insert = true;
+                    // Ephemeral cursor: insert directly into the in-memory buffer.
+                    if self
+                        .cursors
+                        .get(p1 as usize)
+                        .and_then(|c| c.as_ref())
+                        .is_some_and(VdbeCursor::is_ephemeral)
+                    {
+                        let record = match &self.regs[p2 as usize] {
+                            Value::Blob(b) => b.clone(),
+                            _ => return Err(Error::msg("Insert expects a record blob in p2")),
+                        };
+                        let slot = self.cursors.get_mut(p1 as usize).unwrap().as_mut().unwrap();
+                        let eph = slot.as_ephemeral_mut().unwrap();
+                        let rowid = self.regs[p3 as usize].as_i64();
+                        eph.insert(rowid, record);
+                        self.pc += 1;
+                    } else {
+                        let pager = self
+                            .pager
+                            .clone()
+                            .ok_or_else(|| Error::msg("no database is open"))?;
+                        let root = self.cursor_root_of(p1)?;
+                        let record = match &self.regs[p2 as usize] {
+                            Value::Blob(b) => b.clone(),
+                            _ => return Err(Error::msg("Insert expects a record blob in p2")),
+                        };
+                        let rowid = self.regs[p3 as usize].as_i64();
+                        btree::table_insert(&pager, root, rowid, &record).await?;
+                        // `P5_ISUPDATE` means the Insert is the write side of an `UPDATE`: bump
+                        // `changes` (one row updated) but do NOT clobber `last_insert_rowid` —
+                        // SQLite only updates that for an actual `INSERT`.
+                        if p5 & P5_ISUPDATE == 0 {
+                            self.ctx.last_insert_rowid = rowid;
+                            self.ctx.did_insert = true;
+                        }
+                        self.ctx.changes += 1;
+                        self.ctx.total_changes += 1;
+                        self.decoded = None;
+                        self.pc += 1;
                     }
-                    self.ctx.changes += 1;
-                    self.ctx.total_changes += 1;
-                    self.decoded = None;
-                    self.pc += 1;
                 }
                 Opcode::Delete => {
                     // Sanity-check the cursor exists; the actual delete goes through
@@ -896,6 +943,13 @@ impl Vdbe {
                     // architecture each prepared statement re-reads `sqlite_schema` at prepare
                     // time (the catalog is not cached on the connection), so the reload here is a
                     // no-op marker; we keep the opcode for faithfulness and EXPLAIN parity.
+                    self.pc += 1;
+                }
+
+                Opcode::OpenEphemeral => {
+                    // Open an in-memory ephemeral table with p2 fields and stash it under cursor p1.
+                    let nfield = p2 as usize;
+                    self.set_cursor(p1 as usize, VdbeCursor::Ephemeral(Ephemeral::new(nfield, self.encoding)));
                     self.pc += 1;
                 }
 
@@ -1034,8 +1088,8 @@ impl Vdbe {
             .unwrap_or_default()
     }
 
-    /// Mutably borrow any cursor by index (table, index, or sorter). Used by the
-    /// `Rewind` / `Next` opcodes which need to work across all three cursor kinds.
+    /// Mutably borrow any cursor by index (table, index, sorter, or ephemeral). Used by the
+    /// `Rewind` / `Next` opcodes which need to work across all cursor kinds.
     fn cursor_mut(&mut self, p1: i32) -> Result<&mut VdbeCursor> {
         self.cursors
             .get_mut(p1 as usize)
@@ -1053,20 +1107,32 @@ impl Vdbe {
 
     /// `Column p1 p2`: the value of column `col` of cursor `idx`'s current row.
     async fn column(&mut self, idx: usize, col: usize) -> Result<Value> {
-        // Sorter cursors read from their decoded current record.
-        if self
-            .cursors
-            .get(idx)
-            .and_then(|c| c.as_ref())
-            .is_some_and(VdbeCursor::is_sorter)
-        {
-            return Ok(self.cursors[idx]
-                .as_ref()
-                .unwrap()
-                .as_sorter()
-                .unwrap()
-                .column(col));
-        }
+                // Sorter cursors read from their decoded current record.
+                if self
+                    .cursors
+                    .get(idx)
+                    .and_then(|c| c.as_ref())
+                    .is_some_and(VdbeCursor::is_sorter)
+                {
+                    return Ok(self.cursors[idx]
+                        .as_ref()
+                        .unwrap()
+                        .as_sorter()
+                        .unwrap()
+                        .column(col));
+                }
+
+                // Ephemeral cursors read from their decoded current record.
+                if self
+                    .cursors
+                    .get(idx)
+                    .and_then(|c| c.as_ref())
+                    .is_some_and(VdbeCursor::is_ephemeral)
+                {
+                    let slot = self.cursors[idx].as_mut().unwrap();
+                    slot.as_ephemeral_mut().unwrap().data()?;
+                    return Ok(slot.as_ephemeral().unwrap().column(col));
+                }
 
         let rowid = self.table_cursor(idx as i32)?.rowid()?;
         let hit = matches!(&self.decoded, Some((ci, rid, _)) if *ci == idx && *rid == rowid);

@@ -14,8 +14,10 @@
 
 use rustqlite_parser::{DeleteStmt, Expr};
 
+use crate::codegen::returning::Returning;
 use crate::error::{Error, Result};
 use crate::schema::{IndexObject, Table};
+use crate::types::Affinity;
 use crate::vdbe::program::{Program, P4};
 use crate::vdbe::{KeyField, Opcode};
 
@@ -31,7 +33,14 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
     }
     let cursor = 0i32;
     let ctx = Ctx { table, cursor, register_base: None };
+    let ncol = table.columns.len();
     let mut b = ProgramBuilder::new();
+
+    let returning = del
+        .returning
+        .as_deref()
+        .map(|r| Returning::new(r, table))
+        .transpose()?;
 
     // Standard VDBE preamble: `Init 0, setup` at addr 0 jumps to the trailing `Goto after_init`
     // (the `setup` body), which jumps back to the first real work instruction. This is the
@@ -76,6 +85,12 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
     // Reserve cursor numbers for the indexes (1, 2, …). The table cursor is 0. Each cursor
     // carries the index's KeyInfo so deletes compare under the correct collation.
     let index_cursor_base: i32 = 1;
+    let eph_cursor = index_cursor_base + indexes.len() as i32;
+    let mut returning = returning;
+    if let Some(ref mut ret) = returning {
+        ret.emit_open(&mut b, eph_cursor);
+    }
+
     for (i, idx) in indexes.iter().enumerate() {
         let ic = (index_cursor_base + i as i32) as i32;
         let open = b.emit(Opcode::OpenWrite, ic, idx.rootpage as i32, 0);
@@ -105,9 +120,19 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
     if let Some(where_expr) = &del.where_clause {
         let end_of_body = b.new_label();
         compile_where(&mut b, where_expr, end_of_body, ctx)?;
-        // For the WHERE-matching rows only: capture rowid, IdxDelete per index, then Delete.
+        // For the WHERE-matching rows only: capture rowid + OLD values, IdxDelete per index,
+        // then Delete and RETURNING.
         let rowid_reg = b.alloc_reg();
         b.emit(Opcode::Rowid, cursor, rowid_reg, 0);
+        let reg_old = b.alloc_regs(ncol as i32);
+        for ci in 0..ncol {
+            b.emit(Opcode::Column, cursor, ci as i32, reg_old + ci as i32);
+        }
+        for ci in 0..ncol {
+            if table.columns[ci].affinity == Affinity::Real {
+                b.emit(Opcode::RealAffinity, reg_old + ci as i32, 0, 0);
+            }
+        }
         for (i, idx) in indexes.iter().enumerate() {
             let ic = (index_cursor_base + i as i32) as i32;
 
@@ -147,12 +172,24 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
             }
         }
         b.emit(Opcode::Delete, cursor, 0, 0);
+        if let Some(ref ret) = returning {
+            ret.emit_buffer_row(&mut b, table, cursor, reg_old)?;
+        }
         b.resolve(end_of_body);
     } else {
         // Unfiltered delete: every row matches, so unconditionally capture and remove
         // the OLD rowid + index keys.
         let rowid_reg = b.alloc_reg();
         b.emit(Opcode::Rowid, cursor, rowid_reg, 0);
+        let reg_old = b.alloc_regs(ncol as i32);
+        for ci in 0..ncol {
+            b.emit(Opcode::Column, cursor, ci as i32, reg_old + ci as i32);
+        }
+        for ci in 0..ncol {
+            if table.columns[ci].affinity == Affinity::Real {
+                b.emit(Opcode::RealAffinity, reg_old + ci as i32, 0, 0);
+            }
+        }
         for (i, idx) in indexes.iter().enumerate() {
             let ic = (index_cursor_base + i as i32) as i32;
 
@@ -190,12 +227,19 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
             }
         }
         b.emit(Opcode::Delete, cursor, 0, 0);
+        if let Some(ref ret) = returning {
+            ret.emit_buffer_row(&mut b, table, cursor, reg_old)?;
+        }
     }
 
     // Advance: if a row remains, jump back to the start of the body (`loop_body`); otherwise
     // fall through to `end_loop` (which is the next instruction).
     b.emit_jump(Opcode::Next, cursor, loop_body, 0);
     b.resolve(end_loop);
+
+    if let Some(ref ret) = returning {
+        ret.emit_output_loop(&mut b);
+    }
 
     b.emit(Opcode::Halt, 0, 0, 0);
     b.resolve(setup);

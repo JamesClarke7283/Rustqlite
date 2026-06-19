@@ -56,6 +56,7 @@
 use rustqlite_parser::{Assignment, UpdateStmt};
 
 use crate::codegen::builder::Label;
+use crate::codegen::returning::Returning;
 
 use crate::error::{Error, Result};
 use crate::schema::{IndexObject, Table};
@@ -123,6 +124,12 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
     let ctx = Ctx { table, cursor, register_base: None };
     let mut b = ProgramBuilder::new();
 
+    let returning = upd
+        .returning
+        .as_deref()
+        .map(|r| Returning::new(r, table))
+        .transpose()?;
+
     let setup = b.new_label();
     let after_init = b.new_label();
     b.emit_jump(Opcode::Init, 0, setup, 0);
@@ -134,6 +141,14 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
     // (2) Open the rowid-set sorter with one key field (the rowid, ASC, BINARY).
     let so = b.emit(Opcode::SorterOpen, sorter, 1, 0);
     b.set_p4(so, P4::KeyInfo(vec![crate::vdbe::KeyField::asc_binary()]));
+
+    // RETURNING ephemeral cursor sits above the index cursors (allocated later). For now pick a
+    // high cursor number; we open it after index cursors are emitted.
+    let eph_cursor: i32 = 20;
+    let mut returning = returning;
+    if let Some(ref mut ret) = returning {
+        ret.emit_open(&mut b, eph_cursor);
+    }
 
     // (3) Open the table b-tree for read+write.
     let open = b.emit(Opcode::OpenWrite, cursor, table.rootpage as i32, 0);
@@ -217,6 +232,13 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
     let reg_old = b.alloc_regs(ncol as i32);
     for ci in 0..ncol {
         b.emit(Opcode::SCopy, reg_new + ci as i32, reg_old + ci as i32, 0);
+    }
+
+    // (6c) For tables without an INTEGER PRIMARY KEY alias, the staged rowid is not part of
+    // reg_new. RETURNING may reference `rowid`; capture it into the block so the helper can
+    // resolve it.
+    if table.rowid_alias.is_none() {
+        let _placeholder = b.alloc_reg();
     }
 
     for (ci, slot) in target_col.iter().enumerate() {
@@ -307,6 +329,15 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
     let ins_idx = b.emit(Opcode::Insert, cursor, reg_new_rec, reg_old_rowid2);
     b.set_p5(ins_idx, P5_ISUPDATE);
 
+    if let Some(ref ret) = returning {
+        // The rowid-alias slot in the stored record is NULL, but RETURNING needs the logical
+        // column value (the rowid). Patch it into the staged register block before evaluating.
+        if let Some(alias_idx) = table.rowid_alias {
+            b.emit(Opcode::SCopy, reg_old_rowid2, reg_new + alias_idx as i32, 0);
+        }
+        ret.emit_buffer_row(&mut b, table, cursor, reg_new)?;
+    }
+
     // (9c) New-key IdxInsert (post-Insert, so the new values are in `reg_new + col_idx`,
     // whether the SET overwrote them or not).
     for (i, idx) in indexes.iter().enumerate() {
@@ -379,6 +410,11 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
     b.resolve(sort_next);
     b.emit_jump(Opcode::SorterNext, sorter, update_top, 0);
     b.resolve(end_update);
+
+    if let Some(ref ret) = returning {
+        ret.emit_output_loop(&mut b);
+    }
+
     b.emit(Opcode::Halt, 0, 0, 0);
 
     b.resolve(setup);
