@@ -21,6 +21,10 @@
 # files that exercise what the engine ships without depending on the
 # upstream `xtask/fetch-slt.sh` corpus.
 
+# M5.2.10 — expression indexes (CREATE INDEX on arbitrary expressions, maintenance,
+# UNIQUE constraint semantics).
+our/expression-index.slt
+
 # M5.0 — `UPDATE`. The upstream `evidence/slt_lang_update.test` mixes
 # `CREATE INDEX` (still on the M5+ roadmap) and `skipif`/`onlyif`
 # directives the harness's parser does not yet understand, so the hand-

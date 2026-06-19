@@ -1,0 +1,77 @@
+# Expression-index smoke corpus for M5.2.10.
+
+statement ok
+CREATE TABLE t1(x INTEGER, y TEXT)
+
+statement ok
+INSERT INTO t1 VALUES(1, 'one')
+
+statement ok
+INSERT INTO t1 VALUES(2, 'two')
+
+statement ok
+INSERT INTO t1 VALUES(3, 'three')
+
+# An expression index on x+1.
+statement ok
+CREATE INDEX i_x1 ON t1(x + 1)
+
+# Equality against the indexed expression.
+query T rowsort
+SELECT y FROM t1 WHERE x + 1 = 3
+----
+two
+
+# A non-matching value.
+query T rowsort
+SELECT y FROM t1 WHERE x + 1 = 99
+----
+
+# Maintenance: UPDATE that changes the indexed expression.
+statement ok
+UPDATE t1 SET x = 5 WHERE y = 'two'
+
+query T rowsort
+SELECT y FROM t1 WHERE x + 1 = 3
+----
+
+query T rowsort
+SELECT y FROM t1 WHERE x + 1 = 6
+----
+two
+
+# Maintenance: DELETE removes the row from the index.
+statement ok
+DELETE FROM t1 WHERE y = 'three'
+
+query T rowsort
+SELECT y FROM t1 WHERE x + 1 = 4
+----
+
+# A composite expression index: (x+1, upper(y)).
+statement ok
+CREATE INDEX i_xy ON t1(x + 1, upper(y))
+
+query T rowsort
+SELECT y FROM t1 WHERE x + 1 = 2 AND upper(y) = 'ONE'
+----
+one
+
+# Unique expression index rejects duplicates; NULLs are allowed to repeat.
+statement ok
+CREATE UNIQUE INDEX i_ux ON t1(x + 100)
+
+statement error
+INSERT INTO t1 VALUES(1, 'dup')
+
+statement ok
+INSERT INTO t1 VALUES(NULL, 'null1')
+
+statement ok
+INSERT INTO t1 VALUES(NULL, 'null2')
+
+query T rowsort
+SELECT y FROM t1 WHERE y LIKE 'null%' ORDER BY y
+----
+null1
+null2

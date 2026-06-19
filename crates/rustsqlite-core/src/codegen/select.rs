@@ -531,7 +531,9 @@ fn default_col_name(expr: &Expr) -> String {
     }
 }
 
-fn expr_to_text(e: &Expr) -> String {
+/// Render an expression back into a SQL-like text form. This is intentionally public so that
+/// other modules (e.g., schema index error messages) can build human-readable expression text.
+pub fn expr_to_text(e: &Expr) -> String {
     use rustqlite_parser::FunctionArgs;
     match e {
         Expr::Literal(Literal::Null) => "NULL".to_string(),
@@ -573,7 +575,10 @@ fn expr_to_text(e: &Expr) -> String {
         Expr::Subquery(_) => "subquery".to_string(),
         Expr::Cast { .. } => "cast".to_string(),
         Expr::Case { .. } => "case".to_string(),
-        Expr::Collate { .. } => "collate".to_string(),
+        Expr::Collate { expr, collation } => {
+        let s = expr_to_text(expr);
+        format!("{} COLLATE {}", s, collation)
+    }
         Expr::IsDistinctFrom { .. } => "is_distinct".to_string(),
     }
 }

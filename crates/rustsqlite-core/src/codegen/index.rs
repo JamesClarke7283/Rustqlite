@@ -130,23 +130,24 @@ pub fn compile_create_index(
         None
     };
 
-    let nkey = indexed_cis.len() as i32 + 1; // indexed columns + trailing rowid
+    let nkey = dummy.nkey_fields() as i32 + 1; // indexed key fields + trailing rowid
     let key_start = b.alloc_regs(nkey);
     let rec_reg = b.alloc_reg();
-    for (i, col_idx) in indexed_cis.iter().enumerate() {
-        b.emit(
-            Opcode::Column,
-            table_cursor,
-            *col_idx as i32,
-            key_start + i as i32,
-        );
+    let mut plain_iter = indexed_cis.iter();
+    for (i, ic) in dummy.columns.iter().enumerate() {
+        let target = key_start + i as i32;
+        if let Some(expr) = &ic.expr {
+            super::expr::compile_expr(&mut b,
+                expr,
+                target,
+                super::expr::Ctx { table, cursor: table_cursor, register_base: None },
+            )?;
+        } else {
+            let col_idx = *plain_iter.next().expect("plain column aligned with indexed_cis");
+            b.emit(Opcode::Column, table_cursor, col_idx as i32, target);
+        }
     }
-    b.emit(
-        Opcode::Rowid,
-        table_cursor,
-        key_start + indexed_cis.len() as i32,
-        0,
-    );
+    b.emit(Opcode::Rowid, table_cursor, key_start + dummy.nkey_fields() as i32, 0);
     b.emit(Opcode::MakeRecord, key_start, nkey, rec_reg);
     let idx_insert = b.emit(Opcode::IdxInsert, idx_cursor, rec_reg, 0);
     let mut p5 = P5_NCHANGE;

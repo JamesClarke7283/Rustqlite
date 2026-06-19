@@ -20,7 +20,7 @@ use crate::vdbe::program::{Program, P4};
 use crate::vdbe::{KeyField, Opcode};
 
 use super::builder::ProgramBuilder;
-use super::expr::{compile_jump, Ctx};
+use super::expr::{compile_expr, compile_jump, Ctx};
 
 /// Compile `DELETE FROM <table> [WHERE <expr>]` against `table` with `indexes` as the list of
 /// indexes whose entries must be removed alongside each deleted row. Empty `indexes` (the M3a
@@ -93,23 +93,25 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
                 None
             };
 
-            let indexed_cis = idx.table_column_indices(table)?;
-            let nkey = indexed_cis.len() as i32 + 1;
+            let nkey = idx.nkey_fields() as i32 + 1;
             let key_start = b.alloc_regs(nkey);
-            for (j, col_idx) in indexed_cis.iter().enumerate() {
-                b.emit(
-                    Opcode::Column,
-                    cursor,
-                    *col_idx as i32,
-                    key_start + j as i32,
-                );
+            for (j, icol) in idx.columns.iter().enumerate() {
+                let target = key_start + j as i32;
+                if let Some(expr) = &icol.expr {
+                    let expr_ctx = Ctx {
+                        table,
+                        cursor,
+                        register_base: None,
+                    };
+                    compile_expr(&mut b, expr, target, expr_ctx)?;
+                } else {
+                    let col_idx = table
+                        .column_index(&icol.name)
+                        .expect("validated earlier");
+                    b.emit(Opcode::Column, cursor, col_idx as i32, target);
+                }
             }
-            b.emit(
-                Opcode::SCopy,
-                rowid_reg,
-                key_start + indexed_cis.len() as i32,
-                0,
-            );
+            b.emit(Opcode::SCopy, rowid_reg, key_start + idx.nkey_fields() as i32, 0);
             b.emit(Opcode::IdxDelete, ic, key_start, nkey);
 
             if let Some(skip) = skip_label {
@@ -134,23 +136,25 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
                 None
             };
 
-            let indexed_cis = idx.table_column_indices(table)?;
-            let nkey = indexed_cis.len() as i32 + 1;
+            let nkey = idx.nkey_fields() as i32 + 1;
             let key_start = b.alloc_regs(nkey);
-            for (j, col_idx) in indexed_cis.iter().enumerate() {
-                b.emit(
-                    Opcode::Column,
-                    cursor,
-                    *col_idx as i32,
-                    key_start + j as i32,
-                );
+            for (j, icol) in idx.columns.iter().enumerate() {
+                let target = key_start + j as i32;
+                if let Some(expr) = &icol.expr {
+                    let expr_ctx = Ctx {
+                        table,
+                        cursor,
+                        register_base: None,
+                    };
+                    compile_expr(&mut b, expr, target, expr_ctx)?;
+                } else {
+                    let col_idx = table
+                        .column_index(&icol.name)
+                        .expect("validated earlier");
+                    b.emit(Opcode::Column, cursor, col_idx as i32, target);
+                }
             }
-            b.emit(
-                Opcode::SCopy,
-                rowid_reg,
-                key_start + indexed_cis.len() as i32,
-                0,
-            );
+            b.emit(Opcode::SCopy, rowid_reg, key_start + idx.nkey_fields() as i32, 0);
             b.emit(Opcode::IdxDelete, ic, key_start, nkey);
 
             if let Some(skip) = skip_label {

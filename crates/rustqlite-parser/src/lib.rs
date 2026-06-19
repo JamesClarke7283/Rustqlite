@@ -582,13 +582,34 @@ fn build_create_index(pair: Pair<'_, Rule>) -> CreateIndex {
 
 fn build_indexed_column(pair: Pair<'_, Rule>) -> IndexedColumn {
     let mut name: Option<String> = None;
+    let mut expr: Option<Expr> = None;
     let mut collation = None;
     let mut desc = false;
-    // Walk the children in order: the first `ident` is the column name, the second (if present)
-    // is the COLLATE name, and the trailing K_ASC/K_DESC sets the sort direction.
+    // Walk children. The first child that is an `ident` or `expr` establishes the indexed
+    // key. A bare identifier is stored as `name` and, if it is genuinely just a column name
+    // (not an expression such as `a+1`), as an `Expr::Column` so that code that evaluates index
+    // keys can treat plain columns and expressions uniformly. Real expression indexes keep
+    // `name` empty so downstream code can tell them apart.
     for part in pair.into_inner() {
         match part.as_rule() {
-            Rule::ident if name.is_none() => name = Some(part.as_str().to_string()),
+            Rule::ident if name.is_none() && expr.is_none() => {
+                let n = part.as_str().to_string();
+                name = Some(n.clone());
+                expr = Some(Expr::Column {
+                    schema: None,
+                    table: None,
+                    name: n,
+                });
+            }
+            Rule::expr if expr.is_none() => {
+                let built = expr::build_expr(part);
+                // If the expression is a bare column reference, treat it as a plain-column
+                // index (preserves `name`). Anything more complex is a true expression index.
+                if let Expr::Column { name: col, .. } = &built {
+                    name = Some(col.clone());
+                }
+                expr = Some(built);
+            }
             Rule::ident => collation = Some(part.as_str().to_string()),
             Rule::K_DESC => desc = true,
             Rule::K_ASC => desc = false,
@@ -597,6 +618,7 @@ fn build_indexed_column(pair: Pair<'_, Rule>) -> IndexedColumn {
     }
     IndexedColumn {
         name: name.unwrap_or_default(),
+        expr,
         collation,
         desc,
     }

@@ -127,6 +127,10 @@ pub fn index_covers_column(sql: &str, column_name: &str) -> bool {
     if stmt.columns.len() != 1 {
         return false;
     }
+    // Expression indexes are never matched by a bare column name.
+    if stmt.columns[0].expr.is_some() {
+        return false;
+    }
     stmt.columns[0].name.eq_ignore_ascii_case(column_name)
 }
 

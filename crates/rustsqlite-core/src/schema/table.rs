@@ -55,23 +55,46 @@ pub struct IndexObject {
     pub where_clause: Option<rustqlite_parser::Expr>,
 }
 
-/// One column entry in an `IndexObject`. The M5.2 runtime uses `name` to map the column back
-/// to the table; `desc` is recorded for catalog/EXPLAIN metadata but the per-column
-/// `collation` is now the resolved comparison rule used by the index cursor.
+/// One column entry in an `IndexObject`. The M5.2 runtime uses `name` to map plain columns back
+/// to the table; `expr` carries the AST for expression-index keys. The per-column `collation`
+/// is the resolved comparison rule used by the index cursor.
 #[derive(Clone, Debug, PartialEq)]
 pub struct IndexedColumn {
     pub name: String,
+    /// For expression indexes, the parsed expression; `None` for a plain column index.
+    pub expr: Option<rustqlite_parser::Expr>,
     pub collation: Collation,
     pub desc: bool,
 }
 
+impl IndexedColumn {
+    /// True when this indexed key is a real expression rather than a plain column reference.
+    /// A bare column (including one wrapped in `COLLATE`) is *not* considered an expression
+    /// here, even though it is stored as an `Expr::Column`/`Expr::Collate`, because downstream
+    /// code still needs to map it to a table column by name for error messages and key-info.
+    pub fn is_expression(&self) -> bool {
+        if self.expr.is_none() {
+            return false;
+        }
+        // A bare column reference keeps the column name in `name` and is stored as an
+        // `Expr::Column`. A `COLLATE`-wrapped column is still a plain column for this purpose;
+        // the per-column collation lives in `IndexedColumn::collation`. Real expression
+        // indexes have an empty `name` (the parser cannot derive a single column name from
+        // an arbitrary expression).
+        self.name.is_empty()
+    }
+}
+
 impl IndexObject {
-    /// Map each indexed column name to its table column index. Returns `Ok(indices)` when all
-    /// columns exist; otherwise an error naming the missing column. This is used by the
-    /// codegen to build/seek composite index keys.
+    /// Map each plain indexed column to its table column index. Expression-index keys are
+    /// skipped (the caller must evaluate the expression itself); returns `Ok(indices)` when
+    /// all plain columns exist, otherwise an error naming the missing column.
     pub fn table_column_indices(&self, table: &Table) -> Result<Vec<usize>> {
         let mut out = Vec::with_capacity(self.columns.len());
         for ic in &self.columns {
+            if ic.is_expression() {
+                continue;
+            }
             let idx = table.column_index(&ic.name).ok_or_else(|| {
                 Error::msg(format!(
                     "index {} references unknown column {} on table {}",
@@ -81,6 +104,11 @@ impl IndexObject {
             out.push(idx);
         }
         Ok(out)
+    }
+
+    /// The number of indexed key fields (columns or expressions) in this index.
+    pub fn nkey_fields(&self) -> usize {
+        self.columns.len()
     }
 }
 
@@ -270,6 +298,7 @@ impl IndexObject {
             .iter()
             .map(|c| IndexedColumn {
                 name: c.name.clone(),
+                expr: c.expr.clone(),
                 collation: c
                     .collation
                     .as_deref()
@@ -280,10 +309,11 @@ impl IndexObject {
             .collect();
         let unique_not_null = ci.unique
             && columns.iter().all(|ic| {
-                table
-                    .column_index(&ic.name)
-                    .map(|idx| table.columns[idx].notnull)
-                    .unwrap_or(false)
+                !ic.is_expression()
+                    && table
+                        .column_index(&ic.name)
+                        .map(|idx| table.columns[idx].notnull)
+                        .unwrap_or(false)
             });
         IndexObject {
             name,
@@ -302,6 +332,7 @@ impl IndexObject {
     }
 
     /// True when this index covers exactly the given columns (case-insensitive) in order.
+    /// Expression indexes are never matched by this helper.
     pub fn covers_columns(&self, names: &[&str]) -> bool {
         if self.columns.len() != names.len() {
             return false;
@@ -309,14 +340,22 @@ impl IndexObject {
         self.columns
             .iter()
             .zip(names.iter())
-            .all(|(ic, name)| ic.name.eq_ignore_ascii_case(name))
+            .all(|(ic, name)| !ic.is_expression() && ic.name.eq_ignore_ascii_case(name))
     }
 
-    /// The "UNIQUE constraint failed: table.col1, col2, ..." message used by C SQLite for this
-    /// index. Returns `None` when the index is not unique.
+    /// The "UNIQUE constraint failed: ..." message used by C SQLite for this index.
+    /// Returns `None` when the index is not unique.
+    ///
+    /// C SQLite uses two forms:
+    ///   * plain-column indexes: `UNIQUE constraint failed: table.col1, table.col2, ...`
+    ///   * expression indexes (any key is an expression): `UNIQUE constraint failed: index 'name'`
     pub fn unique_constraint_message(&self, table: &Table) -> Option<String> {
         if !self.unique {
             return None;
+        }
+        let has_expression = self.columns.iter().any(|ic| ic.is_expression());
+        if has_expression {
+            return Some(format!("UNIQUE constraint failed: index '{}'", self.name));
         }
         let names: Vec<String> = self
             .columns

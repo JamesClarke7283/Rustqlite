@@ -210,20 +210,13 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
         }
     }
 
-    // (6b) Snapshot the OLD values for the indexed columns (if any) BEFORE the SET
-    // assignments overwrite them. We need them for the per-index `IdxDelete` later in this
-    // loop body. The snapshot is one register per indexed table column; multiple indexes
-    // on the same column share the same snapshot.
-    let mut old_value_reg: std::collections::HashMap<usize, i32> = std::collections::HashMap::new();
-    for idx in indexes.iter() {
-        for col_name in idx.columns.iter().map(|c| &c.name) {
-            let indexed_ci = table.column_index(col_name).expect("validated earlier");
-            old_value_reg.entry(indexed_ci).or_insert_with(|| {
-                let r = b.alloc_reg();
-                b.emit(Opcode::SCopy, reg_new + indexed_ci as i32, r, 0);
-                r
-            });
-        }
+    // (6b) Snapshot the full OLD row into a contiguous register block BEFORE any SET
+    // assignment overwrites `reg_new`. The OLD index keys (and the partial-index predicate
+    // for the old-key delete) are evaluated from this snapshot so they match the on-disk
+    // index entries, even when the SET list changes indexed columns.
+    let reg_old = b.alloc_regs(ncol as i32);
+    for ci in 0..ncol {
+        b.emit(Opcode::SCopy, reg_new + ci as i32, reg_old + ci as i32, 0);
     }
 
     for (ci, slot) in target_col.iter().enumerate() {
@@ -262,12 +255,12 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
     for (i, idx) in indexes.iter().enumerate() {
         let ic = index_cursor_base + i as i32;
         let indexed_cis = idx.table_column_indices(table).expect("validated earlier");
-        let nkey = indexed_cis.len() as i32 + 1; // indexed columns + trailing rowid
+        let nkey = idx.nkey_fields() as i32 + 1; // indexed key fields + trailing rowid
 
         let skip_delete_label = if let Some(pred) = &idx.where_clause {
             validate_partial_pred_on_update(pred, table, &target_col)?;
             let skip = b.new_label();
-                let pred_ctx = Ctx { table, cursor, register_base: None };
+            let pred_ctx = Ctx { table, cursor, register_base: None };
             compile_pred_jump(&mut b, pred, skip, table, reg_new, indexed_cis.as_slice(), pred_ctx)?;
             Some(skip)
         } else {
@@ -275,16 +268,27 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
         };
 
         let old_key = b.alloc_regs(nkey);
-        for (j, col_idx) in indexed_cis.iter().enumerate() {
-            let old_val_reg = *old_value_reg
-                .get(col_idx)
-                .expect("snapshot exists for every indexed column");
-            b.emit(Opcode::SCopy, old_val_reg, old_key + j as i32, 0);
+        for (j, icol) in idx.columns.iter().enumerate() {
+            let target = old_key + j as i32;
+            if let Some(expr) = &icol.expr {
+                // Evaluate the OLD expression against the snapshotted OLD row registers.
+                let expr_ctx = Ctx {
+                    table,
+                    cursor,
+                    register_base: Some(reg_old),
+                };
+                compile_expr(&mut b, expr, target, expr_ctx)?;
+            } else {
+                let col_idx = table
+                    .column_index(&icol.name)
+                    .expect("validated earlier");
+                b.emit(Opcode::SCopy, reg_old + col_idx as i32, target, 0);
+            }
         }
         b.emit(
             Opcode::SCopy,
             reg_old_rowid2,
-            old_key + indexed_cis.len() as i32,
+            old_key + idx.nkey_fields() as i32,
             0,
         );
         // IdxDelete reads the key values from r[p2..p2+p3]; we pass the first register and
@@ -308,13 +312,13 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
     for (i, idx) in indexes.iter().enumerate() {
         let ic = index_cursor_base + i as i32;
         let indexed_cis = idx.table_column_indices(table).expect("validated earlier");
-        let nkey = indexed_cis.len() as i32 + 1;
+        let nkey = idx.nkey_fields() as i32 + 1;
 
         // Partial-index predicate: only insert the NEW row if it satisfies the predicate.
         let skip_insert_label = if let Some(pred) = &idx.where_clause {
             validate_partial_pred_on_update(pred, table, &target_col)?;
             let skip = b.new_label();
-                let pred_ctx = Ctx { table, cursor, register_base: None };
+            let pred_ctx = Ctx { table, cursor, register_base: None };
             compile_pred_jump(&mut b, pred, skip, table, reg_new, indexed_cis.as_slice(), pred_ctx)?;
             Some(skip)
         } else {
@@ -322,18 +326,31 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
         };
 
         let new_key = b.alloc_regs(nkey);
-        for (j, col_idx) in indexed_cis.iter().enumerate() {
-            b.emit(
-                Opcode::SCopy,
-                reg_new + *col_idx as i32,
-                new_key + j as i32,
-                0,
-            );
+        let mut plain_iter = indexed_cis.iter();
+        for (j, icol) in idx.columns.iter().enumerate() {
+            let target = new_key + j as i32;
+            if let Some(expr) = &icol.expr {
+                // Evaluate the expression against the NEW row registers.
+                let expr_ctx = Ctx {
+                    table,
+                    cursor,
+                    register_base: Some(reg_new),
+                };
+                compile_expr(&mut b, expr, target, expr_ctx)?;
+            } else {
+                let col_idx = *plain_iter.next().expect("plain column aligned with indexed_cis");
+                b.emit(
+                    Opcode::SCopy,
+                    reg_new + col_idx as i32,
+                    target,
+                    0,
+                );
+            }
         }
         b.emit(
             Opcode::SCopy,
             reg_old_rowid2,
-            new_key + indexed_cis.len() as i32,
+            new_key + idx.nkey_fields() as i32,
             0,
         );
         let new_key_rec = b.alloc_reg();
@@ -398,8 +415,66 @@ pub(crate) fn compile_pred_jump(
     compile_jump(b, pred, skip, false, true, ctx)
 }
 
+/// Collect the table column names referenced by an expression.
+fn referenced_columns(expr: &rustqlite_parser::Expr) -> Vec<String> {
+    use rustqlite_parser::Expr;
+    let mut out = Vec::new();
+    let mut stack = vec![expr];
+    while let Some(e) = stack.pop() {
+        match e {
+            Expr::Column { name, .. } => out.push(name.clone()),
+            Expr::Unary { expr, .. } => stack.push(expr),
+            Expr::Binary { left, right, .. } => {
+                stack.push(left);
+                stack.push(right);
+            }
+            Expr::Function { args, .. } => {
+                if let rustqlite_parser::FunctionArgs::List(v) = args {
+                    for a in v {
+                        stack.push(a);
+                    }
+                }
+            }
+            Expr::Cast { expr, .. } => stack.push(expr),
+            Expr::Collate { expr, .. } => stack.push(expr),
+            Expr::Case {
+                base,
+                when_then,
+                else_expr,
+            } => {
+                if let Some(b) = base {
+                    stack.push(b);
+                }
+                for (w, t) in when_then {
+                    stack.push(w);
+                    stack.push(t);
+                }
+                if let Some(e) = else_expr {
+                    stack.push(e);
+                }
+            }
+            Expr::Between { expr, low, high, .. } => {
+                stack.push(expr);
+                stack.push(low);
+                stack.push(high);
+            }
+            Expr::In { expr, values, .. } => {
+                stack.push(expr);
+                for v in values {
+                    stack.push(v);
+                }
+            }
+            Expr::IsDistinctFrom { left, right, .. } => {
+                stack.push(left);
+                stack.push(right);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Reject partial-index predicates that reference a column being updated. The current
-/// maintenance code evaluates the predicate against the NEW row values, which is correct
 /// for the old-key deletion only when the predicate does not involve an assigned column.
 fn validate_partial_pred_on_update(
     pred: &rustqlite_parser::Expr,

@@ -74,8 +74,13 @@ pub fn compile_expr(b: &mut ProgramBuilder, e: &Expr, target: i32, ctx: Ctx) -> 
         }
         Expr::Cast { .. } => return Err(Error::msg("CAST is not supported by the executor yet")),
         Expr::Case { .. } => return Err(Error::msg("CASE is not supported by the executor yet")),
-        Expr::Collate { .. } => {
-            return Err(Error::msg("COLLATE is not supported by the executor yet"))
+        Expr::Collate { expr, collation } => {
+            compile_expr(b, expr, target, ctx)?;
+            // The COLLATE operator only matters to the comparison that consumes it. For an
+            // index key we would need to thread the collation into the key-info; that is
+            // handled by the caller (index codegen) which reads the IndexedColumn's collation.
+            // Here we simply evaluate the underlying expression.
+            let _ = collation;
         }
         Expr::IsDistinctFrom { .. } => {
             return Err(Error::msg(

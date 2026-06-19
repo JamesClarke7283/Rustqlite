@@ -151,12 +151,10 @@ pub struct UpdateStmt {
     pub where_clause: Option<Expr>,
 }
 
-/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [schema.]name ON tbl(col [COLLATE name] [ASC|DESC] …)
+/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [schema.]name ON tbl(col_or_expr [COLLATE name] [ASC|DESC] …)
 /// [WHERE expr]`.
-/// Multi-column indexes are accepted from M5.2 onward; the `collation` and `desc` fields are
-/// recorded in the AST but the runtime still treats all indexes as ASC/BINARY in this slice
-/// (they are structural fields for the catalog/EXPLAIN, not behavioral ones yet).
-/// The optional `where_clause` is the partial-index predicate (M5.2.9).
+/// Multi-column and expression indexes are accepted from M5.2 onward; the `collation` and `desc`
+/// fields are recorded in the AST. The optional `where_clause` is the partial-index predicate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateIndex {
     pub unique: bool,
@@ -168,13 +166,17 @@ pub struct CreateIndex {
     pub where_clause: Option<Expr>,
 }
 
-/// One column entry in a `CREATE INDEX` column list.
+/// One entry in a `CREATE INDEX` column/expression list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexedColumn {
+    /// For a plain column index this is the column name and `expr` is `None`.
+    /// For an expression index this is an empty string and `expr` holds the parsed expression.
     pub name: String,
-    /// `COLLATE name` (recorded but unused in this slice — always `None` until collation support).
+    /// The expression indexed when this is an expression index (`None` for a plain column).
+    pub expr: Option<Expr>,
+    /// `COLLATE name` applied to this column/expression.
     pub collation: Option<String>,
-    /// `true` for `DESC`, `false` for `ASC` (default). Recorded but unused in this slice.
+    /// `true` for `DESC`, `false` for `ASC` (default).
     pub desc: bool,
 }
 

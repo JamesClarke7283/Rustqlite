@@ -239,17 +239,16 @@ assignment = { ident ~ "=" ~ expr }
 
 
 // ---- CREATE INDEX (M5.1 / M5.2) ----
-// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON tbl(col [COLLATE n] [ASC|DESC] [, …])`.
-// Multi-column indexes are parsed here; M5.2 extends the engine to consume them. The `COLLATE`
-// and `ASC`/`DESC` are recorded in the AST but the runtime treats them as ASC/BINARY until
-// later slices. No partial-index `WHERE` clause yet.
+// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON tbl(col_expr [, …]) [WHERE expr]` where
+// each `col_expr` is either a column name (with optional COLLATE / ASC|DESC) or an arbitrary
+// expression. M5.2.10 adds the expression form; earlier slices handled only bare columns.
 create_index_stmt = {
     K_CREATE ~ K_UNIQUE? ~ K_INDEX ~ if_not_exists?
     ~ qualified_name ~ K_ON ~ ident
     ~ "(" ~ indexed_column ~ ("," ~ indexed_column)* ~ ")"
     ~ where_item?
 }
-indexed_column = { ident ~ (K_COLLATE ~ ident)? ~ (K_ASC | K_DESC)? }
+indexed_column = { (expr ~ (K_COLLATE ~ ident)? ~ (K_ASC | K_DESC)?) | (ident ~ (K_COLLATE ~ ident)? ~ (K_ASC | K_DESC)?) }
 
 // ---- DROP INDEX (M5.1) ----
 // First slice: `DROP INDEX [IF EXISTS] [schema.]name`. A schema qualifier other than `main` is

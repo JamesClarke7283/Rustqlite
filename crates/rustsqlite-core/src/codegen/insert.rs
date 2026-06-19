@@ -58,11 +58,13 @@ pub fn compile_insert(ins: &InsertStmt, table: &Table, indexes: &[IndexObject]) 
         ins.columns.len()
     };
 
-    // Validate that every index's columns are present on the table. The prepare path is
-    // responsible for this (it built the IndexObject from the catalog), so any error here is a
-    // bug in the loader — we still surface a clear message rather than panic.
+    // Validate that every index's plain columns are present on the table. Expression-index
+    // keys are evaluated from the row values at runtime; they are not validated here.
     for idx in indexes {
         for ic in &idx.columns {
+            if ic.is_expression() {
+                continue;
+            }
             if table.column_index(&ic.name).is_none() {
                 return Err(Error::msg(format!(
                     "index {} references unknown column {} on table {}",
@@ -156,12 +158,12 @@ pub fn compile_insert(ins: &InsertStmt, table: &Table, indexes: &[IndexObject]) 
         b.emit(Opcode::MakeRecord, rec_start, ncol as i32, record);
         b.emit(Opcode::Insert, cursor, record, rowid_reg);
 
-        // Index maintenance: for each index, build the composite key record (indexed columns +
+        // Index maintenance: for each index, build the composite key record (indexed key fields +
         // trailing rowid), MakeRecord it, IdxInsert into the index cursor.
         for (i, idx) in indexes.iter().enumerate() {
             let ic = (index_cursor_base + i as i32) as i32;
             let indexed_cis = idx.table_column_indices(table)?;
-            let nkey = indexed_cis.len() as i32 + 1;
+            let nkey = idx.nkey_fields() as i32 + 1;
 
             // Partial-index predicate: only maintain this index when the new row satisfies it.
             // The predicate is evaluated against the table row registers (rec_start..rec_start+ncol).
@@ -177,18 +179,23 @@ pub fn compile_insert(ins: &InsertStmt, table: &Table, indexes: &[IndexObject]) 
             };
 
             let key_start = b.alloc_regs(nkey);
-            for (j, col_idx) in indexed_cis.iter().enumerate() {
-                b.emit(
-                    Opcode::SCopy,
-                    rec_start + *col_idx as i32,
-                    key_start + j as i32,
-                    0,
-                );
+            let mut plain_iter = indexed_cis.iter();
+            for (j, icol) in idx.columns.iter().enumerate() {
+                let target = key_start + j as i32;
+                if let Some(expr) = &icol.expr {
+                    // For expression indexes evaluate the expression using the row values as a
+                    // register base. The expression may reference rowid aliases and stored columns.
+                    let expr_ctx = Ctx { table, cursor, register_base: Some(rec_start) };
+                    compile_expr(&mut b, expr, target, expr_ctx)?;
+                } else {
+                    let col_idx = *plain_iter.next().expect("plain column aligned with indexed_cis");
+                    b.emit(Opcode::SCopy, rec_start + col_idx as i32, target, 0);
+                }
             }
             b.emit(
                 Opcode::SCopy,
                 rowid_reg,
-                key_start + indexed_cis.len() as i32,
+                key_start + idx.nkey_fields() as i32,
                 0,
             );
             let key_rec = b.alloc_reg();
