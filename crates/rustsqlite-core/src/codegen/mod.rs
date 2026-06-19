@@ -63,11 +63,22 @@ pub fn compile_create_index(
     index::compile_create_index(ci, table, sql_text, schema_cookie)
 }
 
-/// Compile an `INSERT ... VALUES` into a VDBE write program against the resolved `table`. The
+/// Compile an `INSERT` into a VDBE write program against the resolved `table`. The
 /// `indexes` slice is the list of `IndexObject`s attached to `table` (the prepare path
 /// resolves them from the catalog); the program emits per-row `IdxInsert` for each.
-pub fn compile_insert(ins: &InsertStmt, table: &Table, indexes: &[IndexObject]) -> Result<Program> {
-    insert::compile_insert(ins, table, indexes)
+///
+/// For `INSERT ... SELECT`, `source_table` is the catalog-resolved source table (or `None`
+/// for a constant / `VALUES` source); `source_indexes` are the indexes attached to that source
+/// table. These are required so the SELECT body can be compiled with column resolution and
+/// indexed lookups.
+pub fn compile_insert(
+    ins: &InsertStmt,
+    table: &Table,
+    indexes: &[IndexObject],
+    source_table: Option<&Table>,
+    source_indexes: &[IndexObject],
+) -> Result<Program> {
+    insert::compile_insert(ins, table, indexes, source_table, source_indexes)
 }
 
 /// Compile a `DELETE FROM <table> [WHERE <expr>]` into a VDBE write program against the

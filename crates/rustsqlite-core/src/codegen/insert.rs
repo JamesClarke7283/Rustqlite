@@ -15,8 +15,9 @@
 //! indexed column value followed by an `SCopy` of the rowid), then `MakeRecord`-ed. M5.2
 //! generalizes this to multi-column indexes.
 
-use rustqlite_parser::{Expr, InsertStmt};
+use rustqlite_parser::{Expr, InsertSource, InsertStmt, SelectStmt};
 
+use crate::codegen::select;
 use crate::codegen::update::compile_pred_jump;
 use crate::error::{Error, Result};
 use crate::schema::{IndexObject, Table};
@@ -27,12 +28,36 @@ use crate::vdbe::Opcode;
 use super::builder::ProgramBuilder;
 use super::expr::{compile_expr, Ctx};
 
-/// Compile an `INSERT INTO <table> VALUES (...)[, (...)]` statement. `indexes` is the list of
-/// indexes attached to `table` (the prepare path passes this from the catalog; an empty slice
-/// means "no indexes", matching the M3a behavior). Index maintenance is emitted per row per
-/// index.
-pub fn compile_insert(ins: &InsertStmt, table: &Table, indexes: &[IndexObject]) -> Result<Program> {
-    if ins.rows.is_empty() {
+/// Compile an `INSERT INTO <table>` statement. `indexes` is the list of indexes attached to
+/// `table` (the prepare path passes this from the catalog; an empty slice means "no indexes",
+/// matching the M3a behavior). Index maintenance is emitted per row per index.
+///
+/// For `INSERT ... SELECT`, `source_table` is the resolved source table (or `None` for a
+/// constant / `VALUES` source), and `source_indexes` are its indexes; these are passed to the
+/// SELECT compiler so column references resolve and indexed lookups work.
+pub fn compile_insert(
+    ins: &InsertStmt,
+    table: &Table,
+    indexes: &[IndexObject],
+    source_table: Option<&Table>,
+    source_indexes: &[IndexObject],
+) -> Result<Program> {
+    match &ins.source {
+        InsertSource::Values(rows) => compile_insert_values(ins, table, indexes, rows),
+        InsertSource::Select(sel) => {
+            compile_insert_select(ins, table, indexes, sel, source_table, source_indexes)
+        }
+    }
+}
+
+/// Compile `INSERT INTO ... VALUES (...)[, (...)]`.
+fn compile_insert_values(
+    ins: &InsertStmt,
+    table: &Table,
+    indexes: &[IndexObject],
+    rows: &[Vec<Expr>],
+) -> Result<Program> {
+    if rows.is_empty() {
         return Err(Error::msg("INSERT must supply at least one VALUES row"));
     }
 
@@ -58,21 +83,7 @@ pub fn compile_insert(ins: &InsertStmt, table: &Table, indexes: &[IndexObject]) 
         ins.columns.len()
     };
 
-    // Validate that every index's plain columns are present on the table. Expression-index
-    // keys are evaluated from the row values at runtime; they are not validated here.
-    for idx in indexes {
-        for ic in &idx.columns {
-            if ic.is_expression() {
-                continue;
-            }
-            if table.column_index(&ic.name).is_none() {
-                return Err(Error::msg(format!(
-                    "index {} references unknown column {} on table {}",
-                    idx.name, ic.name, table.name
-                )));
-            }
-        }
-    }
+    validate_indexes(table, indexes)?;
 
     let cursor = 0i32;
     let ctx = Ctx { table, cursor, register_base: None };
@@ -87,22 +98,9 @@ pub fn compile_insert(ins: &InsertStmt, table: &Table, indexes: &[IndexObject]) 
 
     // Reserve cursor numbers for the indexes (1, 2, …). The table cursor is 0. Each index
     // cursor carries the index's KeyInfo so inserts compare under the correct collation.
-    let index_cursor_base: i32 = 1;
-    for (i, idx) in indexes.iter().enumerate() {
-        let ic = (index_cursor_base + i as i32) as i32;
-        let open = b.emit(Opcode::OpenWrite, ic, idx.rootpage as i32, 0);
-        let key_info: Vec<crate::vdbe::KeyField> = idx
-            .columns
-            .iter()
-            .map(|ic| crate::vdbe::KeyField {
-                desc: ic.desc,
-                collation: ic.collation,
-            })
-            .collect();
-        b.set_p4(open, P4::KeyInfo(key_info));
-    }
+    let index_cursor_base: i32 = open_index_cursors(&mut b, indexes)?;
 
-    for row in &ins.rows {
+    for row in rows {
         if row.len() != expected {
             return Err(Error::msg(format!(
                 "table {} has {expected} columns but {} values were supplied",
@@ -158,66 +156,7 @@ pub fn compile_insert(ins: &InsertStmt, table: &Table, indexes: &[IndexObject]) 
         b.emit(Opcode::MakeRecord, rec_start, ncol as i32, record);
         b.emit(Opcode::Insert, cursor, record, rowid_reg);
 
-        // Index maintenance: for each index, build the composite key record (indexed key fields +
-        // trailing rowid), MakeRecord it, IdxInsert into the index cursor.
-        for (i, idx) in indexes.iter().enumerate() {
-            let ic = (index_cursor_base + i as i32) as i32;
-            let indexed_cis = idx.table_column_indices(table)?;
-            let nkey = idx.nkey_fields() as i32 + 1;
-
-            // Partial-index predicate: only maintain this index when the new row satisfies it.
-            // The predicate is evaluated against the table row registers (rec_start..rec_start+ncol).
-            let skip_label = if let Some(pred) = &idx.where_clause {
-                let skip = b.new_label();
-                let pred_ctx = Ctx { table, cursor, register_base: None };
-                compile_pred_jump(
-                    &mut b, pred, skip, table, rec_start, indexed_cis.as_slice(), pred_ctx,
-                )?;
-                Some(skip)
-            } else {
-                None
-            };
-
-            let key_start = b.alloc_regs(nkey);
-            let mut plain_iter = indexed_cis.iter();
-            for (j, icol) in idx.columns.iter().enumerate() {
-                let target = key_start + j as i32;
-                if let Some(expr) = &icol.expr {
-                    // For expression indexes evaluate the expression using the row values as a
-                    // register base. The expression may reference rowid aliases and stored columns.
-                    let expr_ctx = Ctx { table, cursor, register_base: Some(rec_start) };
-                    compile_expr(&mut b, expr, target, expr_ctx)?;
-                } else {
-                    let col_idx = *plain_iter.next().expect("plain column aligned with indexed_cis");
-                    b.emit(Opcode::SCopy, rec_start + col_idx as i32, target, 0);
-                }
-            }
-            b.emit(
-                Opcode::SCopy,
-                rowid_reg,
-                key_start + idx.nkey_fields() as i32,
-                0,
-            );
-            let key_rec = b.alloc_reg();
-            b.emit(Opcode::MakeRecord, key_start, nkey, key_rec);
-            let ins_idx = b.emit(Opcode::IdxInsert, ic, key_rec, 0);
-            let mut p5 = P5_NCHANGE;
-            if idx.unique {
-                p5 |= P5_UNIQUE;
-                if let Some(msg) = idx.unique_constraint_message(table) {
-                    b.set_p4(ins_idx, P4::Text(msg));
-                } else {
-                    b.set_p4(ins_idx, P4::Int(0));
-                }
-            } else {
-                b.set_p4(ins_idx, P4::Int(0)); // nMem = 0
-            }
-            b.set_p5(ins_idx, p5);
-
-            if let Some(skip) = skip_label {
-                b.resolve(skip);
-            }
-        }
+        emit_index_inserts(&mut b, indexes, table, rec_start, rowid_reg, index_cursor_base)?;
     }
 
     b.emit(Opcode::Halt, 0, 0, 0); // commits the write transaction
@@ -226,6 +165,337 @@ pub fn compile_insert(ins: &InsertStmt, table: &Table, indexes: &[IndexObject]) 
     b.emit(Opcode::Goto, 0, after_init, 0);
     Ok(b.finish())
 }
+
+/// Compile `INSERT INTO ... SELECT ...`.
+///
+/// The generated program uses a single ephemeral sorter (cursor 1) to stage the selected rows:
+/// the SELECT body is compiled as a subprogram that inserts its result rows into the sorter, then
+/// the main insert loop reads the sorter, applies column mapping / affinity, allocates rowids, and
+/// inserts into the target table (and its indexes). This matches upstream's `sqlite3Insert` shape
+/// for `ONEPASS_OFF` inserts from a query.
+fn compile_insert_select(
+    ins: &InsertStmt,
+    table: &Table,
+    indexes: &[IndexObject],
+    sel: &SelectStmt,
+    source_table: Option<&Table>,
+    source_indexes: &[IndexObject],
+) -> Result<Program> {
+    // Map each SELECT-result position to a table column index. With an explicit column list the
+    // selected columns fill those columns; otherwise they are positional over all columns.
+    let ncol = table.columns.len();
+    let value_for_col: Vec<Option<usize>> = if ins.columns.is_empty() {
+        (0..ncol).map(Some).collect()
+    } else {
+        let mut map = vec![None; ncol];
+        for (vi, name) in ins.columns.iter().enumerate() {
+            let ci = table.column_index(name).ok_or_else(|| {
+                Error::msg(format!("table {} has no column named {name}", table.name))
+            })?;
+            map[ci] = Some(vi);
+        }
+        map
+    };
+    let nselect_cols = if ins.columns.is_empty() {
+        ncol
+    } else {
+        ins.columns.len()
+    };
+
+    // Arity check can only be done for constant VALUES today; for SELECT we trust the runtime
+    // match and let MakeRecord/Column deal with short rows. Still, reject obviously wrong constant
+    // selects with `VALUES` here for early error reporting.
+    if !sel.values.is_empty() {
+        let first_row_cols = sel.values[0].len();
+        if first_row_cols != nselect_cols {
+            return Err(Error::msg(format!(
+                "table {} has {nselect_cols} columns but {} values were supplied",
+                table.name,
+                first_row_cols
+            )));
+        }
+    }
+
+    validate_indexes(table, indexes)?;
+
+    let cursor = 0i32;
+    let sorter = 1i32;
+    let mut b = ProgramBuilder::new();
+
+    let setup = b.new_label();
+    let after_init = b.new_label();
+    b.emit_jump(Opcode::Init, 0, setup, 0);
+    b.resolve(after_init);
+
+    b.emit(Opcode::Transaction, 0, 1, 0);
+    b.emit(Opcode::OpenWrite, cursor, table.rootpage as i32, 0);
+    let index_cursor_base: i32 = open_index_cursors(&mut b, indexes)?;
+
+    // Sorter layout: leading rowid-alias slot (when present) followed by the source columns in
+    // SELECT-result order, then the computed rowid slot. We use a stable KeyInfo so the sorter
+    // preserves insertion order when keys compare equal (all BINARY, all ASC).
+    let sorter_fields: Vec<crate::vdbe::KeyField> =
+        std::iter::repeat(crate::vdbe::KeyField::asc_binary())
+            .take(nselect_cols + 1)
+            .collect();
+    let so = b.emit(Opcode::SorterOpen, sorter, nselect_cols as i32 + 1, 0);
+    b.set_p4(so, P4::KeyInfo(sorter_fields));
+
+    // --- Run the SELECT and store each result row in the sorter. ---
+    // We need a separate VDBE program for the SELECT, but this milestone does not yet have
+    // InitCoroutine/EndCoroutine/Yield. Instead, inline the SELECT's scan loop by compiling the
+    // select body and then changing each ResultRow into a SorterInsert of the result registers.
+    //
+    // The select compiler emits ResultRow with the result registers in a contiguous block. We
+    // rewrite those ResultRow instructions into MakeRecord + SorterInsert so the selected rows
+    // accumulate in the sorter.
+    let (select_program, _names) = select::compile(sel, source_table, source_indexes)?;
+    let select_start = b.cur_addr();
+    // Append the select instructions wholesale, remapping ResultRow and Halt.
+    let select_offset = select_start;
+    for (idx, mut inst) in select_program.instructions.into_iter().enumerate() {
+        let _ = idx;
+        match inst.opcode {
+            Opcode::ResultRow => {
+                // The result registers start at inst.p1 and span inst.p2 columns. Build a sorter
+                // record [rowid-alias-placeholder, result...] and insert it. The placeholder is
+                // overwritten per row during the insert loop if the table has an INTEGER PRIMARY
+                // KEY column that is mapped.
+                let result_start = inst.p1;
+                let nres = inst.p2;
+                let block = b.alloc_regs(nselect_cols as i32 + 1);
+                // rowid placeholder
+                b.emit(Opcode::Null, 0, block, 0);
+                // copy result columns into the sorter record
+                for j in 0..nres {
+                    b.emit(Opcode::SCopy, result_start + j, block + 1 + j, 0);
+                }
+                // Pad missing trailing columns with NULL (e.g. SELECT with fewer columns than target).
+                for j in nres..nselect_cols as i32 {
+                    b.emit(Opcode::Null, 0, block + 1 + j, 0);
+                }
+                let rec = b.alloc_reg();
+                b.emit(Opcode::MakeRecord, block, nselect_cols as i32 + 1, rec);
+                b.emit(Opcode::SorterInsert, sorter, rec, 0);
+            }
+            Opcode::Halt => {
+                // The select's Halt becomes a Goto the insert loop. Preserve the instruction so
+                // the label resolver still has a target for any jumps inside the select.
+                let insert_loop = b.new_label();
+                b.emit_jump(Opcode::Goto, 0, insert_loop, 0);
+                b.resolve(insert_loop);
+                // We intentionally resolve the insert-loop label immediately after the Goto.
+                // This means any later jump to it will land at the next emitted instruction, which
+                // is the start of the insert loop. This is safe because the Goto itself is the
+                // fall-through exit from the inlined select.
+            }
+            _ => {
+                // Remap absolute jumps that target addresses inside this copied select program.
+                // The select compiler emits p2 targets as absolute instruction addresses. We need
+                // to offset them by select_offset, but only for forward/backward jumps inside the
+                // copied block. We do this by mutating the instruction before appending.
+                if is_absolute_jump(&inst) {
+                    inst.p2 += select_offset;
+                }
+                b.append(inst);
+            }
+        }
+    }
+
+    // --- Insert loop: read sorter rows and insert into the table. ---
+    let end_insert = b.new_label();
+    b.emit_jump(Opcode::SorterSort, sorter, end_insert, 0);
+    let insert_top_label = b.new_label();
+    let sort_next = b.new_label();
+    b.resolve(insert_top_label);
+    b.emit(Opcode::SorterData, sorter, 0, 0);
+
+    // Decode the sorter record into a contiguous register block so SCopy can read source columns.
+    // Sorter record layout: [placeholder, source-col-0, source-col-1, ...].
+    let source_start = b.alloc_regs(nselect_cols as i32 + 1);
+    for j in 0..=nselect_cols as i32 {
+        b.emit(Opcode::Column, sorter, j, source_start + j);
+    }
+
+    let rec_start = b.alloc_regs(ncol as i32);
+    let rowid_reg = b.alloc_reg();
+    let mut alias_supplied = false;
+
+    for (ci, col) in table.columns.iter().enumerate() {
+        let target = rec_start + ci as i32;
+        let is_alias = table.rowid_alias == Some(ci);
+        match value_for_col[ci] {
+            Some(vi) => {
+                let source_reg = source_start + 1 + vi as i32;
+                if is_alias {
+                    // INTEGER PRIMARY KEY: the selected value becomes the rowid; the stored column is NULL.
+                    // If the selected value is NULL, we will auto-assign below.
+                    b.emit(Opcode::SCopy, source_reg, rowid_reg, 0);
+                    apply_affinity(&mut b, rowid_reg, Affinity::Integer);
+                    b.emit(Opcode::Null, 0, target, 0);
+                    alias_supplied = true;
+                } else {
+                    b.emit(Opcode::SCopy, source_reg, target, 0);
+                    apply_affinity(&mut b, target, col.affinity);
+                }
+            }
+            None => {
+                b.emit(Opcode::Null, 0, target, 0);
+            }
+        }
+    }
+
+    if alias_supplied {
+        let have_rowid = b.new_label();
+        b.emit_jump(Opcode::NotNull, rowid_reg, have_rowid, 0);
+        b.emit(Opcode::NewRowid, cursor, rowid_reg, 0);
+        b.resolve(have_rowid);
+    } else {
+        b.emit(Opcode::NewRowid, cursor, rowid_reg, 0);
+    }
+
+    let record = b.alloc_reg();
+    b.emit(Opcode::MakeRecord, rec_start, ncol as i32, record);
+    b.emit(Opcode::Insert, cursor, record, rowid_reg);
+
+    emit_index_inserts(&mut b, indexes, table, rec_start, rowid_reg, index_cursor_base)?;
+
+    b.resolve(sort_next);
+    b.emit_jump(Opcode::SorterNext, sorter, insert_top_label, 0);
+    b.resolve(end_insert);
+
+    b.emit(Opcode::Halt, 0, 0, 0);
+
+    b.resolve(setup);
+    b.emit_jump(Opcode::Goto, 0, after_init, 0);
+    Ok(b.finish())
+}
+
+/// The register number where `SorterData` writes the decoded current record.
+fn sorter_data_reg() -> i32 {
+    // SorterData in this engine decodes the current record into the sorter cursor itself and
+    // `Column` reads from there. We use cursor 1 as the sorter; Column reads from it below via
+    // an explicit register base. The actual register is irrelevant because we use SCopy/Null into
+    // the target registers directly from the sorter cursor's decoded record? No — SCopy reads from
+    // registers. We therefore need the selected source columns in registers. We handle this by
+    // decoding the sorter record into a contiguous register block after SorterData: use Column
+    // from the sorter cursor into a fresh register block.
+    // NOTE: This helper is replaced by explicit decode below.
+    0
+}
+
+/// Append the index-insert maintenance sequence for one row. `rec_start` holds the table record
+/// registers; `rowid_reg` holds the rowid; `index_cursor_base` is the first index write cursor.
+fn emit_index_inserts(
+    b: &mut ProgramBuilder,
+    indexes: &[IndexObject],
+    table: &Table,
+    rec_start: i32,
+    rowid_reg: i32,
+    index_cursor_base: i32,
+) -> Result<()> {
+    for (i, idx) in indexes.iter().enumerate() {
+        let ic = index_cursor_base + i as i32;
+        let indexed_cis = idx.table_column_indices(table)?;
+        let nkey = idx.nkey_fields() as i32 + 1;
+
+        let skip_label = if let Some(pred) = &idx.where_clause {
+            let skip = b.new_label();
+            let pred_ctx = Ctx { table, cursor: 0, register_base: None };
+            compile_pred_jump(
+                b, pred, skip, table, rec_start, indexed_cis.as_slice(), pred_ctx,
+            )?;
+            Some(skip)
+        } else {
+            None
+        };
+
+        let key_start = b.alloc_regs(nkey);
+        let mut plain_iter = indexed_cis.iter();
+        for (j, icol) in idx.columns.iter().enumerate() {
+            let target = key_start + j as i32;
+            if let Some(expr) = &icol.expr {
+                let expr_ctx = Ctx {
+                    table,
+                    cursor: 0,
+                    register_base: Some(rec_start),
+                };
+                compile_expr(b, expr, target, expr_ctx)?;
+            } else {
+                let col_idx = *plain_iter.next().expect("plain column aligned with indexed_cis");
+                b.emit(Opcode::SCopy, rec_start + col_idx as i32, target, 0);
+            }
+        }
+        b.emit(Opcode::SCopy, rowid_reg, key_start + idx.nkey_fields() as i32, 0);
+        let key_rec = b.alloc_reg();
+        b.emit(Opcode::MakeRecord, key_start, nkey, key_rec);
+        let ins_idx = b.emit(Opcode::IdxInsert, ic, key_rec, 0);
+        let mut p5 = P5_NCHANGE;
+        if idx.unique {
+            p5 |= P5_UNIQUE;
+            if let Some(msg) = idx.unique_constraint_message(table) {
+                b.set_p4(ins_idx, P4::Text(msg));
+            } else {
+                b.set_p4(ins_idx, P4::Int(0));
+            }
+        } else {
+            b.set_p4(ins_idx, P4::Int(0));
+        }
+        b.set_p5(ins_idx, p5);
+
+        if let Some(skip) = skip_label {
+            b.resolve(skip);
+        }
+    }
+    Ok(())
+}
+
+/// Validate that every index's plain columns are present on the table.
+fn validate_indexes(table: &Table, indexes: &[IndexObject]) -> Result<()> {
+    for idx in indexes {
+        for ic in &idx.columns {
+            if ic.is_expression() {
+                continue;
+            }
+            if table.column_index(&ic.name).is_none() {
+                return Err(Error::msg(format!(
+                    "index {} references unknown column {} on table {}",
+                    idx.name, ic.name, table.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Open write cursors for all indexes starting at cursor 1. Returns the base cursor number.
+fn open_index_cursors(b: &mut ProgramBuilder, indexes: &[IndexObject]) -> Result<i32> {
+    let index_cursor_base: i32 = 1;
+    for (i, idx) in indexes.iter().enumerate() {
+        let ic = (index_cursor_base + i as i32) as i32;
+        let open = b.emit(Opcode::OpenWrite, ic, idx.rootpage as i32, 0);
+        let key_info: Vec<crate::vdbe::KeyField> = idx
+            .columns
+            .iter()
+            .map(|ic| crate::vdbe::KeyField {
+                desc: ic.desc,
+                collation: ic.collation,
+            })
+            .collect();
+        b.set_p4(open, P4::KeyInfo(key_info));
+    }
+    Ok(index_cursor_base)
+}
+
+/// Whether an instruction uses p2 as an absolute jump target.
+fn is_absolute_jump(inst: &crate::vdbe::program::Instruction) -> bool {
+    matches!(
+        inst.opcode,
+        Opcode::Goto | Opcode::Init | Opcode::If | Opcode::IfNot | Opcode::IfPos
+            | Opcode::DecrJumpZero
+    )
+}
+
 
 /// Compile the rowid value for an `INTEGER PRIMARY KEY` column into `rowid_reg`. A NULL value
 /// means "auto-assign" — `NewRowid` will pick max+1 — so we leave the register NULL and let the
@@ -295,7 +565,7 @@ mod tests {
     fn positional_insert_uses_newrowid() {
         let t = table_of("CREATE TABLE t(a, b)");
         let ins = insert_of("INSERT INTO t VALUES (1, 'x'), (2, 'y');");
-        let prog = compile_insert(&ins, &t, &[]).unwrap();
+        let prog = compile_insert(&ins, &t, &[], None, &[]).unwrap();
         let names: Vec<&str> = prog.instructions.iter().map(|i| i.opcode.name()).collect();
         assert!(names.contains(&"OpenWrite"));
         // Two rows → two NewRowid + two Insert (no rowid alias).
@@ -314,7 +584,7 @@ mod tests {
     fn rowid_alias_guards_newrowid_with_notnull() {
         let t = table_of("CREATE TABLE t(id INTEGER PRIMARY KEY, v)");
         let ins = insert_of("INSERT INTO t VALUES (5, 'x');");
-        let prog = compile_insert(&ins, &t, &[]).unwrap();
+        let prog = compile_insert(&ins, &t, &[], None, &[]).unwrap();
         let names: Vec<&str> = prog.instructions.iter().map(|i| i.opcode.name()).collect();
         // The alias value becomes the rowid; NewRowid is emitted but guarded by NotNull so it only
         // runs when the supplied value is NULL (auto-assign).
@@ -327,7 +597,7 @@ mod tests {
     fn explicit_column_list_maps_values() {
         let t = table_of("CREATE TABLE t(a, b, c)");
         let ins = insert_of("INSERT INTO t (b, a) VALUES (10, 20);");
-        let prog = compile_insert(&ins, &t, &[]).unwrap();
+        let prog = compile_insert(&ins, &t, &[], None, &[]).unwrap();
         // 3 record slots are allocated per row; the unlisted column c is NULL.
         let null_count = prog
             .instructions

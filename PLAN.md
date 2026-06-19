@@ -51,7 +51,7 @@ list every granular item needed.
 - [x] **2.18** CTEs: `WITH [RECURSIVE] name AS (…) SELECT …`
 - [x] **2.19** `SELECT … FROM (subquery) AS alias`
 - [x] **2.20** `VALUES (expr_list) [, …]` as a select body
-- [ ] **2.21** `INSERT … SELECT` (read-path INSERT from query)
+- [x] **2.21** `INSERT … SELECT` (read-path INSERT from query)
 - [ ] **2.22** `INSERT … DEFAULT VALUES`
 - [ ] **2.23** UPSERT: `ON CONFLICT [(cols)] DO UPDATE SET … / DO NOTHING`
 - [ ] **2.24** `RETURNING` clause (INSERT / UPDATE / DELETE)

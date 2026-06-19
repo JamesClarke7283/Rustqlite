@@ -37,6 +37,17 @@ pub struct Table {
     pub rowid_alias: Option<usize>,
 }
 
+impl Default for Table {
+    fn default() -> Self {
+        Table {
+            name: String::new(),
+            rootpage: 0,
+            columns: Vec::new(),
+            rowid_alias: None,
+        }
+    }
+}
+
 /// A resolved index: the table it indexes, the b-tree root page, the indexed columns, and
 /// whether `UNIQUE` was declared. From M5.2 onward multi-column indexes are accepted; the
 /// `unique` flag is recorded but uniqueness is not enforced yet (see the milestone doc-comment).

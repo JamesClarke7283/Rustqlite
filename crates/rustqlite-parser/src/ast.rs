@@ -268,7 +268,19 @@ pub struct InsertStmt {
     pub schema: Option<String>,
     pub table: String,
     pub columns: Vec<String>,
-    pub rows: Vec<Vec<Expr>>,
+    /// The source data for the insert. For `INSERT ... VALUES` this carries the literal rows;
+    /// for `INSERT ... SELECT` it carries the select body.
+    pub source: InsertSource,
+}
+
+/// Data source for an `INSERT` statement.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum InsertSource {
+    /// `VALUES (expr_list) [, ...]` — a list of literal/constant rows.
+    Values(Vec<Vec<Expr>>),
+    /// `SELECT ...` — a query whose result rows become the inserted rows.
+    Select(SelectStmt),
 }
 
 /// `DELETE FROM [schema.]tbl [WHERE expr]`. The first M4.6 slice omits `ORDER BY`, `LIMIT`,

@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use rustqlite_parser::{parse, DropIndexStmt, DropTableStmt, ExplainKind, SelectStmt, Stmt};
+use rustqlite_parser::{parse, DropIndexStmt, DropTableStmt, ExplainKind, InsertSource, SelectStmt, Stmt};
 
 use crate::codegen;
 use crate::error::{Error, Result, ResultCode};
@@ -106,10 +106,20 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             })
         }
         Stmt::Insert(ins) => {
-            // INSERT: resolve the target table from the catalog and compile a write program.
+            // INSERT: resolve the target table from the catalog, plus the source table for
+            // `INSERT ... SELECT` so the SELECT body compiles with real column resolution.
             let pager = db.pager_arc()?;
             let (table, indexes) = resolve_table_and_indexes(&pager, &ins.table)?;
-            let program = Arc::new(codegen::compile_insert(&ins, &table, &indexes)?);
+            let (source_table, source_indexes) =
+                resolve_insert_source(&pager, &ins.source)?.unwrap_or_default();
+            let source_table_ref = (!source_table.name.is_empty()).then_some(&source_table);
+            let program = Arc::new(codegen::compile_insert(
+                &ins,
+                &table,
+                &indexes,
+                source_table_ref,
+                &source_indexes,
+            )?);
             let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
@@ -243,6 +253,43 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             })
         }
     }
+}
+
+/// Resolve the source table and its indexes for an `INSERT ... SELECT`. Returns `None` for
+/// `VALUES` or constant SELECT sources (no real FROM table), otherwise the resolved table plus
+/// its attached indexes.
+fn resolve_insert_source(
+    pager: &Arc<Pager>,
+    source: &InsertSource,
+) -> Result<Option<(Table, Vec<IndexObject>)>> {
+    let select = match source {
+        InsertSource::Values(_) => return Ok(None),
+        InsertSource::Select(s) => s,
+    };
+    // A constant SELECT has no FROM clause.
+    let first = match select.from.first() {
+        Some(f) => f,
+        None => return Ok(None),
+    };
+    if select.from.len() > 1 {
+        return Err(Error::msg("joins are not supported"));
+    }
+    let table_ref = match first.table() {
+        Some(t) => t,
+        None => return Err(Error::msg("subqueries are not supported in INSERT ... SELECT")),
+    };
+    let catalog = block_on(read_catalog(pager))?;
+    let table_obj = catalog
+        .find_table(&table_ref.name)
+        .ok_or_else(|| Error::msg(format!("no such table: {}", table_ref.name)))?;
+    let table = Table::from_schema_object(table_obj)?;
+    let mut indexes = Vec::new();
+    for obj in catalog.indexes() {
+        if obj.tbl_name.eq_ignore_ascii_case(&table_ref.name) {
+            indexes.push(IndexObject::from_schema_object(obj)?);
+        }
+    }
+    Ok(Some((table, indexes)))
 }
 
 /// Resolve the table a `DELETE` targets from the current catalog, plus the list of indexes

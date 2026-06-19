@@ -640,7 +640,7 @@ fn build_insert(pair: Pair<'_, Rule>) -> InsertStmt {
         schema: None,
         table: String::new(),
         columns: Vec::new(),
-        rows: Vec::new(),
+        source: InsertSource::Values(Vec::new()),
     };
     for part in pair.into_inner() {
         match part.as_rule() {
@@ -657,17 +657,58 @@ fn build_insert(pair: Pair<'_, Rule>) -> InsertStmt {
                     .map(|p| p.as_str().to_string())
                     .collect();
             }
-            Rule::values_clause => {
-                stmt.rows = part
-                    .into_inner()
-                    .filter(|p| p.as_rule() == Rule::value_row)
-                    .map(|row| row.into_inner().map(expr::build_expr).collect())
-                    .collect();
+            Rule::insert_source => {
+                stmt.source = build_insert_source(part).unwrap_or_else(|e| {
+                    panic!("insert source parse error: {e}");
+                });
             }
             _ => {}
         }
     }
     stmt
+}
+
+fn build_insert_source(pair: Pair<'_, Rule>) -> Result<InsertSource, ParseError> {
+    // The grammar rule is `insert_source = { select_stmt | values_clause }`. Because `select_stmt`
+    // itself includes a `values_core` alternative, a VALUES source may parse as a `select_stmt`
+    // (specifically a select_core containing values). Distinguish them by inspecting the parsed
+    // children directly: if there is a `values_clause` child, use it; otherwise treat the whole
+    // thing as a SELECT.
+    for part in pair.clone().into_inner() {
+        match part.as_rule() {
+            Rule::values_clause => {
+                let rows = part
+                    .into_inner()
+                    .filter(|p| p.as_rule() == Rule::value_row)
+                    .map(|row| row.into_inner().map(expr::build_expr).collect())
+                    .collect();
+                return Ok(InsertSource::Values(rows));
+            }
+            Rule::select_stmt => {
+                let mut select = build_select(part)?;
+                // If the parsed "select" is actually just a VALUES core (because the grammar's
+                // select_stmt alternative swallowed the VALUES clause), normalise it back to a
+                // VALUES insert source. A real SELECT will have `from`, `where_clause`, etc.
+                if !select.values.is_empty()
+                    && select.columns.is_empty()
+                    && select.from.is_empty()
+                    && select.where_clause.is_none()
+                    && select.group_by.is_empty()
+                    && select.having.is_none()
+                    && select.compound.is_empty()
+                    && select.order_by.is_empty()
+                    && select.limit.is_none()
+                    && select.offset.is_none()
+                    && select.with_clause.is_none()
+                {
+                    return Ok(InsertSource::Values(std::mem::take(&mut select.values)));
+                }
+                return Ok(InsertSource::Select(select));
+            }
+            _ => {}
+        }
+    }
+    Err(ParseError::new("INSERT source must be VALUES or SELECT"))
 }
 
 fn build_insert_verb(pair: Pair<'_, Rule>) -> Option<ConflictAction> {
@@ -1028,13 +1069,26 @@ mod tests {
         };
         assert_eq!(ins.table, "t");
         assert_eq!(ins.columns, vec!["a", "b"]);
-        assert_eq!(ins.rows.len(), 2);
-        assert_eq!(ins.rows[0][0], Expr::Literal(Literal::Integer(1)));
+        let InsertSource::Values(rows) = &ins.source else { panic!("expected VALUES source") };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Expr::Literal(Literal::Integer(1)));
 
         let Stmt::Insert(ins) = &parse("INSERT OR IGNORE INTO t VALUES (1);").unwrap()[0] else {
             panic!()
         };
         assert_eq!(ins.or_action, Some(ConflictAction::Ignore));
+    }
+
+    #[test]
+    fn insert_select_parses() {
+        let Stmt::Insert(ins) =
+            &parse("INSERT INTO t (a) SELECT x FROM s WHERE x > 0;").unwrap()[0]
+        else {
+            panic!()
+        };
+        assert_eq!(ins.table, "t");
+        assert_eq!(ins.columns, vec!["a"]);
+        assert!(matches!(ins.source, InsertSource::Select(_)));
     }
 
     #[test]

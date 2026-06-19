@@ -85,6 +85,11 @@ impl ProgramBuilder {
         idx
     }
 
+    /// Append a pre-built instruction directly, bypassing label fixup machinery.
+    pub fn append(&mut self, inst: Instruction) {
+        self.insts.push(inst);
+    }
+
     /// Finalize into a [`Program`], backpatching every labeled jump.
     pub fn finish(mut self) -> Program {
         for (idx, label) in &self.fixups {

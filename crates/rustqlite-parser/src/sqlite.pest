@@ -289,11 +289,12 @@ signed_number = @{ ("+" | "-")? ~ (hex_int | float_or_int) }
 
 // ---- INSERT ----
 insert_stmt = {
-    insert_verb ~ K_INTO ~ qualified_name ~ column_list? ~ values_clause
+    insert_verb ~ K_INTO ~ qualified_name ~ column_list? ~ insert_source
 }
 insert_verb = { (K_INSERT ~ (K_OR ~ conflict_action)?) | K_REPLACE }
 conflict_action = { K_ROLLBACK | K_ABORT | K_FAIL | K_IGNORE | K_REPLACE }
 column_list = { "(" ~ ident ~ ("," ~ ident)* ~ ")" }
+insert_source = { select_stmt | values_clause }
 values_clause = { K_VALUES ~ value_row ~ ("," ~ value_row)* }
 value_row = { "(" ~ expr ~ ("," ~ expr)* ~ ")" }
 
