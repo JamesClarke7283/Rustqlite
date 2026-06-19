@@ -197,10 +197,12 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectStmt, ParseError> {
         limit: None,
         offset: None,
         with_clause: None,
+        values: Vec::new(),
     };
 
     for part in pair.into_inner() {
         match part.as_rule() {
+            Rule::values_core => stmt.values = build_values_core(part),
             Rule::K_DISTINCT => stmt.distinct = true,
             Rule::result_columns => stmt.columns = build_result_columns(part),
             Rule::from_item => stmt.from = build_from_item(part)?,
@@ -211,6 +213,13 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectStmt, ParseError> {
         }
     }
     Ok(stmt)
+}
+
+fn build_values_core(pair: Pair<'_, Rule>) -> Vec<Vec<Expr>> {
+    pair.into_inner()
+        .filter(|p| p.as_rule() == Rule::value_row)
+        .map(|row| row.into_inner().map(expr::build_expr).collect())
+        .collect()
 }
 
 fn build_compound_op(pair: Pair<'_, Rule>) -> CompoundOperator {
@@ -330,14 +339,35 @@ fn build_table_subquery(pair: Pair<'_, Rule>) -> Result<TableOrJoin, ParseError>
     for part in pair.into_inner() {
         match part.as_rule() {
             Rule::select_stmt => query = Some(build_select(part)?),
+            Rule::values_core => query = Some(build_values_select(part)),
             Rule::table_alias => alias = Some(build_as_alias(part)),
             _ => {}
         }
     }
     Ok(TableOrJoin::Subquery {
-        query: Box::new(query.expect("table_subquery has a select_stmt")),
+        query: Box::new(query.expect("table_subquery has a select_stmt or values_core")),
         alias: alias.expect("table_subquery has an alias"),
     })
+}
+
+/// Build a synthetic `SelectStmt` for a parenthesised `VALUES` used as a subquery in FROM.
+/// The values rows are stored in `values`; `columns` is left empty so the codegen emits the
+/// standard column1, column2, ... names.
+fn build_values_select(pair: Pair<'_, Rule>) -> SelectStmt {
+    SelectStmt {
+        distinct: false,
+        columns: Vec::new(),
+        from: Vec::new(),
+        where_clause: None,
+        group_by: Vec::new(),
+        having: None,
+        compound: Vec::new(),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        with_clause: None,
+        values: build_values_core(pair),
+    }
 }
 
 fn build_parenthesised_join(
@@ -1559,6 +1589,7 @@ mod tests {
         assert_eq!(alias, "sq");
         assert_eq!(query.columns.len(), 2);
         assert!(query.from.is_empty());
+        assert!(query.values.is_empty());
 
         // Parenthesised joins can be mixed with subqueries.
         let Stmt::Select(s) =
@@ -1576,6 +1607,17 @@ mod tests {
         };
         assert_eq!(inner.right.name, "t2");
         assert_eq!(inner.left.table().unwrap().name, "t1");
+
+        // VALUES as a parenthesised subquery in FROM.
+        let Stmt::Select(s) = &parse("SELECT * FROM (VALUES (1, 2)) AS sq;").unwrap()[0] else {
+            panic!("expected SELECT")
+        };
+        let TableOrJoin::Subquery { query, alias } = &s.from[0] else {
+            panic!("expected subquery in FROM")
+        };
+        assert_eq!(alias, "sq");
+        assert!(query.columns.is_empty());
+        assert_eq!(query.values.len(), 1);
     }
 
     #[test]
@@ -1584,6 +1626,41 @@ mod tests {
         // semantic analysis. For the parser slice we just verify they parse.
         assert!(parse("SELECT * FROM t1 NATURAL JOIN t2 ON t1.a = t2.a;").is_ok());
         assert!(parse("SELECT * FROM t1 NATURAL JOIN t2 USING(a);").is_ok());
+    }
+
+    #[test]
+    fn values_core_parses() {
+        let Stmt::Select(s) = &parse("VALUES (1, 'a'), (2, 'b');").unwrap()[0] else {
+            panic!("expected SELECT")
+        };
+        assert!(s.columns.is_empty());
+        assert!(s.from.is_empty());
+        assert!(s.values.len() == 2);
+        assert_eq!(s.values[0].len(), 2);
+        assert_eq!(s.values[1].len(), 2);
+
+        // VALUES can appear as the left side of a compound.
+        let Stmt::Select(s) =
+            &parse("VALUES (1, 2) UNION ALL SELECT 3, 4;").unwrap()[0] else {
+                panic!("expected SELECT")
+            };
+        assert!(!s.values.is_empty());
+        assert_eq!(s.compound.len(), 1);
+    }
+
+    #[test]
+    fn values_core_rejects_bad_shape() {
+        // Different arity across rows is a syntax error in SQLite (semantic check in upstream).
+        // Our grammar currently accepts it; codegen later checks for consistent arity. Keep the
+        // test as documentation of the oracle's behavior rather than asserting a parse failure.
+        let Stmt::Select(s) = &parse("VALUES (1, 2), (3);").unwrap()[0] else {
+            panic!("expected SELECT")
+        };
+        assert_eq!(s.values.len(), 2);
+        assert_eq!(s.values[0].len(), 2);
+        assert_eq!(s.values[1].len(), 1);
+        // Empty values row is invalid.
+        assert!(parse("VALUES ();").is_err());
     }
 
     #[test]

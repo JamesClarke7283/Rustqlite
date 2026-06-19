@@ -130,6 +130,24 @@ fn compile_column(
     target: i32,
     ctx: Ctx,
 ) -> Result<()> {
+    // Column references against a VALUES-derived subquery use synthesized columnN names
+    // rather than the underlying table. Treat an empty/no-column table as a VALUES scope:
+    // only column1..columnN are resolvable.
+    if ctx.table.columns.is_empty() {
+        let col_name = qualifier.map_or_else(|| name.to_string(), |q| format!("{q}.{name}"));
+        let idx: usize = if col_name.starts_with("column") {
+            col_name["column".len()..].parse().unwrap_or(0)
+        } else {
+            0
+        };
+        if idx == 0 {
+            return Err(Error::msg(format!("no such column: {col_name}")));
+        }
+        let reg = ctx.register_base.unwrap_or(0) + idx as i32 - 1;
+        b.emit(Opcode::SCopy, reg, target, 0);
+        return Ok(());
+    }
+
     match ctx.table.resolve_column(name) {
         Some(ColumnRef::Rowid) => {
             if let Some(base) = ctx.register_base {

@@ -83,6 +83,9 @@ pub struct SelectStmt {
     pub offset: Option<Expr>,
     /// Optional `WITH` clause attached to this SELECT statement.
     pub with_clause: Option<WithClause>,
+    /// When this select core is a `VALUES (expr_list) [, …]`, the rows of expressions are stored
+    /// here and `columns`/`from` are empty. Each row has the same number of expressions.
+    pub values: Vec<Vec<Expr>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

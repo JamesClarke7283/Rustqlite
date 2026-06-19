@@ -40,17 +40,21 @@ pub fn compile(
     let names: Vec<String> = outputs.iter().map(|(_, n)| n.clone()).collect();
     let (limit, offset) = eval_limit_offset(select)?;
 
-    let program = match table {
-        Some(t) => {
-            // M5.1: try an indexed-equality plan first; fall back to a scan if no index
-            // covers the WHERE.
-            if let Some(plan) = pick_index(select, t, indexes) {
-                compile_indexed_select(select, t, &plan, &outputs, limit, offset)?
-            } else {
-                compile_scan(select, t, &outputs, limit, offset)?
+    let program = if !select.values.is_empty() {
+        compile_values(select, &outputs, limit, offset)?
+    } else {
+        match table {
+            Some(t) => {
+                // M5.1: try an indexed-equality plan first; fall back to a scan if no index
+                // covers the WHERE.
+                if let Some(plan) = pick_index(select, t, indexes) {
+                    compile_indexed_select(select, t, &plan, &outputs, limit, offset)?
+                } else {
+                    compile_scan(select, t, &outputs, limit, offset)?
+                }
             }
+            None => compile_constant(select, &outputs, limit, offset)?,
         }
-        None => compile_constant(select, &outputs, limit, offset)?,
     };
     Ok((program, names))
 }
@@ -210,10 +214,135 @@ fn reject_unsupported(select: &SelectStmt) -> Result<()> {
     if !select.group_by.is_empty() || select.having.is_some() {
         return Err(Error::msg("GROUP BY / HAVING are not supported in M3a"));
     }
-    if select.from.iter().any(|t| t.table().is_none()) {
+    if select.from.iter().any(|t| t.table().is_none() && t.subquery().is_none()) {
         return Err(Error::msg("joins are not supported"));
     }
     Ok(())
+}
+
+/// A `VALUES` select body: emit one result row per literal/constant row. ORDER BY / LIMIT /
+/// OFFSET are supported by wrapping the values in a sorter exactly like a constant SELECT does.
+fn compile_values(
+    select: &SelectStmt,
+    outputs: &[(Expr, String)],
+    limit: Option<i64>,
+    offset: i64,
+) -> Result<Program> {
+    // Validate arity: every row must have the same number of columns as the expansion result set.
+    let ncol = outputs.len();
+    for row in &select.values {
+        if row.len() != ncol {
+            return Err(Error::msg(format!(
+                "all VALUES must have the same number of terms - {} vs {}",
+                row.len(),
+                ncol
+            )));
+        }
+    }
+
+    let empty = Table {
+        name: String::new(),
+        rootpage: 0,
+        columns: Vec::new(),
+        rowid_alias: None,
+    };
+    let ctx = Ctx {
+        table: &empty,
+        cursor: -1,
+        register_base: None,
+    };
+    let ncol_i32 = ncol as i32;
+    let mut b = ProgramBuilder::new();
+
+    let setup = b.new_label();
+    b.emit_jump(Opcode::Init, 0, setup, 0);
+    let after_init = b.cur_addr();
+
+    let no_rows = limit == Some(0) || offset > 0;
+    let limit_reg = match limit {
+        Some(n) if n > 0 => Some(emit_int(&mut b, n)),
+        _ => None,
+    };
+    let offset_reg = (offset > 0).then(|| emit_int(&mut b, offset));
+
+    if !no_rows {
+        let end = b.new_label();
+        if select.order_by.is_empty() {
+            for row in &select.values {
+                if let Some(w) = &select.where_clause {
+                    compile_jump(&mut b, w, end, false, true, ctx)?;
+                }
+                if let Some(oreg) = offset_reg {
+                    b.emit_jump(Opcode::IfPos, oreg, end, 1);
+                }
+                let result_reg = b.alloc_regs(ncol_i32);
+                for (j, expr) in row.iter().enumerate() {
+                    compile_expr(&mut b, expr, result_reg + j as i32, ctx)?;
+                }
+                b.emit(Opcode::ResultRow, result_reg, ncol_i32, 0);
+                if let Some(lreg) = limit_reg {
+                    b.emit_jump(Opcode::DecrJumpZero, lreg, end, 0);
+                }
+            }
+        } else {
+            let sorter = 0i32;
+            let keyinfo: Vec<KeyField> = select
+                .order_by
+                .iter()
+                .map(|t| KeyField {
+                    desc: t.desc,
+                    collation: crate::types::Collation::Binary,
+                })
+                .collect();
+            let nkey = select.order_by.len() as i32;
+            let so = b.emit(Opcode::SorterOpen, sorter, nkey + ncol_i32, 0);
+            b.set_p4(so, P4::KeyInfo(keyinfo));
+
+            for row in &select.values {
+                if let Some(w) = &select.where_clause {
+                    compile_jump(&mut b, w, end, false, true, ctx)?;
+                }
+                let block = b.alloc_regs(nkey + ncol_i32);
+                for (k, term) in select.order_by.iter().enumerate() {
+                    let key_expr = resolve_order_term(term, outputs)?;
+                    compile_expr(&mut b, &key_expr, block + k as i32, ctx)?;
+                }
+                for (j, expr) in row.iter().enumerate() {
+                    compile_expr(&mut b, expr, block + nkey + j as i32, ctx)?;
+                }
+                let rec = b.alloc_reg();
+                b.emit(Opcode::MakeRecord, block, nkey + ncol_i32, rec);
+                b.emit(Opcode::SorterInsert, sorter, rec, 0);
+            }
+
+            // Output loop: sorted iteration with OFFSET/LIMIT.
+            let end_out = b.new_label();
+            b.emit_jump(Opcode::SorterSort, sorter, end_out, 0);
+            let out_top = b.cur_addr();
+            let sort_next = b.new_label();
+            b.emit(Opcode::SorterData, sorter, 0, 0);
+            if let Some(oreg) = offset_reg {
+                b.emit_jump(Opcode::IfPos, oreg, sort_next, 1);
+            }
+            let result_reg = b.alloc_regs(ncol_i32);
+            for j in 0..ncol_i32 {
+                b.emit(Opcode::Column, sorter, nkey + j, result_reg + j);
+            }
+            b.emit(Opcode::ResultRow, result_reg, ncol_i32, 0);
+            if let Some(lreg) = limit_reg {
+                b.emit_jump(Opcode::DecrJumpZero, lreg, end_out, 0);
+            }
+            b.resolve(sort_next);
+            b.emit(Opcode::SorterNext, sorter, out_top, 0);
+            b.resolve(end_out);
+        }
+        b.resolve(end);
+    }
+
+    b.emit(Opcode::Halt, 0, 0, 0);
+    b.resolve(setup);
+    b.emit(Opcode::Goto, 0, after_init, 0);
+    Ok(b.finish())
 }
 
 /// A table scan, optionally ordered, with LIMIT/OFFSET.
@@ -428,6 +557,16 @@ fn compile_constant(
 
 /// Expand `*` / `table.*` and resolve aliases into `(expression, column-name)` pairs.
 fn expand_columns(select: &SelectStmt, table: Option<&Table>) -> Result<Vec<(Expr, String)>> {
+    if !select.values.is_empty() {
+        // VALUES rows provide unnamed output columns. Name them column1, column2, ... matching
+        // the oracle. The arity was already validated by the caller; use the first row's length.
+        let mut out = Vec::new();
+        let ncols = select.values[0].len();
+        for i in 0..ncols {
+            out.push((select.values[0][i].clone(), format!("column{}", i + 1)));
+        }
+        return Ok(out);
+    }
     let mut out = Vec::new();
     for rc in &select.columns {
         match rc {

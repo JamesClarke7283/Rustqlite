@@ -432,13 +432,19 @@ struct CompiledSelect {
 }
 
 /// Resolve the single FROM table (if any) from the catalog and compile the SELECT. Shared by the
+/// Resolve the single FROM table (if any) from the catalog and compile the SELECT. Shared by the
 /// normal SELECT path and the EXPLAIN path.
 fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelect> {
-    let (table, pager, indexes) = if let Some(table_or_join) = select.from.first() {
+    let (table, pager, indexes) = if !select.values.is_empty() {
+        // VALUES select bodies never have a real FROM table; run them without a pager/database.
+        (None, None, Vec::new())
+    } else if let Some(table_or_join) = select.from.first() {
         if select.from.len() > 1 {
             return Err(Error::msg("joins are not supported"));
         }
         let Some(table_ref) = table_or_join.table() else {
+            // Subqueries in FROM (including parenthesised VALUES) are not yet executable;
+            // reject with the same message as joins until M8 materializes them.
             return Err(Error::msg("joins are not supported"));
         };
         // The implicit `sqlite_schema` / `sqlite_master` table lives at page 1 and is not

@@ -148,9 +148,19 @@ fn synopsis(inst: &Instruction) -> String {
 /// followed by `USE TEMP B-TREE FOR ORDER BY` as a sibling, not nested). `notused` is always 0.
 pub fn query_plan_rows(select: &SelectStmt, table_name: Option<&str>) -> Vec<Vec<Value>> {
     let mut details: Vec<String> = Vec::new();
-    match table_name {
-        Some(name) => details.push(format!("SCAN {name}")),
-        None => details.push("SCAN CONSTANT ROW".to_string()),
+    if !select.values.is_empty() {
+        // Upstream says "SCAN n-ROW VALUES CLAUSE" for multi-row VALUES, otherwise
+        // "SCAN CONSTANT ROW". We match that wording exactly.
+        if select.values.len() == 1 {
+            details.push("SCAN CONSTANT ROW".to_string());
+        } else {
+            details.push(format!("SCAN {}-ROW VALUES CLAUSE", select.values.len()));
+        }
+    } else {
+        match table_name {
+            Some(name) => details.push(format!("SCAN {name}")),
+            None => details.push("SCAN CONSTANT ROW".to_string()),
+        }
     }
     if !select.order_by.is_empty() {
         // Our engine always materializes ORDER BY through the in-memory sorter, so this row is
