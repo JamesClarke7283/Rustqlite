@@ -212,10 +212,20 @@ implicit_alias = { !join_modifier ~ alias }
 
 from_item = { K_FROM ~ from_clause }
 from_clause = { table_ref_with_joins ~ ("," ~ table_ref_with_joins)* }
-// `table_ref_with_joins` is a plain table reference optionally followed by one or more explicit
-// joins; the grammar is right-recursive (no left recursion) and the builder re-associates to
-// a left-deep tree matching upstream's SrcList.
-table_ref_with_joins = { table_ref ~ join_suffix* }
+// `table_ref_with_joins` is a plain table reference, a subquery with alias, or a parenthesised
+// join optionally followed by one or more explicit joins; the grammar is right-recursive (no
+// left recursion) and the builder re-associates to a left-deep tree matching upstream's SrcList.
+table_ref_with_joins = { (table_ref | table_subquery | parenthesised_join) ~ join_suffix* }
+
+// `SELECT … FROM (subquery) AS alias` — a parenthesised SELECT with a mandatory alias.
+// The alias must be explicit or implicit; upstream allows `AS` but also accepts a bare
+// identifier here. The rule requires the alias so the subquery has a name for column
+// resolution.
+table_subquery = { "(" ~ select_stmt ~ ")" ~ table_alias }
+
+// Parenthesised join group, e.g. `FROM (t1 JOIN t2 ON ...)`. It is treated as a single
+// `table_ref_with_joins` element and re-associated by the builder.
+parenthesised_join = { "(" ~ from_clause ~ ")" }
 
 // Upstream's lexer accepts up to three join modifier tokens in any order before `JOIN`,
 // then `sqlite3JoinType` validates the combination. We mirror that by accepting all six

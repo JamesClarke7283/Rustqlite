@@ -121,7 +121,15 @@ impl TableOrJoin {
     pub fn table(&self) -> Option<&TableRef> {
         match self {
             TableOrJoin::Table(t) => Some(t),
-            TableOrJoin::Join(_) => None,
+            TableOrJoin::Subquery { .. } | TableOrJoin::Join(_) => None,
+        }
+    }
+
+    /// If this node is a subquery, return it; otherwise `None`.
+    pub fn subquery(&self) -> Option<(&SelectStmt, &str)> {
+        match self {
+            TableOrJoin::Subquery { query, alias } => Some((query, alias)),
+            _ => None,
         }
     }
 }
@@ -195,10 +203,15 @@ pub enum JoinConstraint {
     Using(Vec<String>),
 }
 
-/// A node in the `FROM` clause: either a plain table reference or a (possibly nested) join.
+/// A node in the `FROM` clause: either a plain table reference, a subquery (with required
+/// alias), or a (possibly nested) join.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableOrJoin {
     Table(TableRef),
+    Subquery {
+        query: Box<SelectStmt>,
+        alias: String,
+    },
     Join(Join),
 }
 

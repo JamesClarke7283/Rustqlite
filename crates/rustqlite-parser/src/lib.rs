@@ -296,9 +296,9 @@ fn build_table_ref_with_joins(pair: Pair<'_, Rule>) -> Result<TableOrJoin, Parse
     let mut items: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
     assert!(
         !items.is_empty(),
-        "table_ref_with_joins has a leading table_ref"
+        "table_ref_with_joins has a leading table_ref, subquery, or parenthesised join"
     );
-    let mut acc = TableOrJoin::Table(build_table_ref(items.remove(0)));
+    let mut acc = build_table_or_join_source(items.remove(0))?;
     for suffix in items {
         let (op, right, constraint) = build_join_suffix(suffix)?;
         acc = TableOrJoin::Join(Join {
@@ -310,6 +310,69 @@ fn build_table_ref_with_joins(pair: Pair<'_, Rule>) -> Result<TableOrJoin, Parse
     }
     Ok(acc)
 }
+
+/// Build the leading element of a `table_ref_with_joins`: a plain table reference, a subquery
+/// with alias, or a parenthesised join.
+fn build_table_or_join_source(
+    pair: Pair<'_, Rule>,
+) -> Result<TableOrJoin, ParseError> {
+    match pair.as_rule() {
+        Rule::table_ref => Ok(TableOrJoin::Table(build_table_ref(pair))),
+        Rule::table_subquery => Ok(build_table_subquery(pair)?),
+        Rule::parenthesised_join => build_parenthesised_join(pair),
+        other => unreachable!("unexpected table_ref_with_joins leading child {other:?}"),
+    }
+}
+
+fn build_table_subquery(pair: Pair<'_, Rule>) -> Result<TableOrJoin, ParseError> {
+    let mut query: Option<SelectStmt> = None;
+    let mut alias: Option<String> = None;
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::select_stmt => query = Some(build_select(part)?),
+            Rule::table_alias => alias = Some(build_as_alias(part)),
+            _ => {}
+        }
+    }
+    Ok(TableOrJoin::Subquery {
+        query: Box::new(query.expect("table_subquery has a select_stmt")),
+        alias: alias.expect("table_subquery has an alias"),
+    })
+}
+
+fn build_parenthesised_join(
+    pair: Pair<'_, Rule>,
+) -> Result<TableOrJoin, ParseError> {
+    let from_clause = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::from_clause)
+        .expect("parenthesised_join has a from_clause");
+    let mut refs: Vec<TableOrJoin> = from_clause
+        .into_inner()
+        .filter(|p| p.as_rule() == Rule::table_ref_with_joins)
+        .map(build_table_ref_with_joins)
+        .collect::<Result<_, _>>()?;
+    if refs.len() == 1 {
+        Ok(refs.pop().unwrap())
+    } else {
+        // Comma-separated list inside parentheses: model as a left-deep chain of implicit
+        // Inner joins with no constraint, matching the outer from_clause treatment.
+        let mut acc = refs.remove(0);
+        for right in refs {
+            let right_table = right.table().ok_or_else(|| {
+                ParseError::new("expected plain table reference in parenthesised join list".to_string())
+            })?;
+            acc = TableOrJoin::Join(Join {
+                op: JoinOp::Inner,
+                left: Box::new(acc),
+                right: right_table.clone(),
+                constraint: None,
+            });
+        }
+        Ok(acc)
+    }
+}
+
 fn build_join_suffix(
     pair: Pair<'_, Rule>,
 ) -> Result<(JoinOp, TableRef, Option<JoinConstraint>), ParseError> {
@@ -1482,6 +1545,37 @@ mod tests {
         assert!(parse("SELECT * FROM t1 INNER OUTER JOIN t2;").is_err());
         assert!(parse("SELECT * FROM t1 OUTER JOIN t2;").is_err());
         assert!(parse("SELECT * FROM t1 LEFT BOGUS JOIN t2;").is_err());
+    }
+
+    #[test]
+    fn subquery_in_from_clause_parses() {
+        let Stmt::Select(s) = &parse("SELECT * FROM (SELECT 1 AS x, 2 AS y) AS sq;").unwrap()[0]
+        else {
+            panic!("expected SELECT")
+        };
+        let TableOrJoin::Subquery { query, alias } = &s.from[0] else {
+            panic!("expected subquery in FROM")
+        };
+        assert_eq!(alias, "sq");
+        assert_eq!(query.columns.len(), 2);
+        assert!(query.from.is_empty());
+
+        // Parenthesised joins can be mixed with subqueries.
+        let Stmt::Select(s) =
+            &parse("SELECT * FROM (t1 JOIN t2 ON t1.a = t2.b) JOIN t3 ON t2.c = t3.c;")
+                .unwrap()[0]
+        else {
+            panic!("expected SELECT")
+        };
+        let TableOrJoin::Join(outer) = &s.from[0] else {
+            panic!("expected join")
+        };
+        assert_eq!(outer.right.name, "t3");
+        let TableOrJoin::Join(inner) = outer.left.as_ref() else {
+            panic!("expected nested join")
+        };
+        assert_eq!(inner.right.name, "t2");
+        assert_eq!(inner.left.table().unwrap().name, "t1");
     }
 
     #[test]
