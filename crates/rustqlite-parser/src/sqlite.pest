@@ -119,6 +119,9 @@ K_DROP          = @{ ^"drop"          ~ !ident_cont }
 K_UPDATE        = @{ ^"update"        ~ !ident_cont }
 K_SET           = @{ ^"set"           ~ !ident_cont }
 K_INDEX         = @{ ^"index"         ~ !ident_cont }
+K_WITH          = @{ ^"with"          ~ !ident_cont }
+K_RECURSIVE     = @{ ^"recursive"     ~ !ident_cont }
+K_MATERIALIZED  = @{ ^"materialized"  ~ !ident_cont }
 
 // JOIN keywords are matched in context.  `JOIN`, `ON`, and `USING` are fully reserved and
 // added to the global `keyword` rule (e.g. `CREATE TABLE join` must be quoted).  The join
@@ -154,7 +157,7 @@ keyword = @{
     | K_ON | K_CONFLICT | K_ABORT | K_FAIL | K_IGNORE | K_ROLLBACK
     | K_EXPLAIN | K_DELETE | K_DROP | K_UPDATE | K_SET | K_INDEX
     | K_UNION | K_INTERSECT | K_EXCEPT
-    | K_JOIN | K_USING
+    | K_JOIN | K_USING | K_WITH | K_RECURSIVE
 }
 
 // ---- Top level: a list of statements separated/terminated by ';' ----
@@ -172,7 +175,8 @@ qualified_name = { ident ~ ("." ~ ident)? }
 // ---- SELECT ----
 // A compound SELECT: one or more cores joined by UNION/UNION ALL/INTERSECT/EXCEPT, with a
 // single trailing ORDER BY / LIMIT that binds to the whole compound (not the last arm).
-select_stmt = { select_core ~ (compound_op ~ select_core)* ~ order_item? ~ limit_item? }
+// A leading WITH / WITH RECURSIVE clause attaches to the whole statement.
+select_stmt = { with_clause? ~ select_core ~ (compound_op ~ select_core)* ~ order_item? ~ limit_item? }
 select_core = {
     K_SELECT ~ (K_DISTINCT | K_ALL)? ~ result_columns
     ~ from_item?
@@ -181,6 +185,11 @@ select_core = {
     ~ having_item?
 }
 // `union_all` is tried before `union` so `UNION ALL` is not parsed as `UNION` + a stray core.
+with_clause = { with_prefix ~ cte_list }
+with_prefix = { K_WITH ~ K_RECURSIVE? }
+cte_list = { cte ~ ("," ~ cte)* }
+cte = { ident ~ column_list? ~ K_AS ~ (K_MATERIALIZED | (K_NOT ~ K_MATERIALIZED?))? ~ "(" ~ select_stmt ~ ")" }
+
 compound_op = { union_all | union | intersect | except }
 union_all = { K_UNION ~ K_ALL }
 union = { K_UNION }

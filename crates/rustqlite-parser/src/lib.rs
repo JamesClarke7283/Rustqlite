@@ -93,12 +93,17 @@ fn explain_kind(prefix: &Pair<'_, Rule>) -> ExplainKind {
 }
 
 fn build_select(pair: Pair<'_, Rule>) -> Result<SelectStmt, ParseError> {
-    // select_stmt = select_core ~ (compound_op ~ select_core)* ~ order_item? ~ limit_item?
+    // select_stmt = with_clause? ~ select_core ~ (compound_op ~ select_core)*
+    //               ~ order_item? ~ limit_item?
     let mut stmt: Option<SelectStmt> = None;
     let mut pending_op: Option<CompoundOperator> = None;
+    let mut with_clause: Option<WithClause> = None;
 
     for part in pair.into_inner() {
         match part.as_rule() {
+            Rule::with_clause => {
+                with_clause = Some(build_with_clause(part)?);
+            }
             Rule::select_core => {
                 let core = build_select_core(part)?;
                 match stmt {
@@ -122,7 +127,61 @@ fn build_select(pair: Pair<'_, Rule>) -> Result<SelectStmt, ParseError> {
             _ => {}
         }
     }
-    stmt.ok_or_else(|| ParseError::new("select_stmt has at least one select_core"))
+    let mut stmt = stmt.ok_or_else(|| ParseError::new("select_stmt has at least one select_core"))?;
+    stmt.with_clause = with_clause;
+    Ok(stmt)
+}
+
+fn build_with_clause(pair: Pair<'_, Rule>) -> Result<WithClause, ParseError> {
+    let mut recursive = false;
+    let mut ctes = Vec::new();
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::with_prefix => {
+                for kw in part.into_inner() {
+                    if kw.as_rule() == Rule::K_RECURSIVE {
+                        recursive = true;
+                    }
+                }
+            }
+            Rule::cte_list => {
+                ctes = part.into_inner().map(build_cte).collect::<Result<_, _>>()?;
+            }
+            _ => {}
+        }
+    }
+    Ok(WithClause { recursive, ctes })
+}
+
+fn build_cte(pair: Pair<'_, Rule>) -> Result<Cte, ParseError> {
+    let mut name = String::new();
+    let mut columns = Vec::new();
+    let mut query: Option<SelectStmt> = None;
+    let mut materialized: Option<bool> = None;
+    let mut after_as = false;
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::ident if name.is_empty() => name = part.as_str().to_string(),
+            Rule::column_list => {
+                columns = part
+                    .into_inner()
+                    .filter(|p| p.as_rule() == Rule::ident)
+                    .map(|p| p.as_str().to_string())
+                    .collect();
+            }
+            Rule::K_AS => after_as = true,
+            Rule::K_MATERIALIZED if after_as => materialized = Some(true),
+            Rule::K_NOT if after_as && materialized.is_none() => materialized = Some(false),
+            Rule::select_stmt => query = Some(build_select(part)?),
+            _ => {}
+        }
+    }
+    Ok(Cte {
+        name,
+        columns,
+        query: query.expect("cte has a select_stmt"),
+        materialized,
+    })
 }
 
 fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectStmt, ParseError> {
@@ -137,6 +196,7 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectStmt, ParseError> {
         order_by: Vec::new(),
         limit: None,
         offset: None,
+        with_clause: None,
     };
 
     for part in pair.into_inner() {
@@ -1430,6 +1490,36 @@ mod tests {
         // semantic analysis. For the parser slice we just verify they parse.
         assert!(parse("SELECT * FROM t1 NATURAL JOIN t2 ON t1.a = t2.a;").is_ok());
         assert!(parse("SELECT * FROM t1 NATURAL JOIN t2 USING(a);").is_ok());
+    }
+
+    #[test]
+    fn cte_with_recursive_parses() {
+        let Stmt::Select(s) = &parse(
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) SELECT * FROM t;",
+        )
+        .unwrap()[0]
+        else {
+            panic!("expected SELECT")
+        };
+        let wc = s.with_clause.as_ref().expect("WITH clause present");
+        assert!(wc.recursive);
+        assert_eq!(wc.ctes.len(), 1);
+        assert_eq!(wc.ctes[0].name, "t");
+        assert_eq!(wc.ctes[0].columns, vec!["n".to_string()]);
+        assert_eq!(wc.ctes[0].query.compound.len(), 1);
+
+        let Stmt::Select(s) = &parse(
+            "WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a, b;",
+        )
+        .unwrap()[0]
+        else {
+            panic!("expected SELECT")
+        };
+        let wc = s.with_clause.as_ref().expect("WITH clause present");
+        assert!(!wc.recursive);
+        assert_eq!(wc.ctes.len(), 2);
+        assert_eq!(wc.ctes[0].name, "a");
+        assert_eq!(wc.ctes[1].name, "b");
     }
 
     #[test]

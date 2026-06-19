@@ -46,6 +46,23 @@ pub enum CompoundOperator {
     Except,
 }
 
+/// A single common table expression.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cte {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub query: SelectStmt,
+    /// `AS MATERIALIZED` / `AS NOT MATERIALIZED` hint. None means no hint.
+    pub materialized: Option<bool>,
+}
+
+/// A `WITH [RECURSIVE] …` clause: a list of CTEs and a recursion flag.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithClause {
+    pub recursive: bool,
+    pub ctes: Vec<Cte>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
     pub distinct: bool,
@@ -64,6 +81,8 @@ pub struct SelectStmt {
     pub order_by: Vec<OrderingTerm>,
     pub limit: Option<Expr>,
     pub offset: Option<Expr>,
+    /// Optional `WITH` clause attached to this SELECT statement.
+    pub with_clause: Option<WithClause>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
