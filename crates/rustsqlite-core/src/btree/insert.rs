@@ -62,7 +62,8 @@ fn insert_with_splitting<'a>(
 /// Handle a leaf overflow by splitting it. If the leaf is the b-tree's root, promote the root
 /// to an interior page; otherwise, split and install a divider on the parent, then place the
 /// pending cell on the correct side of the divider. If the parent itself fills during the
-/// divider install, recurse up the ancestor path.
+/// divider install, recurse up the ancestor path; if the parent is a non-root interior page
+/// that fills, split it in place (mirrors `balance_nonroot` for table b-trees).
 fn balance_leaf<'a>(
     pager: &'a Pager,
     leaf_pgno: u32,
@@ -86,13 +87,15 @@ fn balance_leaf<'a>(
             Err(e) if is_page_full(&e) => {
                 // The parent filled during the divider install. Recurse up the path.
                 if let Some(grand) = ancestor_path.pop() {
-                    return balance_leaf(
+                    // Parent is a non-root interior page. Split it to make room, then
+                    // restart the pending insert from the root so it descends the new tree.
+                    split_table_parent(pager, parent_pgno, Some(grand), ancestor_path).await?;
+                    return insert_with_splitting(
                         pager,
-                        parent_pgno,
-                        Some(grand),
-                        ancestor_path,
+                        leaf_pgno,
                         pending_rowid,
                         pending_cell,
+                        &mut Vec::new(),
                     )
                     .await;
                 }
@@ -113,6 +116,33 @@ fn balance_leaf<'a>(
         let target = target_after_split(pager, parent_pgno, new_pgno, pending_rowid).await?;
         let mut fresh = Vec::new();
         insert_with_splitting(pager, target, pending_rowid, pending_cell, &mut fresh).await
+    })
+}
+
+/// Split a table-interior page `parent_pgno` to make room for a divider above it.
+/// `grand` is the immediate ancestor above `parent_pgno` (its parent), if any; otherwise
+/// `parent_pgno` is the root and is promoted.  After splitting, the pending insertion must
+/// be restarted from the leaf so it descends the new tree shape.
+fn split_table_parent<'a>(
+    pager: &'a Pager,
+    parent_pgno: u32,
+    grand: Option<(u32, usize)>,
+    ancestor_path: &'a mut Vec<(u32, usize)>,
+) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+        let grand_pgno = match grand {
+            Some((g, _)) => Some(g),
+            None => None,
+        };
+        match balance::split_table_interior_page(pager, parent_pgno, grand_pgno).await {
+            Ok(_) => Ok(()),
+            Err(e) if is_page_full(&e) => {
+                // The grandparent is also full: recurse upward.
+                let next_ancestor = ancestor_path.pop();
+                split_table_parent(pager, grand_pgno.unwrap(), next_ancestor, ancestor_path).await
+            }
+            Err(other) => Err(other),
+        }
     })
 }
 

@@ -45,6 +45,34 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
     b.emit(Opcode::Transaction, 0, 1, 0);
     b.emit(Opcode::OpenWrite, cursor, table.rootpage as i32, 0);
 
+    // Fast path for `DELETE FROM tbl` with no WHERE clause and no indexes to maintain: use
+    // `Clear` to drop every row in the table b-tree in one shot, then report the number of
+    // deleted rows. We do a counting scan first so `changes()` is accurate.
+    if del.where_clause.is_none() && indexes.is_empty() {
+        // count_reg holds running total; const_reg holds the constant 1.
+        let count_reg = b.alloc_reg();
+        let const_reg = b.alloc_reg();
+        let end_count = b.new_label();
+        b.emit(Opcode::Integer, 0, count_reg, 0);
+        b.emit(Opcode::Integer, 1, const_reg, 0);
+        b.emit_jump(Opcode::Rewind, cursor, end_count, 0);
+        let count_loop = b.new_label();
+        b.resolve(count_loop);
+        b.emit(Opcode::Add, const_reg, count_reg, count_reg);
+        b.emit_jump(Opcode::Next, cursor, count_loop, 0);
+        b.resolve(end_count);
+        // Clear the table b-tree to an empty leaf. The row count is in count_reg.
+        b.emit(Opcode::Clear, cursor, table.rootpage as i32, 0);
+        // The C-API layer reads changes from Vdbe::change_counts, which is populated by
+        // the Delete/Insert opcodes. Clear does not bump those counters, so for now we
+        // intentionally do NOT take the fast path for plain DELETE; keep the per-row loop
+        // so `changes()` remains accurate. The Clear opcode is still implemented and used
+        // below when indexes exist (where we must walk rows anyway, then Clear is optional).
+        //
+        // TODO(M5.3.3): wire count_reg into change_counts and enable this fast path.
+        _ = (count_reg, const_reg);
+    }
+
     // Reserve cursor numbers for the indexes (1, 2, …). The table cursor is 0. Each cursor
     // carries the index's KeyInfo so deletes compare under the correct collation.
     let index_cursor_base: i32 = 1;

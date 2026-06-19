@@ -897,6 +897,166 @@ pub struct RebalanceOutcome {
     pub cell_idx_offset: usize,
 }
 
+/// Split a **full table-interior** page into two halves. The divider is the
+/// rightmost rowid on the left side (a copy of an existing row, as table b-trees
+/// use `leafData==1`). This mirrors the table-side leaf split for interior pages
+/// and lets table b-trees grow past two levels.
+///
+/// Returns the page number of the newly allocated right sibling.
+pub async fn split_table_interior_page(
+    pager: &Pager,
+    interior_pgno: u32,
+    parent_root: Option<u32>,
+) -> Result<u32> {
+    let usable = pager.usable_size();
+    let base = pager.btree_header_offset(interior_pgno);
+    let buf = pager.read_page_for_write(interior_pgno).await?;
+    let hdr = PageHeader::parse(&buf, base)?;
+    if hdr.page_type != PageType::InteriorTable {
+        return Err(Error::corrupt(
+            "split_table_interior_page called on a non-table-interior page",
+        ));
+    }
+    let right_most = hdr.right_most_pointer;
+
+    let mut cells: Vec<Vec<u8>> = Vec::with_capacity(hdr.num_cells as usize);
+    for i in 0..hdr.num_cells as usize {
+        let off = hdr.cell_pointer(&buf, i)?;
+        let size = table_interior_cell_on_page_size(&buf, off)?;
+        let mut cell = vec![0u8; size];
+        cell.copy_from_slice(&buf[off..off + size]);
+        cells.push(cell);
+    }
+
+    let target = usable / 2;
+    let mut left_size = 0usize;
+    let mut split_at = cells.len();
+    for (i, c) in cells.iter().enumerate() {
+        let projected = left_size + c.len() + 2;
+        if projected > target && i > 0 {
+            split_at = i;
+            break;
+        }
+        left_size = projected;
+    }
+    if split_at >= cells.len() {
+        return Err(Error::corrupt(
+            "split_table_interior_page: cannot find a split point",
+        ));
+    }
+    let divider_rowid = max_rowid_of_cell(&cells[split_at - 1])?;
+    let left_right_most = super::be_u32(&cells[split_at - 1][..4]);
+
+    let left_cells: Vec<(u16, Vec<u8>)> = cells[..split_at]
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i as u16, c.clone()))
+        .collect();
+    let right_cells: Vec<(u16, Vec<u8>)> = cells[split_at..]
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i as u16, c.clone()))
+        .collect();
+
+    let new_pgno = pager.allocate_page();
+
+    if let Some(parent_pgno) = parent_root {
+        install_table_divider(pager, parent_pgno, interior_pgno, new_pgno, divider_rowid).await?;
+    }
+
+    let mut new_right = vec![0u8; pager.page_size()];
+    page::write_page_cells(
+        &mut new_right,
+        pager.btree_header_offset(new_pgno),
+        PageType::InteriorTable,
+        right_most,
+        &right_cells,
+    )?;
+    pager.write_page(new_pgno, new_right)?;
+
+    let mut new_left = vec![0u8; pager.page_size()];
+    page::write_page_cells(
+        &mut new_left,
+        base,
+        PageType::InteriorTable,
+        Some(left_right_most),
+        &left_cells,
+    )?;
+    pager.write_page(interior_pgno, new_left)?;
+
+    Ok(new_pgno)
+}
+
+/// Install a divider into an interior-table parent after a child split. The divider
+/// cell is `(left=old_child, rowid=divider_rowid)` and the parent's right-most pointer
+/// (or the next cell's left_child) is updated to point at `new_child`.
+async fn install_table_divider(
+    pager: &Pager,
+    parent_pgno: u32,
+    old_child: u32,
+    new_child: u32,
+    divider_rowid: i64,
+) -> Result<()> {
+    let pbase = pager.btree_header_offset(parent_pgno);
+    let mut pbuf = pager.read_page_for_write(parent_pgno).await?;
+    let phdr = PageHeader::parse(&pbuf, pbase)?;
+    if phdr.page_type != PageType::InteriorTable {
+        return Err(Error::corrupt(
+            "install_table_divider: declared parent is not an interior-table page",
+        ));
+    }
+    let is_rightmost = phdr.right_most_pointer == Some(old_child);
+
+    if is_rightmost {
+        let insert_idx = phdr.num_cells as usize;
+        let cell = build_table_interior_cell(old_child, divider_rowid);
+        page::insert_interior_cell(&mut pbuf, pbase, insert_idx, &cell)?;
+        pbuf[pbase + 8..pbase + 12].copy_from_slice(&new_child.to_be_bytes());
+    } else {
+        let child_idx = find_child_cell_index(&pbuf, &phdr, old_child)?;
+        let cells_with_idx: Vec<(usize, Vec<u8>)> = (0..phdr.num_cells as usize)
+            .map(|i| {
+                let off = phdr.cell_pointer(&pbuf, i).ok()?;
+                let left = super::be_u32(&pbuf[off..off + 4]);
+                let (rowid, rowid_size) = crate::format::read_varint_i64(&pbuf[off + 4..])?;
+                let mut cell = Vec::with_capacity(4 + rowid_size);
+                cell.extend_from_slice(&left.to_be_bytes());
+                crate::format::write_varint(rowid as u64, &mut cell);
+                Some((i, cell))
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| Error::corrupt("install_table_divider: bad parent cell"))?;
+
+        let mut new_cells: Vec<(u16, Vec<u8>)> = Vec::with_capacity(cells_with_idx.len() + 1);
+        for (i, c) in cells_with_idx.iter().enumerate() {
+            if i == child_idx {
+                new_cells.push((i as u16, build_table_interior_cell(old_child, divider_rowid)));
+                // The old cell's rowid becomes the boundary for the new child pointer.
+                let old_rowid = max_rowid_of_cell(&c.1)?;
+                new_cells.push((i as u16 + 1, build_table_interior_cell(new_child, old_rowid)));
+            } else {
+                new_cells.push((i as u16, c.1.clone()));
+            }
+        }
+        page::write_page_cells(
+            &mut pbuf,
+            pbase,
+            PageType::InteriorTable,
+            phdr.right_most_pointer,
+            &new_cells,
+        )?;
+    }
+    pager.write_page(parent_pgno, pbuf)?;
+    Ok(())
+}
+
+/// The on-page size of a table-interior cell: `u32(left_child) ++ varint(rowid)`.
+fn table_interior_cell_on_page_size(page: &[u8], offset: usize) -> Result<usize> {
+    let (_, rowid_size) = crate::format::read_varint_i64(&page[offset + 4..])
+        .ok_or_else(|| Error::corrupt("table interior rowid varint"))?;
+    Ok(4 + rowid_size)
+}
+
 /// Rebalance a table-leaf page after a delete has left it underfull.
 ///
 /// SQLite rebalances when a leaf's free space exceeds 2/3 of the usable area.

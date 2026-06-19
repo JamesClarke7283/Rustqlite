@@ -29,6 +29,7 @@ pub use cell::{
 pub use cursor::{scan_table, TableCursor};
 pub use delete::leaf_delete_current;
 pub use destroy::destroy as btree_destroy;
+pub use destroy::clear as btree_clear;
 pub use index::{create_index_btree, scan_index};
 pub use index_cursor::IndexCursor;
 pub use index_delete::index_leaf_delete;

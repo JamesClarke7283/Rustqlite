@@ -38,6 +38,9 @@ pub enum Opcode {
     /// `Destroy p1 p2 p3`: erase the b-tree rooted at page `p1`. Currently `p2`/`p3` are
     /// unused (no `iMoved` / db-index plumbing in the first slice). Mirrors `OP_Destroy`.
     Destroy,
+    /// `Clear p1`: delete all rows from the table b-tree rooted at page `p1`, leaving an empty
+    /// b-tree. Mirrors `OP_Clear`.
+    Clear,
 
     // --- cursors ---
     /// `OpenRead p1 p2 p3 p4`: open read cursor `p1` on the b-tree rooted at page `p2`; `p4`
@@ -255,6 +258,7 @@ impl Opcode {
             Opcode::ParseSchema => "ParseSchema",
             Opcode::CreateBtree => "CreateBtree",
             Opcode::Destroy => "Destroy",
+            Opcode::Clear => "Clear",
             Opcode::OpenRead => "OpenRead",
             Opcode::OpenWrite => "OpenWrite",
             Opcode::OpenWriteReg => "OpenWriteReg",

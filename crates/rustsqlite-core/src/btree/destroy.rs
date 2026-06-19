@@ -75,6 +75,92 @@ pub async fn destroy(pager: &Pager, root: u32) -> Result<u32> {
     Ok(freed)
 }
 
+/// Delete every row from the table b-tree rooted at `root`, leaving it as a single
+/// empty leaf page at `root`. All data pages (including overflow chains) are added to
+/// the pager's freelist, and the root page itself is reset as an empty leaf-table page.
+/// This is the analogue of `OP_Clear` for ordinary rowid tables.
+pub async fn clear(pager: &Pager, root: u32) -> Result<u32> {
+    if root == 0 {
+        return Ok(0);
+    }
+    let mut freed = 0u32;
+    // Gather every page owned by the tree except the root itself.
+    let mut stack: Vec<u32> = Vec::new();
+    {
+        let base = pager.btree_header_offset(root);
+        let page = pager.get_page(root).await?;
+        let hdr = PageHeader::parse(&page, base)?;
+        match hdr.page_type {
+            PageType::LeafTable => {
+                // Root is already a leaf: just clear its cells below.
+            }
+            PageType::InteriorTable => {
+                let n = hdr.num_cells as usize;
+                for i in 0..n {
+                    let off = hdr.cell_pointer(&page, i)?;
+                    let cell = parse_table_interior_cell(&page, off)?;
+                    stack.push(cell.left_child);
+                }
+                if let Some(rm) = hdr.right_most_pointer {
+                    stack.push(rm);
+                }
+            }
+            _ => {
+                return Err(Error::corrupt(format!(
+                    "clear: unexpected page type on root page {root}"
+                )))
+            }
+        }
+    }
+
+    // Free all non-root pages (and their overflow chains for leaf pages).
+    while let Some(pgno) = stack.pop() {
+        let base = pager.btree_header_offset(pgno);
+        let page = pager.get_page(pgno).await?;
+        let hdr = PageHeader::parse(&page, base)?;
+        match hdr.page_type {
+            PageType::LeafTable => {
+                let usable = pager.usable_size();
+                for i in 0..hdr.num_cells as usize {
+                    let off = hdr.cell_pointer(&page, i)?;
+                    if let Ok(cell) = super::cell::parse_table_leaf_cell(&page, off, usable) {
+                        if let Some(first) = cell.overflow_page {
+                            free_overflow_chain(pager, first).await?;
+                        }
+                    }
+                }
+                pager.free_page(pgno).await?;
+                freed += 1;
+            }
+            PageType::InteriorTable => {
+                let n = hdr.num_cells as usize;
+                for i in 0..n {
+                    let off = hdr.cell_pointer(&page, i)?;
+                    let cell = parse_table_interior_cell(&page, off)?;
+                    stack.push(cell.left_child);
+                }
+                if let Some(rm) = hdr.right_most_pointer {
+                    stack.push(rm);
+                }
+                pager.free_page(pgno).await?;
+                freed += 1;
+            }
+            _ => {
+                return Err(Error::corrupt(format!(
+                    "clear: unexpected page type on page {pgno}"
+                )))
+            }
+        }
+    }
+
+    // Reset the root page to an empty leaf-table page.
+    let base = pager.btree_header_offset(root);
+    let mut root_buf = pager.read_page_for_write(root).await?;
+    super::page::init_empty_leaf(&mut root_buf, base);
+    pager.write_page(root, root_buf)?;
+    Ok(freed)
+}
+
 /// Walk an overflow chain (set of pages with `[u32 next][chunk]…` layout) and free each.
 async fn free_overflow_chain(pager: &Pager, first_pgno: u32) -> Result<()> {
     let mut pgno = first_pgno;

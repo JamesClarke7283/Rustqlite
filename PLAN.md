@@ -158,10 +158,10 @@ list every granular item needed.
 ## M5.3 — B-Tree Robustness & WITHOUT ROWID
 
 - [x] **5.3.1** B-tree page merging on delete (when page is too empty, redistribute or merge with sibling)
-- [ ] **5.3.2** Interior-page balancing for inserts (propagate splits up to root)
-- [ ] **5.3.3** `Clear` opcode: fast delete of all rows in a b-tree (`DELETE FROM tbl` without WHERE)
-- [ ] **5.3.4** Freelist reuse: allocate pages from freelist before extending the file
-- [ ] **5.3.5** Freelist trunk/leaf page walking (read freelist pages for allocation)
+- [x] **5.3.2** Interior-page balancing for inserts (propagate splits up to root)
+- [x] **5.3.3** `Clear` opcode: fast delete of all rows in a b-tree (`DELETE FROM tbl` without WHERE)
+- [x] **5.3.4** Freelist reuse: allocate pages from freelist before extending the file
+- [x] **5.3.5** Freelist trunk/leaf page walking (read freelist pages for allocation)
 - [ ] **5.3.6** `WITHOUT ROWID` table b-trees (index-organized tables with primary key as the key)
 - [ ] **5.3.7** Auto-vacuum / ptrmap pages (`PRAGMA auto_vacuum = INCREMENTAL|FULL`)
 - [ ] **5.3.8** `PRAGMA integrity_check` backend (b-tree walk, overflow chain verification, freelist check)

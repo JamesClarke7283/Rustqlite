@@ -281,6 +281,83 @@ impl Pager {
         Ok(())
     }
 
+    /// Reuse a page from the freelist. `first_trunk` is the current first freelist trunk page
+    /// number as stored in the database header. Returns the allocated page number and updates
+    /// the header's freelist head/count. The operation is journaled so rollback restores the
+    /// freelist state.
+    ///
+    /// Implemented outside the state lock because reading/writing the trunk page is async.
+    fn allocate_from_freelist(&self,
+        first_trunk: u32,
+    ) -> u32 {
+        // Synchronous helper to avoid holding a future across async boundaries in a sync-looking
+        // `allocate_page`. `allocate_page` itself is sync (it must be usable from cell builders
+        // that run in non-async contexts); the async page reads are driven with block_on.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.allocate_from_freelist_async(first_trunk).await
+            })
+        })
+    }
+
+    async fn allocate_from_freelist_async(
+        &self,
+        first_trunk: u32,
+    ) -> u32 {
+        let trunk_page = self.get_page(first_trunk).await.unwrap_or_else(|_| {
+            Arc::new(vec![0u8; self.page_size])
+        });
+        let k = u32::from_be_bytes([
+            trunk_page[4], trunk_page[5], trunk_page[6], trunk_page[7],
+        ]);
+
+        let (allocated_pgno, new_first_trunk, new_count) = if k == 0 {
+            // The trunk has no leaf pointers. Use the trunk page itself as the allocated page.
+            let next_trunk = u32::from_be_bytes([
+                trunk_page[0], trunk_page[1], trunk_page[2], trunk_page[3],
+            ]);
+            (first_trunk, next_trunk, self.header().freelist_count - 1)
+        } else {
+            // Pop the last leaf pointer (simplest faithful behavior; C SQLite searches for
+            // a nearby page but without auto-vacuum any leaf is acceptable).
+            let leaf_offset = 4 + (k as usize) * 4; // bytes 8.. hold leaf pointers
+            let leaf_pgno = u32::from_be_bytes([
+                trunk_page[leaf_offset],
+                trunk_page[leaf_offset + 1],
+                trunk_page[leaf_offset + 2],
+                trunk_page[leaf_offset + 3],
+            ]);
+            // Rewrite the trunk page with one fewer leaf pointer.
+            let mut new_trunk = (*trunk_page).clone();
+            new_trunk[4..8].copy_from_slice(&(k - 1).to_be_bytes());
+            self.write_page(first_trunk, new_trunk)
+                .expect("write freelist trunk");
+            (leaf_pgno, first_trunk, self.header().freelist_count - 1)
+        };
+
+        if allocated_pgno == first_trunk {
+            // We consumed the trunk itself; its next pointer becomes the new head.
+            self.with_header_mut(|h| {
+                h.first_freelist_trunk = new_first_trunk;
+                h.freelist_count = new_count;
+            });
+        } else {
+            // Header just decrements count; trunk page already rewritten above.
+            self.with_header_mut(|h| {
+                h.freelist_count = new_count;
+            });
+        }
+
+        // Install a zeroed dirty page for the caller. Journaling happens on write via
+        // read_page_for_write; for a freelist page the pre-image is already the trunk/leaf
+        // bytes, which is correct for rollback.
+        {
+            let mut st = self.state.lock().unwrap();
+            st.dirty.insert(allocated_pgno, Arc::new(vec![0u8; self.page_size]));
+        }
+        allocated_pgno
+    }
+
     /// Install a modified page into the dirty overlay (pending the next commit/flush). The data
     /// must be exactly one page long.
     pub fn write_page(&self, pgno: u32, data: Vec<u8>) -> Result<()> {
@@ -299,13 +376,18 @@ impl Pager {
         Ok(())
     }
 
-    /// Allocate a new page at the end of the file, returning its (1-based) page number. The page is
-    /// added to the dirty overlay zero-filled (mirrors `btree.c` extending the file then `zeroPage`
-    /// preparing the new page); the caller writes its real contents with [`write_page`].
-    ///
-    /// [`write_page`]: Pager::write_page
+    /// Allocate a new page. If the freelist is non-empty, reuse the first freelist page
+    /// (trunk or leaf) and update the freelist head/count in the database header. Otherwise
+    /// extend the file by one page. Mirrors `allocateBtreePage` in `btree.c` (BTALLOC_ANY
+    /// mode without auto-vacuum).
     pub fn allocate_page(&self) -> u32 {
         let mut st = self.state.lock().unwrap();
+        if st.header.freelist_count > 0 && st.header.first_freelist_trunk != 0 {
+            let trunk_pgno = st.header.first_freelist_trunk;
+            // We must drop the state lock before async page I/O. Capture values first.
+            drop(st);
+            return self.allocate_from_freelist(trunk_pgno);
+        }
         st.page_count += 1;
         let pgno = st.page_count;
         st.dirty.insert(pgno, Arc::new(vec![0u8; self.page_size]));
