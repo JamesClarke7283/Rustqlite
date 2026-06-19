@@ -74,7 +74,11 @@ fn compile_indexed_select(
     let cursor = 0i32;
     let idx_cursor = 1i32;
     let ncol = outputs.len() as i32;
-    let ctx = Ctx { table, cursor, register_base: None };
+    let ctx = Ctx {
+        table,
+        cursor,
+        register_base: None,
+    };
     let mut b = ProgramBuilder::new();
 
     let setup = b.new_label();
@@ -206,6 +210,9 @@ fn reject_unsupported(select: &SelectStmt) -> Result<()> {
     if !select.group_by.is_empty() || select.having.is_some() {
         return Err(Error::msg("GROUP BY / HAVING are not supported in M3a"));
     }
+    if select.from.iter().any(|t| t.table().is_none()) {
+        return Err(Error::msg("joins are not supported"));
+    }
     Ok(())
 }
 
@@ -219,7 +226,11 @@ fn compile_scan(
 ) -> Result<Program> {
     let cursor = 0i32;
     let ncol = outputs.len() as i32;
-    let ctx = Ctx { table, cursor, register_base: None };
+    let ctx = Ctx {
+        table,
+        cursor,
+        register_base: None,
+    };
     let mut b = ProgramBuilder::new();
 
     let setup = b.new_label();
@@ -576,9 +587,9 @@ pub fn expr_to_text(e: &Expr) -> String {
         Expr::Cast { .. } => "cast".to_string(),
         Expr::Case { .. } => "case".to_string(),
         Expr::Collate { expr, collation } => {
-        let s = expr_to_text(expr);
-        format!("{} COLLATE {}", s, collation)
-    }
+            let s = expr_to_text(expr);
+            format!("{} COLLATE {}", s, collation)
+        }
         Expr::IsDistinctFrom { .. } => "is_distinct".to_string(),
     }
 }

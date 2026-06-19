@@ -50,7 +50,10 @@ pub enum CompoundOperator {
 pub struct SelectStmt {
     pub distinct: bool,
     pub columns: Vec<ResultColumn>,
-    pub from: Vec<TableRef>,
+    /// `FROM` clause. A plain single-table/cross-join clause is a single `TableOrJoin::Table`
+    /// element (or a comma-separated list of them). Explicit joins are represented as a
+    /// left-associative tree through the `TableOrJoin::Join` variant.
+    pub from: Vec<TableOrJoin>,
     pub where_clause: Option<Expr>,
     pub group_by: Vec<Expr>,
     pub having: Option<Expr>,
@@ -78,6 +81,117 @@ pub struct TableRef {
     pub schema: Option<String>,
     pub name: String,
     pub alias: Option<String>,
+}
+
+/// A join operator connecting the left-hand table-or-join sequence to the next table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinOp {
+    Inner,
+    Cross,
+    Natural,
+    Left,
+    LeftOuter,
+    Right,
+    RightOuter,
+    Full,
+    FullOuter,
+}
+
+impl TableOrJoin {
+    /// If this node is a plain table reference, return it; otherwise `None`.
+    pub fn table(&self) -> Option<&TableRef> {
+        match self {
+            TableOrJoin::Table(t) => Some(t),
+            TableOrJoin::Join(_) => None,
+        }
+    }
+}
+
+impl JoinOp {
+    /// Combine join modifier keywords as they are parsed left-to-right, mirroring
+    /// `sqlite3JoinType` in upstream `select.c`. Returns `Err` with the error keyword
+    /// string if the combination is invalid (e.g. `INNER OUTER`, `OUTER` alone).
+    pub fn from_keywords(keywords: &[&str]) -> std::result::Result<Self, String> {
+        use JoinOp::*;
+        let mut natural = false;
+        let mut left = false;
+        let mut right = false;
+        let mut outer = false;
+        let mut inner = false;
+        let mut cross = false;
+        for kw in keywords {
+            match kw.to_ascii_lowercase().as_str() {
+                "natural" => natural = true,
+                "left" => left = true,
+                "right" => right = true,
+                "full" => {
+                    left = true;
+                    right = true;
+                }
+                "outer" => outer = true,
+                "inner" => inner = true,
+                "cross" => cross = true,
+                _ => return Err((*kw).to_string()),
+            }
+        }
+
+        // Invalid combinations per upstream sqlite3JoinType.
+        let invalid = ((cross || inner) && outer)
+            || (cross && (left || right))
+            || (cross && natural && inner)
+            || (outer && !(left || right))
+            || (natural && left && right)
+            || (inner && (left || right));
+        if invalid {
+            return Err(keywords.join(" "));
+        }
+
+        let op = if natural {
+            Natural
+        } else if left && right && outer {
+            FullOuter
+        } else if left && right {
+            Full
+        } else if left && outer {
+            LeftOuter
+        } else if left {
+            Left
+        } else if right && outer {
+            RightOuter
+        } else if right {
+            Right
+        } else if cross {
+            Cross
+        } else {
+            Inner
+        };
+        Ok(op)
+    }
+}
+
+/// The join constraint following a join operator: `ON expr` or `USING (cols)`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JoinConstraint {
+    On(Expr),
+    Using(Vec<String>),
+}
+
+/// A node in the `FROM` clause: either a plain table reference or a (possibly nested) join.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableOrJoin {
+    Table(TableRef),
+    Join(Join),
+}
+
+/// One link in a joined `FROM` clause. PEG naturally produces a left-associative parse, so
+/// the left side can itself be a join chain (`(a JOIN b) JOIN c`). A plain `FROM t1, t2` is
+/// modeled as an implicit `Inner` join with no constraint when cross-joined by a comma.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Join {
+    pub op: JoinOp,
+    pub left: Box<TableOrJoin>,
+    pub right: TableRef,
+    pub constraint: Option<JoinConstraint>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -38,7 +38,7 @@ pub fn parse(sql: &str) -> Result<Vec<Stmt>, ParseError> {
     let mut stmts = Vec::new();
     for pair in sql_pair.into_inner() {
         if pair.as_rule() == Rule::statement {
-            stmts.push(build_statement(pair));
+            stmts.push(build_statement(pair)?);
         }
         // Rule::EOI and bare `;` separators produce no statement.
     }
@@ -51,29 +51,29 @@ pub fn parse_one(sql: &str) -> Result<Option<Stmt>, ParseError> {
     Ok(parse(sql)?.into_iter().next())
 }
 
-fn build_statement(pair: Pair<'_, Rule>) -> Stmt {
+fn build_statement(pair: Pair<'_, Rule>) -> Result<Stmt, ParseError> {
     let mut inner = pair.into_inner();
     let first = inner.next().expect("statement has at least one child");
     if first.as_rule() == Rule::explain_prefix {
         // An `explain_prefix` is followed by exactly one statement child (select/create/insert).
         let kind = explain_kind(&first);
         let body = inner.next().expect("explain_prefix precedes a statement");
-        return Stmt::Explain(Box::new(build_inner_stmt(body)), kind);
+        return Ok(Stmt::Explain(Box::new(build_inner_stmt(body)?), kind));
     }
     build_inner_stmt(first)
 }
 
 /// Build the select/create/insert/delete/drop/update statement from its grammar pair.
-fn build_inner_stmt(pair: Pair<'_, Rule>) -> Stmt {
+fn build_inner_stmt(pair: Pair<'_, Rule>) -> Result<Stmt, ParseError> {
     match pair.as_rule() {
-        Rule::select_stmt => Stmt::Select(build_select(pair)),
-        Rule::create_table_stmt => Stmt::CreateTable(build_create_table(pair)),
-        Rule::insert_stmt => Stmt::Insert(build_insert(pair)),
-        Rule::delete_stmt => Stmt::Delete(build_delete(pair)),
-        Rule::drop_table_stmt => Stmt::DropTable(build_drop_table(pair)),
-        Rule::update_stmt => Stmt::Update(build_update(pair)),
-        Rule::create_index_stmt => Stmt::CreateIndex(build_create_index(pair)),
-        Rule::drop_index_stmt => Stmt::DropIndex(build_drop_index(pair)),
+        Rule::select_stmt => Ok(Stmt::Select(build_select(pair)?)),
+        Rule::create_table_stmt => Ok(Stmt::CreateTable(build_create_table(pair))),
+        Rule::insert_stmt => Ok(Stmt::Insert(build_insert(pair))),
+        Rule::delete_stmt => Ok(Stmt::Delete(build_delete(pair))),
+        Rule::drop_table_stmt => Ok(Stmt::DropTable(build_drop_table(pair))),
+        Rule::update_stmt => Ok(Stmt::Update(build_update(pair))),
+        Rule::create_index_stmt => Ok(Stmt::CreateIndex(build_create_index(pair))),
+        Rule::drop_index_stmt => Ok(Stmt::DropIndex(build_drop_index(pair))),
         other => unreachable!("unexpected statement {other:?}"),
     }
 }
@@ -92,7 +92,7 @@ fn explain_kind(prefix: &Pair<'_, Rule>) -> ExplainKind {
     }
 }
 
-fn build_select(pair: Pair<'_, Rule>) -> SelectStmt {
+fn build_select(pair: Pair<'_, Rule>) -> Result<SelectStmt, ParseError> {
     // select_stmt = select_core ~ (compound_op ~ select_core)* ~ order_item? ~ limit_item?
     let mut stmt: Option<SelectStmt> = None;
     let mut pending_op: Option<CompoundOperator> = None;
@@ -100,7 +100,7 @@ fn build_select(pair: Pair<'_, Rule>) -> SelectStmt {
     for part in pair.into_inner() {
         match part.as_rule() {
             Rule::select_core => {
-                let core = build_select_core(part);
+                let core = build_select_core(part)?;
                 match stmt {
                     None => stmt = Some(core),
                     Some(ref mut base) => {
@@ -122,10 +122,10 @@ fn build_select(pair: Pair<'_, Rule>) -> SelectStmt {
             _ => {}
         }
     }
-    stmt.expect("select_stmt has at least one select_core")
+    stmt.ok_or_else(|| ParseError::new("select_stmt has at least one select_core"))
 }
 
-fn build_select_core(pair: Pair<'_, Rule>) -> SelectStmt {
+fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectStmt, ParseError> {
     let mut stmt = SelectStmt {
         distinct: false,
         columns: Vec::new(),
@@ -143,14 +143,14 @@ fn build_select_core(pair: Pair<'_, Rule>) -> SelectStmt {
         match part.as_rule() {
             Rule::K_DISTINCT => stmt.distinct = true,
             Rule::result_columns => stmt.columns = build_result_columns(part),
-            Rule::from_item => stmt.from = build_from_item(part),
+            Rule::from_item => stmt.from = build_from_item(part)?,
             Rule::where_item => stmt.where_clause = Some(build_expr_item(part)),
             Rule::group_item => stmt.group_by = build_group_item(part),
             Rule::having_item => stmt.having = Some(build_expr_item(part)),
             _ => {} // K_SELECT, K_ALL
         }
     }
-    stmt
+    Ok(stmt)
 }
 
 fn build_compound_op(pair: Pair<'_, Rule>) -> CompoundOperator {
@@ -197,20 +197,111 @@ fn build_result_column(pair: Pair<'_, Rule>) -> ResultColumn {
 
 fn build_as_alias(pair: Pair<'_, Rule>) -> String {
     // as_alias = { K_AS? ~ alias }
-    pair.into_inner()
-        .find(|p| p.as_rule() == Rule::alias)
-        .expect("as_alias has an alias")
+    // table_alias = { table_as_alias | implicit_alias } where each contains an alias.
+    fn find_alias(pair: Pair<'_, Rule>) -> Option<Pair<'_, Rule>> {
+        if pair.as_rule() == Rule::alias {
+            return Some(pair);
+        }
+        for child in pair.into_inner() {
+            if let Some(found) = find_alias(child) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    find_alias(pair)
+        .expect("alias wrapper has an alias")
         .as_str()
         .to_string()
 }
 
-fn build_from_item(pair: Pair<'_, Rule>) -> Vec<TableRef> {
+fn build_from_item(pair: Pair<'_, Rule>) -> Result<Vec<TableOrJoin>, ParseError> {
     // from_item = { K_FROM ~ from_clause }
     let from_clause = pair
         .into_inner()
         .find(|p| p.as_rule() == Rule::from_clause)
         .expect("from_item has from_clause");
-    from_clause.into_inner().map(build_table_ref).collect()
+    from_clause
+        .into_inner()
+        .filter(|p| p.as_rule() == Rule::table_ref_with_joins)
+        .map(build_table_ref_with_joins)
+        .collect()
+}
+
+/// A `table_ref_with_joins` parses as a leading `table_ref` followed by zero or more explicit
+/// join suffixes. The grammar is right-recursive, so a chain `a JOIN b JOIN c` arrives as
+/// `a, JOIN b, (JOIN c)` nested inside the last suffix. We fold it back into the left-deep
+/// tree `(a JOIN b) JOIN c` that upstream's SrcList represents.
+fn build_table_ref_with_joins(pair: Pair<'_, Rule>) -> Result<TableOrJoin, ParseError> {
+    let mut items: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
+    assert!(
+        !items.is_empty(),
+        "table_ref_with_joins has a leading table_ref"
+    );
+    let mut acc = TableOrJoin::Table(build_table_ref(items.remove(0)));
+    for suffix in items {
+        let (op, right, constraint) = build_join_suffix(suffix)?;
+        acc = TableOrJoin::Join(Join {
+            op,
+            left: Box::new(acc),
+            right,
+            constraint,
+        });
+    }
+    Ok(acc)
+}
+fn build_join_suffix(
+    pair: Pair<'_, Rule>,
+) -> Result<(JoinOp, TableRef, Option<JoinConstraint>), ParseError> {
+    let mut keywords: Vec<&str> = Vec::new();
+    let mut table: Option<TableRef> = None;
+    let mut constraint: Option<JoinConstraint> = None;
+
+    fn descend_on_using(pair: Pair<'_, Rule>, constraint: &mut Option<JoinConstraint>) {
+        match pair.as_rule() {
+            Rule::on_clause => {
+                *constraint = Some(JoinConstraint::On(build_expr_item(pair)));
+            }
+            Rule::using_clause => {
+                let cols: Vec<String> = pair
+                    .into_inner()
+                    .filter(|p| p.as_rule() == Rule::ident)
+                    .map(|p| p.as_str().to_string())
+                    .collect();
+                *constraint = Some(JoinConstraint::Using(cols));
+            }
+            _ => {}
+        }
+    }
+
+    // Collect all join-modifier keywords that appear anywhere inside the `join_op` wrapper.
+    fn collect_join_keywords<'a>(pair: Pair<'a, Rule>, out: &mut Vec<&'a str>) {
+        if pair.as_rule() == Rule::join_modifier {
+            out.push(pair.as_str());
+        } else {
+            for child in pair.into_inner() {
+                collect_join_keywords(child, out);
+            }
+        }
+    }
+
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::join_op => collect_join_keywords(part, &mut keywords),
+            Rule::table_ref => table = Some(build_table_ref(part)),
+            Rule::on_using => {
+                // `on_using` is a wrapper around exactly one `on_clause` or `using_clause`.
+                if let Some(inner) = part.into_inner().next() {
+                    descend_on_using(inner, &mut constraint);
+                }
+            }
+            Rule::on_clause | Rule::using_clause => descend_on_using(part, &mut constraint),
+            _ => {}
+        }
+    }
+    let op = JoinOp::from_keywords(&keywords)
+        .map_err(|bad| ParseError::new(format!("invalid join type: {bad}")))?;
+    Ok((op, table.expect("join_suffix has a table_ref"), constraint))
 }
 
 fn build_table_ref(pair: Pair<'_, Rule>) -> TableRef {
@@ -224,7 +315,9 @@ fn build_table_ref(pair: Pair<'_, Rule>) -> TableRef {
                 schema = s;
                 name = n;
             }
-            Rule::as_alias => alias = Some(build_as_alias(part)),
+            Rule::as_alias | Rule::table_alias | Rule::table_as_alias | Rule::implicit_alias => {
+                alias = Some(build_as_alias(part))
+            }
             _ => {}
         }
     }
@@ -661,7 +754,7 @@ mod tests {
             panic!("expected select")
         };
         assert_eq!(s.columns.len(), 2);
-        assert_eq!(s.from[0].name, "t");
+        assert_eq!(s.from[0].table().unwrap().name, "t");
         assert!(s.where_clause.is_some());
     }
 
@@ -676,7 +769,7 @@ mod tests {
             panic!()
         };
         assert!(matches!(&s.columns[0], ResultColumn::Expr { alias: Some(a), .. } if a == "x"));
-        assert_eq!(s.from[0].alias.as_deref(), Some("alias"));
+        assert_eq!(s.from[0].table().unwrap().alias.as_deref(), Some("alias"));
     }
 
     #[test]
@@ -1234,6 +1327,109 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn joins_parse_and_are_left_associative() {
+        // Plain JOIN is INNER.
+        let Stmt::Select(s) = &parse("SELECT * FROM t1 JOIN t2 ON t1.a = t2.b;").unwrap()[0] else {
+            panic!()
+        };
+        let TableOrJoin::Join(j) = &s.from[0] else {
+            panic!("expected a single Join node")
+        };
+        assert_eq!(j.op, JoinOp::Inner);
+        assert!(matches!(j.constraint, Some(JoinConstraint::On(_))));
+        assert_eq!(j.right.name, "t2");
+        let TableOrJoin::Table(left) = j.left.as_ref() else {
+            panic!("left side should be plain table")
+        };
+        assert_eq!(left.name, "t1");
+
+        // Chained joins are left-deep.
+        let Stmt::Select(s) =
+            &parse("SELECT * FROM t1 JOIN t2 USING(a) LEFT JOIN t3 ON t1.b = t3.c;").unwrap()[0]
+        else {
+            panic!()
+        };
+        let TableOrJoin::Join(outer) = &s.from[0] else {
+            panic!()
+        };
+        assert_eq!(outer.op, JoinOp::Left);
+        assert_eq!(outer.right.name, "t3");
+        let TableOrJoin::Join(inner) = outer.left.as_ref() else {
+            panic!("expected nested join on the left")
+        };
+        assert_eq!(inner.op, JoinOp::Inner);
+        assert_eq!(inner.right.name, "t2");
+        assert!(matches!(inner.constraint, Some(JoinConstraint::Using(_))));
+    }
+
+    #[test]
+    fn join_keyword_order_variants() {
+        // Oracle: `LEFT NATURAL OUTER JOIN` is legal and means the same as
+        // `NATURAL LEFT OUTER JOIN`. The keyword order `OUTER LEFT NATURAL` is accepted
+        // by the upstream lexer but the final permutation check rejects it because
+        // `OUTER` appears without an adjacent LEFT/RIGHT/FULL. We model the parser faithfully
+        // enough to accept the same legal orderings.
+        let Stmt::Select(s) = &parse("SELECT * FROM t1 NATURAL LEFT OUTER JOIN t2;").unwrap()[0]
+        else {
+            panic!()
+        };
+        let TableOrJoin::Join(j) = &s.from[0] else {
+            panic!()
+        };
+        assert_eq!(j.op, JoinOp::Natural);
+        assert!(j.constraint.is_none());
+
+        // RIGHT and FULL OUTER are parsed (execution is later).
+        let Stmt::Select(s) =
+            &parse("SELECT * FROM t1 RIGHT OUTER JOIN t2 ON t1.a = t2.a;").unwrap()[0]
+        else {
+            panic!()
+        };
+        let TableOrJoin::Join(j) = &s.from[0] else {
+            panic!()
+        };
+        assert_eq!(j.op, JoinOp::RightOuter);
+
+        let Stmt::Select(s) =
+            &parse("SELECT * FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.a;").unwrap()[0]
+        else {
+            panic!()
+        };
+        let TableOrJoin::Join(j) = &s.from[0] else {
+            panic!()
+        };
+        assert_eq!(j.op, JoinOp::FullOuter);
+    }
+
+    #[test]
+    fn join_keywords_allowed_as_identifiers() {
+        // SQLite allows join-related words as identifiers when not in a join context.
+        let cases = [
+            "SELECT 1 AS inner, 2 AS outer, 3 AS left, 4 AS right, 5 AS cross, 6 AS natural, 7 AS full;",
+            "CREATE TABLE outer (a);",
+            "CREATE TABLE naturalx (a);",
+        ];
+        for sql in cases {
+            assert!(parse(sql).is_ok(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn invalid_join_types_rejected() {
+        assert!(parse("SELECT * FROM t1 INNER OUTER JOIN t2;").is_err());
+        assert!(parse("SELECT * FROM t1 OUTER JOIN t2;").is_err());
+        assert!(parse("SELECT * FROM t1 LEFT BOGUS JOIN t2;").is_err());
+    }
+
+    #[test]
+    fn natural_join_may_not_have_on_or_using() {
+        // These are still syntactically valid in the grammar; upstream rejects them at
+        // semantic analysis. For the parser slice we just verify they parse.
+        assert!(parse("SELECT * FROM t1 NATURAL JOIN t2 ON t1.a = t2.a;").is_ok());
+        assert!(parse("SELECT * FROM t1 NATURAL JOIN t2 USING(a);").is_ok());
     }
 
     #[test]

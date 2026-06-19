@@ -434,10 +434,13 @@ struct CompiledSelect {
 /// Resolve the single FROM table (if any) from the catalog and compile the SELECT. Shared by the
 /// normal SELECT path and the EXPLAIN path.
 fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelect> {
-    let (table, pager, indexes) = if let Some(table_ref) = select.from.first() {
+    let (table, pager, indexes) = if let Some(table_or_join) = select.from.first() {
         if select.from.len() > 1 {
             return Err(Error::msg("joins are not supported"));
         }
+        let Some(table_ref) = table_or_join.table() else {
+            return Err(Error::msg("joins are not supported"));
+        };
         // The implicit `sqlite_schema` / `sqlite_master` table lives at page 1 and is not
         // listed in the catalog (it IS the catalog); synthesize a `Table` for it directly.
         if table_ref.name.eq_ignore_ascii_case("sqlite_schema")

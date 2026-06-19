@@ -389,14 +389,18 @@ fn map_primary(pair: Pair<'_, Rule>) -> Expr {
                 .into_inner()
                 .find(|p| p.as_rule() == Rule::select_stmt)
                 .expect("exists_expr has a select_stmt");
-            Expr::Exists(Box::new(build_select(select_pair)))
+            Expr::Exists(Box::new(
+                build_select(select_pair).expect("subquery select"),
+            ))
         }
         Rule::subquery => {
             let select_pair = pair
                 .into_inner()
                 .find(|p| p.as_rule() == Rule::select_stmt)
                 .expect("subquery has a select_stmt");
-            Expr::Subquery(Box::new(build_select(select_pair)))
+            Expr::Subquery(Box::new(
+                build_select(select_pair).expect("subquery select"),
+            ))
         }
         Rule::cast_expr => {
             let mut inner = pair.into_inner();

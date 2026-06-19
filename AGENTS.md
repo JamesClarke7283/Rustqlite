@@ -91,7 +91,7 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   reader. CLI `.tables`/`.schema` read real C-SQLite databases. Remaining: index b-tree read cursor,
   `WITHOUT ROWID`, ptrmap/auto-vacuum awareness.
 - **M2 — Parser**: 🚧 a working subset grammar (`SELECT`/`CREATE TABLE`/`INSERT` + the full expression
-  atom/operator set, including `IS NOT`); full `parse.y` port pending. Known gap: a bare integer literal
+  atom/operator set, including `IS NOT` and **JOIN syntax**); full `parse.y` port pending. Known gap: a bare integer literal
   larger than `i64` (e.g. the exact `-9223372036854775808`) is parsed as REAL rather than special-cased.
 - **M3a — Read query path (single-table SELECT)**: ✅ a faithful register VDBE (executor + opcode set),
   code generator (projection, `WHERE` with 3-valued logic, `ORDER BY` via an in-memory sorter,

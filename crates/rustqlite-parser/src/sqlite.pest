@@ -119,6 +119,24 @@ K_DROP          = @{ ^"drop"          ~ !ident_cont }
 K_UPDATE        = @{ ^"update"        ~ !ident_cont }
 K_SET           = @{ ^"set"           ~ !ident_cont }
 K_INDEX         = @{ ^"index"         ~ !ident_cont }
+
+// JOIN keywords are matched in context.  `JOIN`, `ON`, and `USING` are fully reserved and
+// added to the global `keyword` rule (e.g. `CREATE TABLE join` must be quoted).  The join
+// *modifier* keywords (`INNER`, `CROSS`, `LEFT`, `RIGHT`, `FULL`, `NATURAL`, `OUTER`) are
+// deliberately NOT in the global `keyword` rule: SQLite allows them as table/column names
+// (`CREATE TABLE leftx(a)`) and as aliases **when `AS` is present** (`FROM t AS inner`).
+// They are contextually reserved only as a bare table alias (`FROM t inner` starts a new
+// join, it is not an alias).  Each rule ends with a word boundary so `innerx` is still
+// parsed as a single identifier.
+K_JOIN          = @{ ^"join"          ~ !ident_cont }
+K_INNER         = @{ ^"inner"         ~ !ident_cont }
+K_CROSS         = @{ ^"cross"         ~ !ident_cont }
+K_LEFT          = @{ ^"left"          ~ !ident_cont }
+K_RIGHT         = @{ ^"right"         ~ !ident_cont }
+K_FULL          = @{ ^"full"          ~ !ident_cont }
+K_NATURAL       = @{ ^"natural"       ~ !ident_cont }
+K_OUTER         = @{ ^"outer"         ~ !ident_cont }
+K_USING         = @{ ^"using"         ~ !ident_cont }
 // QUERY and PLAN are matched only after EXPLAIN (in `explain_query_plan`); they are
 // deliberately NOT in the aggregate `keyword` rule below, because — unlike EXPLAIN — SQLite
 // does NOT reserve them: `query` and `plan` are valid identifiers (e.g. column names). Only
@@ -136,6 +154,7 @@ keyword = @{
     | K_ON | K_CONFLICT | K_ABORT | K_FAIL | K_IGNORE | K_ROLLBACK
     | K_EXPLAIN | K_DELETE | K_DROP | K_UPDATE | K_SET | K_INDEX
     | K_UNION | K_INTERSECT | K_EXCEPT
+    | K_JOIN | K_USING
 }
 
 // ---- Top level: a list of statements separated/terminated by ';' ----
@@ -174,9 +193,43 @@ table_star = { ident ~ "." ~ "*" }
 as_alias = { K_AS? ~ alias }
 alias = @{ ident }
 
+// Table references need a stricter alias rule than result columns: a join-modifier keyword
+// (`INNER`, `LEFT`, ...) is a valid table alias only when preceded by `AS`.  Without `AS` it
+// is interpreted as starting the next join.  We therefore use a separate rule for the
+// optional table alias.
+table_as_alias = { K_AS ~ alias }
+table_alias = { table_as_alias | implicit_alias }
+implicit_alias = { !join_modifier ~ alias }
+
 from_item = { K_FROM ~ from_clause }
-from_clause = { table_ref ~ ("," ~ table_ref)* }
-table_ref = { qualified_name ~ as_alias? }
+from_clause = { table_ref_with_joins ~ ("," ~ table_ref_with_joins)* }
+// `table_ref_with_joins` is a plain table reference optionally followed by one or more explicit
+// joins; the grammar is right-recursive (no left recursion) and the builder re-associates to
+// a left-deep tree matching upstream's SrcList.
+table_ref_with_joins = { table_ref ~ join_suffix* }
+
+// Upstream's lexer accepts up to three join modifier tokens in any order before `JOIN`,
+// then `sqlite3JoinType` validates the combination. We mirror that by accepting all six
+// modifier keywords in any order, then checking validity in `JoinOp::from_keywords` so
+// invalid permutations (e.g. `INNER OUTER`, bare `OUTER`) produce the same "unknown join type"
+// error as upstream.
+join_suffix   = { join_op ~ table_ref ~ on_using? }
+join_op       = { join_modifier* ~ K_JOIN }
+join_modifier = { K_NATURAL | K_INNER | K_CROSS | K_LEFT | K_RIGHT | K_FULL | K_OUTER }
+
+// `ON expr` or `USING (idlist)` — exactly one, optional. Upstream rejects a NATURAL join
+// that also carries an ON/USING clause at semantic analysis time; the grammar allows it for
+// fidelity to the lexer.
+on_using      = { on_clause | using_clause }
+on_clause     = { K_ON ~ expr }
+using_clause  = { K_USING ~ "(" ~ ident ~ ("," ~ ident)* ~ ")" }
+
+// An unqualified table reference, optionally aliased.  The bare-alias form is
+// context-sensitive in SQLite: a join-modifier keyword (`INNER`, `LEFT`, ...) is a
+// table alias only when preceded by `AS`; without `AS` it is interpreted as starting the
+// next join.  We model that with two sub-rules: `table_as_alias` requires `AS`, and
+// `implicit_alias` is a plain identifier that is not a join-modifier keyword.
+table_ref = { qualified_name ~ table_alias? }
 
 where_item = { K_WHERE ~ expr }
 group_item = { K_GROUP ~ K_BY ~ group_by }
