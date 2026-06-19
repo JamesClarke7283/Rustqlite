@@ -643,6 +643,7 @@ fn build_insert(pair: Pair<'_, Rule>) -> InsertStmt {
         table: String::new(),
         columns: Vec::new(),
         source: InsertSource::Values(Vec::new()),
+        upsert: Vec::new(),
     };
     for part in pair.into_inner() {
         match part.as_rule() {
@@ -664,10 +665,123 @@ fn build_insert(pair: Pair<'_, Rule>) -> InsertStmt {
                     panic!("insert source parse error: {e}");
                 });
             }
+            Rule::upsert_clause => stmt.upsert.push(build_upsert_clause(part)),
             _ => {}
         }
     }
     stmt
+}
+
+fn build_upsert_clause(pair: Pair<'_, Rule>) -> UpsertClause {
+    let mut target = None;
+    let mut action = None;
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::upsert_target => {
+                target = Some(build_upsert_target(part));
+            }
+            Rule::upsert_action => {
+                action = Some(build_upsert_action(part));
+            }
+            _ => {}
+        }
+    }
+    UpsertClause {
+        target,
+        action: action.expect("upsert action present"),
+    }
+}
+
+fn build_upsert_target(pair: Pair<'_, Rule>) -> UpsertTarget {
+    let mut columns = Vec::new();
+    let mut where_clause = None;
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::upsert_target_column => columns.push(build_upsert_target_column(part)),
+            Rule::where_item => where_clause = Some(build_expr_item(part)),
+            _ => {}
+        }
+    }
+    UpsertTarget {
+        columns,
+        where_clause,
+    }
+}
+
+fn build_upsert_target_column(pair: Pair<'_, Rule>) -> UpsertTargetColumn {
+    // The grammar rule accepts either a bare `ident` with optional COLLATE/ASC/DESC,
+    // or an arbitrary expression. Disambiguate by walking the children: if the
+    // first meaningful child is an ident and the remaining children are only
+    // COLLATE/ASC/DESC, treat it as a named column; otherwise treat it as an
+    // expression.
+    let mut name: Option<String> = None;
+    let mut expr: Option<Expr> = None;
+    let mut collation = None;
+    let mut desc = false;
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::ident if name.is_none() && expr.is_none() => {
+                let n = part.as_str().to_string();
+                name = Some(n.clone());
+                expr = Some(Expr::Column {
+                    schema: None,
+                    table: None,
+                    name: n,
+                });
+            }
+            Rule::expr if expr.is_none() => {
+                let built = expr::build_expr(part);
+                if let Expr::Column { name: col, .. } = &built {
+                    name = Some(col.clone());
+                }
+                expr = Some(built);
+            }
+            Rule::ident => collation = Some(part.as_str().to_string()),
+            Rule::K_DESC => desc = true,
+            Rule::K_ASC => desc = false,
+            _ => {}
+        }
+    }
+    if let Some(expr) = expr {
+        if name.is_some() && matches!(&expr, Expr::Column { .. }) {
+            UpsertTargetColumn::Column {
+                name: name.unwrap_or_default(),
+                collation,
+                desc,
+            }
+        } else {
+            UpsertTargetColumn::Expr(expr)
+        }
+    } else {
+        UpsertTargetColumn::Column {
+            name: name.unwrap_or_default(),
+            collation,
+            desc,
+        }
+    }
+}
+
+fn build_upsert_action(pair: Pair<'_, Rule>) -> UpsertAction {
+    let mut assignments = Vec::new();
+    let mut where_clause = None;
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::K_NOTHING => return UpsertAction::Nothing,
+            Rule::assignment_list => assignments = build_assignment_list(part),
+            Rule::where_item => where_clause = Some(build_expr_item(part)),
+            _ => {}
+        }
+    }
+    if assignments.is_empty() {
+        // Fallback: if neither NOTHING nor UPDATE matched, treat as DO NOTHING so the
+        // grammar stays resilient (this path should not be reached with a valid parse).
+        UpsertAction::Nothing
+    } else {
+        UpsertAction::Update {
+            assignments,
+            where_clause,
+        }
+    }
 }
 
 fn build_insert_source(pair: Pair<'_, Rule>) -> Result<InsertSource, ParseError> {
@@ -1118,6 +1232,80 @@ mod tests {
         assert_eq!(ins.table, "t");
         assert_eq!(ins.columns, vec!["a", "b"]);
         assert_eq!(ins.source, InsertSource::DefaultValues);
+    }
+
+    #[test]
+    fn upsert_parses() {
+        let Stmt::Insert(ins) =
+            &parse("INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING;").unwrap()[0]
+        else {
+            panic!()
+        };
+        assert_eq!(ins.upsert.len(), 1);
+        assert!(ins.upsert[0].target.is_none());
+        assert_eq!(ins.upsert[0].action, UpsertAction::Nothing);
+
+        let Stmt::Insert(ins) =
+            &parse("INSERT INTO t (a) VALUES (1) ON CONFLICT(a) DO UPDATE SET a = excluded.a;").unwrap()[0]
+        else {
+            panic!()
+        };
+        assert_eq!(ins.upsert.len(), 1);
+        let target = ins.upsert[0].target.as_ref().expect("target present");
+        assert_eq!(target.columns.len(), 1);
+        assert!(matches!(
+            &target.columns[0],
+            UpsertTargetColumn::Column { name, .. } if name == "a"
+        ));
+        let UpsertAction::Update { assignments, .. } = &ins.upsert[0].action else {
+            panic!("expected DO UPDATE")
+        };
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].column, "a");
+
+        let Stmt::Insert(ins) =
+            &parse("INSERT INTO t VALUES (1) ON CONFLICT(a, b) WHERE a > 0 DO UPDATE SET c = 2 WHERE c > 0;").unwrap()[0]
+        else {
+            panic!()
+        };
+        assert_eq!(ins.upsert.len(), 1);
+        let target = ins.upsert[0].target.as_ref().expect("target present");
+        assert_eq!(target.columns.len(), 2);
+        assert!(target.where_clause.is_some());
+        let UpsertAction::Update { where_clause, .. } = &ins.upsert[0].action else {
+            panic!("expected DO UPDATE")
+        };
+        assert!(where_clause.is_some());
+
+        // Multiple ON CONFLICT clauses may be chained (upstream supports multi-clause upsert).
+        let Stmt::Insert(ins) =
+            &parse("INSERT INTO t VALUES (1) ON CONFLICT(a) DO NOTHING ON CONFLICT(b) DO UPDATE SET c = 1;").unwrap()[0]
+        else {
+            panic!()
+        };
+        assert_eq!(ins.upsert.len(), 2);
+
+        // `DO NOTHING` may omit the target entirely.
+        let Stmt::Insert(ins) =
+            &parse("INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING;").unwrap()[0]
+        else {
+            panic!()
+        };
+        assert_eq!(ins.upsert.len(), 1);
+        assert!(ins.upsert[0].target.is_none());
+        assert_eq!(ins.upsert[0].action, UpsertAction::Nothing);
+
+        // `DO UPDATE` without a target is allowed by upstream.
+        let Stmt::Insert(ins) =
+            &parse("INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET a = 1;").unwrap()[0]
+        else {
+            panic!()
+        };
+        assert!(ins.upsert[0].target.is_none());
+        let UpsertAction::Update { assignments, .. } = &ins.upsert[0].action else {
+            panic!("expected DO UPDATE")
+        };
+        assert_eq!(assignments.len(), 1);
     }
 
     #[test]

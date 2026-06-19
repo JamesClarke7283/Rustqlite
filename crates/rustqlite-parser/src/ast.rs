@@ -271,6 +271,8 @@ pub struct InsertStmt {
     /// The source data for the insert. For `INSERT ... VALUES` this carries the literal rows;
     /// for `INSERT ... SELECT` it carries the select body.
     pub source: InsertSource,
+    /// Optional UPSERT clause(s) at the end of the INSERT.
+    pub upsert: Vec<UpsertClause>,
 }
 
 /// Data source for an `INSERT` statement.
@@ -367,6 +369,43 @@ pub enum ConflictAction {
     Fail,
     Ignore,
     Replace,
+}
+
+/// A single `ON CONFLICT ... DO ...` clause from an UPSERT.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpsertClause {
+    /// Optional conflict target: list of indexed columns/expressions, plus an
+    /// optional WHERE predicate that narrows which unique index is selected.
+    pub target: Option<UpsertTarget>,
+    /// The action to take on conflict.
+    pub action: UpsertAction,
+}
+
+/// Target of an UPSERT clause: the `(a, b, ...)` list plus optional `WHERE idx_predicate`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpsertTarget {
+    pub columns: Vec<UpsertTargetColumn>,
+    pub where_clause: Option<Expr>,
+}
+
+/// A column (or expression) named in the UPSERT conflict target. Bare identifiers
+/// carry optional collation and sort order to mirror upstream's `sortlist` form.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpsertTargetColumn {
+    Column { name: String, collation: Option<String>, desc: bool },
+    Expr(Expr),
+}
+
+/// Action side of an UPSERT clause.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpsertAction {
+    /// `DO NOTHING`.
+    Nothing,
+    /// `DO UPDATE SET ... [WHERE ...]`.
+    Update {
+        assignments: Vec<Assignment>,
+        where_clause: Option<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

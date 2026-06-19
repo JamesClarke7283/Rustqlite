@@ -87,6 +87,8 @@ K_INSERT        = @{ ^"insert"        ~ !ident_cont }
 K_REPLACE       = @{ ^"replace"       ~ !ident_cont }
 K_INTO          = @{ ^"into"          ~ !ident_cont }
 K_VALUES        = @{ ^"values"        ~ !ident_cont }
+K_DO            = @{ ^"do"            ~ !ident_cont }
+K_NOTHING       = @{ ^"nothing"       ~ !ident_cont }
 K_NULL          = @{ ^"null"          ~ !ident_cont }
 K_TRUE          = @{ ^"true"          ~ !ident_cont }
 K_FALSE         = @{ ^"false"         ~ !ident_cont }
@@ -158,6 +160,7 @@ keyword = @{
     | K_EXPLAIN | K_DELETE | K_DROP | K_UPDATE | K_SET | K_INDEX
     | K_UNION | K_INTERSECT | K_EXCEPT
     | K_JOIN | K_USING | K_WITH | K_RECURSIVE
+    | K_DO | K_NOTHING
 }
 
 // ---- Top level: a list of statements separated/terminated by ';' ----
@@ -289,10 +292,15 @@ signed_number = @{ ("+" | "-")? ~ (hex_int | float_or_int) }
 
 // ---- INSERT ----
 insert_stmt = {
-    insert_verb ~ K_INTO ~ qualified_name ~ column_list? ~ insert_source
+    insert_verb ~ K_INTO ~ qualified_name ~ column_list? ~ insert_source ~ upsert_clause*
 }
 insert_verb = { (K_INSERT ~ (K_OR ~ conflict_action)?) | K_REPLACE }
 conflict_action = { K_ROLLBACK | K_ABORT | K_FAIL | K_IGNORE | K_REPLACE }
+
+upsert_clause = { K_ON ~ K_CONFLICT ~ upsert_target? ~ upsert_action }
+upsert_target = { "(" ~ upsert_target_column ~ ("," ~ upsert_target_column)* ~ ")" ~ where_item? }
+upsert_target_column = { ident ~ (K_COLLATE ~ ident)? ~ (K_ASC | K_DESC)? | expr }
+upsert_action = { K_DO ~ (K_NOTHING | (K_UPDATE ~ K_SET ~ assignment_list ~ where_item?)) }
 column_list = { "(" ~ ident ~ ("," ~ ident)* ~ ")" }
 insert_source = { select_stmt | values_clause | default_values_clause }
 default_values_clause = { K_DEFAULT ~ K_VALUES }
