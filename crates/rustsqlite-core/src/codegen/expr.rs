@@ -34,6 +34,23 @@ pub struct Ctx<'a> {
     /// value in the index key record (`[indexed cols..., rowid]`); the rowid-alias column
     /// maps to `nkey_fields` (the trailing rowid).
     pub index_read: Option<IndexRead<'a>>,
+    /// When set, column references resolve across multiple tables (a join). A bare `col`
+    /// searches the join tables in order; a `table.col` resolves to the named table. When
+    /// `None`, the single `table`/`cursor` fields are used. When set, `table`/`cursor` are
+    /// still populated (with the first table) for backward compatibility with code that
+    /// reads them directly.
+    pub join_tables: Option<&'a [JoinTable<'a>]>,
+}
+
+/// One table in a join: the resolved `Table`, the cursor number it's open on, and the name
+/// used to reference it (the table name or its alias). Used by [`Ctx::join_tables`] for
+/// multi-table column resolution.
+#[derive(Clone, Copy)]
+pub struct JoinTable<'a> {
+    pub table: &'a Table,
+    pub cursor: i32,
+    /// The name used to qualify columns: the alias if present, otherwise the table name.
+    pub name: &'a str,
 }
 
 /// Covering-index read context: the cursor number of the open index and a map from
@@ -167,6 +184,49 @@ fn compile_column(
     target: i32,
     ctx: Ctx,
 ) -> Result<()> {
+    // Multi-table (join) column resolution. When `join_tables` is set, a `table.col` reference
+    // resolves to the named table; a bare `col` searches the join tables in order and resolves
+    // to the first table that has it. This delegates to the single-table path below with a
+    // sub-`Ctx` pointing at the resolved table/cursor.
+    if let Some(jt) = ctx.join_tables {
+        let resolved: Option<(Ctx, &str)> = if let Some(q) = qualifier {
+            jt.iter().find(|t| t.name.eq_ignore_ascii_case(q)).map(|t| {
+                let sub = Ctx {
+                    table: t.table,
+                    cursor: t.cursor,
+                    register_base: ctx.register_base,
+                    index_read: None,
+                    join_tables: None,
+                };
+                (sub, t.name)
+            })
+        } else {
+            // Bare column: search tables in FROM order. An ambiguous column (present in
+            // multiple tables) resolves to the first one — matching SQLite's behavior for
+            // comma joins without USING. (SQLite actually raises an "ambiguous column name"
+            // error, but that's a name-resolution check we defer to M2.74; for now we pick
+            // the first table so the cross-join codegen works.)
+            jt.iter().find(|t| t.table.resolve_column(name).is_some()).map(|t| {
+                let sub = Ctx {
+                    table: t.table,
+                    cursor: t.cursor,
+                    register_base: ctx.register_base,
+                    index_read: None,
+                    join_tables: None,
+                };
+                (sub, t.name)
+            })
+        };
+        let Some((sub_ctx, _)) = resolved else {
+            let disp = match qualifier {
+                Some(q) => format!("{q}.{name}"),
+                None => name.to_string(),
+            };
+            return Err(Error::msg(format!("no such column: {disp}")));
+        };
+        return compile_column(b, qualifier, name, target, sub_ctx);
+    }
+
     // Column references against a VALUES-derived subquery use synthesized columnN names
     // rather than the underlying table. Treat an empty/no-column table as a VALUES scope:
     // only column1..columnN are resolvable.

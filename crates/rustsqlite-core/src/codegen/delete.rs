@@ -40,7 +40,7 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
         ));
     }
     let cursor = 0i32;
-    let ctx = Ctx { table, cursor, register_base: None, index_read: None };
+    let ctx = Ctx { table, cursor, register_base: None, join_tables: None, index_read: None };
     let ncol = table.columns.len();
     let mut b = ProgramBuilder::new();
 
@@ -162,7 +162,7 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
                     let expr_ctx = Ctx {
                         table,
                         cursor,
-                        register_base: None,
+                        register_base: None, join_tables: None,
                         index_read: None,
                     };
                     compile_expr(&mut b, expr, target, expr_ctx)?;
@@ -218,7 +218,7 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
                     let expr_ctx = Ctx {
                         table,
                         cursor,
-                        register_base: None,
+                        register_base: None, join_tables: None,
                         index_read: None,
                     };
                     compile_expr(&mut b, expr, target, expr_ctx)?;

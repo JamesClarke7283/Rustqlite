@@ -1017,3 +1017,53 @@ fn eqp_index_plan_details_match_oracle() {
         assert_eq!(got, expected, "EQP mismatch for: {eqp}");
     }
 }
+
+/// Cross / inner joins (M7.4–M7.5). The M7 first slice handles two-table cross joins
+/// (`FROM t1, t2` / `CROSS JOIN`) and inner joins with an `ON` predicate, as a nested loop.
+/// LEFT/RIGHT/FULL/NATURAL joins and `USING` are deferred.
+#[test]
+fn cross_and_inner_joins() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup(
+        "CREATE TABLE t1(a INT, b TEXT);\
+         CREATE TABLE t2(c INT, d TEXT);\
+         INSERT INTO t1 VALUES (1,'x'),(2,'y'),(3,'z');\
+         INSERT INTO t2 VALUES (10,'p'),(20,'q'),(NULL,'r');",
+    );
+    for q in [
+        // Cross join (comma syntax).
+        "SELECT * FROM t1, t2;",
+        "SELECT t1.a, t2.c FROM t1, t2;",
+        "SELECT a, c FROM t1, t2;",
+        "SELECT t1.a, t2.d FROM t1, t2 WHERE t1.a = 2;",
+        "SELECT a, d FROM t1, t2 WHERE a > 1;",
+        // Cross join (explicit CROSS JOIN).
+        "SELECT * FROM t1 CROSS JOIN t2;",
+        "SELECT t1.* FROM t1 CROSS JOIN t2;",
+        "SELECT t2.* FROM t1 CROSS JOIN t2;",
+        // Inner join with ON.
+        "SELECT * FROM t1 INNER JOIN t2 ON t1.a = 1;",
+        "SELECT t1.a, t2.c FROM t1 JOIN t2 ON t1.a < t2.c;",
+        "SELECT t1.a, t2.d FROM t1 INNER JOIN t2 ON t2.c > 15;",
+        "SELECT a, d FROM t1 JOIN t2 ON a = 2 AND d IS NOT NULL;",
+        // Inner join with ON + WHERE (both apply).
+        "SELECT t1.a, t2.c FROM t1 JOIN t2 ON t1.a < t2.c WHERE t1.a > 1;",
+        // LIMIT / OFFSET on a join.
+        "SELECT * FROM t1, t2 LIMIT 3;",
+        "SELECT * FROM t1, t2 LIMIT 2 OFFSET 4;",
+        // ORDER BY on a join (uses the sorter).
+        "SELECT t1.a, t2.c FROM t1, t2 ORDER BY t1.a, t2.c;",
+        "SELECT t1.a, t2.c FROM t1, t2 ORDER BY t1.a DESC;",
+        // Table-qualified column references in projection and WHERE.
+        "SELECT t1.a, t1.b, t2.c, t2.d FROM t1, t2 WHERE t1.a = 3 AND t2.c = 10;",
+        // Aliased tables.
+        "SELECT x.a, y.c FROM t1 AS x, t2 AS y WHERE x.a = 1;",
+        "SELECT x.a, y.d FROM t1 x, t2 y WHERE y.c = 20;",
+    ] {
+        assert_same(db.str(), q);
+    }
+}

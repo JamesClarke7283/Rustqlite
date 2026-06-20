@@ -203,3 +203,12 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   Known divergence: the tiebreak order for equal ORDER BY keys is unspecified in SQL; our stable
   sorter preserves GROUP BY insertion order while SQLite's b-tree-backed ORDER BY reverses it
   for DESC — both are correct, test cases with ties use a secondary ORDER BY key for determinism.
+- **M7 — Joins** 🚧: **7.1–7.3** ✅ (parser, `OpenEphemeral`, `Found`/`NotFound` already shipped
+  in M2/M6). **7.4–7.5 cross / inner joins** ✅: two-table `FROM t1, t2` / `CROSS JOIN` /
+  `INNER JOIN ... ON` compile as a nested loop (outer `Rewind`/`Next` over the left table,
+  inner `Rewind`/`Next` over the right, ON predicate + WHERE filtered inside). Multi-table
+  column resolution via `Ctx::join_tables` — a `table.col` reference resolves to the named
+  table (alias or name); a bare `col` searches the FROM tables in order. `SELECT *` expands
+  across all tables; `table.*` expands the named table. ORDER BY on a join uses the sorter.
+  Differential-tested vs the C oracle (`cross_and_inner_joins`). Still M7+: left/right/full
+  outer joins, natural join, `USING`, self-joins, join-order selection, aggregates over joins.

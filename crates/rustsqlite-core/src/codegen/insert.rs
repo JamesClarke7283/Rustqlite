@@ -94,7 +94,7 @@ fn compile_insert_values(
     let ctx = Ctx {
         table,
         cursor,
-        register_base: None,
+        register_base: None, join_tables: None,
         index_read: None,
     };
     let mut b = ProgramBuilder::new();
@@ -268,7 +268,7 @@ fn compile_insert_without_rowid(
     let ctx = Ctx {
         table,
         cursor,
-        register_base: None,
+        register_base: None, join_tables: None,
         index_read: None,
     };
     let mut b = ProgramBuilder::new();
@@ -424,7 +424,7 @@ fn emit_index_inserts_without_rowid(
             let pred_ctx = Ctx {
                 table,
                 cursor: 0,
-                register_base: None,
+                register_base: None, join_tables: None,
                 index_read: None,
             };
             compile_pred_jump(
@@ -449,7 +449,7 @@ fn emit_index_inserts_without_rowid(
                 let expr_ctx = Ctx {
                     table,
                     cursor: 0,
-                    register_base: Some(col_start),
+                    register_base: Some(col_start), join_tables: None,
                     index_read: None,
                 };
                 compile_expr(b, expr, target, expr_ctx)?;
@@ -513,7 +513,7 @@ fn compile_insert_default_values(
     let ctx = Ctx {
         table,
         cursor,
-        register_base: None,
+        register_base: None, join_tables: None,
         index_read: None,
     };
     let mut b = ProgramBuilder::new();
@@ -840,7 +840,7 @@ fn emit_index_inserts(
             let pred_ctx = Ctx {
                 table,
                 cursor: 0,
-                register_base: None,
+                register_base: None, join_tables: None,
                 index_read: None,
             };
             compile_pred_jump(
@@ -865,7 +865,7 @@ fn emit_index_inserts(
                 let expr_ctx = Ctx {
                     table,
                     cursor: 0,
-                    register_base: Some(rec_start),
+                    register_base: Some(rec_start), join_tables: None,
                     index_read: None,
                 };
                 compile_expr(b, expr, target, expr_ctx)?;

@@ -33,9 +33,6 @@ pub fn compile(
     indexes: &[IndexObject],
 ) -> Result<(Program, Vec<String>)> {
     reject_unsupported(select)?;
-    if select.from.len() > 1 {
-        return Err(Error::msg("joins are not supported in M3a"));
-    }
 
     let outputs = expand_columns(select, table)?;
     // HAVING is only valid on an aggregate query (one with a GROUP BY or an aggregate function
@@ -131,7 +128,7 @@ fn compile_aggregate(
     let ctx = Ctx {
         table,
         cursor,
-        register_base: None,
+        register_base: None, join_tables: None,
         index_read: None,
     };
     let mut b = ProgramBuilder::new();
@@ -800,7 +797,7 @@ fn compile_indexed_select(
     let ctx = Ctx {
         table,
         cursor: if covering { idx_cursor } else { table_cursor },
-        register_base: None,
+        register_base: None, join_tables: None,
         index_read,
     };
     let mut b = ProgramBuilder::new();
@@ -996,9 +993,6 @@ fn reject_unsupported(select: &SelectStmt) -> Result<()> {
         return Err(Error::msg(
             "DISTINCT with ORDER BY is not supported yet (M6.8)",
         ));
-    }
-    if select.from.iter().any(|t| t.table().is_none() && t.subquery().is_none()) {
-        return Err(Error::msg("joins are not supported"));
     }
     Ok(())
 }
@@ -1240,7 +1234,7 @@ fn compile_values(
     let ctx = Ctx {
         table: &empty,
         cursor: -1,
-        register_base: None,
+        register_base: None, join_tables: None,
         index_read: None,
     };
     let ncol_i32 = ncol as i32;
@@ -1350,7 +1344,7 @@ fn compile_scan(
     let ctx = Ctx {
         table,
         cursor,
-        register_base: None,
+        register_base: None, join_tables: None,
         index_read: None,
     };
     let mut b = ProgramBuilder::new();
@@ -1544,7 +1538,7 @@ fn compile_constant(
     let ctx = Ctx {
         table: &empty,
         cursor: -1,
-        register_base: None,
+        register_base: None, join_tables: None,
         index_read: None,
     };
     let ncol = outputs.len() as i32;
@@ -1574,7 +1568,7 @@ fn compile_constant(
 }
 
 /// Expand `*` / `table.*` and resolve aliases into `(expression, column-name)` pairs.
-fn expand_columns(select: &SelectStmt, table: Option<&Table>) -> Result<Vec<(Expr, String)>> {
+pub(crate) fn expand_columns(select: &SelectStmt, table: Option<&Table>) -> Result<Vec<(Expr, String)>> {
     if !select.values.is_empty() {
         // VALUES rows provide unnamed output columns. Name them column1, column2, ... matching
         // the oracle. The arity was already validated by the caller; use the first row's length.
@@ -1606,6 +1600,45 @@ fn expand_columns(select: &SelectStmt, table: Option<&Table>) -> Result<Vec<(Exp
     Ok(out)
 }
 
+/// Like [`expand_columns`] but for a multi-table (join) FROM clause. `*` expands to all columns
+/// of all tables in FROM order; `table.*` expands to the columns of the named table. Bare
+/// column expressions are left as-is (the join codegen resolves them via `Ctx::join_tables`).
+pub(crate) fn expand_columns_with_tables(
+    select: &SelectStmt,
+    tables: &[(&Table, &str)],
+) -> Result<Vec<(Expr, String)>> {
+    let mut out = Vec::new();
+    for rc in &select.columns {
+        match rc {
+            ResultColumn::Star => {
+                for (t, _) in tables {
+                    for col in &t.columns {
+                        out.push((column_expr(&col.name), col.name.clone()));
+                    }
+                }
+            }
+            ResultColumn::TableStar(qname) => {
+                let t = tables
+                    .iter()
+                    .find(|(_, name)| name.eq_ignore_ascii_case(qname))
+                    .map(|(t, _)| *t)
+                    .ok_or_else(|| Error::msg(format!("no such table: {qname}")))?;
+                for col in &t.columns {
+                    out.push((column_expr(&col.name), col.name.clone()));
+                }
+            }
+            ResultColumn::Expr { expr, alias } => {
+                let name = alias.clone().unwrap_or_else(|| default_col_name(expr));
+                out.push((expr.clone(), name));
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(Error::msg("no result columns"));
+    }
+    Ok(out)
+}
+
 fn column_expr(name: &str) -> Expr {
     Expr::Column {
         schema: None,
@@ -1616,7 +1649,7 @@ fn column_expr(name: &str) -> Expr {
 
 /// Resolve an `ORDER BY` term: an integer ordinal selects an output column; a bare name that
 /// matches an output alias uses that output's expression; otherwise the term is used as written.
-fn resolve_order_term(term: &OrderingTerm, outputs: &[(Expr, String)]) -> Result<Expr> {
+pub(crate) fn resolve_order_term(term: &OrderingTerm, outputs: &[(Expr, String)]) -> Result<Expr> {
     if let Expr::Literal(Literal::Integer(n)) = &term.expr {
         let idx = *n;
         if idx >= 1 && (idx as usize) <= outputs.len() {
@@ -1641,7 +1674,7 @@ fn resolve_order_term(term: &OrderingTerm, outputs: &[(Expr, String)]) -> Result
 /// Const-evaluate a literal-integer `LIMIT`/`OFFSET`. Returns `(limit, offset)` where `limit`
 /// is `None` for "unlimited" (absent or negative) and `Some(n)` otherwise; `offset` is clamped
 /// to `>= 0`.
-fn eval_limit_offset(select: &SelectStmt) -> Result<(Option<i64>, i64)> {
+pub(crate) fn eval_limit_offset(select: &SelectStmt) -> Result<(Option<i64>, i64)> {
     let limit = match &select.limit {
         None => None,
         Some(e) => {
@@ -1675,7 +1708,7 @@ fn const_int(e: &Expr) -> Option<i64> {
 }
 
 /// Emit a load of an `i64` constant into a fresh register, returning it.
-fn emit_int(b: &mut ProgramBuilder, n: i64) -> i32 {
+pub(crate) fn emit_int(b: &mut ProgramBuilder, n: i64) -> i32 {
     let r = b.alloc_reg();
     match i32::try_from(n) {
         Ok(n32) => {

@@ -184,7 +184,7 @@ impl Returning {
     let ctx = Ctx {
         table,
         cursor,
-        register_base: Some(register_base),
+        register_base: Some(register_base), join_tables: None,
         index_read: None,
     };
     compile_expr(b, expr, target, ctx)

@@ -121,7 +121,7 @@ pub fn compile_create_index(
     // Partial-index predicate: skip rows that don't satisfy the WHERE clause. Evaluate the
     // predicate directly from the table cursor (Column opcodes work here because the table cursor
     // is positioned for each row in the populate loop).
-    let ctx = super::expr::Ctx { table, cursor: table_cursor, register_base: None, index_read: None };
+    let ctx = super::expr::Ctx { table, cursor: table_cursor, register_base: None, join_tables: None, index_read: None };
     let skip_label = if let Some(pred) = &dummy.where_clause {
         let skip = b.new_label();
         super::expr::compile_jump(&mut b, pred, skip, false, true, ctx)?;
@@ -140,7 +140,7 @@ pub fn compile_create_index(
             super::expr::compile_expr(&mut b,
                 expr,
                 target,
-                super::expr::Ctx { table, cursor: table_cursor, register_base: None, index_read: None },
+                super::expr::Ctx { table, cursor: table_cursor, register_base: None, join_tables: None, index_read: None },
             )?;
         } else {
             let col_idx = *plain_iter.next().expect("plain column aligned with indexed_cis");

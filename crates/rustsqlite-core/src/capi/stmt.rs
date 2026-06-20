@@ -574,6 +574,44 @@ struct CompiledSelect {
 /// Resolve the single FROM table (if any) from the catalog and compile the SELECT. Shared by the
 /// normal SELECT path and the EXPLAIN path.
 fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelect> {
+    // Multi-table (join) path: when the FROM clause is a cross/inner join of plain tables,
+    // resolve each table from the catalog and compile via the join codegen. This returns
+    // early; the single-table path below handles the rest.
+    if !select.from.is_empty() && !select.values.is_empty() == false {
+        if let Some(flat) = codegen::join::flatten_cross_join(&select.from) {
+            if flat.len() >= 2 {
+                codegen::join::validate_join(&select.from)?;
+                let pager = db.pager_arc()?;
+                let catalog = block_on(read_catalog(&pager))?;
+                let mut resolved: Vec<(Table, String)> = Vec::new();
+                for (tref, _constraint) in &flat {
+                    let obj = catalog
+                        .find_table(&tref.name)
+                        .ok_or_else(|| Error::msg(format!("no such table: {}", tref.name)))?;
+                    let table = Table::from_schema_object(obj)?;
+                    let name = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
+                    resolved.push((table, name));
+                }
+                // The ON predicate for the first join level (the M7 first slice handles one
+                // ON predicate; a chain of joins with multiple ONs is deferred).
+                let on_predicate = flat
+                    .iter()
+                    .find_map(|(_, c)| codegen::join::on_predicate(*c));
+                let table_refs: Vec<(&Table, &str)> =
+                    resolved.iter().map(|(t, n)| (t, n.as_str())).collect();
+                let (program, column_names) =
+                    codegen::join::compile_cross_join(select, &table_refs[..2].try_into().unwrap(), on_predicate)?;
+                return Ok(CompiledSelect {
+                    program,
+                    column_names,
+                    pager: Some(pager),
+                    table: Some(resolved[0].0.clone()),
+                    index_plan_info: None,
+                });
+            }
+        }
+    }
+
     let (table, pager, indexes) = if !select.values.is_empty() {
         // VALUES select bodies never have a real FROM table; run them without a pager/database.
         (None, None, Vec::new())
