@@ -1556,12 +1556,22 @@ impl Vdbe {
                     // store the result in `r[p3]` *without* consuming the accumulator. `p1`/`p2`
                     // are unused (upstream carries the arg count in `p2` for disambiguation
                     // only). Mirrors `OP_AggValue` in `vdbe.c`.
+                    //
+                    // Window-only built-in functions (row_number/rank/…/lead/lag) have a
+                    // mutating `xValue` (e.g. `rankValueFunc` resets `nValue = 0`); plain
+                    // aggregates' `xValue` is non-mutating. We dispatch via `kind.window_only()`.
                     let kind = match &inst.p4 {
                         P4::FuncDef(k) => *k,
                         _ => return Err(Error::msg("AggValue requires a FuncDef p4")),
                     };
-                    let result = match self.aggregates.get(&(p1 as usize)) {
-                        Some(acc) => acc.value(),
+                    let result = match self.aggregates.get_mut(&(p1 as usize)) {
+                        Some(acc) => {
+                            if kind.window_only() {
+                                acc.value_mut()
+                            } else {
+                                acc.value()
+                            }
+                        }
                         None => empty_aggregate_result(kind),
                     };
                     self.regs[p3 as usize] = result;
@@ -1788,7 +1798,7 @@ fn collation_of(p4: &P4) -> Collation {
 
 /// Finalize an accumulator into its result `Value`, mirroring upstream's `xFinal` path. This is
 /// the per-aggregate "read out the state" logic that `AggFinal` dispatches to.
-fn finalize_accumulator(acc: Accumulator, kind: AggregateKind) -> Value {
+fn finalize_accumulator(mut acc: Accumulator, kind: AggregateKind) -> Value {
     match kind {
         AggregateKind::Count => Value::Int(acc.count),
         AggregateKind::Sum => {
@@ -1821,21 +1831,42 @@ fn finalize_accumulator(acc: Accumulator, kind: AggregateKind) -> Value {
             }
         }
         AggregateKind::Min | AggregateKind::Max => acc.best.unwrap_or(Value::Null),
-        AggregateKind::GroupConcat => {
-            acc.concat.map(Value::Text).unwrap_or(Value::Null)
-        }
+        AggregateKind::GroupConcat => acc.concat.map(Value::Text).unwrap_or(Value::Null),
+        // Window-only built-ins (M11.4–M11.6): their `xFinalize` aliases `xValue` (upstream
+        // `#define percent_rankFinalizeFunc percent_rankValueFunc` etc.), so finalize just reads
+        // the current state via the mutating `value_mut` path.
+        AggregateKind::RowNumber
+        | AggregateKind::Rank
+        | AggregateKind::DenseRank
+        | AggregateKind::PercentRank
+        | AggregateKind::CumeDist
+        | AggregateKind::Ntile
+        | AggregateKind::FirstValue
+        | AggregateKind::LastValue
+        | AggregateKind::NthValue
+        | AggregateKind::Lead
+        | AggregateKind::Lag => acc.value_mut(),
     }
 }
 
 /// The result of finalizing an aggregate that never received an `AggStep` call (an empty group).
 /// Mirrors the oracle's behavior for `SELECT count(*) FROM t WHERE 0=1` (0) vs `sum` (NULL) vs
-/// `total` (0.0) etc.
+/// `total` (0.0) etc. For window-only built-ins, the empty-frame result mirrors the `xValue`
+/// callback's behavior on a never-stepped accumulator.
 fn empty_aggregate_result(kind: AggregateKind) -> Value {
     match kind {
         AggregateKind::Count => Value::Int(0),
         AggregateKind::Sum | AggregateKind::Avg | AggregateKind::Min | AggregateKind::Max
         | AggregateKind::GroupConcat => Value::Null,
         AggregateKind::Total => Value::Real(0.0),
+        // Window-only built-ins on an empty frame: `row_number`/`rank`/`dense_rank`/`ntile`
+        // emit 0 (matches `row_numberValueFunc` on a null `p` and `rankValueFunc` on `nValue=0`);
+        // `percent_rank`/`cume_dist` emit 0.0; the value-capture functions emit NULL.
+        AggregateKind::RowNumber | AggregateKind::Rank | AggregateKind::DenseRank
+        | AggregateKind::Ntile => Value::Int(0),
+        AggregateKind::PercentRank | AggregateKind::CumeDist => Value::Real(0.0),
+        AggregateKind::FirstValue | AggregateKind::LastValue | AggregateKind::NthValue
+        | AggregateKind::Lead | AggregateKind::Lag => Value::Null,
     }
 }
 
@@ -2776,5 +2807,164 @@ mod tests {
             vec![vec![Value::Int(1)]],
             "recursive call with same p5 token should be skipped"
         );
+    }
+
+    // ---- window-only built-in accumulator VDBE tests (M11.4–M11.6) ----
+    //
+    // These exercise the executor's `AggStep`/`AggInverse`/`AggValue`/`AggFinal` dispatch for
+    // the window-only `AggregateKind` variants via hand-built programs (no pager needed). The
+    // full end-to-end window codegen driver lands in M11.7; these verify the accumulator +
+    // opcode plumbing is correct in isolation.
+
+    /// `row_number()` over a 3-row frame: step 3 times (no inverse — the default frame only
+    /// grows), value after each step emits 1, 2, 3. Verifies the executor dispatches
+    /// `RowNumber` through `AggStep` (counter bump) and `AggValue` (via `value_mut`).
+    #[tokio::test]
+    async fn agg_value_row_number_increments() {
+        // r3 = accumulator, r4 = value-out. row_number() takes 0 args.
+        let prog = Program {
+            instructions: vec![
+                inst(Opcode::Init, 0, 11, 0), // 0: Init -> 11 (Transaction)
+                inst_with(Opcode::AggStep, 0, 0, 3, P4::FuncDef(AggregateKind::RowNumber), 0), // 1
+                inst_with(Opcode::AggValue, 3, 0, 4, P4::FuncDef(AggregateKind::RowNumber), 0), // 2: r4 = 1
+                inst(Opcode::ResultRow, 4, 1, 0), // 3: emit 1
+                inst_with(Opcode::AggStep, 0, 0, 3, P4::FuncDef(AggregateKind::RowNumber), 0), // 4
+                inst_with(Opcode::AggValue, 3, 0, 4, P4::FuncDef(AggregateKind::RowNumber), 0), // 5: r4 = 2
+                inst(Opcode::ResultRow, 4, 1, 0), // 6: emit 2
+                inst_with(Opcode::AggStep, 0, 0, 3, P4::FuncDef(AggregateKind::RowNumber), 0), // 7
+                inst_with(Opcode::AggValue, 3, 0, 4, P4::FuncDef(AggregateKind::RowNumber), 0), // 8: r4 = 3
+                inst(Opcode::ResultRow, 4, 1, 0), // 9: emit 3
+                inst(Opcode::Halt, 0, 0, 0), // 10
+                inst(Opcode::Transaction, 0, 0, 0), // 11
+                inst(Opcode::Goto, 0, 1, 0), // 12
+            ],
+            num_registers: 5, num_cursors: 0,
+        };
+        let mut v = Vdbe::new(Arc::new(prog), None);
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        while let StepResult::Row = v.step().await.expect("step") {
+            let n = v.result_count();
+            rows.push((0..n).map(|i| v.result_value(i)).collect());
+        }
+        assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(2)], vec![Value::Int(3)]]);
+    }
+
+    /// `rank()` over a 3-row peer group then a 2-row peer group. Step bumps `nStep`; on the
+    /// first row of a peer group `nValue` is latched to `nStep`. `AggValue` (via `value_mut`)
+    /// emits the latched value and resets `nValue = 0` so the next peer re-latches.
+    #[tokio::test]
+    async fn agg_value_rank_latches_peer_groups() {
+        // r3 = accumulator, r4 = value-out. rank() takes 0 args.
+        // Peer group 1 (3 rows): steps 1-3, latches nValue=1 on the first step.
+        //   value_mut → 1, nValue reset to 0.
+        // Peer group 2 (2 rows): steps 4-5, latches nValue=4 on the first step of the peer.
+        //   value_mut → 4.
+        let prog = Program {
+            instructions: vec![
+                inst(Opcode::Init, 0, 11, 0), // 0: Init -> 11 (Transaction)
+                // Peer group 1: step 3 times.
+                inst_with(Opcode::AggStep, 0, 0, 3, P4::FuncDef(AggregateKind::Rank), 0), // 1
+                inst_with(Opcode::AggStep, 0, 0, 3, P4::FuncDef(AggregateKind::Rank), 0), // 2
+                inst_with(Opcode::AggStep, 0, 0, 3, P4::FuncDef(AggregateKind::Rank), 0), // 3
+                inst_with(Opcode::AggValue, 3, 0, 4, P4::FuncDef(AggregateKind::Rank), 0), // 4: r4 = 1
+                inst(Opcode::ResultRow, 4, 1, 0), // 5: emit 1
+                // Peer group 2: step 2 times (nStep is now 5; first step of peer latches nValue=4).
+                inst_with(Opcode::AggStep, 0, 0, 3, P4::FuncDef(AggregateKind::Rank), 0), // 6
+                inst_with(Opcode::AggStep, 0, 0, 3, P4::FuncDef(AggregateKind::Rank), 0), // 7
+                inst_with(Opcode::AggValue, 3, 0, 4, P4::FuncDef(AggregateKind::Rank), 0), // 8: r4 = 4
+                inst(Opcode::ResultRow, 4, 1, 0), // 9: emit 4
+                inst(Opcode::Halt, 0, 0, 0), // 10
+                inst(Opcode::Transaction, 0, 0, 0), // 11
+                inst(Opcode::Goto, 0, 1, 0), // 12
+            ],
+            num_registers: 5, num_cursors: 0,
+        };
+        let mut v = Vdbe::new(Arc::new(prog), None);
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        while let StepResult::Row = v.step().await.expect("step") {
+            let n = v.result_count();
+            rows.push((0..n).map(|i| v.result_value(i)).collect());
+        }
+        assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(4)]]);
+    }
+
+    /// `cume_dist()` over a 4-row partition. Step counts `nTotal` (4); inverse counts `nStep`
+    /// (the row index from the start + 1). `AggValue` (via `value_mut`) emits `nStep / nTotal`.
+    /// Verifies the executor dispatches `CumeDist` through both `AggStep` and `AggInverse`.
+    #[tokio::test]
+    async fn agg_value_cume_dist_ratio() {
+        // r3 = accumulator, r4 = value-out. cume_dist() takes 0 args.
+        let prog = Program {
+            instructions: vec![
+                inst(Opcode::Init, 0, 12, 0), // 0: Init -> 12 (Transaction)
+                // 4 steps: nTotal=4.
+                inst_with(Opcode::AggStep, 0, 0, 3, P4::FuncDef(AggregateKind::CumeDist), 0), // 1
+                inst_with(Opcode::AggStep, 0, 0, 3, P4::FuncDef(AggregateKind::CumeDist), 0), // 2
+                inst_with(Opcode::AggStep, 0, 0, 3, P4::FuncDef(AggregateKind::CumeDist), 0), // 3
+                inst_with(Opcode::AggStep, 0, 0, 3, P4::FuncDef(AggregateKind::CumeDist), 0), // 4
+                // inverse 1 → nStep=1, value = 1/4 = 0.25
+                inst_with(Opcode::AggInverse, 1, 0, 3, P4::FuncDef(AggregateKind::CumeDist), 0), // 5
+                inst_with(Opcode::AggValue, 3, 0, 4, P4::FuncDef(AggregateKind::CumeDist), 0), // 6: r4 = 0.25
+                inst(Opcode::ResultRow, 4, 1, 0), // 7: emit 0.25
+                // inverse 1 → nStep=2, value = 2/4 = 0.5
+                inst_with(Opcode::AggInverse, 1, 0, 3, P4::FuncDef(AggregateKind::CumeDist), 0), // 8
+                inst_with(Opcode::AggValue, 3, 0, 4, P4::FuncDef(AggregateKind::CumeDist), 0), // 9: r4 = 0.5
+                inst(Opcode::ResultRow, 4, 1, 0), // 10: emit 0.5
+                inst(Opcode::Halt, 0, 0, 0), // 11
+                inst(Opcode::Transaction, 0, 0, 0), // 12
+                inst(Opcode::Goto, 0, 1, 0), // 13
+            ],
+            num_registers: 5, num_cursors: 0,
+        };
+        let mut v = Vdbe::new(Arc::new(prog), None);
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        while let StepResult::Row = v.step().await.expect("step") {
+            let n = v.result_count();
+            rows.push((0..n).map(|i| v.result_value(i)).collect());
+        }
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(rows[0][0], Value::Real(r) if (r - 0.25).abs() < 1e-12));
+        assert!(matches!(rows[1][0], Value::Real(r) if (r - 0.5).abs() < 1e-12));
+    }
+
+    /// `ntile(3)` over a 7-row partition. Step captures `nParam=3` on the first call and
+    /// counts `nTotal` (7); inverse bumps `iRow`. `AggValue` emits the 1-based bucket index.
+    #[tokio::test]
+    async fn agg_value_ntile_buckets() {
+        // r2 = arg (nParam), r3 = accumulator, r4 = value-out. ntile(N) takes 1 arg.
+        let prog = Program {
+            instructions: vec![
+                inst(Opcode::Init, 0, 18, 0), // 0: Init -> 18 (Transaction)
+                // 7 steps with N=3: nParam=3, nTotal=7.
+                inst(Opcode::Integer, 3, 2, 0), // 1
+                inst_with(Opcode::AggStep, 0, 2, 3, P4::FuncDef(AggregateKind::Ntile), 1), // 2
+                inst(Opcode::Integer, 3, 2, 0), // 3
+                inst_with(Opcode::AggStep, 0, 2, 3, P4::FuncDef(AggregateKind::Ntile), 1), // 4
+                inst(Opcode::Integer, 3, 2, 0), // 5
+                inst_with(Opcode::AggStep, 0, 2, 3, P4::FuncDef(AggregateKind::Ntile), 1), // 6
+                inst(Opcode::Integer, 3, 2, 0), // 7
+                inst_with(Opcode::AggStep, 0, 2, 3, P4::FuncDef(AggregateKind::Ntile), 1), // 8
+                inst(Opcode::Integer, 3, 2, 0), // 9
+                inst_with(Opcode::AggStep, 0, 2, 3, P4::FuncDef(AggregateKind::Ntile), 1), // 10
+                inst(Opcode::Integer, 3, 2, 0), // 11
+                inst_with(Opcode::AggStep, 0, 2, 3, P4::FuncDef(AggregateKind::Ntile), 1), // 12
+                inst(Opcode::Integer, 3, 2, 0), // 13
+                inst_with(Opcode::AggStep, 0, 2, 3, P4::FuncDef(AggregateKind::Ntile), 1), // 14
+                // iRow=0: value = 1 + 0/3 = 1
+                inst_with(Opcode::AggValue, 3, 0, 4, P4::FuncDef(AggregateKind::Ntile), 0), // 15: r4 = 1
+                inst(Opcode::ResultRow, 4, 1, 0), // 16: emit 1
+                inst(Opcode::Halt, 0, 0, 0), // 17
+                inst(Opcode::Transaction, 0, 0, 0), // 18
+                inst(Opcode::Goto, 0, 1, 0), // 19
+            ],
+            num_registers: 5, num_cursors: 0,
+        };
+        let mut v = Vdbe::new(Arc::new(prog), None);
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        while let StepResult::Row = v.step().await.expect("step") {
+            let n = v.result_count();
+            rows.push((0..n).map(|i| v.result_value(i)).collect());
+        }
+        assert_eq!(rows, vec![vec![Value::Int(1)]]);
     }
 }

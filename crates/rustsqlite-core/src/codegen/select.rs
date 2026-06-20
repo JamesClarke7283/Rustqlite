@@ -9,7 +9,7 @@
 //!   projects; the sorter is dropped when `ORDER BY <indexed_col> ASC` is also present (the
 //!   index is already ordered).
 
-use rustqlite_parser::{Expr, FunctionArgs, Literal, OrderingTerm, ResultColumn, SelectStmt, UnaryOp};
+use rustqlite_parser::{Expr, FunctionArgs, Literal, OrderingTerm, ResultColumn, SelectStmt, UnaryOp, Window};
 
 use crate::error::{Error, Result};
 use crate::func::aggregate::{is_aggregate_call, AggregateKind};
@@ -52,6 +52,24 @@ pub fn compile(
     // error, not a "not supported" limitation — the message matches the oracle.
     if select.having.is_some() && !is_aggregate_query(select, &outputs) {
         return Err(Error::msg("HAVING clause on a non-aggregate query"));
+    }
+    // Window-function queries (any function call with an `OVER` clause) are not yet supported
+    // by the codegen — the partition-sort + frame-step driver lands in M11.7. Raise the
+    // upstream-faithful "misuse of window function <name>()" error for a window-only function
+    // used without an `OVER` clause, and "window functions are not yet supported" for a
+    // properly windowed call (the latter is a Rustqlite-specific limitation, not an upstream
+    // error — upstream supports them; we don't yet).
+    if has_window_function_query(select, &outputs) {
+        return Err(Error::msg(
+            "window functions are not yet supported (M11.7: codegen driver pending)",
+        ));
+    }
+    // A window-only function (row_number/rank/…/lead/lag) used *without* an `OVER` clause is a
+    // semantic error in upstream ("misuse of window function <name>()"). We detect it here so
+    // the user sees the right message rather than a downstream "no such function" or a wrong
+    // scalar codegen path.
+    for (e, _) in &outputs {
+        check_no_window_only_without_over(e)?;
     }
     let names: Vec<String> = outputs.iter().map(|(_, n)| n.clone()).collect();
     let (limit, offset) = eval_limit_offset(select)?;
@@ -725,14 +743,15 @@ fn rewrite_aggregates_with_group_keys(
         return Expr::AggRef(reg);
     }
     match e {
-        Expr::Function { name, args, .. }
-            if is_aggregate_call(
-                name,
-                match args {
-                    FunctionArgs::Star => 0,
-                    FunctionArgs::List(v) => v.len(),
-                },
-            ) =>
+        Expr::Function { name, args, over, .. }
+            if over.is_none()
+                && is_aggregate_call(
+                    name,
+                    match args {
+                        FunctionArgs::Star => 0,
+                        FunctionArgs::List(v) => v.len(),
+                    },
+                ) =>
         {
             let call = AggCall {
                 name: name.clone(),
@@ -1018,18 +1037,112 @@ fn reject_unsupported(select: &SelectStmt) -> Result<()> {
     Ok(())
 }
 
-/// `true` if `e` contains an aggregate function call (recursing through the operator tree).
-/// Mirrors the analysis walk upstream does in `sqlite3ExprAnalyzeAggregates`. A function name
-/// that is also an aggregate name (e.g. `max`) only counts as an aggregate when its argument
-/// count matches the aggregate's arity — `max(a, 0)` is the scalar `max`, not the aggregate.
-fn contains_aggregate(e: &Expr) -> bool {
+/// Recursively check that no window-only function (row_number/rank/dense_rank/percent_rank/
+/// cume_dist/ntile/first_value/last_value/nth_value/lead/lag) is used *without* an `OVER`
+/// clause. Upstream raises "misuse of window function <name>()" — the user must write `OVER
+/// (...)` (even `OVER ()`) for these. A window-only function with `OVER` is a window query
+/// rejected earlier by [`has_window_function_query`]; this walker catches the bare-window-only
+/// case so it doesn't fall through to the scalar codegen path (which would call `func::check`
+/// and either wrongly accept it as a scalar or raise a less informative "no such function").
+fn check_no_window_only_without_over(e: &Expr) -> Result<()> {
+    use crate::func::aggregate::is_window_only_name;
     match e {
-        Expr::Function { name, args, .. } => {
+        Expr::Function { name, args, over, .. } => {
             let n_arg = match args {
                 FunctionArgs::Star => 0,
                 FunctionArgs::List(v) => v.len(),
             };
-            is_aggregate_call(name, n_arg)
+            if over.is_none() && is_window_only_name(name) {
+                // Resolve the arity to confirm this is the window-only function at this arity
+                // (e.g. `lead` at 4 args is "no such function", not "misuse of window function").
+                if crate::func::aggregate::AggregateKind::from_name(name, n_arg).is_some() {
+                    return Err(Error::msg(format!(
+                        "misuse of window function {}()",
+                        name
+                    )));
+                }
+                // Wrong arity falls through to the scalar `check` path, which raises the
+                // upstream "no such function" / "wrong number of arguments" error.
+            }
+            if let FunctionArgs::List(v) = args {
+                for a in v {
+                    check_no_window_only_without_over(a)?;
+                }
+            }
+        }
+        Expr::Unary { expr, .. } => check_no_window_only_without_over(expr)?,
+        Expr::Binary { left, right, .. } => {
+            check_no_window_only_without_over(left)?;
+            check_no_window_only_without_over(right)?;
+        }
+        Expr::Between { expr, low, high, .. } => {
+            check_no_window_only_without_over(expr)?;
+            check_no_window_only_without_over(low)?;
+            check_no_window_only_without_over(high)?;
+        }
+        Expr::In { expr, values, .. } => {
+            check_no_window_only_without_over(expr)?;
+            for v in values {
+                check_no_window_only_without_over(v)?;
+            }
+        }
+        Expr::InSubquery { expr, .. } => check_no_window_only_without_over(expr)?,
+        Expr::Cast { expr, .. } => check_no_window_only_without_over(expr)?,
+        Expr::Case {
+            base,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(b) = base {
+                check_no_window_only_without_over(b)?;
+            }
+            for (w, t) in when_then {
+                check_no_window_only_without_over(w)?;
+                check_no_window_only_without_over(t)?;
+            }
+            if let Some(e) = else_expr {
+                check_no_window_only_without_over(e)?;
+            }
+        }
+        Expr::Collate { expr, .. } => check_no_window_only_without_over(expr)?,
+        Expr::IsDistinctFrom { left, right, .. } => {
+            check_no_window_only_without_over(left)?;
+            check_no_window_only_without_over(right)?;
+        }
+        Expr::Row(es) => {
+            for e in es {
+                check_no_window_only_without_over(e)?;
+            }
+        }
+        Expr::Coalesce2 { left, right } => {
+            check_no_window_only_without_over(left)?;
+            check_no_window_only_without_over(right)?;
+        }
+        Expr::Literal(_) | Expr::Column { .. } | Expr::BindParam(_)
+        | Expr::Exists(_) | Expr::Subquery(_) | Expr::AggRef(_) => {}
+    }
+    Ok(())
+}
+
+/// `true` if `e` contains an aggregate function call (recursing through the operator tree).
+/// Mirrors the analysis walk upstream does in `sqlite3ExprAnalyzeAggregates`. A function name
+/// that is also an aggregate name (e.g. `max`) only counts as an aggregate when its argument
+/// count matches the aggregate's arity — `max(a, 0)` is the scalar `max`, not the aggregate.
+///
+/// A call with an `OVER (...)` clause is a **window** function call, not a plain aggregate,
+/// even if the name is one of the aggregate names (`count(*) OVER (...)`); those are detected
+/// separately by [`contains_window_function`]. This function returns `true` only for plain
+/// aggregate calls (`over.is_none()`).
+fn contains_aggregate(e: &Expr) -> bool {
+    match e {
+        Expr::Function { name, args, over, .. } => {
+            let n_arg = match args {
+                FunctionArgs::Star => 0,
+                FunctionArgs::List(v) => v.len(),
+            };
+            // A windowed call (OVER present) is not a plain aggregate even if the name matches.
+            over.is_none()
+                && is_aggregate_call(name, n_arg)
                 || matches!(args, FunctionArgs::List(v) if v.iter().any(contains_aggregate))
         }
         Expr::Unary { expr, .. } => contains_aggregate(expr),
@@ -1075,6 +1188,162 @@ fn is_aggregate_query(select: &SelectStmt, outputs: &[(Expr, String)]) -> bool {
     !select.group_by.is_empty() || outputs.iter().any(|(e, _)| contains_aggregate(e))
 }
 
+/// `true` if `e` contains a **window function call** — any function call with an `OVER (...)`
+/// clause (aggregate-as-window or window-only). Mirrors the `EP_WinFunc` flag upstream sets
+/// during expression analysis.
+pub(crate) fn contains_window_function(e: &Expr) -> bool {
+    match e {
+        Expr::Function { over, args, .. } => {
+            over.is_some()
+                || matches!(args, FunctionArgs::List(v) if v.iter().any(contains_window_function))
+        }
+        Expr::Unary { expr, .. } => contains_window_function(expr),
+        Expr::Binary { left, right, .. } => {
+            contains_window_function(left) || contains_window_function(right)
+        }
+        Expr::Between { expr, low, high, .. } => {
+            contains_window_function(expr)
+                || contains_window_function(low)
+                || contains_window_function(high)
+        }
+        Expr::In { expr, values, .. } => {
+            contains_window_function(expr) || values.iter().any(contains_window_function)
+        }
+        Expr::InSubquery { expr, .. } => contains_window_function(expr),
+        Expr::Cast { expr, .. } => contains_window_function(expr),
+        Expr::Case {
+            base,
+            when_then,
+            else_expr,
+        } => {
+            base.as_ref().is_some_and(|b| contains_window_function(b))
+                || when_then
+                    .iter()
+                    .any(|(w, t)| contains_window_function(w) || contains_window_function(t))
+                || else_expr.as_ref().is_some_and(|e| contains_window_function(e))
+        }
+        Expr::Collate { expr, .. } => contains_window_function(expr),
+        Expr::IsDistinctFrom { left, right, .. } => {
+            contains_window_function(left) || contains_window_function(right)
+        }
+        Expr::Row(es) => es.iter().any(contains_window_function),
+        Expr::Coalesce2 { left, right } => {
+            contains_window_function(left) || contains_window_function(right)
+        }
+        // Plain leaves — no window function hidden inside.
+        Expr::Literal(_)
+        | Expr::Column { .. }
+        | Expr::BindParam(_)
+        | Expr::Exists(_)
+        | Expr::Subquery(_)
+        | Expr::AggRef(_) => false,
+    }
+}
+
+/// A located window-function call discovered during analysis: the function name, its argument
+/// list (or `Star`), and the `OVER` clause's resolved window spec. Used by the future window
+/// codegen path (M11.7) to emit the partition-sort + frame-step program.
+#[derive(Clone, Debug)]
+pub(crate) struct WindowCall {
+    pub name: String,
+    pub args: FunctionArgs,
+    pub filter: Option<Box<Expr>>,
+    pub window: Window,
+}
+
+/// Walk an expression, collecting every window-function call (any function call with an
+/// `OVER (...)` clause) in evaluation order. The future window codegen path (M11.7) will use
+/// this to allocate per-call accumulator registers and emit the partition-sort + frame-step
+/// program. For now, [`compile`] rejects window queries via [`has_window_function_query`] with
+/// "misuse of window function" / "window functions are not yet supported" until 11.7 lands.
+fn collect_window_functions(e: &Expr, out: &mut Vec<WindowCall>) {
+    match e {
+        Expr::Function {
+            name,
+            distinct: _,
+            args,
+            filter,
+            over,
+        } => {
+            if let Some(window) = over {
+                out.push(WindowCall {
+                    name: name.clone(),
+                    args: args.clone(),
+                    filter: filter.clone(),
+                    window: window.clone(),
+                });
+            } else if let FunctionArgs::List(v) = args {
+                for a in v {
+                    collect_window_functions(a, out);
+                }
+            }
+        }
+        Expr::Unary { expr, .. } => collect_window_functions(expr, out),
+        Expr::Binary { left, right, .. } => {
+            collect_window_functions(left, out);
+            collect_window_functions(right, out);
+        }
+        Expr::Between { expr, low, high, .. } => {
+            collect_window_functions(expr, out);
+            collect_window_functions(low, out);
+            collect_window_functions(high, out);
+        }
+        Expr::In { expr, values, .. } => {
+            collect_window_functions(expr, out);
+            for v in values {
+                collect_window_functions(v, out);
+            }
+        }
+        Expr::InSubquery { expr, .. } => collect_window_functions(expr, out),
+        Expr::Cast { expr, .. } => collect_window_functions(expr, out),
+        Expr::Case {
+            base,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(b) = base {
+                collect_window_functions(b, out);
+            }
+            for (w, t) in when_then {
+                collect_window_functions(w, out);
+                collect_window_functions(t, out);
+            }
+            if let Some(e) = else_expr {
+                collect_window_functions(e, out);
+            }
+        }
+        Expr::Collate { expr, .. } => collect_window_functions(expr, out),
+        Expr::IsDistinctFrom { left, right, .. } => {
+            collect_window_functions(left, out);
+            collect_window_functions(right, out);
+        }
+        Expr::Row(es) => es.iter().for_each(|e| collect_window_functions(e, out)),
+        Expr::Coalesce2 { left, right } => {
+            collect_window_functions(left, out);
+            collect_window_functions(right, out);
+        }
+        Expr::Literal(_) | Expr::Column { .. } | Expr::BindParam(_)
+        | Expr::Exists(_) | Expr::Subquery(_) | Expr::AggRef(_) => {}
+    }
+}
+
+/// `true` if this SELECT uses any window function (any function call with an `OVER` clause).
+fn has_window_function_query(select: &SelectStmt, outputs: &[(Expr, String)]) -> bool {
+    outputs.iter().any(|(e, _)| contains_window_function(e))
+        || select
+            .where_clause
+            .as_ref()
+            .is_some_and(|w| contains_window_function(w))
+        || select
+            .having
+            .as_ref()
+            .is_some_and(|h| contains_window_function(h))
+        || select
+            .order_by
+            .iter()
+            .any(|t| contains_window_function(&t.expr))
+}
+
 /// A located aggregate call discovered during analysis: the function name, its argument list
 /// (or `Star`), and a stable identity used to deduplicate the same call appearing twice.
 #[derive(Clone, Debug)]
@@ -1083,19 +1352,24 @@ struct AggCall {
     args: FunctionArgs,
 }
 
-/// Walk an expression, collecting every aggregate function call in evaluation order (left to
-/// right). The same call syntactically appearing twice is recorded once and both sites reference
-/// the same accumulator register — matching upstream's `AggInfo` deduplication.
+/// Walk an expression, collecting every plain-aggregate function call in evaluation order
+/// (left to right). The same call syntactically appearing twice is recorded once and both sites
+/// reference the same accumulator register — matching upstream's `AggInfo` deduplication.
+///
+/// A call with an `OVER (...)` clause is a **window** function call, not a plain aggregate, and
+/// is *not* collected here even if its name is one of the aggregate names (`count(*) OVER (...)`).
+/// Window calls are collected separately by [`collect_window_functions`].
 fn collect_aggregates(e: &Expr, out: &mut Vec<AggCall>) {
     match e {
-        Expr::Function { name, args, .. }
-            if is_aggregate_call(
-                name,
-                match args {
-                    FunctionArgs::Star => 0,
-                    FunctionArgs::List(v) => v.len(),
-                },
-            ) =>
+        Expr::Function { name, args, over, .. }
+            if over.is_none()
+                && is_aggregate_call(
+                    name,
+                    match args {
+                        FunctionArgs::Star => 0,
+                        FunctionArgs::List(v) => v.len(),
+                    },
+                ) =>
         {
             // The arguments of an aggregate are NOT themselves walked for nested aggregates —
             // SQLite disallows nested aggregate calls (`sum(count(*))` is a parse error).
@@ -1103,6 +1377,18 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggCall>) {
                 name: name.clone(),
                 args: args.clone(),
             });
+        }
+        Expr::Function { args, .. } => {
+            // A non-aggregate function call (or a window call) — recurse into its arguments so a
+            // plain aggregate nested inside (e.g. `length(count(*))` — though that's actually
+            // invalid SQL, the walker still descends) is collected. Window calls' arguments are
+            // walked too so a plain aggregate inside a windowed call's args is still detected
+            // for the outer query's aggregate analysis (rare but valid).
+            if let FunctionArgs::List(v) = args {
+                for a in v {
+                    collect_aggregates(a, out);
+                }
+            }
         }
         Expr::Unary { expr, .. } => collect_aggregates(expr, out),
         Expr::Binary { left, right, .. } => {
@@ -1145,25 +1431,29 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggCall>) {
         }
         Expr::Row(es) => es.iter().for_each(|e| collect_aggregates(e, out)),
         Expr::Literal(_) | Expr::Column { .. } | Expr::BindParam(_)
-        | Expr::Exists(_) | Expr::Subquery(_) | Expr::AggRef(_) | Expr::Function { .. }
-        | Expr::Coalesce2 { .. } => {}
+        | Expr::Exists(_) | Expr::Subquery(_) | Expr::AggRef(_) | Expr::Coalesce2 { .. } => {}
     }
 }
 
-/// Rewrite an expression tree so every aggregate call is replaced by an `AggRef` to its
+/// Rewrite an expression tree so every plain-aggregate call is replaced by an `AggRef` to its
 /// assigned accumulator register. Non-aggregate function calls are left untouched. The
 /// `reg_of` closure maps a syntactic call (name + args) to its register; calls not present in
 /// `reg_of` (which should not happen if analysis was complete) are left as-is.
+///
+/// A call with an `OVER (...)` clause is a window function call and is *not* rewritten here even
+/// if its name is an aggregate name — the window codegen path (M11.7) handles windowed calls
+/// separately.
 fn rewrite_aggregates(e: &Expr, reg_of: &impl Fn(&AggCall) -> Option<i32>) -> Expr {
     match e {
-        Expr::Function { name, args, .. }
-            if is_aggregate_call(
-                name,
-                match args {
-                    FunctionArgs::Star => 0,
-                    FunctionArgs::List(v) => v.len(),
-                },
-            ) =>
+        Expr::Function { name, args, over, .. }
+            if over.is_none()
+                && is_aggregate_call(
+                    name,
+                    match args {
+                        FunctionArgs::Star => 0,
+                        FunctionArgs::List(v) => v.len(),
+                    },
+                ) =>
         {
             let call = AggCall {
                 name: name.clone(),

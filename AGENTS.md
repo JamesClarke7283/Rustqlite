@@ -448,3 +448,47 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   subquery is not yet rewritten (the SubqueryResolver path doesn't apply the CTE rewrite);
   nested subqueries in FROM block a non-recursive CTE-referencing-CTE whose inner CTE is
   rewritten to a subquery — these land with nested-subquery support.
+- **M11 — Window Functions** 🚧: **11.1–11.3** ✅ (parser `OVER`/`FILTER`/named windows, and
+  VDBE accumulator state `AggInverse`/`AggValue` opcodes — landed in earlier iterations).
+  **11.4–11.6 built-in window function accumulators** ✅: `AggregateKind` now carries the
+  window-only kinds `RowNumber`/`Rank`/`DenseRank`/`PercentRank`/`CumeDist`/`Ntile`/
+  `FirstValue`/`LastValue`/`NthValue`/`Lead`/`Lag`, resolved case-insensitively at codegen
+  time alongside the plain aggregates via `AggregateKind::from_name`. The `Accumulator` struct
+  gained `n_value`/`n_step`/`n_total`/`n_param`/`nth_step`/`captured` fields mirroring
+  upstream's `CallCount`/`NtileCtx`/`NthValueCtx`/`LastValueCtx` state. The `step`/`inverse`/
+  `value_mut` implementations faithfully port `row_numberStepFunc`/`rankStepFunc`/
+  `dense_rankStepFunc`/`percent_rankStepFunc`+`InvFunc`/`cume_distStepFunc`+`InvFunc`/
+  `ntileStepFunc`+`InvFunc`/`first_valueStepFunc`/`last_valueStepFunc`+`InvFunc`/
+  `nth_valueStepFunc` from `window.c`. The executor's `AggValue` arm dispatches window-only
+  kinds through a new `value_mut` path (mutating `xValue`, matching upstream — e.g.
+  `rankValueFunc` resets `nValue = 0` so the next peer group re-latches); plain aggregates
+  keep the non-mutating `value` path. `AggregateKind::default_frame` returns the
+  upstream-coerced frame for each built-in (mirrors the `aUp[]` table in
+  `sqlite3WindowUpdate`, `window.c:699`). `AggregateKind::window_only` distinguishes the
+  window-only built-ins from the aggregate-as-window kinds. Codegen-time validation:
+  `check_no_window_only_without_over` walks the projection/WHERE/HAVING/ORDER BY and raises
+  the upstream "misuse of window function <name>()" error for a window-only function used
+  without an `OVER` clause (matches the oracle); a windowed call (`OVER` present) raises
+  the Rustqlite-specific "window functions are not yet supported (M11.7: codegen driver
+  pending)" — the partition-sort + frame-step driver is M11.7. `collect_aggregates` and
+  `contains_aggregate` now check `over.is_none()` so a windowed aggregate call
+  (`count(*) OVER (...)`) is not double-counted by the plain-aggregate path; the
+  `rewrite_aggregates`/`rewrite_aggregates_with_group_keys` walks likewise skip windowed
+  calls. Differential-tested vs the C oracle (`window_function_errors` — misuse error parity
+  for all 11 window-only names, plus the not-yet-supported message for windowed calls).
+  Unit-tested at the accumulator level (40 tests in `func::aggregate::tests` — including
+  `row_number_increments`, `rank_latches_and_resets`, `dense_rank_increments_on_peer_change`,
+  `percent_rank_computes_ratio`, `cume_dist_computes_ratio`, `ntile_distributes_evenly`,
+  `first_value_captures_first`, `last_value_captures_latest`/`last_value_inverse_clears_when_empty`,
+  `nth_value_captures_nth`, `from_name_resolves_window_only`, `window_only_classification`,
+  `default_frame_matches_upstream`) and at the VDBE level (4 new hand-built programs in
+  `vdbe::exec::tests`: `agg_value_row_number_increments`, `agg_value_rank_latches_peer_groups`,
+  `agg_value_cume_dist_ratio`, `agg_value_ntile_buckets` — exercise the executor's
+  `AggStep`/`AggInverse`/`AggValue` dispatch for the window-only kinds). Still M11:
+  **11.7** the partition-sort + frame-step codegen driver (the `sqlite3WindowCodeStep` port
+  that emits the partition ephemeral + frame-step + `AggValue`-per-row shape), **11.8** the
+  full frame-spec (`ROWS`/`RANGE`/`GROUPS` bounds), **11.9** frame bound expressions, and
+  **11.10** the `EXCLUDE` clause. Known gap: `lead`/`lag` are registered for name resolution
+  and frame coercion but their `step`/`inverse`/`value_mut` are no-ops — upstream implements
+  them with VDBE instructions (the `WINDOWFUNCNOOP` registration), so they need the M11.7
+  codegen driver to function.

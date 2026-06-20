@@ -1630,3 +1630,84 @@ fn compound_select_column_count_mismatch() {
         }
     }
 }
+
+/// Window-only function misuse and "not yet supported" error parity (M11.4–M11.6).
+/// A window-only built-in (`row_number`/`rank`/`dense_rank`/`percent_rank`/`cume_dist`/
+/// `ntile`/`first_value`/`last_value`/`nth_value`/`lead`/`lag`) used *without* an `OVER` clause
+/// is rejected by both engines with "misuse of window function <name>()". A windowed call
+/// (`OVER (...)` present) is supported by the oracle but not yet by Rustqlite (M11.7 pending),
+/// so we only verify our error (the oracle succeeds — we don't `assert_same` those).
+#[test]
+fn window_function_errors() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup("CREATE TABLE t(a INT); INSERT INTO t VALUES (1), (2), (3);");
+
+    // Window-only functions used without OVER — both engines error with "misuse of window
+    // function <name>()".
+    let misuse_cases = [
+        "SELECT row_number() FROM t;",
+        "SELECT rank() FROM t;",
+        "SELECT dense_rank() FROM t;",
+        "SELECT percent_rank() FROM t;",
+        "SELECT cume_dist() FROM t;",
+        "SELECT ntile(2) FROM t;",
+        "SELECT first_value(a) FROM t;",
+        "SELECT last_value(a) FROM t;",
+        "SELECT nth_value(a, 1) FROM t;",
+        "SELECT lead(a) FROM t;",
+        "SELECT lag(a) FROM t;",
+    ];
+    for q in misuse_cases {
+        // The oracle errors with "misuse of window function ...".
+        let oracle_out = std::process::Command::new("sqlite3")
+            .arg("-batch")
+            .arg(db.str())
+            .arg(q)
+            .output()
+            .expect("run sqlite3");
+        let oracle_err = String::from_utf8_lossy(&oracle_out.stderr);
+        assert!(
+            oracle_err.contains("misuse of window function"),
+            "oracle did not error as expected for {q}: {oracle_err}"
+        );
+        // Our engine should also error with the same message.
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let res = sqlite3_prepare_v2(&mut conn, q);
+        match res {
+            Ok(_) => panic!("expected misuse error for: {q}"),
+            Err(e) => {
+                assert!(
+                    e.message.contains("misuse of window function"),
+                    "error mismatch for {q}: got {:?}",
+                    e.message
+                );
+            }
+        }
+    }
+
+    // Windowed calls (OVER present) — the oracle succeeds; our engine returns "not yet
+    // supported". We only check our error here (the oracle's rows are not asserted because we
+    // don't produce them yet).
+    let not_yet_cases = [
+        "SELECT row_number() OVER () FROM t;",
+        "SELECT rank() OVER (ORDER BY a) FROM t;",
+        "SELECT dense_rank() OVER (ORDER BY a) FROM t;",
+        "SELECT count(*) OVER () FROM t;",
+        "SELECT sum(a) OVER (ORDER BY a) FROM t;",
+    ];
+    for q in not_yet_cases {
+        match rustsqlite_rows(db.str(), q) {
+            Ok(_) => panic!("expected 'not yet supported' error for: {q}"),
+            Err(e) => {
+                assert!(
+                    e.contains("window functions are not yet supported"),
+                    "wrong error for `{q}`: {e}"
+                );
+            }
+        }
+    }
+}
