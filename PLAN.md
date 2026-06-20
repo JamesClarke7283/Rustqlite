@@ -190,8 +190,8 @@ list every granular item needed.
 - [x] **7.3** VDBE: `NotFound` / `Found` opcodes — index existence check
 - [x] **7.4** Codegen: cross join (cartesian product, nested loop)
 - [x] **7.5** Codegen: inner join — nested-loop with `NotExists`/`Found` on inner table
-- [ ] **7.6** Codegen: left outer join — emit NULL row when inner match fails (`IfNullRow` opcode)
-- [ ] **7.7** VDBE: `NullRow` opcode — set cursor to all-NULL row for LEFT JOIN miss
+- [x] **7.6** Codegen: left outer join — emit NULL row when inner match fails (`IfNullRow` opcode)
+- [x] **7.7** VDBE: `NullRow` opcode — set cursor to all-NULL row for LEFT JOIN miss
 - [ ] **7.8** Right join (implemented as left join with swapped tables)
 - [ ] **7.9** Full outer join (left + right with NULL fill)
 - [ ] **7.10** Natural join: USING columns → deduped projection + coalesced ON condition

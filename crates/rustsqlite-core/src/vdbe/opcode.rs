@@ -82,6 +82,11 @@ pub enum Opcode {
     /// no such row exists, jump to `p2`. Mirrors `OP_NotExists` from `vdbe.c` and is the rowid-
     /// seek used by `UPDATE`'s two-pass rewrite.
     NotExists,
+    /// `NullRow p1`: set cursor `p1` to a synthetic all-NULL row. Used by LEFT JOIN to emit
+    /// a NULL-filled right-table row when no inner match is found. Subsequent `Column` reads
+    /// from this cursor return NULL until the cursor is repositioned by `Next`/`Rewind`/etc.
+    /// Mirrors `OP_NullRow` in `vdbe.c`.
+    NullRow,
 
     // --- row access ---
     /// `Rowid p1 p2`: `r[p2]` = the integer rowid of cursor `p1`'s current row.
@@ -314,6 +319,7 @@ impl Opcode {
             Opcode::Found => "Found",
             Opcode::NotFound => "NotFound",
             Opcode::NotExists => "NotExists",
+            Opcode::NullRow => "NullRow",
             Opcode::Rowid => "Rowid",
             Opcode::Column => "Column",
             Opcode::ResultRow => "ResultRow",

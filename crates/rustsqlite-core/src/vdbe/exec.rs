@@ -446,6 +446,26 @@ impl Vdbe {
                     self.pc += 1;
                 }
 
+                Opcode::NullRow => {
+                    // Set the cursor to a synthetic all-NULL row. Used by LEFT JOIN to emit a
+                    // NULL-filled right-table row when no inner match is found.
+                    match self.cursor_mut(p1)? {
+                        VdbeCursor::Table(c) => c.set_null_row(),
+                        VdbeCursor::Index(c) => {
+                            // Index cursors don't have a null-row state; the LEFT JOIN codegen
+                            // only uses NullRow on table cursors. Defensive: clear the payload
+                            // so Column reads return NULL.
+                            let _ = c;
+                            return Err(Error::msg("NullRow on an index cursor is not supported"));
+                        }
+                        VdbeCursor::Sorter(_) | VdbeCursor::Ephemeral(_) => {
+                            return Err(Error::msg("NullRow on a sorter/ephemeral cursor is not supported"));
+                        }
+                    }
+                    self.decoded = None;
+                    self.pc += 1;
+                }
+
                 Opcode::Rewind => {
                     // Rewind the cursor and jump to `p2` if it is empty. Works on
                     // table/index cursors and ephemeral/sorter cursors.
@@ -1329,6 +1349,14 @@ impl Vdbe {
                     let vals = decode_record(&payload, self.encoding)?;
                     return Ok(vals.get(col).cloned().unwrap_or(Value::Null));
                 }
+
+        // Table cursor: check the null-row state first (LEFT JOIN miss). When in the
+        // all-NULL state, every column reads as NULL without touching the record.
+        if let Some(VdbeCursor::Table(c)) = self.cursors.get(idx).and_then(|c| c.as_ref()) {
+            if c.is_null_row() {
+                return Ok(Value::Null);
+            }
+        }
 
         let rowid = self.table_cursor(idx as i32)?.rowid()?;
         let hit = matches!(&self.decoded, Some((ci, rid, _)) if *ci == idx && *rid == rowid);

@@ -34,14 +34,17 @@ use super::builder::ProgramBuilder;
 use super::expr::{compile_expr, compile_jump, Ctx, JoinTable};
 use super::select::{eval_limit_offset, expand_columns_with_tables, resolve_order_term};
 
-/// Compile a two-table cross / inner join. `tables` is the resolved pair (left, right) with
-/// their cursor numbers (0, 1). The `ON` predicate (if any) is evaluated inside the inner
-/// loop before the projection; the `WHERE` clause is evaluated after the `ON`.
+/// Compile a two-table cross / inner / left join. `tables` is the resolved pair (left, right)
+/// with their cursor numbers (0, 1). The `ON` predicate (if any) is evaluated inside the inner
+/// loop before the projection; the `WHERE` clause is evaluated after the `ON`. When
+/// `left_join` is true, a left-outer join is emitted: if no inner row matches, a NULL-filled
+/// right-table row is emitted via `OP_NullRow`.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_cross_join(
     select: &SelectStmt,
     tables: &[(&Table, &str); 2],
     on_predicate: Option<&Expr>,
+    left_join: bool,
 ) -> Result<(Program, Vec<String>)> {
     let (limit, offset) = eval_limit_offset(select)?;
     let outputs = expand_columns_with_tables(select, tables)?;
@@ -120,18 +123,37 @@ pub fn compile_cross_join(
     b.emit_jump(Opcode::Rewind, 0, end, 0);
     let loop_a = b.new_label();
     b.resolve(loop_a);
+
+    // For a LEFT JOIN, a per-outer-row flag tracks whether any inner row matched. When the
+    // inner loop ends with no match, a NULL-filled right-table row is emitted.
+    let match_flag = if left_join { Some(b.alloc_reg()) } else { None };
+    if let Some(mf) = match_flag {
+        b.emit(Opcode::Integer, 0, mf, 0);
+    }
+
     // Inner loop over the right table.
     let next_a = b.new_label();
-    b.emit_jump(Opcode::Rewind, 1, next_a, 0);
+    // For a LEFT JOIN, the "no match" path lands here (after the inner loop). For a cross/
+    // inner join, the inner loop exhaustion jumps straight to next_a.
+    let no_match = b.new_label();
+    b.emit_jump(Opcode::Rewind, 1, if left_join { no_match } else { next_a }, 0);
     let loop_b = b.new_label();
     b.resolve(loop_b);
     let next_b = b.new_label();
 
-    // ON predicate (inner join only): jump to next_b on false.
+    // ON predicate (inner/left join): jump to next_b on false.
     if let Some(on) = on_predicate {
         compile_jump(&mut b, on, next_b, false, true, ctx)?;
     }
-    // WHERE clause: jump to next_b on false.
+
+    // A match was found: set the flag for LEFT JOIN.
+    if let Some(mf) = match_flag {
+        b.emit(Opcode::Integer, 1, mf, 0);
+    }
+
+    // WHERE clause: jump to next_b on false. (For a LEFT JOIN, a WHERE on the right table's
+    // columns filters out NULL-filled rows too — NULL comparisons yield UNKNOWN, which is
+    // false, so the row is skipped. This matches SQLite's semantics.)
     if let Some(w) = &select.where_clause {
         compile_jump(&mut b, w, next_b, false, true, ctx)?;
     }
@@ -169,6 +191,50 @@ pub fn compile_cross_join(
     // Advance inner loop.
     b.resolve(next_b);
     b.emit_jump(Opcode::Next, 1, loop_b, 0);
+
+    // LEFT JOIN no-match handler: after the inner loop ends with no match, set the right
+    // cursor to a NULL row and emit one row. The WHERE clause is re-applied (a WHERE on the
+    // right table's columns will filter this out since NULL comparisons are UNKNOWN).
+    if let Some(mf) = match_flag {
+        b.resolve(no_match);
+        // If a match was found, skip the NULL-row emission.
+        let skip = b.new_label();
+        b.emit_jump(Opcode::If, mf, skip, 0);
+        // Set the right cursor to a NULL row.
+        b.emit(Opcode::NullRow, 1, 0, 0);
+        // Re-apply the WHERE clause on the NULL-filled row.
+        if let Some(w) = &select.where_clause {
+            compile_jump(&mut b, w, skip, false, true, ctx)?;
+        }
+        // Project the NULL-filled row.
+        let null_result_reg = b.alloc_regs(ncol);
+        for (j, (expr, _)) in outputs.iter().enumerate() {
+            compile_expr(&mut b, expr, null_result_reg + j as i32, ctx)?;
+        }
+        if has_order_by {
+            let block = b.alloc_regs(norder + ncol);
+            for (k, term) in select.order_by.iter().enumerate() {
+                let key_expr = resolve_order_term(term, &outputs)?;
+                compile_expr(&mut b, &key_expr, block + k as i32, ctx)?;
+            }
+            for j in 0..ncol {
+                b.emit(Opcode::SCopy, null_result_reg + j, block + norder + j, 0);
+            }
+            let rec = b.alloc_reg();
+            b.emit(Opcode::MakeRecord, block, norder + ncol, rec);
+            b.emit(Opcode::SorterInsert, sorter, rec, 0);
+        } else {
+            if let Some(oreg) = offset_reg {
+                b.emit_jump(Opcode::IfPos, oreg, skip, 1);
+            }
+            b.emit(Opcode::ResultRow, null_result_reg, ncol, 0);
+            if let Some(lreg) = limit_reg {
+                b.emit_jump(Opcode::DecrJumpZero, lreg, end, 0);
+            }
+        }
+        b.resolve(skip);
+    }
+
     // Advance outer loop.
     b.resolve(next_a);
     b.emit_jump(Opcode::Next, 0, loop_a, 0);
@@ -230,9 +296,10 @@ fn flatten_into<'a>(
                 return;
             }
             TableOrJoin::Join(j) => {
-                // Only handle CROSS and plain INNER joins with an ON constraint.
+                // Handle CROSS, INNER, and LEFT joins. RIGHT/FULL/NATURAL are rejected by
+                // `validate_join`.
                 match j.op {
-                    JoinOp::Cross | JoinOp::Inner => {}
+                    JoinOp::Cross | JoinOp::Inner | JoinOp::Left | JoinOp::LeftOuter => {}
                     _ => {
                         out.clear();
                         return;
@@ -258,6 +325,16 @@ pub fn on_predicate(constraint: Option<&rustqlite_parser::JoinConstraint>) -> Op
     }
 }
 
+/// True when the FROM clause's top-level join is a LEFT (OUTER) join. The M7 first slice
+/// only handles a single join level; a chain of joins is deferred.
+pub fn is_left_join(from: &[TableOrJoin]) -> bool {
+    if let Some(TableOrJoin::Join(j)) = from.first() {
+        matches!(j.op, JoinOp::Left | JoinOp::LeftOuter)
+    } else {
+        false
+    }
+}
+
 /// Reject unsupported join features that `flatten_cross_join` accepts but the codegen can't
 /// handle yet (USING, etc.). Returns an error message for the first unsupported feature.
 pub fn validate_join(from: &[TableOrJoin]) -> Result<()> {
@@ -266,8 +343,8 @@ pub fn validate_join(from: &[TableOrJoin]) -> Result<()> {
             if matches!(j.constraint, Some(rustqlite_parser::JoinConstraint::Using(_))) {
                 return Err(Error::msg("USING clause is not supported yet (M7.10)"));
             }
-            if matches!(j.op, JoinOp::Left | JoinOp::LeftOuter | JoinOp::Right | JoinOp::RightOuter | JoinOp::Full | JoinOp::FullOuter | JoinOp::Natural) {
-                return Err(Error::msg("OUTER/NATURAL joins are not supported yet (M7.6-M7.10)"));
+            if matches!(j.op, JoinOp::Right | JoinOp::RightOuter | JoinOp::Full | JoinOp::FullOuter | JoinOp::Natural) {
+                return Err(Error::msg("RIGHT/FULL/NATURAL joins are not supported yet (M7.8-M7.10)"));
             }
             validate_join(std::slice::from_ref(&*j.left))?;
         }

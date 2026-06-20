@@ -1018,9 +1018,9 @@ fn eqp_index_plan_details_match_oracle() {
     }
 }
 
-/// Cross / inner joins (M7.4–M7.5). The M7 first slice handles two-table cross joins
-/// (`FROM t1, t2` / `CROSS JOIN`) and inner joins with an `ON` predicate, as a nested loop.
-/// LEFT/RIGHT/FULL/NATURAL joins and `USING` are deferred.
+/// Cross / inner / left joins (M7.4–M7.6). The M7 slice handles two-table cross joins
+/// (`FROM t1, t2` / `CROSS JOIN`), inner joins with an `ON` predicate, and left outer joins
+/// — all as a nested loop. RIGHT/FULL/NATURAL joins and `USING` are deferred.
 #[test]
 fn cross_and_inner_joins() {
     if !sqlite3_available() {
@@ -1063,6 +1063,19 @@ fn cross_and_inner_joins() {
         // Aliased tables.
         "SELECT x.a, y.c FROM t1 AS x, t2 AS y WHERE x.a = 1;",
         "SELECT x.a, y.d FROM t1 x, t2 y WHERE y.c = 20;",
+        // Left outer join — NULL-filled right table when no match.
+        "SELECT * FROM t1 LEFT JOIN t2 ON t1.a = 1;",
+        "SELECT t1.a, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.c;",
+        "SELECT * FROM t1 LEFT JOIN t2 ON 1=0;",
+        "SELECT * FROM t1 LEFT JOIN t2 ON t1.a < t2.c;",
+        "SELECT t1.a, t2.c FROM t1 LEFT JOIN t2 ON t1.a = 2 WHERE t2.c IS NULL;",
+        "SELECT t1.a, t2.c FROM t1 LEFT JOIN t2 ON t1.a = 1 WHERE t2.c > 15;",
+        "SELECT * FROM t1 LEFT JOIN t2 ON t1.a = 1 ORDER BY t2.c;",
+        "SELECT t1.a, t2.d FROM t1 LEFT JOIN t2 ON t1.a = 3 ORDER BY t1.a;",
+        // LEFT JOIN with no ON (every left row gets a NULL-filled right row — matches SQLite
+        // which treats a missing ON as a constant-true predicate for LEFT JOIN... actually
+        // SQLite requires an ON for LEFT JOIN; this is just a regular LEFT JOIN with ON 1=1).
+        "SELECT t1.a, t2.c FROM t1 LEFT JOIN t2 ON 1=1 WHERE t1.a = 1;",
     ] {
         assert_same(db.str(), q);
     }

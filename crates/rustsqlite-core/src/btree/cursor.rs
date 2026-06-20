@@ -158,6 +158,10 @@ pub struct TableCursor {
     /// Guard to prevent infinite recursion if a rebalance triggers another delete/seek on
     /// the same cursor.
     rebalance_in_progress: bool,
+    /// `true` when the cursor is in the synthetic all-NULL state set by `OP_NullRow` (LEFT
+    /// JOIN miss). While set, `Column` reads return NULL and `rowid` returns 0. Cleared by
+    /// the next `rewind`/`next`/`seek_rowid`.
+    null_row: bool,
 }
 
 impl TableCursor {
@@ -177,6 +181,7 @@ impl TableCursor {
             at_end: true,
             pending_advance: false,
             rebalance_in_progress: false,
+            null_row: false,
         }
     }
 
@@ -200,6 +205,7 @@ impl TableCursor {
         self.cell_idx = 0;
         self.at_end = false;
         self.pending_advance = false;
+        self.null_row = false;
         self.descend_left(self.root).await?;
         // An empty leaf (e.g. an empty single-page table) means we must advance — which, with
         // an empty stack, simply marks the cursor at-end.
@@ -215,6 +221,7 @@ impl TableCursor {
         if self.at_end {
             return Ok(());
         }
+        self.null_row = false;
         // If the previous op was a delete, the cell at the current `cell_idx` is the row
         // that just slid in; we want the next `next()` to land on the cell AFTER it.
         if self.pending_advance {
@@ -228,15 +235,35 @@ impl TableCursor {
         self.advance_to_next_leaf().await
     }
 
-    /// The rowid of the current row.
+    /// The rowid of the current row. Returns 0 when in the all-NULL state (`NullRow`).
     pub fn rowid(&self) -> Result<i64> {
+        if self.null_row {
+            return Ok(0);
+        }
         Ok(self.current_cell()?.rowid)
     }
 
-    /// The full record payload of the current row (overflow chains followed).
+    /// The full record payload of the current row (overflow chains followed). Returns an
+    /// empty record (which decodes to all-NULL columns) when in the all-NULL state.
     pub async fn payload(&self) -> Result<Vec<u8>> {
+        if self.null_row {
+            // An empty record decodes to zero values; the executor's `Column` returns NULL
+            // for out-of-range columns, so this yields NULLs for every column.
+            return Ok(Vec::new());
+        }
         let cell = self.current_cell()?;
         assemble_payload(&self.pager, &cell).await
+    }
+
+    /// Set the cursor to the synthetic all-NULL state (`OP_NullRow`). Cleared by the next
+    /// `rewind`/`next`/`seek_rowid`.
+    pub fn set_null_row(&mut self) {
+        self.null_row = true;
+    }
+
+    /// Whether the cursor is currently in the all-NULL state.
+    pub fn is_null_row(&self) -> bool {
+        self.null_row
     }
 
     /// The 1-based page number of the leaf the cursor is currently on (0 if not on a
@@ -258,6 +285,7 @@ impl TableCursor {
         self.cell_idx = 0;
         self.at_end = false;
         self.pending_advance = false;
+        self.null_row = false;
         self.descend_to_target(self.root, target).await?;
         if !self.is_valid() {
             return Ok(false);

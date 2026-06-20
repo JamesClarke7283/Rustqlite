@@ -599,8 +599,9 @@ fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelec
                     .find_map(|(_, c)| codegen::join::on_predicate(*c));
                 let table_refs: Vec<(&Table, &str)> =
                     resolved.iter().map(|(t, n)| (t, n.as_str())).collect();
+                let left_join = codegen::join::is_left_join(&select.from);
                 let (program, column_names) =
-                    codegen::join::compile_cross_join(select, &table_refs[..2].try_into().unwrap(), on_predicate)?;
+                    codegen::join::compile_cross_join(select, &table_refs[..2].try_into().unwrap(), on_predicate, left_join)?;
                 return Ok(CompiledSelect {
                     program,
                     column_names,

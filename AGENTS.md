@@ -212,3 +212,10 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   across all tables; `table.*` expands the named table. ORDER BY on a join uses the sorter.
   Differential-tested vs the C oracle (`cross_and_inner_joins`). Still M7+: left/right/full
   outer joins, natural join, `USING`, self-joins, join-order selection, aggregates over joins.
+  **7.6–7.7 left outer join + `NullRow`** ✅: `LEFT JOIN ... ON` emits a NULL-filled right-table
+  row (via the new `OP_NullRow` opcode) when no inner row matches the ON predicate. A per-outer-
+  row match flag tracks whether any inner row matched; after the inner loop, if the flag is 0,
+  the right cursor is set to a NULL row and one row is emitted (re-applying the WHERE clause,
+  which filters out NULL-filled rows when it tests right-table columns). Differential-tested
+  vs the C oracle (LEFT JOIN cases in `cross_and_inner_joins`). Still M7+: right/full outer
+  joins, natural join, `USING`, self-joins, join-order selection, aggregates over joins.
