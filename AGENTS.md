@@ -320,3 +320,17 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   columns) caches the first row's result and replays it for every outer row (wrong but
   non-crashing); correlation support needs M8.11 `Param` + M8.13 re-materialization,
   plus name resolution (M2.74) to detect `EP_VarSelect`.
+  **8.8 `EXISTS (subquery)`** ✅: `Expr::Exists` is compiled by
+  `codegen::subquery::compile_exists_subquery` (mirrors `sqlite3CodeSubselect` in
+  `expr.c` for the `TK_EXISTS` case). The subquery body is compiled as a sub-program via
+  `select::compile`, then inlined into the outer program as a subroutine wrapped in
+  `OP_Once` + `OP_Gosub`/`OP_Return` (same shape as 8.7). The `SRT_Exists` destination
+  pre-fills `result_reg` with `Integer 0` (the no-rows case), then rewrites each
+  `ResultRow` into `Integer 1, result_reg` + `Goto subroutine_end` (the `LIMIT 1`
+  equivalent — the first yielded row flips the result to 1 and the subroutine returns).
+  The body's `Halt` becomes the `Return`. Register/cursor rebasing and jump-patch loop
+  are shared with `compile_scalar_subquery` via `rebase_operands`/`is_absolute_jump`.
+  Supports: bare `EXISTS`/`NOT EXISTS` as a scalar, `EXISTS` in `WHERE`, `EXISTS` over a
+  real table (with `WHERE`), `EXISTS` with constant subquery, multiple `EXISTS` in one
+  query, and `EXISTS` combined with scalar subqueries. Differential-tested vs the C
+  oracle (`exists_subquery`). Same non-correlated limitation as 8.7.

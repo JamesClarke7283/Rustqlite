@@ -608,6 +608,123 @@ pub fn compile_scalar_subquery(
     Ok(result_reg)
 }
 
+/// Compile an `EXISTS (SELECT …)` expression, returning the register that holds the boolean
+/// result (1 if the subquery returns at least one row, 0 otherwise). Mirrors
+/// `sqlite3CodeSubselect` in `expr.c` for the `TK_EXISTS` case: the subquery body is compiled
+/// as a subroutine (`OP_Gosub`/`OP_Return`), wrapped in `OP_Once` so a non-correlated
+/// subquery runs only once per statement even if the expression is evaluated many times.
+///
+/// Each `ResultRow` in the inlined subquery body is rewritten into `Integer 1, result_reg`
+/// followed by `Goto <end_of_subroutine>` — i.e. the first yielded row sets `result_reg` to 1
+/// and the subroutine returns immediately (the equivalent of upstream's `LIMIT 1` injection).
+/// The body's `Halt` (the scan-end label) is rewritten to the subroutine's `Return`.
+///
+/// Like [`compile_scalar_subquery`], the M8.8 first slice assumes the subquery is
+/// **non-correlated** — it must not reference outer-query columns. The `OP_Once` wrapping
+/// caches the result across all encounters; a correlated subquery would need to re-run on
+/// each outer row (M8.11 `Param` + M8.13 re-materialization).
+pub fn compile_exists_subquery(
+    b: &mut ProgramBuilder,
+    subquery: &SelectStmt,
+    subquery_table: Option<&Table>,
+    subquery_indexes: &[IndexObject],
+) -> Result<i32> {
+    // Compile the subquery body first so we know its register count. The inlined body uses
+    // registers 1..N (its own `ProgramBuilder` allocation); our `result_reg`/`return_reg`
+    // must live ABOVE that range to avoid being clobbered by the subquery's `Column`/`Integer`/
+    // comparison-register writes.
+    let (sub_program, _sub_names) = select::compile(subquery, subquery_table, subquery_indexes, None)?;
+    let sub_num_regs = sub_program.num_registers as i32;
+
+    // Cursor offset: the subquery's `select::compile` hardcodes cursor 0 for its table scan
+    // (and 1 for a sorter, 2 for DISTINCT dedup). The outer program may already be using those
+    // cursor numbers for its own scan. Offset the subquery's cursor numbers by the outer
+    // builder's `next_cursor()` so they land in a free range.
+    let cursor_offset = b.next_cursor();
+
+    // Allocate the result register and the subroutine return-address register ABOVE the
+    // subquery's register range. The result register is pre-filled with 0 (the no-rows case);
+    // the first yielded row overwrites it with 1 (matching SQLite's `SRT_Exists` destination).
+    let reg_offset = b.next_reg() - 1;
+    let _ = b.alloc_regs(sub_num_regs);
+    let result_reg = b.alloc_reg();
+    let return_reg = b.alloc_reg();
+
+    // `OP_Once` wraps the subroutine call so a non-correlated subquery runs only once.
+    let after_sub = b.new_label();
+    b.emit_jump(Opcode::Once, 0, after_sub, 0);
+
+    // Pre-fill the result with 0 (the no-rows case).
+    b.emit(Opcode::Integer, 0, result_reg, 0);
+
+    // Call the subroutine.
+    let subroutine_start = b.new_label();
+    b.emit_jump(Opcode::Gosub, return_reg, subroutine_start, 0);
+    b.emit_jump(Opcode::Goto, 0, after_sub, 0);
+
+    // --- Subroutine body: the inlined subquery scan. ---
+    b.resolve(subroutine_start);
+
+    let halt_idx = sub_program
+        .instructions
+        .iter()
+        .position(|i| i.opcode == Opcode::Halt)
+        .ok_or_else(|| Error::msg("EXISTS subquery program has no Halt"))?;
+
+    let subroutine_end = b.new_label();
+
+    let mut addr_map: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+    let sub_start = b.cur_addr();
+
+    for idx in 1..halt_idx {
+        let inst = &sub_program.instructions[idx];
+        let sub_addr = idx as i32;
+        let inlined_addr = b.cur_addr();
+        addr_map.insert(sub_addr, inlined_addr);
+        match inst.opcode {
+            Opcode::ResultRow => {
+                // SRT_Exists rewrite: set `result_reg` to 1 and jump to the subroutine's
+                // `Return`. The first yielded row flips the result from 0 to 1 and the
+                // subroutine returns immediately (the LIMIT 1 injection).
+                b.emit(Opcode::Integer, 1, result_reg, 0);
+                b.emit_jump(Opcode::Goto, 0, subroutine_end, 0);
+            }
+            _ => {
+                let mut new_inst = inst.clone();
+                rebase_operands(&mut new_inst, reg_offset, cursor_offset);
+                b.append(new_inst);
+            }
+        }
+    }
+
+    b.resolve(subroutine_end);
+    b.emit(Opcode::Return, return_reg, 0, 1);
+
+    b.resolve(after_sub);
+
+    // Patch every inlined jump's `p2` using the address map.
+    let subroutine_end_addr = b.label_addr_of(subroutine_end);
+    for (i, inst) in b.iter_insts_mut().enumerate() {
+        let addr = i as i32;
+        if addr < sub_start || addr >= subroutine_end_addr {
+            continue;
+        }
+        if !is_absolute_jump(inst) {
+            continue;
+        }
+        let sub_target = inst.p2;
+        if sub_target == halt_idx as i32 {
+            inst.p2 = subroutine_end_addr;
+        } else if let Some(&inlined) = addr_map.get(&sub_target) {
+            inst.p2 = inlined;
+        } else if sub_target == 0 {
+            inst.p2 = sub_start;
+        }
+    }
+
+    Ok(result_reg)
+}
+
 /// Rebase every register operand of `inst` by `reg_offset` and every cursor operand by
 /// `cursor_offset`, so an inlined sub-program's register N becomes the outer program's
 /// register `reg_offset + N` and its cursor C becomes `cursor_offset + C`. Per-opcode rules
@@ -1027,6 +1144,63 @@ mod tests {
             "4 Goto 0 9 0 None 0",
             "5 Integer 1 1 0 None 0",
             "6 SCopy 1 3 0 None 0",
+            "7 Goto 0 8 0 None 0",
+            "8 Return 4 0 1 None 0",
+            "9 SCopy 3 5 0 None 0",
+            "10 ResultRow 5 1 0 None 0",
+            "11 Halt 0 0 0 None 0",
+            "12 Transaction 0 0 0 None 0",
+            "13 Goto 0 1 0 None 0",
+        ];
+        assert_eq!(got, expected);
+    }
+
+    /// An `EXISTS (SELECT 1)` golden test: the subquery's first yielded row sets `result_reg`
+    /// to 1 and the subroutine returns immediately. Mirrors the scalar-subquery golden test
+    /// but with `Integer 0` initialization (the no-rows case) and `Integer 1, result_reg` on
+    /// the `ResultRow` rewrite (the `SRT_Exists` destination).
+    #[test]
+    fn golden_exists_subquery_constant() {
+        let stmt = "SELECT 1";
+        let parsed = rustqlite_parser::parse(stmt).unwrap().into_iter().next().unwrap();
+        let rustqlite_parser::Stmt::Select(s) = parsed else { panic!("expected SELECT") };
+        let mut b = ProgramBuilder::new();
+        let setup = b.new_label();
+        b.emit_jump(Opcode::Init, 0, setup, 0);
+        let after_init = b.cur_addr();
+        let result_reg = compile_exists_subquery(&mut b, &s, None, &[]).unwrap();
+        let target = b.alloc_reg();
+        b.emit(Opcode::SCopy, result_reg, target, 0);
+        b.emit(Opcode::ResultRow, target, 1, 0);
+        b.emit(Opcode::Halt, 0, 0, 0);
+        b.resolve(setup);
+        b.emit(Opcode::Transaction, 0, 0, 0);
+        b.emit(Opcode::Goto, 0, after_init, 0);
+        let prog = b.finish();
+        let got: Vec<String> = prog
+            .instructions
+            .iter()
+            .enumerate()
+            .map(|(addr, i)| {
+                format!(
+                    "{addr} {} {} {} {} {:?} {}",
+                    i.opcode.name(),
+                    i.p1,
+                    i.p2,
+                    i.p3,
+                    i.p4,
+                    i.p5
+                )
+            })
+            .collect();
+        let expected = vec![
+            "0 Init 0 12 0 None 0",
+            "1 Once 0 9 0 None 0",
+            "2 Integer 0 3 0 None 0",
+            "3 Gosub 4 5 0 None 0",
+            "4 Goto 0 9 0 None 0",
+            "5 Integer 1 1 0 None 0",
+            "6 Integer 1 3 0 None 0",
             "7 Goto 0 8 0 None 0",
             "8 Return 4 0 1 None 0",
             "9 SCopy 3 5 0 None 0",

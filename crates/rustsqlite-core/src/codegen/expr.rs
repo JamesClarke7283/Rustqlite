@@ -128,7 +128,27 @@ pub fn compile_expr(b: &mut ProgramBuilder, e: &Expr, target: i32, ctx: Ctx) -> 
         Expr::InSubquery { .. } => {
             return Err(Error::msg("IN subquery is not supported by the executor yet"))
         }
-        Expr::Exists(_) => return Err(Error::msg("EXISTS is not supported by the executor yet")),
+        Expr::Exists(s) => {
+            // `EXISTS (SELECT …)`: evaluates to 1 if the subquery returns at least one row,
+            // 0 otherwise. Mirrors `sqlite3CodeSubselect` for the `TK_EXISTS` case: the
+            // subquery body is inlined as a subroutine wrapped in `OP_Once` (the M8.8 first
+            // slice assumes the subquery is non-correlated — `Once` caches the result across
+            // encounters). See [`super::subquery::compile_scalar_subquery`] for the same
+            // shape with `SRT_Mem` instead of `SRT_Exists`.
+            let Some(resolver) = ctx.subquery_resolver else {
+                return Err(Error::msg(
+                    "subqueries are not supported by the executor yet",
+                ));
+            };
+            let (sub_table, sub_indexes) = resolver.resolve(s)?;
+            let result_reg = super::subquery::compile_exists_subquery(
+                b,
+                s,
+                sub_table.as_ref(),
+                &sub_indexes,
+            )?;
+            b.emit(Opcode::SCopy, result_reg, target, 0);
+        }
         Expr::Subquery(s) => {
             // Scalar subquery `(SELECT …)`: evaluate to the first column of the first row, or
             // NULL if the subquery returns no rows. The subquery body is compiled via

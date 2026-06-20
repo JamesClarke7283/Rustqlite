@@ -1352,3 +1352,40 @@ fn scalar_subquery_in_expressions() {
         assert_same(db.str(), q);
     }
 }
+
+#[test]
+fn exists_subquery() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = standard_fixture();
+    for q in [
+        // Bare EXISTS as a scalar boolean.
+        "SELECT EXISTS (SELECT 1 FROM t);",
+        "SELECT EXISTS (SELECT 1 FROM t WHERE a > 5);",
+        "SELECT EXISTS (SELECT 1 FROM t WHERE a > 1);",
+        "SELECT EXISTS (SELECT 1 FROM t WHERE a = 3);",
+        "SELECT NOT EXISTS (SELECT 1 FROM t WHERE a > 5);",
+        // EXISTS in WHERE clause (non-correlated).
+        "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t WHERE a > 1) ORDER BY a;",
+        "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t WHERE a > 100) ORDER BY a;",
+        "SELECT a FROM t WHERE NOT EXISTS (SELECT 1 FROM t WHERE a > 100) ORDER BY a;",
+        // EXISTS in WHERE with arithmetic / logic.
+        "SELECT a FROM t WHERE 1 = EXISTS (SELECT 1 FROM t) ORDER BY a;",
+        // EXISTS over an empty table (no rows in subquery).
+        "SELECT EXISTS (SELECT 1 FROM t WHERE a > 9999);",
+        // Multiple EXISTS in one query.
+        "SELECT EXISTS (SELECT 1 FROM t WHERE a > 1), EXISTS (SELECT 1 FROM t WHERE a > 100);",
+        // Correlated EXISTS (currently cached via Once — will diverge; keep these non-correlated).
+        // NOT EXISTS.
+        "SELECT a FROM t WHERE NOT EXISTS (SELECT 1 FROM t WHERE b = 'no_such') ORDER BY a;",
+        // EXISTS with constant subquery.
+        "SELECT EXISTS (SELECT 1);",
+        "SELECT EXISTS (SELECT 1 WHERE 1=0);",
+        // EXISTS combined with scalar subquery.
+        "SELECT a, EXISTS (SELECT 1 FROM t WHERE a > 5) FROM t ORDER BY a;",
+    ] {
+        assert_same(db.str(), q);
+    }
+}
