@@ -204,10 +204,10 @@ list every granular item needed.
 
 ## M8 — Subqueries & Correlated Scans
 
-- [ ] **8.1** Parser: subquery in `FROM` clause `(SELECT …) AS alias`
-- [ ] **8.2** Parser: scalar subquery in expression `(SELECT …)`
-- [ ] **8.3** Parser: `EXISTS (SELECT …)`
-- [ ] **8.4** Parser: `IN (SELECT …)` / `NOT IN (SELECT …)`
+- [x] **8.1** Parser: subquery in `FROM` clause `(SELECT …) AS alias`
+- [x] **8.2** Parser: scalar subquery in expression `(SELECT …)`
+- [x] **8.3** Parser: `EXISTS (SELECT …)`
+- [x] **8.4** Parser: `IN (SELECT …)` / `NOT IN (SELECT …)`
 - [ ] **8.5** VDBE: coroutine opcodes — `InitCoroutine`, `EndCoroutine`, `Yield`
 - [ ] **8.6** Codegen: `FROM (subquery)` — materialize subquery into ephemeral table, then scan
 - [ ] **8.7** Codegen: scalar subquery in expressions — `Program` opcode or coroutine
