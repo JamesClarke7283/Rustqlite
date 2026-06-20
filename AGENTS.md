@@ -334,3 +334,28 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   real table (with `WHERE`), `EXISTS` with constant subquery, multiple `EXISTS` in one
   query, and `EXISTS` combined with scalar subqueries. Differential-tested vs the C
   oracle (`exists_subquery`). Same non-correlated limitation as 8.7.
+  **8.9 `IN (subquery)`** ✅: `Expr::InSubquery` is compiled by
+  `codegen::subquery::compile_in_subquery` (mirrors `sqlite3ExprCodeIN` in `expr.c` for
+  the `ExprUseXSelect` case, the `IN_INDEX_EPH` path). The subquery body is compiled as a
+  sub-program via `select::compile`, then inlined into the outer program as a subroutine
+  wrapped in `OP_Once` + `OP_Gosub`/`OP_Return` (same shape as 8.7/8.8). The `SRT_Set`
+  destination rewrites each `ResultRow` into `SCopy <col0>, col_reg` + `MakeRecord` +
+  `IdxInsert` into an ephemeral index (opened with `P4::KeyInfo` for the record-keyed
+  variant). A `rhs_has_null_reg` flag is set to NULL whenever a materialized row's first
+  column is NULL (the "RHS contains NULL" flag from `sqlite3SetHasNullFlag`, used by the
+  post-probe FALSE-vs-NULL distinction). After the subroutine, the LHS is evaluated and
+  the membership test follows in-operator.md's optimized algorithm: Step 2 (LHS NULL →
+  Step 6 scan), Step 3 (`Found`/`NotFound` probe), Step 4 (RHS non-NULL → FALSE),
+  Step 6 (scan RHS for a NULL comparison → NULL, else FALSE), Step 7 (FALSE). The
+  `dest_if_false == dest_if_null` combined case emits a single `NotFound` to dest (Step 3+5
+  fused). The value form (`compile_expr`) wraps the jump form with three labels
+  (false/null/true) and stores 1/0/NULL into the target; `NOT IN` swaps the TRUE/FALSE
+  storage. Register/cursor rebasing and jump-patch loop are shared with
+  `compile_scalar_subquery` via `rebase_operands`/`is_absolute_jump`. Supports: constant
+  subquery, subquery over a real table (with `WHERE`), `IN`/`NOT IN` in `WHERE` and
+  projection, NULL LHS (NULL → NULL when RHS non-empty, FALSE when RHS empty), NULL RHS
+  (the FALSE-vs-NULL distinction), empty subquery, and multiple `IN` subqueries in one
+  query. Differential-tested vs the C oracle (`in_subquery`). Same non-correlated
+  limitation as 8.7/8.8. Known divergence: the parser parses `a = 10 OR a IN (...)` as
+  `(a = 10 OR a) IN (...)` (IN binds looser than OR in our grammar — a parser precedence
+  bug to fix in the full parse.y port, not in M8.9).

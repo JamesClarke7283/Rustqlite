@@ -1389,3 +1389,49 @@ fn exists_subquery() {
         assert_same(db.str(), q);
     }
 }
+
+/// `X [NOT] IN (SELECT …)` — the subquery's result rows are materialized into an ephemeral
+/// index, then the LHS is probed for membership. Mirrors `sqlite3ExprCodeIN`'s
+/// `IN_INDEX_EPH` path. Tests cover: a constant subquery, a subquery over a real table,
+/// `IN` in WHERE, `NOT IN`, NULL LHS, NULL RHS (the FALSE-vs-NULL distinction), an empty
+/// subquery, and a subquery with duplicates (the ephemeral index dedups).
+#[test]
+fn in_subquery() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = standard_fixture();
+    for q in [
+        // Constant subquery — LHS in the set.
+        "SELECT 1 IN (SELECT 1);",
+        "SELECT 1 IN (SELECT 2);",
+        // Constant subquery — NOT IN.
+        "SELECT 1 NOT IN (SELECT 1);",
+        "SELECT 1 NOT IN (SELECT 2);",
+        // Subquery over a real table.
+        "SELECT a FROM t WHERE a IN (SELECT a FROM t);",
+        "SELECT a FROM t WHERE a IN (SELECT a FROM t WHERE a > 1) ORDER BY a;",
+        "SELECT a FROM t WHERE a NOT IN (SELECT a FROM t WHERE a > 1) ORDER BY a;",
+        // Subquery with a NULL in the RHS — FALSE vs NULL distinction.
+        "SELECT a FROM t WHERE a IN (SELECT a FROM t WHERE a IS NULL);",
+        // NULL LHS.
+        "SELECT NULL IN (SELECT 1);",
+        "SELECT NULL IN (SELECT 1 WHERE 1=0);",
+        "SELECT NULL NOT IN (SELECT 1);",
+        // Empty subquery.
+        "SELECT 1 IN (SELECT 1 WHERE 1=0);",
+        "SELECT 1 NOT IN (SELECT 1 WHERE 1=0);",
+        "SELECT NULL IN (SELECT 1 WHERE 1=0);",
+        // IN with arithmetic / projection.
+        "SELECT a + 1 IN (SELECT a + 1 FROM t) FROM t ORDER BY a;",
+        // Multiple IN subqueries in one query.
+        "SELECT a IN (SELECT a FROM t), a IN (SELECT a FROM t WHERE a > 5) FROM t ORDER BY a;",
+        // IN subquery in projection (value form, not just WHERE).
+        "SELECT 3 IN (SELECT a FROM t);",
+        "SELECT 100 IN (SELECT a FROM t);",
+        "SELECT 3 NOT IN (SELECT a FROM t);",
+    ] {
+        assert_same(db.str(), q);
+    }
+}

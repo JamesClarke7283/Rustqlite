@@ -23,7 +23,7 @@ use crate::types::{Affinity, Collation};
 use crate::vdbe::program::{Instruction, Program, P4};
 use crate::vdbe::Opcode;
 
-use super::builder::ProgramBuilder;
+use super::builder::{Label, ProgramBuilder};
 use super::expr::{compile_expr, compile_jump, Ctx};
 use super::select::{
     self, eval_limit_offset, expand_columns, resolve_order_term, emit_int,
@@ -913,6 +913,260 @@ fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) 
             r(&mut inst.p1);
         }
     }
+}
+
+/// Compile an `X [NOT] IN (SELECT …)` expression as a jump, mirroring `sqlite3ExprCodeIN` in
+/// `expr.c` for the `ExprUseXSelect` case (the `IN_INDEX_EPH` path).
+///
+/// The subquery's result rows are materialized into an ephemeral index (one column for a scalar
+/// LHS), then the LHS is evaluated and probed with `OP_NotFound`/`OP_Found`. The
+/// `dest_if_false`/`dest_if_null` labels match upstream's semantics:
+/// * fall through (next instruction) when the LHS is a member of the RHS set (TRUE);
+/// * jump to `dest_if_false` when the LHS is definitely not a member (FALSE);
+/// * jump to `dest_if_null` when NULL values make the answer indeterminate (NULL).
+///
+/// For `NOT IN`, the caller swaps the FALSE/NULL destinations and the fall-through target so
+/// the same code shape produces the negated result.
+///
+/// Like [`compile_scalar_subquery`] / [`compile_exists_subquery`], the M8.9 first slice assumes
+/// the subquery is **non-correlated** — the materialization is wrapped in `OP_Once` so the
+/// ephemeral is populated only once per statement. A correlated subquery would need to
+/// re-materialize on each outer row (M8.11 `Param` + M8.13 re-materialization); for now an
+/// outer-column reference inside the subquery fails column resolution with "no such column",
+/// which is the right error for unsupported correlation.
+///
+/// `subquery_table`/`subquery_indexes` describe the subquery's own FROM table (or `None` for
+/// a constant / `VALUES` subquery), resolved by the caller via a [`super::expr::SubqueryResolver`].
+pub fn compile_in_subquery(
+    b: &mut ProgramBuilder,
+    expr: &Expr,
+    subquery: &SelectStmt,
+    negated: bool,
+    subquery_table: Option<&Table>,
+    subquery_indexes: &[IndexObject],
+    dest_if_false: Label,
+    dest_if_null: Label,
+    ctx: Ctx,
+) -> Result<()> {
+    // The LHS must be a scalar (row-value IN lands with M2.60 row-value expressions; the parser
+    // builds `Expr::InSubquery` with a single-column LHS for the common case). A vector LHS
+    // would require matching the subquery's column count — we surface the same error SQLite
+    // raises when the counts don't match.
+    let n_vector = 1i32;
+
+    // Validate the subquery produces exactly n_vector columns. SQLite raises
+    // "sub-select returns N columns - expected M" on a mismatch.
+    let inner_outputs = expand_columns(subquery, subquery_table)?;
+    let inner_ncol = inner_outputs.len();
+    if inner_ncol as i32 != n_vector {
+        return Err(Error::msg(format!(
+            "{n_vector} columns on the LHS of IN but {inner_ncol} on the RHS"
+        )));
+    }
+
+    // 1. Compile the subquery body first so we know its register/cursor high-water mark. The
+    //    inlined body uses registers 1..N (its own `ProgramBuilder` allocation) and cursors
+    //    0/1/2 (table/sorter/distinct). Our ephemeral index cursor must live ABOVE that range,
+    //    and our result registers must live ABOVE the subquery's register range.
+    let (sub_program, _sub_names) = select::compile(subquery, subquery_table, subquery_indexes, None)?;
+    let sub_num_regs = sub_program.num_registers as i32;
+
+    // Cursor offset for the inlined subquery body. The subquery's `select::compile` hardcodes
+    // cursor 0 for its table scan, 1 for a sorter, 2 for DISTINCT dedup. Offset past the outer
+    // builder's `next_cursor()` so they land in a free range.
+    let cursor_offset = b.next_cursor();
+    // The subquery uses at most cursors 0, 1, 2 (table/sorter/distinct). The ephemeral index
+    // cursor for the IN set must live past all of those, so place it at `cursor_offset + 3`.
+    let eph_cursor = cursor_offset + 3;
+    b.note_cursor(eph_cursor);
+
+    // Reserve the subquery's register block in the outer builder so the inlined body's
+    // register writes (1..sub_num_regs) land in a free range, then allocate the registers we
+    // need above it: the LHS register, the rRhsHasNull register, and the subroutine return reg.
+    let reg_offset = b.next_reg() - 1; // sub reg R -> outer reg reg_offset + R
+    let _ = b.alloc_regs(sub_num_regs);
+    let lhs_reg = b.alloc_reg();
+    let rhs_has_null_reg = b.alloc_reg();
+    let return_reg = b.alloc_reg();
+
+    // `OP_Once` wraps the materialization so a non-correlated subquery runs only once. On a
+    // repeat encounter, `Once` jumps past the subroutine to the membership test.
+    let after_sub = b.new_label();
+    b.emit_jump(Opcode::Once, 0, after_sub, 0);
+
+    // Open the ephemeral index: single-column key, BINARY collation (the LHS/RHS comparison in
+    // `OP_Found`/`OP_NotFound` on an ephemeral uses BINARY collation with NULL-equality, matching
+    // `ephemeral::find_values`).
+    let oe = b.emit(Opcode::OpenEphemeral, eph_cursor, 1, 0);
+    b.set_p4(oe, P4::KeyInfo(Vec::new()));
+
+    // Pre-fill `rhs_has_null_reg` with a non-NULL sentinel (Integer 0). During the subquery
+    // materialization, each yielded row whose first column is NULL sets this register to NULL
+    // (it sticks — once NULL it stays NULL). This is the "RHS contains a NULL" flag used by the
+    // post-probe FALSE/NULL distinction (Step 4 of in-operator.md). Our ephemeral is unsorted
+    // (Vec-backed, not a b-tree), so we cannot use upstream's "first row only" optimization;
+    // the per-row NULL check is O(n) per materialization, same asymptotic as the materialization.
+    b.emit(Opcode::Integer, 0, rhs_has_null_reg, 0);
+
+    // Call the materialization subroutine.
+    let subroutine_start = b.new_label();
+    b.emit_jump(Opcode::Gosub, return_reg, subroutine_start, 0);
+    b.emit_jump(Opcode::Goto, 0, after_sub, 0);
+
+    // --- Subroutine body: the inlined subquery scan, materializing into the ephemeral. ---
+    b.resolve(subroutine_start);
+
+    let halt_idx = sub_program
+        .instructions
+        .iter()
+        .position(|i| i.opcode == Opcode::Halt)
+        .ok_or_else(|| Error::msg("IN subquery program has no Halt"))?;
+
+    let subroutine_end = b.new_label();
+
+    let mut addr_map: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+    let sub_start = b.cur_addr();
+
+    for idx in 1..halt_idx {
+        let inst = &sub_program.instructions[idx];
+        let sub_addr = idx as i32;
+        let inlined_addr = b.cur_addr();
+        addr_map.insert(sub_addr, inlined_addr);
+        match inst.opcode {
+            Opcode::ResultRow => {
+                // SRT_Set rewrite: build a 1-column record from the yielded row and `IdxInsert`
+                // it into the ephemeral. The subquery's `ResultRow p1 p2 p3` has `p1` = result
+                // start (in subquery register space) and `p2` = ncol. For a scalar IN we take
+                // the first column; if the subquery has more than one column the codegen would
+                // have errored at expand_columns time (we validate ncol == 1 below).
+                let result_start = inst.p1;
+                let nres = inst.p2;
+                let _ = n_vector; // scalar — validated by expand_columns
+                let col_reg = b.alloc_reg();
+                if nres >= 1 {
+                    b.emit(Opcode::SCopy, reg_offset + result_start, col_reg, 0);
+                } else {
+                    b.emit(Opcode::Null, 0, col_reg, 0);
+                }
+                let rec = b.alloc_reg();
+                b.emit(Opcode::MakeRecord, col_reg, 1, rec);
+                b.emit(Opcode::IdxInsert, eph_cursor, rec, 0);
+                // Track whether the RHS contains a NULL in its first column. Once the flag is
+                // NULL it stays NULL (subsequent rows can't un-NULL it). Skip-over pattern:
+                //   IsNull col_reg → set_null
+                //   Goto after
+                // set_null: Null 0, rhs_has_null_reg
+                // after:
+                let set_null = b.new_label();
+                let after = b.new_label();
+                b.emit_jump(Opcode::IsNull, col_reg, set_null, 0);
+                b.emit_jump(Opcode::Goto, 0, after, 0);
+                b.resolve(set_null);
+                b.emit(Opcode::Null, 0, rhs_has_null_reg, 0);
+                b.resolve(after);
+            }
+            _ => {
+                let mut new_inst = inst.clone();
+                rebase_operands(&mut new_inst, reg_offset, cursor_offset);
+                b.append(new_inst);
+            }
+        }
+    }
+    let _ = ctx; // the LHS is evaluated outside the subroutine, against the outer ctx.
+
+    b.resolve(subroutine_end);
+    b.emit(Opcode::Return, return_reg, 0, 1);
+
+    // Bind `after_sub` to the membership test (the next emitted instruction).
+    b.resolve(after_sub);
+
+    // Patch every inlined jump's `p2` using the address map.
+    let subroutine_end_addr = b.label_addr_of(subroutine_end);
+    for (i, inst) in b.iter_insts_mut().enumerate() {
+        let addr = i as i32;
+        if addr < sub_start || addr >= subroutine_end_addr {
+            continue;
+        }
+        if !is_absolute_jump(inst) {
+            continue;
+        }
+        let sub_target = inst.p2;
+        if sub_target == halt_idx as i32 {
+            inst.p2 = subroutine_end_addr;
+        } else if let Some(&inlined) = addr_map.get(&sub_target) {
+            inst.p2 = inlined;
+        } else if sub_target == 0 {
+            inst.p2 = sub_start;
+        }
+    }
+
+    // 2. Evaluate the LHS into `lhs_reg`.
+    compile_expr(b, expr, lhs_reg, ctx)?;
+
+    // 3. Step 2 of in-operator.md: if the LHS is NULL (total-NULL for a scalar), the result is
+    //    NULL when the RHS is non-empty (Step 6's first comparison is NULL) and FALSE when the
+    //    RHS is empty (Step 7). So a NULL LHS jumps to the Step 6 loop, NOT directly to
+    //    dest_if_null. When dest_if_false == dest_if_null (the combined case), the LHS NULL
+    //    check jumps straight to dest_if_false (we don't distinguish FALSE from NULL).
+    let step6_label = b.new_label();
+    if dest_if_false == dest_if_null {
+        b.emit_jump(Opcode::IsNull, lhs_reg, dest_if_false, 0);
+    } else {
+        b.emit_jump(Opcode::IsNull, lhs_reg, step6_label, 0);
+    }
+
+    // 4. Step 3: probe the ephemeral index with the LHS. If the LHS is found, the IN is TRUE
+    //    (fall through). If not found, the result is FALSE or NULL (depending on RHS NULLs).
+    //    When dest_if_false == dest_if_null, combine Step 3 + Step 5: a single `NotFound`
+    //    jumps to dest_if_false (we don't need to distinguish FALSE from NULL).
+    if dest_if_false == dest_if_null {
+        let nf = b.emit_jump(Opcode::NotFound, eph_cursor, dest_if_false, lhs_reg);
+        b.set_p4(nf, P4::Int(1));
+        // Fall through = member = TRUE.
+    } else {
+        // Step 3 (distinct FALSE/NULL): `Found` to a "truth" label; the not-found case falls
+        // through to Step 4/5/6.
+        let truth_label = b.new_label();
+        let found = b.emit_jump(Opcode::Found, eph_cursor, truth_label, lhs_reg);
+        b.set_p4(found, P4::Int(1));
+        // Step 4: if the RHS is known to have no NULLs (the `rhs_has_null_reg` flag is
+        // non-NULL), the not-found case is FALSE — jump to dest_if_false.
+        b.emit_jump(Opcode::NotNull, rhs_has_null_reg, dest_if_false, 0);
+        // Step 5: distinct-dest path — we care about FALSE vs NULL, so fall through to Step 6.
+        // Step 6: scan the RHS. For each row, compare LHS against the RHS row: if the
+        // comparison is NULL (one side is NULL), the IN result is NULL → dest_if_null. If the
+        // comparison is TRUE (not equal) for all rows, the result is FALSE → dest_if_false.
+        // (Upstream's ephemeral is a sorted b-tree so NULLs come first and it only checks the
+        // first row; our Vec-backed ephemeral is unsorted, so we scan all rows. A NULL
+        // comparison short-circuits to dest_if_null on the first NULL row.)
+        b.resolve(step6_label);
+        b.emit_jump(Opcode::Rewind, eph_cursor, dest_if_false, 0);
+        let loop_top = b.cur_addr();
+        let col_reg = b.alloc_reg();
+        b.emit(Opcode::Column, eph_cursor, 0, col_reg);
+        // `Ne lhs, dest_not_null, col_reg` — jump to dest_not_null when `lhs != col_reg` is
+        // TRUE (they differ). Fall through when the comparison is FALSE (equal — should not
+        // happen post-probe, but be defensive) or NULL (one side NULL → result is NULL).
+        let dest_not_null = b.new_label();
+        let ne_idx = b.emit_jump(Opcode::Ne, lhs_reg, dest_not_null, col_reg);
+        // NULL comparison (fall-through from `Ne`): result is NULL.
+        b.emit_jump(Opcode::Goto, 0, dest_if_null, 0);
+        b.resolve(dest_not_null);
+        b.emit(Opcode::Next, eph_cursor, loop_top, 0);
+        // Step 7: no NULL comparison found — the result is FALSE.
+        b.emit_jump(Opcode::Goto, 0, dest_if_false, 0);
+        // The "truth" label: the LHS is a member — fall through (TRUE).
+        b.resolve(truth_label);
+        let _ = ne_idx;
+    }
+
+    // `negated` is unused here — the IN form is compiled; the caller (`compile_expr`'s value
+    // form) handles the `NOT IN` negation by swapping the TRUE/FALSE storage. The jump form
+    // (`compile_jump`'s `other` arm) also handles it via the value form + `IfNot`. Kept in the
+    // signature so a future direct jump-form negation can use it without reshaping the API.
+    let _ = negated;
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -125,8 +125,54 @@ pub fn compile_expr(b: &mut ProgramBuilder, e: &Expr, target: i32, ctx: Ctx) -> 
             return Err(Error::msg("BETWEEN is not supported by the executor yet"))
         }
         Expr::In { .. } => return Err(Error::msg("IN is not supported by the executor yet")),
-        Expr::InSubquery { .. } => {
-            return Err(Error::msg("IN subquery is not supported by the executor yet"))
+        Expr::InSubquery { expr, subquery, negated } => {
+            // `X [NOT] IN (SELECT …)`: evaluate the membership test and store the boolean
+            // result (1/0/NULL) into `target`. Mirrors `sqlite3ExprCodeIN` in `expr.c` for the
+            // `ExprUseXSelect` case — the subquery is materialized into an ephemeral index
+            // (wrapped in `OP_Once` so a non-correlated subquery runs only once), then the LHS
+            // is probed against it. See [`super::subquery::compile_in_subquery`] for the jump
+            // form; here we wrap it with FALSE/NULL labels and store the 3-valued result.
+            let Some(resolver) = ctx.subquery_resolver else {
+                return Err(Error::msg(
+                    "subqueries are not supported by the executor yet",
+                ));
+            };
+            let (sub_table, sub_indexes) = resolver.resolve(subquery)?;
+            // Allocate three labels: false (LHS not in set), null (indeterminate), and truth
+            // (fall-through = member). The value form stores 1/NULL/0 into `target` based on
+            // which label is taken.
+            let dest_false = b.new_label();
+            let dest_null = b.new_label();
+            let dest_true = b.new_label();
+            super::subquery::compile_in_subquery(
+                b,
+                expr,
+                subquery,
+                *negated,
+                sub_table.as_ref(),
+                &sub_indexes,
+                dest_false,
+                dest_null,
+                ctx,
+            )?;
+            // Fall-through = IN-is-TRUE. For `NOT IN`, TRUE becomes FALSE (store 0); for `IN`,
+            // TRUE becomes 1. The FALSE/NULL cases are stored the same way (NOT IN of FALSE is
+            // TRUE only when there are no NULLs — but the FALSE destination here means "LHS not
+            // in set AND no NULL ambiguity", so NOT IN of that is TRUE; however we route FALSE
+            // to store 0 to keep the value-form simple and let `compile_jump` handle the
+            // negation's jump routing). To keep the value form correct for both, we store:
+            //   * fall-through (IN TRUE):  `negated ? 0 : 1`
+            //   * dest_false (IN FALSE):  `negated ? 1 : 0`
+            //   * dest_null  (IN NULL):   NULL  (NOT IN of NULL is NULL)
+            b.emit(Opcode::Integer, if *negated { 0 } else { 1 }, target, 0);
+            b.emit_jump(Opcode::Goto, 0, dest_true, 0);
+            b.resolve(dest_false);
+            b.emit(Opcode::Integer, if *negated { 1 } else { 0 }, target, 0);
+            b.emit_jump(Opcode::Goto, 0, dest_true, 0);
+            // NULL: store NULL (both IN and NOT IN yield NULL when the result is indeterminate).
+            b.resolve(dest_null);
+            b.emit(Opcode::Null, 0, target, 0);
+            b.resolve(dest_true);
         }
         Expr::Exists(s) => {
             // `EXISTS (SELECT …)`: evaluates to 1 if the subquery returns at least one row,
