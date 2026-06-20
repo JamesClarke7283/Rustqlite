@@ -249,7 +249,7 @@ list every granular item needed.
 - [x] **11.4** Built-in window functions: `row_number()`, `rank()`, `dense_rank()`, `percent_rank()`, `cume_dist()`, `ntile(N)`
 - [x] **11.5** Built-in window functions: `first_value(expr)`, `last_value(expr)`, `nth_value(expr, N)`
 - [x] **11.6** Built-in window functions: `lead(expr [, offset [, default]])`, `lag(expr [, offset [, default]])`
-- [ ] **11.7** Codegen: sort input by PARTITION BY + ORDER BY, then slide the frame
+- [x] **11.7** Codegen: sort input by PARTITION BY + ORDER BY, then slide the frame
 - [ ] **11.8** Frame specification: `ROWS BETWEEN … AND …`, `RANGE BETWEEN … AND …`, `GROUPS BETWEEN … AND …`
 - [ ] **11.9** Frame bounds: `UNBOUNDED PRECEDING`, `CURRENT ROW`, `expr PRECEDING/FOLLOWING`
 - [ ] **11.10** `EXCLUDE` clause: `NO OTHERS`, `CURRENT ROW`, `GROUP`, `TIES`

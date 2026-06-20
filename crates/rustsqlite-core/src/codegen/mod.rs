@@ -24,6 +24,7 @@ pub mod returning;
 pub mod select;
 pub mod subquery;
 pub mod update;
+pub mod window;
 
 pub use expr::SubqueryResolver;
 

@@ -818,12 +818,19 @@ impl Accumulator {
                     }
                 }
             }
-            AggregateKind::FirstValue | AggregateKind::NthValue => {
-                // `first_valueFinalizeFunc` / `nth_valueFinalizeFunc`: emit the captured value
-                // (or NULL if none), then clear it (matches upstream's `sqlite3_value_free`).
-                let v = self.captured.clone().unwrap_or(Value::Null);
-                self.captured = None;
-                v
+            AggregateKind::FirstValue => {
+                // `first_valueValueFunc` is `noopValueFunc` in upstream — the value is only
+                // emitted via `first_valueFinalizeFunc` (which clears). But the window codegen
+                // (M11.7) uses `AggValue` per peer group, not `AggFinal`, so we return the
+                // captured value WITHOUT clearing (so it can be read repeatedly across peer
+                // groups in the same partition). The accumulator is reset on partition change
+                // by the codegen's `Null` opcode, which clears the `aggregates` entry.
+                self.captured.clone().unwrap_or(Value::Null)
+            }
+            AggregateKind::NthValue => {
+                // `nth_valueValueFunc` is `noopValueFunc` in upstream — same rationale as
+                // `first_value`: return the captured value without clearing.
+                self.captured.clone().unwrap_or(Value::Null)
             }
             AggregateKind::LastValue => {
                 // `last_valueValueFunc`: emit the captured value (without clearing — `inverse`
@@ -1367,9 +1374,10 @@ mod tests {
         acc.step(&[i(20)], false);
         acc.step(&[i(30)], false);
         assert_eq!(acc.value_mut(), Value::Int(10));
-        // value_mut for first_value clears the captured value (matches finalize).
-        // A subsequent value_mut returns NULL.
-        assert_eq!(acc.value_mut(), Value::Null);
+        // value_mut for first_value does NOT clear the captured value (the window codegen
+        // reads it across peer groups; the accumulator is reset by the codegen's `Null`
+        // opcode on a partition change). A subsequent value_mut returns the same value.
+        assert_eq!(acc.value_mut(), Value::Int(10));
     }
 
     /// `last_value(expr)` captures each row's argument (overwriting); `value_mut` emits the

@@ -1689,25 +1689,96 @@ fn window_function_errors() {
         }
     }
 
-    // Windowed calls (OVER present) — the oracle succeeds; our engine returns "not yet
-    // supported". We only check our error here (the oracle's rows are not asserted because we
-    // don't produce them yet).
-    let not_yet_cases = [
+    // Windowed calls (OVER present) — the oracle succeeds; our engine should now produce
+    // the same rows (M11.7 first slice). Differential-test against the oracle.
+    let supported_cases = [
         "SELECT row_number() OVER () FROM t;",
         "SELECT rank() OVER (ORDER BY a) FROM t;",
         "SELECT dense_rank() OVER (ORDER BY a) FROM t;",
         "SELECT count(*) OVER () FROM t;",
         "SELECT sum(a) OVER (ORDER BY a) FROM t;",
     ];
-    for q in not_yet_cases {
-        match rustsqlite_rows(db.str(), q) {
-            Ok(_) => panic!("expected 'not yet supported' error for: {q}"),
-            Err(e) => {
-                assert!(
-                    e.contains("window functions are not yet supported"),
-                    "wrong error for `{q}`: {e}"
-                );
-            }
-        }
+    for q in supported_cases {
+        assert_same(db.str(), q);
     }
 }
+
+/// Window functions (M11.7 first slice): the partition-sort + frame-step codegen driver
+/// lowers `OVER (...)` calls to the VDBE. This differential test covers the supported default
+/// frames: `row_number()`, `rank()`, `dense_rank()`, `first_value()`, `nth_value()`, and the
+/// aggregate-as-window functions (`count`/`sum`/`total`/`avg`/`min`/`max`/`group_concat`),
+/// with `OVER ()`, `OVER (ORDER BY …)`, `OVER (PARTITION BY …)`, and
+/// `OVER (PARTITION BY … ORDER BY …)`. Also tests peers (equal ORDER BY values share a rank),
+/// NULL ORDER BY values, multiple window calls in one query, and the outer `WHERE`/`ORDER BY`/
+/// `LIMIT` clauses.
+#[test]
+fn window_functions() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup(
+        "CREATE TABLE t(a INT, b INT, c TEXT);\
+         INSERT INTO t(a,b,c) VALUES\
+             (1, 10, 'x'),\
+             (1, 20, 'y'),\
+             (2, 30, 'z'),\
+             (2, 40, NULL),\
+             (3, 50, 'w'),\
+             (NULL, 60, 'v');",
+    );
+    for q in [
+        // row_number — per-row, no peers.
+        "SELECT row_number() OVER () FROM t;",
+        "SELECT row_number() OVER (ORDER BY a) FROM t;",
+        "SELECT row_number() OVER (PARTITION BY a) FROM t;",
+        "SELECT row_number() OVER (PARTITION BY a ORDER BY b) FROM t;",
+        // rank — per-peer-group (RANGE default frame).
+        "SELECT rank() OVER (ORDER BY a) FROM t;",
+        "SELECT rank() OVER (PARTITION BY a ORDER BY b) FROM t;",
+        // dense_rank — per-peer-group.
+        "SELECT dense_rank() OVER (ORDER BY a) FROM t;",
+        "SELECT dense_rank() OVER (PARTITION BY a ORDER BY b) FROM t;",
+        // first_value — per-peer-group (RANGE default frame).
+        "SELECT first_value(b) OVER (ORDER BY a) FROM t;",
+        "SELECT first_value(b) OVER (PARTITION BY a ORDER BY b) FROM t;",
+        // nth_value — per-peer-group.
+        "SELECT nth_value(b, 2) OVER (ORDER BY a) FROM t;",
+        // count — aggregate-as-window.
+        "SELECT count(*) OVER () FROM t;",
+        "SELECT count(*) OVER (ORDER BY a) FROM t;",
+        "SELECT count(*) OVER (PARTITION BY a) FROM t;",
+        "SELECT count(*) OVER (PARTITION BY a ORDER BY b) FROM t;",
+        "SELECT count(b) OVER (PARTITION BY a) FROM t;",
+        // sum — aggregate-as-window.
+        "SELECT sum(b) OVER () FROM t;",
+        "SELECT sum(b) OVER (ORDER BY a) FROM t;",
+        "SELECT sum(b) OVER (PARTITION BY a) FROM t;",
+        "SELECT sum(b) OVER (PARTITION BY a ORDER BY b) FROM t;",
+        // total — always REAL.
+        "SELECT total(b) OVER (PARTITION BY a) FROM t;",
+        // avg — aggregate-as-window.
+        "SELECT avg(b) OVER (PARTITION BY a) FROM t;",
+        // min / max — aggregate-as-window.
+        "SELECT min(b) OVER (PARTITION BY a) FROM t;",
+        "SELECT max(b) OVER (PARTITION BY a ORDER BY b) FROM t;",
+        // group_concat — aggregate-as-window.
+        "SELECT group_concat(b) OVER (PARTITION BY a) FROM t;",
+        "SELECT group_concat(c) OVER (PARTITION BY a) FROM t;",
+        // Multiple window calls in one query (same OVER spec).
+        "SELECT row_number() OVER (PARTITION BY a ORDER BY b), rank() OVER (PARTITION BY a ORDER BY b) FROM t;",
+        "SELECT a, b, row_number() OVER (PARTITION BY a ORDER BY b) AS rn, sum(b) OVER (PARTITION BY a ORDER BY b) AS running_sum FROM t;",
+        // Outer WHERE / ORDER BY / LIMIT.
+        "SELECT a, b, row_number() OVER (PARTITION BY a ORDER BY b) FROM t WHERE b > 15;",
+        "SELECT a, b, row_number() OVER (PARTITION BY a ORDER BY b) FROM t ORDER BY b DESC;",
+        "SELECT a, b, row_number() OVER (PARTITION BY a ORDER BY b) FROM t LIMIT 3;",
+        "SELECT a, b, row_number() OVER (PARTITION BY a ORDER BY b) FROM t WHERE b > 15 ORDER BY b DESC LIMIT 2;",
+        // Peers (equal ORDER BY values share a rank).
+        "SELECT a, rank() OVER (ORDER BY a) FROM t;",
+    ] {
+        assert_same(db.str(), q);
+    }
+}
+
+

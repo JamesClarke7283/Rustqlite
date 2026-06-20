@@ -173,4 +173,13 @@ impl Ephemeral {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
+
+    /// Remove all records and reset the iteration position. Used by `OP_Clear` on an
+    /// ephemeral cursor (window-function peer-buf reset between peer groups).
+    pub fn clear(&mut self) {
+        self.records.clear();
+        self.next_rowid = 1;
+        self.pos = 0;
+        self.current = None;
+    }
 }

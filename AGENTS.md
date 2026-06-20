@@ -468,27 +468,36 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   window-only built-ins from the aggregate-as-window kinds. Codegen-time validation:
   `check_no_window_only_without_over` walks the projection/WHERE/HAVING/ORDER BY and raises
   the upstream "misuse of window function <name>()" error for a window-only function used
-  without an `OVER` clause (matches the oracle); a windowed call (`OVER` present) raises
-  the Rustqlite-specific "window functions are not yet supported (M11.7: codegen driver
-  pending)" — the partition-sort + frame-step driver is M11.7. `collect_aggregates` and
+  without an `OVER` clause (matches the oracle). `collect_aggregates` and
   `contains_aggregate` now check `over.is_none()` so a windowed aggregate call
   (`count(*) OVER (...)`) is not double-counted by the plain-aggregate path; the
   `rewrite_aggregates`/`rewrite_aggregates_with_group_keys` walks likewise skip windowed
-  calls. Differential-tested vs the C oracle (`window_function_errors` — misuse error parity
-  for all 11 window-only names, plus the not-yet-supported message for windowed calls).
-  Unit-tested at the accumulator level (40 tests in `func::aggregate::tests` — including
-  `row_number_increments`, `rank_latches_and_resets`, `dense_rank_increments_on_peer_change`,
-  `percent_rank_computes_ratio`, `cume_dist_computes_ratio`, `ntile_distributes_evenly`,
-  `first_value_captures_first`, `last_value_captures_latest`/`last_value_inverse_clears_when_empty`,
-  `nth_value_captures_nth`, `from_name_resolves_window_only`, `window_only_classification`,
-  `default_frame_matches_upstream`) and at the VDBE level (4 new hand-built programs in
-  `vdbe::exec::tests`: `agg_value_row_number_increments`, `agg_value_rank_latches_peer_groups`,
-  `agg_value_cume_dist_ratio`, `agg_value_ntile_buckets` — exercise the executor's
-  `AggStep`/`AggInverse`/`AggValue` dispatch for the window-only kinds). Still M11:
-  **11.7** the partition-sort + frame-step codegen driver (the `sqlite3WindowCodeStep` port
-  that emits the partition ephemeral + frame-step + `AggValue`-per-row shape), **11.8** the
-  full frame-spec (`ROWS`/`RANGE`/`GROUPS` bounds), **11.9** frame bound expressions, and
-  **11.10** the `EXCLUDE` clause. Known gap: `lead`/`lag` are registered for name resolution
-  and frame coercion but their `step`/`inverse`/`value_mut` are no-ops — upstream implements
-  them with VDBE instructions (the `WINDOWFUNCNOOP` registration), so they need the M11.7
-  codegen driver to function.
+  calls. **11.7 partition-sort + frame-step codegen driver (first slice)** ✅:
+  `codegen::window::compile_window_select` lowers a `SELECT` with `OVER (...)` calls to a
+  VDBE program. The shape is: scan the table → sort by PARTITION BY + ORDER BY into a sorter
+  (carrying the full table row as payload) → walk the sorted sorter, driving accumulators
+  and emitting rows. Two frame shapes are supported in this first slice: **PerRow**
+  (`ROWS UNBOUNDED PRECEDING → CURRENT ROW` — the `row_number()` default; each row gets one
+  `AggStep` + `AggValue` + `ResultRow`) and **PerPeerGroup** (`RANGE UNBOUNDED PRECEDING →
+  CURRENT ROW` — the `rank()`/`dense_rank()`/default-aggregate shape; a peer group is stepped
+  together, `AggValue` is read once, and every row in the peer group is emitted with that same
+  result via a `Gosub`-driven flush subroutine over a peer-buf ephemeral). Partition changes
+  reset the accumulators (the `Null` opcode now clears the `aggregates` HashMap entry so the
+  next `AggStep` creates a fresh accumulator). The `Clear` opcode now handles ephemeral
+  cursors (resets the in-memory record buffer) so the peer-buf can be cleared between peer
+  groups. `first_value`/`nth_value`'s `value_mut` returns the captured value WITHOUT
+  clearing (matching the window codegen's per-peer-group `AggValue` pattern; upstream uses
+  `noopValueFunc` for `xValue` and emits via `xFinalize`, but our codegen uses `AggValue` per
+  peer group, so the non-clearing path is correct). Supports: `PARTITION BY`, `ORDER BY`,
+  `FILTER (WHERE expr)`, multiple window calls sharing one `OVER` spec, outer `WHERE`/
+  `ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT`, and the aggregate-as-window functions
+  (`count`/`sum`/`total`/`avg`/`min`/`max`/`group_concat`). Differential-tested vs the C
+  oracle (`window_functions` — 40+ queries covering all supported shapes). Still M11:
+  **11.8** the full frame-spec (`ROWS`/`RANGE`/`GROUPS` bounds with `<expr> PRECEDING`/
+  `FOLLOWING`), **11.9** frame bound expressions, and **11.10** the `EXCLUDE` clause. Known
+  gaps: `lead`/`lag`/`ntile`/`last_value`/`percent_rank`/`cume_dist` are rejected at codegen
+  time (their default frames need the sliding-frame `AggInverse` shape, which lands with the
+  M11.7 follow-up); multiple *different* `OVER` specs in one query are rejected (the follow-up
+  lowers each distinct window separately); `ORDER BY` on the outer query that references
+  non-projection columns in the PerPeerGroup flush pass may read NULL (the peer-buf only
+  carries projection columns — the follow-up carries the full row).

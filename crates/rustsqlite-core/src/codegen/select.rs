@@ -60,9 +60,7 @@ pub fn compile(
     // properly windowed call (the latter is a Rustqlite-specific limitation, not an upstream
     // error — upstream supports them; we don't yet).
     if has_window_function_query(select, &outputs) {
-        return Err(Error::msg(
-            "window functions are not yet supported (M11.7: codegen driver pending)",
-        ));
+        return super::window::compile_window_select(select, table, indexes, subquery_resolver);
     }
     // A window-only function (row_number/rank/…/lead/lag) used *without* an `OVER` clause is a
     // semantic error in upstream ("misuse of window function <name>()"). We detect it here so
@@ -1256,7 +1254,7 @@ pub(crate) struct WindowCall {
 /// this to allocate per-call accumulator registers and emit the partition-sort + frame-step
 /// program. For now, [`compile`] rejects window queries via [`has_window_function_query`] with
 /// "misuse of window function" / "window functions are not yet supported" until 11.7 lands.
-fn collect_window_functions(e: &Expr, out: &mut Vec<WindowCall>) {
+pub(crate) fn collect_window_functions(e: &Expr, out: &mut Vec<WindowCall>) {
     match e {
         Expr::Function {
             name,

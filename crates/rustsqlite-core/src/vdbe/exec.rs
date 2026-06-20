@@ -1027,9 +1027,14 @@ impl Vdbe {
                     if p3 > p2 {
                         for i in p2..=p3 {
                             self.regs[i as usize] = Value::Null;
+                            // Clear any aggregate accumulator stored at this register so a
+                            // subsequent `AggStep` creates a fresh accumulator. Used by the
+                            // window codegen to reset accumulators on a partition change.
+                            self.aggregates.remove(&(i as usize));
                         }
                     } else {
                         self.regs[p2 as usize] = Value::Null;
+                        self.aggregates.remove(&(p2 as usize));
                     }
                     self.pc += 1;
                 }
@@ -1253,6 +1258,19 @@ impl Vdbe {
                     self.pc += 1;
                 }
                 Opcode::Clear => {
+                    // An ephemeral cursor (window-function peer-buf) uses the in-memory clear
+                    // path; a table b-tree cursor uses the pager-backed path.
+                    let is_ephemeral = self
+                        .cursors
+                        .get(p1 as usize)
+                        .and_then(|c| c.as_ref())
+                        .is_some_and(VdbeCursor::is_ephemeral);
+                    if is_ephemeral {
+                        let slot = self.cursors[p1 as usize].as_mut().unwrap();
+                        slot.as_ephemeral_mut().unwrap().clear();
+                        self.pc += 1;
+                        continue;
+                    }
                     let pager = self
                         .pager
                         .clone()
