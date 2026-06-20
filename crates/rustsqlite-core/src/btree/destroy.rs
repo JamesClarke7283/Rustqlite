@@ -1,23 +1,25 @@
 //! B-tree destruction (the analogue of `OP_Destroy` / `sqlite3BtreeDropTable`).
 //!
-//! Walk a table b-tree rooted at `root` and free every page in it, adding each to the
+//! Walk a b-tree rooted at `root` and free every page in it, adding each to the
 //! pager's freelist. Interior pages are descended recursively; leaves are freed once
-//! their cells have been cleared. The freed pages can be re-used by future
-//! `allocate_page` calls (or reclaimed by `VACUUM`).
+//! their cells' overflow chains have been reaped. The freed pages can be re-used by
+//! future `allocate_page` calls (or reclaimed by `VACUUM`).
 //!
-//! This is the write-path half of `DROP TABLE`: the `sqlite_schema` row is removed
-//! separately by the codegen path. Index b-trees, `WITHOUT ROWID` tables, and the
-//! `auto-vacuum` ptrmap are out of scope for the first slice.
+//! This is the write-path half of `DROP TABLE` / `DROP INDEX`: the `sqlite_schema`
+//! row is removed separately by the codegen path. Handles table b-trees, index
+//! b-trees, and `WITHOUT ROWID` (index-organized) tables uniformly — the on-disk
+//! shape of any interior page is identical (a 4-byte left-child pointer per cell
+//! plus a right-most pointer in the header), so the same DFS works for all three.
 
 use crate::error::{Error, Result};
 use crate::pager::Pager;
 
-use super::cell::parse_table_interior_cell;
+use super::cell::{parse_index_interior_cell, parse_index_leaf_cell, parse_table_interior_cell};
 use super::page::{PageHeader, PageType};
 
-/// Recursively free every page in the table b-tree rooted at `root`. The page is
-/// added to the pager's freelist (so a subsequent `allocate_page` will reuse it).
-/// Returns the number of pages freed.
+/// Recursively free every page in the b-tree rooted at `root`. The page is added to
+/// the pager's freelist (so a subsequent `allocate_page` will reuse it). Returns the
+/// number of pages freed. Works for table, index, and `WITHOUT ROWID` b-trees.
 pub async fn destroy(pager: &Pager, root: u32) -> Result<u32> {
     if root == 0 {
         return Ok(0);
@@ -33,42 +35,54 @@ pub async fn destroy(pager: &Pager, root: u32) -> Result<u32> {
         let hdr = PageHeader::parse(&page, base)?;
         match hdr.page_type {
             PageType::LeafTable | PageType::LeafIndex => {
-                // Reap the cells' overflow chains before freeing the page. (For
-                // table-leaf cells, an overflow chain is possible; index leaves will be
-                // exercised when index destroy lands.)
-                if hdr.page_type == PageType::LeafTable {
-                    let usable = pager.usable_size();
-                    for i in 0..hdr.num_cells as usize {
-                        let off = hdr.cell_pointer(&page, i)?;
-                        if let Ok(cell) = super::cell::parse_table_leaf_cell(&page, off, usable) {
-                            if let Some(first) = cell.overflow_page {
-                                free_overflow_chain(pager, first).await?;
-                            }
+                // Reap each leaf cell's overflow chain before freeing the page itself.
+                // Both table-leaf and index-leaf cells can carry overflow when the
+                // payload exceeds the local-only window.
+                let usable = pager.usable_size();
+                for i in 0..hdr.num_cells as usize {
+                    let off = hdr.cell_pointer(&page, i)?;
+                    let overflow = match hdr.page_type {
+                        PageType::LeafTable => {
+                            super::cell::parse_table_leaf_cell(&page, off, usable)
+                                .ok()
+                                .and_then(|c| c.overflow_page)
                         }
+                        PageType::LeafIndex => parse_index_leaf_cell(&page, off, usable)
+                            .ok()
+                            .and_then(|c| c.overflow_page),
+                        _ => None,
+                    };
+                    if let Some(first) = overflow {
+                        free_overflow_chain(pager, first).await?;
                     }
                 }
                 pager.free_page(pgno).await?;
                 freed += 1;
             }
-            PageType::InteriorTable => {
-                // Push children first; we cannot free the interior page until the
-                // children are queued.
+            PageType::InteriorTable | PageType::InteriorIndex => {
+                // Both interior-table and interior-index cells start with a 4-byte
+                // left-child pointer; the right-most child sits in the page header at
+                // hdr+8. Push every child before freeing the interior page itself.
                 let n = hdr.num_cells as usize;
+                let usable = pager.usable_size();
                 for i in 0..n {
                     let off = hdr.cell_pointer(&page, i)?;
-                    let cell = parse_table_interior_cell(&page, off)?;
-                    stack.push(cell.left_child);
+                    let left_child = match hdr.page_type {
+                        PageType::InteriorTable => {
+                            parse_table_interior_cell(&page, off)?.left_child
+                        }
+                        PageType::InteriorIndex => {
+                            parse_index_interior_cell(&page, off, usable)?.left_child
+                        }
+                        _ => unreachable!(),
+                    };
+                    stack.push(left_child);
                 }
                 if let Some(rm) = hdr.right_most_pointer {
                     stack.push(rm);
                 }
                 pager.free_page(pgno).await?;
                 freed += 1;
-            }
-            _ => {
-                return Err(Error::corrupt(format!(
-                    "destroy: unexpected page type on page {pgno}"
-                )));
             }
         }
     }

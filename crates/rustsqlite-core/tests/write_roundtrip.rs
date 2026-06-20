@@ -441,6 +441,84 @@ fn drop_index_roundtrip_and_c_oracle() {
 }
 
 #[test]
+fn drop_large_index_with_interior_pages_reuses_freelist() {
+    // `OP_Destroy` must walk an index b-tree that has interior pages (not just a
+    // single leaf) and free every page into the freelist. The proof that the freelist
+    // was actually populated is that re-creating the index does not grow the file.
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("drop_large_index");
+
+    let page_count_before;
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        // Page size is 4096; ~2000 integer keys easily overflow one index leaf and
+        // require an interior page to fan out.
+        for i in 0..2000i64 {
+            exec(&mut conn, &format!("INSERT INTO t VALUES ({i}, 'x{i}');"));
+        }
+        exec(&mut conn, "CREATE INDEX idx_a ON t(a);");
+
+        page_count_before = db.query("PRAGMA page_count;").parse::<u64>().unwrap();
+
+        exec(&mut conn, "DROP INDEX idx_a;");
+
+        // Re-create the index: the freed pages must be reused from the freelist
+        // rather than extending the file.
+        exec(&mut conn, "CREATE INDEX idx_a2 ON t(a);");
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(
+        db.query("SELECT count(*) FROM sqlite_schema WHERE name='idx_a';"),
+        "0"
+    );
+    let page_count_after = db.query("PRAGMA page_count;").parse::<u64>().unwrap();
+    assert_eq!(
+        page_count_after, page_count_before,
+        "freelist pages from DROP INDEX were not reused (file grew)"
+    );
+}
+
+#[test]
+fn drop_large_table_with_interior_pages_reuses_freelist() {
+    // `OP_Destroy` on a table b-tree with interior table pages must free every page
+    // into the freelist. Re-creating a similar table should not grow the file.
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("drop_large_table");
+
+    let page_count_before;
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        for i in 0..2000i64 {
+            exec(&mut conn, &format!("INSERT INTO t VALUES ({i}, 'x{i}');"));
+        }
+        page_count_before = db.query("PRAGMA page_count;").parse::<u64>().unwrap();
+
+        exec(&mut conn, "DROP TABLE t;");
+
+        // Re-create a similar table: the freed pages must be reused from the
+        // freelist rather than extending the file.
+        exec(&mut conn, "CREATE TABLE u(a, b);");
+        for i in 0..2000i64 {
+            exec(&mut conn, &format!("INSERT INTO u VALUES ({i}, 'y{i}');"));
+        }
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(
+        db.query("SELECT count(*) FROM sqlite_schema WHERE name='t';"),
+        "0"
+    );
+    let page_count_after = db.query("PRAGMA page_count;").parse::<u64>().unwrap();
+    assert_eq!(
+        page_count_after, page_count_before,
+        "freelist pages from DROP TABLE were not reused (file grew)"
+    );
+}
+
+#[test]
 fn multi_column_index_select() {
     skip_if_no_sqlite3!();
     let db = TempDb::new("multi_col_index_select");

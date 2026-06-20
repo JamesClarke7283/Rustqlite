@@ -165,7 +165,7 @@ list every granular item needed.
 - [x] **5.3.6** `WITHOUT ROWID` table b-trees (index-organized tables with primary key as the key)
 - [x] **5.3.7** Auto-vacuum / ptrmap pages (`PRAGMA auto_vacuum = INCREMENTAL|FULL`)
 - [x] **5.3.8** `PRAGMA integrity_check` backend (b-tree walk, overflow chain verification, freelist check)
-- [ ] **5.3.9** `Destroy` opcode: remove b-tree + add pages to freelist (already partial; ensure freelist pages are reusable)
+- [x] **5.3.9** `Destroy` opcode: remove b-tree + add pages to freelist (already partial; ensure freelist pages are reusable)
 
 ---
 
