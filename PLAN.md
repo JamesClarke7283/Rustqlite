@@ -213,8 +213,8 @@ list every granular item needed.
 - [x] **8.7** Codegen: scalar subquery in expressions — `Program` opcode or coroutine
 - [x] **8.8** Codegen: `EXISTS (subquery)` — materialize, check if any row exists
 - [x] **8.9** Codegen: `IN (subquery)` — ephemeral index or sorter for the subquery result set
-- [ ] **8.10** VDBE: `Program` opcode — execute a sub-VDBE program (for triggers, views)
-- [ ] **8.11** VDBE: `Param` opcode — pass outer-query values into correlated subqueries
+- [x] **8.10** VDBE: `Program` opcode — execute a sub-VDBE program (for triggers, views)
+- [x] **8.11** VDBE: `Param` opcode — pass outer-query values into correlated subqueries
 
 ---
 

@@ -77,6 +77,11 @@ pub fn render_p4(p4: &P4) -> String {
             out
         }
         P4::FuncDef(kind) => kind.name().to_string(),
+        P4::SubProgram(prog) => {
+            // Upstream's displayP4 renders a sub-program as "program(N,M,...)" giving the
+            // instruction count and register count. We match that shape.
+            format!("program({},{})", prog.instructions.len(), prog.num_registers)
+        }
     }
 }
 
@@ -141,6 +146,8 @@ fn synopsis(inst: &Instruction) -> String {
         EndCoroutine => format!("end coroutine r[{p1}]"),
         Yield => format!("yield r[{p1}]; on end jmp to {p2}"),
         Once => format!("once jmp to {p2}"),
+        Program => format!("call subprogram r[{p3}]; on ignore jmp to {p2}"),
+        Param => format!("r[{p2}]=parent r[{p1}+caller.p1]"),
         // Cursor/scan/sorter/control opcodes have no concise value synopsis; leave blank.
         _ => String::new(),
     }

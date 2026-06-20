@@ -912,6 +912,18 @@ fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) 
         Yield => {
             r(&mut inst.p1);
         }
+        // Sub-program invocation opcodes. These do not appear inside the scalar/EXISTS/IN
+        // subquery bodies that `rebase_operands` is used for (those are inlined scan-by-scan,
+        // not compiled as separate `Program`-invoked sub-programs), so the arms are defensive.
+        Program => {
+            // p3 is the runtime register (unused by us); p1 is the parent register base. Both
+            // belong to the calling (outer) frame, not the inlined scan, so leave them alone.
+        }
+        Param => {
+            // p2 is a register in the sub-program's own frame; rebase it. p1 is an offset from
+            // the parent's base, not a register, so leave it alone.
+            r(&mut inst.p2);
+        }
     }
 }
 

@@ -4,6 +4,8 @@
 //! instruction has the classic SQLite shape: an opcode and operands `p1..p3` (i32), a typed
 //! `p4`, and a `p5` flag byte. The executor (`exec.rs`) walks this with a program counter.
 
+use std::sync::Arc;
+
 use crate::func::aggregate::AggregateKind;
 use crate::types::Collation;
 
@@ -47,6 +49,14 @@ pub enum P4 {
     /// (resolved case-insensitively at codegen time) so the executor can dispatch to the right
     /// step/finalize path without re-parsing the function name. Mirrors upstream's `P4_FUNCDEF`.
     FuncDef(AggregateKind),
+    /// A sub-VDBE program for `OP_Program` (triggers, future views). Carries an `Arc<Program>`
+    /// so it can be cheaply shared between the parent's instruction stream and the frame the
+    /// executor installs when it enters the sub-program. Mirrors upstream's `P4_SUBPROGRAM`.
+    /// The sub-program's own `num_registers` determines the size of the fresh register file the
+    /// executor allocates for the frame; its `instructions` are executed in place of the
+    /// parent's until a `Halt` pops the frame (or a `Return` from a `Gosub`-shaped sub-program
+    /// returns to the parent).
+    SubProgram(Arc<Program>),
 }
 
 /// A single VDBE instruction.

@@ -48,6 +48,23 @@ pub enum Opcode {
     /// Used to wrap non-correlated scalar subquery code so it runs only once per statement.
     /// Mirrors `OP_Once` in `vdbe.c`.
     Once,
+    /// `Program p1 p2 p3 p4=SubProgram p5=token`: invoke a sub-VDBE program (trigger program,
+    /// view body, or other sub-program). Save the current program state into a frame stored in
+    /// `r[p3]`, install the sub-program from `p4` with a fresh register file and cursor table,
+    /// and begin executing it at its first instruction. When the sub-program halts (its `Halt`
+    /// with `p1 == SQLITE_OK`), the frame is popped and execution resumes in the parent at the
+    /// instruction following this `Program`. `p1` is the register in the *parent* where the
+    /// sub-program's inputs begin (the base for `OP_Param`); `p2` is the jump target when the
+    /// sub-program halts with `OE_Ignore`. `p5` non-zero enables recursive-trigger guard
+    /// (a sub-program with the same `p5` token already on the frame stack is a no-op).
+    /// Mirrors `OP_Program` in `vdbe.c`.
+    Program,
+    /// `Param p1 p2`: copy a value from the calling (parent) frame's register file into the
+    /// current frame's `r[p2]`. The parent register index is `p1 + (parent_program.p1 at the
+    /// calling Program instruction)`. Used inside sub-programs (trigger bodies, correlated
+    /// subqueries) to access the outer row's `NEW.*` / `OLD.*` values or outer-query columns.
+    /// Mirrors `OP_Param` in `vdbe.c`.
+    Param,
     /// `Compare p1 p2 p3 p4=KeyInfo`: compare `n=p3` registers starting at `r[p1]` against
     /// `r[p2]` under the per-key collation in `p4`, leaving the result (`-1/0/+1`) in a hidden
     /// `last_compare` cell that the immediately following `Jump` reads. Mirrors `OP_Compare`.
@@ -318,6 +335,8 @@ impl Opcode {
             Opcode::EndCoroutine => "EndCoroutine",
             Opcode::Yield => "Yield",
             Opcode::Once => "Once",
+            Opcode::Program => "Program",
+            Opcode::Param => "Param",
             Opcode::Compare => "Compare",
             Opcode::Jump => "Jump",
             Opcode::Transaction => "Transaction",

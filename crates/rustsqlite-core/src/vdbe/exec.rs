@@ -141,6 +141,46 @@ pub enum StepResult {
     Done,
 }
 
+/// A saved execution frame for `OP_Program` (mirrors `VdbeFrame` in `vdbe.c`).
+///
+/// When `OP_Program` invokes a sub-VDBE (a trigger program, view body, or other sub-program),
+/// the parent's running state is captured into a `VdbeFrame` and pushed on [`Vdbe::frames`].
+/// The executor then installs the sub-program with a fresh register file and cursor table and
+/// runs it. When the sub-program halts (its `OP_Halt` with `p1 == SQLITE_OK`), the frame is
+/// popped and the parent's state is restored so execution resumes at the instruction following
+/// the `OP_Program`.
+///
+/// `param_base` is the calling `OP_Program`'s `p1` operand — the register in the PARENT frame
+/// where the sub-program's inputs begin. `OP_Param p1 p2` inside the sub-program copies the
+/// parent's register at index `param_base + p1` into the current frame's `r[p2]`.
+struct VdbeFrame {
+    /// The parent program (restored on pop).
+    program: Arc<Program>,
+    /// The parent program counter to resume at (the address of the instruction following the
+    /// `OP_Program`).
+    pc: usize,
+    /// The parent's register file.
+    regs: Vec<Value>,
+    /// The parent's cursor table.
+    cursors: Vec<Option<VdbeCursor>>,
+    /// The parent's `cursor_root` map (rootpage per open cursor).
+    cursor_root: HashMap<i32, u32>,
+    /// The parent's decoded-record cache.
+    decoded: Option<(usize, i64, Vec<Value>)>,
+    /// The parent's per-accumulator state (aggregate sub-programs are rare but supported).
+    aggregates: HashMap<usize, Accumulator>,
+    /// The parent's `Once`-fired set.
+    once_done: std::collections::HashSet<usize>,
+    /// The parent's `write_txn` flag.
+    write_txn: bool,
+    /// The `p1` operand of the calling `OP_Program` — the base register in the parent frame
+    /// for `OP_Param` resolution.
+    param_base: i32,
+    /// The `p5` operand of the calling `OP_Program` — the recursion token. Non-zero for
+    /// trigger sub-programs; the recursive-trigger guard matches on this value.
+    token: u8,
+}
+
 /// A running VDBE program instance — the execution state behind a `sqlite3_stmt`.
 pub struct Vdbe {
     program: Arc<Program>,
@@ -180,6 +220,10 @@ pub struct Vdbe {
     /// added. Cleared by [`Self::reset`]. Mirrors the `aOp[0].p1`-cookie trick in `vdbe.c`'s
     /// `OP_Once` but using an explicit set keyed by instruction address for clarity.
     once_done: std::collections::HashSet<usize>,
+    /// The stack of saved parent frames for `OP_Program`. The top of the stack is the most
+    /// recently entered sub-program's parent. Empty for a flat (non-sub-program) statement.
+    /// Mirrors `p->pFrame` in `vdbe.c` (kept as a `Vec` so a pop is a simple `pop()`).
+    frames: Vec<VdbeFrame>,
 }
 
 impl Vdbe {
@@ -206,6 +250,7 @@ impl Vdbe {
             aggregates: HashMap::new(),
             last_compare: Ordering::Equal,
             once_done: std::collections::HashSet::new(),
+            frames: Vec::new(),
         }
     }
 
@@ -239,6 +284,10 @@ impl Vdbe {
         self.aggregates.clear();
         self.last_compare = Ordering::Equal;
         self.once_done.clear();
+        // Drop any residual sub-program state (a reset mid-sub-program should not happen in
+        // normal use, but be defensive — the parent program is the canonical `self.program`,
+        // so restoring frames would just put back the same program).
+        self.frames.clear();
     }
 
     /// Number of columns in the current result row.
@@ -279,8 +328,11 @@ impl Vdbe {
         if self.halted {
             return Ok(StepResult::Done);
         }
-        let program = Arc::clone(&self.program);
         loop {
+            // Re-clone the current program each iteration so a `Program` opcode (which swaps
+            // `self.program` to a sub-program) or a frame-popping `Halt` sees the new program
+            // immediately. The `Arc` clone is cheap (one refcount bump).
+            let program = Arc::clone(&self.program);
             let pc = self.pc;
             let inst: &Instruction = program
                 .instructions
@@ -300,6 +352,78 @@ impl Vdbe {
                         self.once_done.insert(pc);
                         self.pc += 1;
                     }
+                }
+                Opcode::Program => {
+                    // `OP_Program p1 p2 p3 p4=SubProgram`: invoke a sub-VDBE. Save the current
+                    // state into a frame stored on `self.frames`, install the sub-program with
+                    // a fresh register file and cursor table, and begin executing it at its
+                    // first instruction. Mirrors `OP_Program` in `vdbe.c`.
+                    //
+                    // `p1` is the parent-frame register base for `OP_Param`; `p2` is the
+                    // ignore-jump target (used when the sub-program halts with `OE_Ignore`,
+                    // which we record on the frame and consult at pop time); `p3` is unused
+                    // here (upstream stores a `pRt` runtime blob in `r[p3]`; we keep the
+                    // parent state on `self.frames` instead, so `p3` is informational only);
+                    // `p4` carries the sub-program; `p5` is the recursion-token (non-zero
+                    // enables the recursive-trigger guard).
+                    // Recursive-trigger guard: if `p5 != 0` and a frame with the same token is
+                    // already on the stack, this is a recursive invocation that P5 says to
+                    // suppress — skip the sub-program entirely (fall through). Upstream matches
+                    // on `pProgram->token`; we use `p5` as the token (the codegen picks a
+                    // distinct non-zero value per trigger).
+                    if p5 != 0 && self.frames.iter().any(|f| f.token == p5) {
+                        self.pc += 1;
+                        continue;
+                    }
+                    // Save the parent state into a new frame.
+                    let sub_program = match &inst.p4 {
+                        P4::SubProgram(p) => Arc::clone(p),
+                        _ => return Err(Error::msg("OP_Program requires a SubProgram p4")),
+                    };
+                    let parent_program = std::mem::replace(&mut self.program, sub_program.clone());
+                    let frame = VdbeFrame {
+                        program: parent_program,
+                        pc: pc + 1,
+                        regs: std::mem::take(&mut self.regs),
+                        cursors: std::mem::take(&mut self.cursors),
+                        cursor_root: std::mem::take(&mut self.cursor_root),
+                        decoded: self.decoded.take(),
+                        aggregates: std::mem::take(&mut self.aggregates),
+                        once_done: std::mem::take(&mut self.once_done),
+                        write_txn: self.write_txn,
+                        param_base: p1,
+                        token: p5,
+                    };
+                    self.frames.push(frame);
+                    // Install a fresh register file sized for the sub-program and reset the
+                    // cursor table / per-frame scratch. The sub-program's `Init` (if present)
+                    // runs next and jumps to its setup block; otherwise execution starts at
+                    // its first instruction.
+                    let nreg = sub_program.num_registers.max(1);
+                    self.regs = vec![Value::Null; nreg];
+                    self.cursors = Vec::new();
+                    self.cursor_root = HashMap::new();
+                    self.decoded = None;
+                    self.aggregates = HashMap::new();
+                    self.once_done = std::collections::HashSet::new();
+                    self.pc = 0;
+                }
+                Opcode::Param => {
+                    // `OP_Param p1 p2`: copy a value from the PARENT frame's register file into
+                    // the current frame's `r[p2]`. The parent register index is
+                    // `param_base + p1`, where `param_base` is the calling `OP_Program`'s `p1`.
+                    // Mirrors `OP_Param` in `vdbe.c`.
+                    let frame = self.frames.last().ok_or_else(|| {
+                        Error::msg("OP_Param outside of a sub-program (no parent frame)")
+                    })?;
+                    let parent_idx = (frame.param_base + p1) as usize;
+                    let val = frame
+                        .regs
+                        .get(parent_idx)
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    self.regs[p2 as usize] = val;
+                    self.pc += 1;
                 }
                 Opcode::Gosub => {
                     // Store the address of the *next* instruction in `r[p1]` and jump to `p2`.
@@ -429,9 +553,53 @@ impl Vdbe {
                     };
                 }
                 Opcode::Halt => {
-                    // A successful Halt commits an open write transaction (the durable commit
-                    // point); read-only programs have no transaction to commit. Mirrors the
-                    // CommitPhase in `sqlite3VdbeHalt` for a non-erroring statement.
+                    // `OP_Halt p1 p2 p3 p4 p5`: stop execution. `p1` is the result code (0 =
+                    // SQLITE_OK); `p2` is the conflict-resolution action on error (`OE_Abort`
+                    // etc.); `p3`/`p4` carry an error message when `p1 != 0`; `p5` is the
+                    // constraint type for error formatting.
+                    //
+                    // When inside a sub-program (there is a parent frame on `self.frames`) and
+                    // `p1 == SQLITE_OK`, the sub-program is returning control to the parent.
+                    // Pop the frame and resume at the saved PC. Mirrors the `p->pFrame` branch
+                    // of `OP_Halt` in `vdbe.c` / `sqlite3VdbeFrameRestore`.
+                    if p1 == 0 && !self.frames.is_empty() {
+                        let frame = self.frames.pop().unwrap();
+                        // Restore the parent's state. The sub-program's `write_txn` flag is
+                        // discarded — the parent's is restored (matches upstream: a sub-program
+                        // does not independently commit; the parent's transaction owns the
+                        // commit). The sub-program's change-counter deltas propagate via the
+                        // shared `RuntimeCtx` (`self.ctx`), which is NOT saved on the frame.
+                        self.program = frame.program;
+                        self.pc = frame.pc;
+                        self.regs = frame.regs;
+                        self.cursors = frame.cursors;
+                        self.cursor_root = frame.cursor_root;
+                        self.decoded = frame.decoded;
+                        self.aggregates = frame.aggregates;
+                        self.once_done = frame.once_done;
+                        self.write_txn = frame.write_txn;
+                        // `p2 == OE_Ignore` (5) means the sub-program threw an IGNORE
+                        // exception — jump to the calling `OP_Program`'s `p2` (the ignore-jump
+                        // target) instead of resuming at the next instruction. Upstream does
+                        // `pcx = p->aOp[pcx].p2 - 1`; we set `pc` directly to the calling
+                        // `OP_Program`'s `p2`. The calling `OP_Program` is at
+                        // `frame.pc - 1` (we saved `pc + 1` as the resume point).
+                        if p2 == 5 {
+                            // The ignore-jump target is the calling Program's p2. Read it from
+                            // the now-restored parent program.
+                            let caller_pc = self.pc - 1;
+                            if let Some(caller) = self.program.instructions.get(caller_pc) {
+                                if matches!(caller.opcode, Opcode::Program) {
+                                    self.pc = caller.p2 as usize;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    // A successful top-level Halt commits an open write transaction (the
+                    // durable commit point); read-only programs have no transaction to commit.
+                    // Mirrors the CommitPhase in `sqlite3VdbeHalt` for a non-erroring
+                    // statement.
                     if self.write_txn {
                         if let Some(pager) = &self.pager {
                             pager.commit().await?;
@@ -2159,5 +2327,169 @@ mod tests {
             rows.push((0..n).map(|i| v.result_value(i)).collect());
         }
         assert!(rows.is_empty(), "empty coroutine should emit no rows");
+    }
+
+    /// `OP_Program` / `OP_Param` round-trip: a parent program loads 42 into r1, invokes a
+    /// sub-program whose body reads the parent's r1 via `OP_Param` and emits a result row
+    /// computed from it (doubled). When the sub-program halts, control returns to the parent,
+    /// which then emits its own row. Verifies the frame save/restore, the `Param` register
+    /// resolution (`param_base + p1`), and the `Halt`-pops-frame path.
+    #[tokio::test]
+    async fn program_param_round_trip() {
+        // Sub-program layout (3 instructions, 3 registers):
+        //   0 Param  0  1 0   ; r1 = parent[param_base + 0] = parent r1 = 42
+        //   1 Add    1  1 2   ; r2 = r1 + r1 = 84
+        //   2 ResultRow 2 1 0 ; emit r2
+        //   3 Halt   0  0 0   ; return to parent
+        let sub = Program {
+            instructions: vec![
+                inst(Opcode::Param, 0, 1, 0),
+                inst(Opcode::Add, 1, 1, 2),
+                inst(Opcode::ResultRow, 2, 1, 0),
+                inst(Opcode::Halt, 0, 0, 0),
+            ],
+            num_registers: 3,
+        };
+        // Parent layout (6 instructions, 4 registers):
+        //   0 Init    0  6 0          ; -> 6 (setup)
+        //   1 Integer 42 1 0          ; r1 = 42
+        //   2 Program 1  0 3 SubProgram(0)  ; call sub with param_base=1, runtime r3
+        //   3 ResultRow 1 1 0         ; emit parent r1 (42) after sub returns
+        //   4 Halt    0  0 0          ; done
+        //   5 Transaction 0 0 0       ; setup (Init jumps here)
+        //   6 Goto 0 1 0
+        let parent = Program {
+            instructions: vec![
+                inst(Opcode::Init, 0, 5, 0),
+                inst(Opcode::Integer, 42, 1, 0),
+                inst_with(
+                    Opcode::Program,
+                    1,
+                    0,
+                    3,
+                    P4::SubProgram(Arc::new(sub)),
+                    0,
+                ),
+                inst(Opcode::ResultRow, 1, 1, 0),
+                inst(Opcode::Halt, 0, 0, 0),
+                inst(Opcode::Transaction, 0, 0, 0),
+                inst(Opcode::Goto, 0, 1, 0),
+            ],
+            num_registers: 4,
+        };
+        let mut v = Vdbe::new(Arc::new(parent), None);
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        while let StepResult::Row = v.step().await.expect("step") {
+            let n = v.result_count();
+            rows.push((0..n).map(|i| v.result_value(i)).collect());
+        }
+        // First row: from the sub-program (84). Second row: from the parent after return (42).
+        assert_eq!(
+            rows,
+            vec![vec![Value::Int(84)], vec![Value::Int(42)]],
+            "sub-program should emit its row then parent resumes"
+        );
+    }
+
+    /// `OP_Program` with `OE_Ignore` halt: the sub-program halts with `p2 == 5` (OE_Ignore),
+    /// so the parent jumps to the calling `OP_Program`'s `p2` instead of resuming at the next
+    /// instruction. Verifies the ignore-jump path.
+    #[tokio::test]
+    async fn program_halt_with_ignore_jumps_to_caller_p2() {
+        // Sub-program: immediately halt with OE_Ignore (p2 == 5), emitting no rows.
+        let sub = Program {
+            instructions: vec![
+                inst(Opcode::Halt, 0, 5, 0), // p1=OK, p2=OE_Ignore
+            ],
+            num_registers: 1,
+        };
+        // Parent layout:
+        //   0 Init    0  6 0
+        //   1 Program 1  4 2 SubProgram(0)  ; call sub; ignore-jump target = 4
+        //   2 Integer 99 1 0                ; r1 = 99 (skipped on ignore)
+        //   3 ResultRow 1 1 0               ; emit 99 (skipped on ignore)
+        //   4 Integer 77 1 0                ; ignore target: r1 = 77
+        //   5 ResultRow 1 1 0               ; emit 77
+        //   6 Halt    0  0 0
+        //   7 Transaction 0 0 0
+        //   8 Goto 0 1 0
+        let parent = Program {
+            instructions: vec![
+                inst(Opcode::Init, 0, 7, 0),
+                inst_with(Opcode::Program, 1, 4, 2, P4::SubProgram(Arc::new(sub)), 0),
+                inst(Opcode::Integer, 99, 1, 0),
+                inst(Opcode::ResultRow, 1, 1, 0),
+                inst(Opcode::Integer, 77, 1, 0),
+                inst(Opcode::ResultRow, 1, 1, 0),
+                inst(Opcode::Halt, 0, 0, 0),
+                inst(Opcode::Transaction, 0, 0, 0),
+                inst(Opcode::Goto, 0, 1, 0),
+            ],
+            num_registers: 3,
+        };
+        let mut v = Vdbe::new(Arc::new(parent), None);
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        while let StepResult::Row = v.step().await.expect("step") {
+            let n = v.result_count();
+            rows.push((0..n).map(|i| v.result_value(i)).collect());
+        }
+        // The sub-program's IGNORE halts jumps to caller.p2 = 4, skipping the 99 row.
+        assert_eq!(
+            rows,
+            vec![vec![Value::Int(77)]],
+            "OE_Ignore halt should jump to the calling Program's p2"
+        );
+    }
+
+    /// Recursive-trigger guard: a sub-program invoked with `p5 != 0` while a frame with the
+    /// same token is already on the stack is skipped (the recursive call is a no-op). Verifies
+    /// the `p5`-token guard in `OP_Program`.
+    #[tokio::test]
+    async fn program_recursive_guard_skips_duplicate_token() {
+        // The parent calls an outer sub-program with p5=7. The outer sub-program emits a row
+        // and then attempts to call an inner sub-program with the SAME token (7). The guard
+        // sees the outer's frame (token 7) on the stack and skips the inner call, so the inner
+        // sub-program's row (999) is never emitted.
+        let inner = Program {
+            instructions: vec![
+                inst(Opcode::Integer, 999, 1, 0),
+                inst(Opcode::ResultRow, 1, 1, 0),
+                inst(Opcode::Halt, 0, 0, 0),
+            ],
+            num_registers: 2,
+        };
+        let inner_arc = Arc::new(inner);
+        let outer = Program {
+            instructions: vec![
+                inst(Opcode::Integer, 1, 1, 0),
+                inst(Opcode::ResultRow, 1, 1, 0),
+                inst_with(Opcode::Program, 0, 0, 2, P4::SubProgram(inner_arc), 7),
+                inst(Opcode::Halt, 0, 0, 0),
+            ],
+            num_registers: 3,
+        };
+        let outer_arc = Arc::new(outer);
+        let parent = Program {
+            instructions: vec![
+                inst(Opcode::Init, 0, 4, 0),
+                inst_with(Opcode::Program, 0, 0, 1, P4::SubProgram(outer_arc), 7),
+                inst(Opcode::Halt, 0, 0, 0),
+                inst(Opcode::Transaction, 0, 0, 0),
+                inst(Opcode::Goto, 0, 1, 0),
+            ],
+            num_registers: 2,
+        };
+        let mut v = Vdbe::new(Arc::new(parent), None);
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        while let StepResult::Row = v.step().await.expect("step") {
+            let n = v.result_count();
+            rows.push((0..n).map(|i| v.result_value(i)).collect());
+        }
+        // Only the outer sub's row (1) is emitted; the inner call is suppressed by the guard.
+        assert_eq!(
+            rows,
+            vec![vec![Value::Int(1)]],
+            "recursive call with same p5 token should be skipped"
+        );
     }
 }

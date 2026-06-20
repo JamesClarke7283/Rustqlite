@@ -359,3 +359,31 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   limitation as 8.7/8.8. Known divergence: the parser parses `a = 10 OR a IN (...)` as
   `(a = 10 OR a) IN (...)` (IN binds looser than OR in our grammar — a parser precedence
   bug to fix in the full parse.y port, not in M8.9).
+  **8.10 `Program` opcode** ✅ / **8.11 `Param` opcode** ✅: the VDBE now implements
+  `OP_Program` and `OP_Param` (mirrors `vdbe.c`'s `OP_Program`/`OP_Param`). `OP_Program
+  p1 p2 p3 p4=SubProgram p5=token` invokes a sub-VDBE: the parent's running state
+  (program, pc, register file, cursor table, cursor-root map, decoded-record cache,
+  aggregate state, `Once`-fired set, `write_txn` flag) is saved into a new `VdbeFrame`
+  pushed on `self.frames`; the sub-program from `P4::SubProgram(Arc<Program>)` is
+  installed with a fresh register file (sized to `sub_program.num_registers`) and empty
+  cursor table; execution begins at the sub-program's first instruction. `p1` is the
+  parent-frame register base for `OP_Param` resolution; `p2` is the `OE_Ignore` jump
+  target (consulted when the sub-program halts with `p2 == 5`); `p5` is the recursion
+  token (non-zero enables the recursive-trigger guard — a sub-program with the same
+  token already on the frame stack is skipped, mirroring `pProgram->token` matching in
+  `vdbe.c`). `OP_Param p1 p2` copies the parent frame's register at `param_base + p1`
+  into the current frame's `r[p2]`. `OP_Halt` with `p1 == SQLITE_OK` and a non-empty
+  frame stack pops the frame and resumes the parent at the saved PC; on `OE_Ignore`
+  (`p2 == 5`) it jumps to the calling `Program`'s `p2` instead. A new `P4::SubProgram
+  (Arc<Program>)` variant carries the sub-program; `render_p4` renders it as
+  `program(N,M)` (instruction count, register count) matching upstream's `displayP4`.
+  The change-counter deltas in the shared `RuntimeCtx` propagate across the frame
+  boundary (the sub-program's writes bump the parent's `changes()`), matching upstream.
+  Unit-tested with three hand-built programs: a `Program`+`Param` round-trip (sub reads
+  a parent register via `Param`, computes, emits a row, returns; parent resumes and
+  emits its own row), an `OE_Ignore` halt (sub halts with `p2 == 5`, parent jumps to
+  the calling `Program`'s `p2`), and the recursive-trigger guard (a sub-program calling
+  another sub-program with the same `p5` token is skipped). The codegen does not yet
+  emit `OP_Program` (no trigger/view sub-programs compiled yet) — these opcodes are the
+  runtime infrastructure for M15 views, M16 triggers, and M8.13 correlated-subquery
+  re-materialization.
