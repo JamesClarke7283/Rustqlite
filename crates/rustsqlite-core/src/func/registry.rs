@@ -101,6 +101,13 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
 /// `n_arg` arguments, returning the same error SQLite would (`no such function` / `wrong number
 /// of arguments`).
 pub fn check(name: &str, n_arg: usize) -> Result<()> {
+    // Aggregate names are accepted by `check` so the scalar `Function` codegen arm does not
+    // reject them prematurely; the aggregate codegen path resolves them via
+    // [`aggregate::AggregateKind::from_name`] before reaching `check`. This keeps the scalar
+    // `min(X,Y,...)` / `max(X,Y,...)` forms working alongside the 1-arg aggregate forms.
+    if super::aggregate::AggregateKind::from_name(name, n_arg).is_some() {
+        return Ok(());
+    }
     let lname = name.to_ascii_lowercase();
     let arity_ok = match lname.as_str() {
         // core scalars (M3a)
@@ -225,8 +232,10 @@ mod tests {
         assert!(check("log", 2).is_ok());
         // Wrong arities.
         assert!(check("concat_ws", 1).is_err()); // needs the separator + ≥1 value
-        assert!(check("min", 1).is_err()); // the 1-arg aggregate form is a later milestone
-        assert!(check("max", 1).is_err());
+        // `min`/`max` at arity 1 are the aggregate forms (accepted now that M6 is landing);
+        // only the scalar forms (arity ≥2) go through `call_scalar`.
+        assert!(check("min", 1).is_ok());
+        assert!(check("max", 1).is_ok());
         assert!(check("pi", 1).is_err());
         assert!(check("sqrt", 2).is_err());
         // Unknown name.

@@ -5,10 +5,12 @@
 //! scalars arrive in later milestones. Function names and edge-case behavior mirror upstream
 //! exactly (verified against the `sqlite3` binary).
 
+pub mod aggregate;
 pub mod like;
 pub mod math;
 pub mod registry;
 pub mod scalar;
 pub mod string;
 
+pub use aggregate::{is_aggregate_name, Accumulator, AggregateKind};
 pub use registry::{call_scalar, check};

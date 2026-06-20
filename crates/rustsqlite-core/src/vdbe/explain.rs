@@ -76,6 +76,7 @@ pub fn render_p4(p4: &P4) -> String {
             out.push(')');
             out
         }
+        P4::FuncDef(kind) => kind.name().to_string(),
     }
 }
 
@@ -134,6 +135,8 @@ fn synopsis(inst: &Instruction) -> String {
         SCopy => format!("r[{p2}]=r[{p1}]"),
         Copy => format!("r[{p2}..{}]=r[{p1}..]", p2 + p3),
         Function => format!("r[{p3}]={}(...)", render_p4(&inst.p4)),
+        AggStep => format!("accum=r[{p3}] step(r[{p2}..])"),
+        AggFinal => format!("accum=r[{p1}]"),
         // Cursor/scan/sorter/control opcodes have no concise value synopsis; leave blank.
         _ => String::new(),
     }
@@ -262,5 +265,10 @@ mod tests {
             },
         ]);
         assert_eq!(render_p4(&ki), "k(2,B,-B)");
+        // FuncDef: the aggregate function name.
+        assert_eq!(
+            render_p4(&P4::FuncDef(crate::func::aggregate::AggregateKind::Count)),
+            "count"
+        );
     }
 }

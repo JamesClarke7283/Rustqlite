@@ -171,8 +171,8 @@ list every granular item needed.
 
 ## M6 — Aggregates, GROUP BY, DISTINCT
 
-- [ ] **6.1** VDBE: implement `AggStep` execution (accumulate per-group aggregate state)
-- [ ] **6.2** VDBE: implement `AggFinal` execution (finalize aggregate, write result register)
+- [x] **6.1** VDBE: implement `AggStep` execution (accumulate per-group aggregate state)
+- [x] **6.2** VDBE: implement `AggFinal` execution (finalize aggregate, write result register)
 - [ ] **6.3** Codegen: `GROUP BY` — sorter on group key + `AggStep` per row + `AggFinal` per group
 - [ ] **6.4** Codegen: `HAVING` — filter after `AggFinal`
 - [ ] **6.5** Aggregate functions: `count(*)`, `count(expr)`, `sum(expr)`, `total(expr)`, `avg(expr)`, `min(expr)`, `max(expr)`, `group_concat(expr [, sep])`

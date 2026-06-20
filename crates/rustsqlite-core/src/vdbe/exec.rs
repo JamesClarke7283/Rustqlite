@@ -17,6 +17,7 @@ use crate::btree::{self, IndexCursor, TableCursor};
 use crate::error::{Error, Result};
 use crate::format::{decode_record, encode_record, TextEncoding};
 use crate::func;
+use crate::func::aggregate::{Accumulator, AggregateKind};
 use crate::pager::Pager;
 use crate::types::{Affinity, Collation, Value};
 
@@ -165,6 +166,11 @@ pub struct Vdbe {
     /// Set to `true` once a write `Transaction` opcode has opened a write transaction, so `Halt`
     /// knows to commit and a step error knows to roll back. Read-only programs leave this `false`.
     write_txn: bool,
+    /// Per-accumulator state keyed by the register that holds the aggregate's result (the `p3`
+    /// of `AggStep` / `p1` of `AggFinal`). SQLite stores this inside the `Mem` cell itself; we
+    /// keep it in a side table so the `Value` type stays storage-class-only. An entry is created
+    /// lazily by `AggStep` on its first call for a given register, and consumed by `AggFinal`.
+    aggregates: HashMap<usize, Accumulator>,
 }
 
 impl Vdbe {
@@ -188,6 +194,7 @@ impl Vdbe {
             ctx: RuntimeCtx::new(),
             cursor_root: HashMap::new(),
             write_txn: false,
+            aggregates: HashMap::new(),
         }
     }
 
@@ -218,6 +225,7 @@ impl Vdbe {
         self.decoded = None;
         self.cursor_root.clear();
         self.write_txn = false;
+        self.aggregates.clear();
     }
 
     /// Number of columns in the current result row.
@@ -1028,12 +1036,45 @@ impl Vdbe {
                     }
                 }
 
-                // ---- not implemented in M3a (write path / index / aggregates) ----
-                other => {
-                    return Err(Error::msg(format!(
-                        "opcode {} is not implemented in M3a",
-                        other.name()
-                    )))
+                // ---- aggregates (M6) ----
+                Opcode::AggStep => {
+                    // `AggStep p1 p2 p3 p4=FuncDef(kind) p5=nArg`: accumulate one row's
+                    // arguments from `r[p2 .. p2+nArg]` into the accumulator at `r[p3]`. `p1`
+                    // is reserved (upstream uses it to mark `AggInverse`); we only emit the
+                    // step form. The accumulator is created lazily on the first call for a given
+                    // register and reused for subsequent calls in the same group.
+                    let kind = match &inst.p4 {
+                        P4::FuncDef(k) => *k,
+                        _ => return Err(Error::msg("AggStep requires a FuncDef p4")),
+                    };
+                    let n_arg = p5 as usize;
+                    let is_count_star = kind == AggregateKind::Count && n_arg == 0;
+                    let args: Vec<Value> = if is_count_star {
+                        Vec::new()
+                    } else {
+                        self.regs[p2 as usize..p2 as usize + n_arg].to_vec()
+                    };
+                    let acc = self
+                        .aggregates
+                        .entry(p3 as usize)
+                        .or_insert_with(|| Accumulator::new(kind));
+                    acc.step(&args, is_count_star);
+                    self.pc += 1;
+                }
+                Opcode::AggFinal => {
+                    // `AggFinal p1 p2 p3 p4=FuncDef(kind)`: finalize the accumulator at `r[p1]`
+                    // and store the result value there. `p2` is the original argument count
+                    // (unused by us, like upstream) and `p4` is the function descriptor.
+                    let kind = match &inst.p4 {
+                        P4::FuncDef(k) => *k,
+                        _ => return Err(Error::msg("AggFinal requires a FuncDef p4")),
+                    };
+                    let result = match self.aggregates.remove(&(p1 as usize)) {
+                        Some(acc) => finalize_accumulator(acc, kind),
+                        None => empty_aggregate_result(kind),
+                    };
+                    self.regs[p1 as usize] = result;
+                    self.pc += 1;
                 }
             }
         }
@@ -1229,6 +1270,59 @@ fn collation_of(p4: &P4) -> Collation {
     match p4 {
         P4::Symbol(name) => Collation::from_name(name).unwrap_or(Collation::Binary),
         _ => Collation::Binary,
+    }
+}
+
+/// Finalize an accumulator into its result `Value`, mirroring upstream's `xFinal` path. This is
+/// the per-aggregate "read out the state" logic that `AggFinal` dispatches to.
+fn finalize_accumulator(acc: Accumulator, kind: AggregateKind) -> Value {
+    match kind {
+        AggregateKind::Count => Value::Int(acc.count),
+        AggregateKind::Sum => {
+            if acc.count == 0 {
+                Value::Null
+            } else if acc.has_real {
+                Value::Real(acc.sum_r)
+            } else {
+                Value::Int(acc.sum_i)
+            }
+        }
+        AggregateKind::Total => {
+            // `total()` is always REAL and never NULL (0.0 for an empty set).
+            if acc.has_real {
+                Value::Real(acc.sum_r)
+            } else {
+                Value::Real(acc.sum_i as f64)
+            }
+        }
+        AggregateKind::Avg => {
+            if acc.count == 0 {
+                Value::Null
+            } else {
+                let total = if acc.has_real {
+                    acc.sum_r
+                } else {
+                    acc.sum_i as f64
+                };
+                Value::Real(total / acc.count as f64)
+            }
+        }
+        AggregateKind::Min | AggregateKind::Max => acc.best.unwrap_or(Value::Null),
+        AggregateKind::GroupConcat => {
+            acc.concat.map(Value::Text).unwrap_or(Value::Null)
+        }
+    }
+}
+
+/// The result of finalizing an aggregate that never received an `AggStep` call (an empty group).
+/// Mirrors the oracle's behavior for `SELECT count(*) FROM t WHERE 0=1` (0) vs `sum` (NULL) vs
+/// `total` (0.0) etc.
+fn empty_aggregate_result(kind: AggregateKind) -> Value {
+    match kind {
+        AggregateKind::Count => Value::Int(0),
+        AggregateKind::Sum | AggregateKind::Avg | AggregateKind::Min | AggregateKind::Max
+        | AggregateKind::GroupConcat => Value::Null,
+        AggregateKind::Total => Value::Real(0.0),
     }
 }
 
@@ -1501,5 +1595,192 @@ fn concat(b: &Value, a: &Value) -> Value {
     match (b.to_text(), a.to_text()) {
         (Some(tb), Some(ta)) => Value::Text(tb + &ta),
         _ => Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::func::aggregate::AggregateKind;
+    use crate::vdbe::program::{Instruction, Program, P4};
+
+    fn inst(opcode: Opcode, p1: i32, p2: i32, p3: i32) -> Instruction {
+        Instruction::new(opcode, p1, p2, p3)
+    }
+
+    fn inst_with(
+        opcode: Opcode,
+        p1: i32,
+        p2: i32,
+        p3: i32,
+        p4: P4,
+        p5: u8,
+    ) -> Instruction {
+        Instruction {
+            opcode,
+            p1,
+            p2,
+            p3,
+            p4,
+            p5,
+        }
+    }
+
+    /// A hand-built `SELECT count(*) FROM (constant 3-row scan)` program that exercises the
+    /// `AggStep` → `AggFinal` → `ResultRow` path without needing a pager or a real table. The
+    /// "table" is a 3-iteration loop that loads the literal 1 into r2 each row and steps the
+    /// accumulator at r3, then finalizes and emits.
+    async fn run_aggregate_program(kind: AggregateKind, n_arg: u8, is_count_star: bool) -> Value {
+        // r1 = loop counter / scratch, r2 = arg value, r3 = accumulator / result.
+        // Layout:
+        //   0 Init           -> 10
+        //   1 Integer 0       r1      (loop counter)
+        //   2 Integer 1       r2      (arg value; reused each row)
+        //   3 AggStep  0 r2 r3  FuncDef(kind) p5=n_arg
+        //   4 Add      r1 r2 r1      (r1 = r1 + 1) — actually r1 = r2 + r1 = 1 + r1
+        //   5 Lt       r1 9 r1       (if r1 < 3 jump back to step; SQLite compares r[p3] OP r[p1])
+        //   6 AggFinal r3 0 0  FuncDef(kind)
+        //   7 ResultRow r3 1
+        //   8 Halt
+        //   9 (loop body target — but we use a forward jump model)
+        //   10 Transaction
+        //   11 Goto -> 1
+        //
+        // We use a simpler countdown shape: emit 3 explicit AggStep calls.
+        let mut prog = Program {
+            instructions: Vec::new(),
+            num_registers: 4,
+        };
+        prog.instructions.push(inst(Opcode::Init, 0, 8, 0));
+        // Setup: load the literal 1 into r2 (the per-row argument).
+        prog.instructions.push(inst(Opcode::Integer, 1, 2, 0));
+        // Three rows → three AggStep calls.
+        for _ in 0..3 {
+            let n_arg_eff = if is_count_star { 0 } else { n_arg };
+            prog.instructions.push(inst_with(
+                Opcode::AggStep,
+                0,
+                2,
+                3,
+                P4::FuncDef(kind),
+                n_arg_eff,
+            ));
+        }
+        prog.instructions.push(inst_with(
+            Opcode::AggFinal,
+            3,
+            0,
+            0,
+            P4::FuncDef(kind),
+            0,
+        ));
+        prog.instructions.push(inst(Opcode::ResultRow, 3, 1, 0));
+        prog.instructions.push(inst(Opcode::Halt, 0, 0, 0));
+        prog.instructions.push(inst(Opcode::Transaction, 0, 0, 0));
+        prog.instructions.push(inst(Opcode::Goto, 0, 1, 0));
+
+        let mut v = Vdbe::new(Arc::new(prog), None);
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        while let StepResult::Row = v.step().await.expect("step") {
+            let n = v.result_count();
+            rows.push((0..n).map(|i| v.result_value(i)).collect());
+        }
+        assert_eq!(rows.len(), 1, "aggregate query should emit exactly one row");
+        rows[0][0].clone()
+    }
+
+    #[tokio::test]
+    async fn agg_step_count_star_three_rows() {
+        let r = run_aggregate_program(AggregateKind::Count, 1, true).await;
+        assert_eq!(r, Value::Int(3));
+    }
+
+    #[tokio::test]
+    async fn agg_step_sum_three_ones() {
+        let r = run_aggregate_program(AggregateKind::Sum, 1, false).await;
+        assert_eq!(r, Value::Int(3));
+    }
+
+    #[tokio::test]
+    async fn agg_step_total_three_ones() {
+        let r = run_aggregate_program(AggregateKind::Total, 1, false).await;
+        assert_eq!(r, Value::Real(3.0));
+    }
+
+    #[tokio::test]
+    async fn agg_step_min_max() {
+        // min/max of three 1s is 1.
+        let r = run_aggregate_program(AggregateKind::Min, 1, false).await;
+        assert_eq!(r, Value::Int(1));
+        let r = run_aggregate_program(AggregateKind::Max, 1, false).await;
+        assert_eq!(r, Value::Int(1));
+    }
+
+    #[tokio::test]
+    async fn agg_final_empty_group_count() {
+        // An AggFinal with no preceding AggStep should yield the empty-group result.
+        let prog = Program {
+            instructions: vec![
+                inst(Opcode::Init, 0, 5, 0),
+                inst_with(
+                    Opcode::AggFinal,
+                    1,
+                    0,
+                    0,
+                    P4::FuncDef(AggregateKind::Count),
+                    0,
+                ),
+                inst(Opcode::ResultRow, 1, 1, 0),
+                inst(Opcode::Halt, 0, 0, 0),
+                inst(Opcode::Transaction, 0, 0, 0),
+                inst(Opcode::Goto, 0, 1, 0),
+            ],
+            num_registers: 2,
+        };
+        let mut v = Vdbe::new(Arc::new(prog), None);
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        while let StepResult::Row = v.step().await.expect("step") {
+            let n = v.result_count();
+            rows.push((0..n).map(|i| v.result_value(i)).collect());
+        }
+        assert_eq!(rows, vec![vec![Value::Int(0)]]);
+    }
+
+    #[tokio::test]
+    async fn agg_final_empty_group_sum_total() {
+        let prog = Program {
+            instructions: vec![
+                inst(Opcode::Init, 0, 5, 0),
+                inst_with(
+                    Opcode::AggFinal,
+                    1,
+                    0,
+                    0,
+                    P4::FuncDef(AggregateKind::Sum),
+                    0,
+                ),
+                inst_with(
+                    Opcode::AggFinal,
+                    2,
+                    0,
+                    0,
+                    P4::FuncDef(AggregateKind::Total),
+                    0,
+                ),
+                inst(Opcode::ResultRow, 1, 2, 0),
+                inst(Opcode::Halt, 0, 0, 0),
+                inst(Opcode::Transaction, 0, 0, 0),
+                inst(Opcode::Goto, 0, 1, 0),
+            ],
+            num_registers: 3,
+        };
+        let mut v = Vdbe::new(Arc::new(prog), None);
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        while let StepResult::Row = v.step().await.expect("step") {
+            let n = v.result_count();
+            rows.push((0..n).map(|i| v.result_value(i)).collect());
+        }
+        // sum of empty set is NULL, total of empty set is 0.0.
+        assert_eq!(rows, vec![vec![Value::Null, Value::Real(0.0)]]);
     }
 }
