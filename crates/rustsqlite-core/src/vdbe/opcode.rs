@@ -320,11 +320,24 @@ pub enum Opcode {
     /// `IfPos p1 p2 p3`: if `r[p1] > 0`, decrement it by `p3` and jump to `p2` (OFFSET).
     IfPos,
 
-    // --- aggregates (M6) ---
-    /// `AggStep`: accumulate an aggregate (unimplemented in M3a).
+    // --- aggregates (M6) / window functions (M11.3) ---
+    /// `AggStep p1=0 P2 P3 P4=FuncDef P5=nArg`: accumulate one row's arguments from
+    /// `r[P2..P2+nArg]` into the accumulator at `r[P3]`. Mirrors `OP_AggStep` in `vdbe.c`.
     AggStep,
-    /// `AggFinal`: finalize an aggregate (unimplemented in M3a).
+    /// `AggInverse p1=1 P2 P3 P4=FuncDef P5=nArg`: remove one row's arguments from the
+    /// accumulator at `r[P3]` (the window-frame "inverse step" that slides the frame start
+    /// forward). Mirrors `OP_AggInverse` in `vdbe.c`. Only valid for aggregates that implement
+    /// `xInverse` (`count`/`sum`/`total`/`avg`/`group_concat`); `min`/`max` use a different
+    /// (VDBE-instruction) path for non-default frames and never emit `AggInverse`.
+    AggInverse,
+    /// `AggFinal P1 P2 P3=0 P4=FuncDef`: finalize the accumulator at `r[P1]` and store the
+    /// result there (consumes the accumulator). Mirrors `OP_AggFinal` in `vdbe.c`.
     AggFinal,
+    /// `AggValue P3 P4=FuncDef`: invoke the aggregate's `xValue` and store the result in
+    /// `r[P3]` *without* consuming the accumulator (so a window function can keep stepping
+    /// after reading the current frame's value). `P1`/`P2` are unused (upstream carries the
+    /// arg count in `P2` for disambiguation only). Mirrors `OP_AggValue` in `vdbe.c`.
+    AggValue,
     /// `HaltIfNull p3 p4=Text(msg)`: if `r[p3]` is NULL, halt the program with a constraint
     /// error whose message is `p4`. Used by WITHOUT ROWID inserts to enforce the implicit
     /// NOT NULL on PRIMARY KEY columns. Mirrors `OP_HaltIfNull` in `vdbe.c`.
@@ -429,7 +442,9 @@ impl Opcode {
             Opcode::DecrJumpZero => "DecrJumpZero",
             Opcode::IfPos => "IfPos",
             Opcode::AggStep => "AggStep",
+            Opcode::AggInverse => "AggInverse",
             Opcode::AggFinal => "AggFinal",
+            Opcode::AggValue => "AggValue",
             Opcode::HaltIfNull => "HaltIfNull",
         }
     }

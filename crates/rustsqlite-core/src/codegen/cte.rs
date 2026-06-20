@@ -927,8 +927,14 @@ fn rebase_register_operands(inst: &mut Instruction, reg_offset: i32) {
         AggStep => {
             r(&mut inst.p2);
         }
+        AggInverse => {
+            r(&mut inst.p2);
+        }
         AggFinal => {
             r(&mut inst.p2);
+        }
+        AggValue => {
+            r(&mut inst.p3);
         }
         // Function call — p3 = result register; p1/p2 depend on the function.
         Function => {

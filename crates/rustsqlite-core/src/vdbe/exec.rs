@@ -1485,9 +1485,9 @@ impl Vdbe {
                     }
                 }
 
-                // ---- aggregates (M6) ----
+                // ---- aggregates (M6) / window functions (M11.3) ----
                 Opcode::AggStep => {
-                    // `AggStep p1 p2 p3 p4=FuncDef(kind) p5=nArg`: accumulate one row's
+                    // `AggStep p1=0 p2 p3 p4=FuncDef(kind) p5=nArg`: accumulate one row's
                     // arguments from `r[p2 .. p2+nArg]` into the accumulator at `r[p3]`. `p1`
                     // is reserved (upstream uses it to mark `AggInverse`); we only emit the
                     // step form. The accumulator is created lazily on the first call for a given
@@ -1510,8 +1510,34 @@ impl Vdbe {
                     acc.step(&args, is_count_star);
                     self.pc += 1;
                 }
+                Opcode::AggInverse => {
+                    // `AggInverse p1=1 p2 p3 p4=FuncDef(kind) p5=nArg`: remove one row's
+                    // arguments from the accumulator at `r[p3]` (the window-frame inverse step).
+                    // The accumulator must already exist (a prior `AggStep` for the same row);
+                    // upstream asserts this with `pMem->uTemp == 0x1122e0e3`.
+                    let kind = match &inst.p4 {
+                        P4::FuncDef(k) => *k,
+                        _ => return Err(Error::msg("AggInverse requires a FuncDef p4")),
+                    };
+                    let n_arg = p5 as usize;
+                    let is_count_star = kind == AggregateKind::Count && n_arg == 0;
+                    let args: Vec<Value> = if is_count_star {
+                        Vec::new()
+                    } else {
+                        self.regs[p2 as usize..p2 as usize + n_arg].to_vec()
+                    };
+                    match self.aggregates.get_mut(&(p3 as usize)) {
+                        Some(acc) => acc.inverse(&args, is_count_star),
+                        None => {
+                            return Err(Error::msg(
+                                "AggInverse without a preceding AggStep on the accumulator",
+                            ))
+                        }
+                    }
+                    self.pc += 1;
+                }
                 Opcode::AggFinal => {
-                    // `AggFinal p1 p2 p3 p4=FuncDef(kind)`: finalize the accumulator at `r[p1]`
+                    // `AggFinal p1 p2 p3=0 p4=FuncDef(kind)`: finalize the accumulator at `r[p1]`
                     // and store the result value there. `p2` is the original argument count
                     // (unused by us, like upstream) and `p4` is the function descriptor.
                     let kind = match &inst.p4 {
@@ -1523,6 +1549,22 @@ impl Vdbe {
                         None => empty_aggregate_result(kind),
                     };
                     self.regs[p1 as usize] = result;
+                    self.pc += 1;
+                }
+                Opcode::AggValue => {
+                    // `AggValue p1 p2 p3 p4=FuncDef(kind)`: invoke the aggregate's `xValue` and
+                    // store the result in `r[p3]` *without* consuming the accumulator. `p1`/`p2`
+                    // are unused (upstream carries the arg count in `p2` for disambiguation
+                    // only). Mirrors `OP_AggValue` in `vdbe.c`.
+                    let kind = match &inst.p4 {
+                        P4::FuncDef(k) => *k,
+                        _ => return Err(Error::msg("AggValue requires a FuncDef p4")),
+                    };
+                    let result = match self.aggregates.get(&(p1 as usize)) {
+                        Some(acc) => acc.value(),
+                        None => empty_aggregate_result(kind),
+                    };
+                    self.regs[p3 as usize] = result;
                     self.pc += 1;
                 }
             }
@@ -2253,6 +2295,177 @@ mod tests {
         }
         // sum of empty set is NULL, total of empty set is 0.0.
         assert_eq!(rows, vec![vec![Value::Null, Value::Real(0.0)]]);
+    }
+
+    /// Hand-built program that exercises `AggStep` → `AggValue` → `AggInverse` → `AggValue` →
+    /// `AggFinal` over a `sum` accumulator, modeling the sliding-window shape M11.3 enables.
+    /// The window slides over values `[10, 20, 30]` with a 2-row frame:
+    ///   * step 10 → value = 10
+    ///   * step 20 → value = 30
+    ///   * inverse 10 → value = 20
+    ///   * step 30 → value = 50
+    ///   * finalize → 50
+    #[tokio::test]
+    async fn agg_inverse_and_value_sum_sliding_window() {
+        // r2 = arg, r3 = accumulator, r4 = value-out
+        let prog = Program {
+            instructions: vec![
+                inst(Opcode::Init, 0, 17, 0), // 0: Init -> 17 (Transaction)
+                // step 10
+                inst(Opcode::Integer, 10, 2, 0), // 1
+                inst_with(Opcode::AggStep, 0, 2, 3, P4::FuncDef(AggregateKind::Sum), 1), // 2
+                inst_with(Opcode::AggValue, 3, 0, 4, P4::FuncDef(AggregateKind::Sum), 0), // 3: r4 = 10
+                inst(Opcode::ResultRow, 4, 1, 0), // 4: emit 10
+                // step 20
+                inst(Opcode::Integer, 20, 2, 0), // 5
+                inst_with(Opcode::AggStep, 0, 2, 3, P4::FuncDef(AggregateKind::Sum), 1), // 6
+                inst_with(Opcode::AggValue, 3, 0, 4, P4::FuncDef(AggregateKind::Sum), 0), // 7: r4 = 30
+                inst(Opcode::ResultRow, 4, 1, 0), // 8: emit 30
+                // inverse 10
+                inst(Opcode::Integer, 10, 2, 0), // 9
+                inst_with(Opcode::AggInverse, 1, 2, 3, P4::FuncDef(AggregateKind::Sum), 1), // 10
+                inst_with(Opcode::AggValue, 3, 0, 4, P4::FuncDef(AggregateKind::Sum), 0), // 11: r4 = 20
+                inst(Opcode::ResultRow, 4, 1, 0), // 12: emit 20
+                // step 30
+                inst(Opcode::Integer, 30, 2, 0), // 13
+                inst_with(Opcode::AggStep, 0, 2, 3, P4::FuncDef(AggregateKind::Sum), 1), // 14
+                inst_with(Opcode::AggFinal, 3, 0, 0, P4::FuncDef(AggregateKind::Sum), 0), // 15: r3 = 50
+                inst(Opcode::Halt, 0, 0, 0), // 16
+                inst(Opcode::Transaction, 0, 0, 0), // 17
+                inst(Opcode::Goto, 0, 1, 0), // 18
+            ],
+            num_registers: 5, num_cursors: 0,
+        };
+        let mut v = Vdbe::new(Arc::new(prog), None);
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        while let StepResult::Row = v.step().await.expect("step") {
+            let n = v.result_count();
+            rows.push((0..n).map(|i| v.result_value(i)).collect());
+        }
+        // Three AggValue rows (10, 30, 20), then AggFinal writes r3 but we don't emit it.
+        assert_eq!(rows, vec![vec![Value::Int(10)], vec![Value::Int(30)], vec![Value::Int(20)]]);
+    }
+
+    /// `count(*)` sliding window: step 3 rows → value 3; inverse one → value 2; finalize → 2.
+    #[tokio::test]
+    async fn agg_inverse_count_star_sliding_window() {
+        // r3 = accumulator, r4 = value-out
+        let prog = Program {
+            instructions: vec![
+                inst(Opcode::Init, 0, 12, 0), // 0: Init -> 12 (Transaction)
+                // step, step, step (count(*) has 0 args)
+                inst_with(Opcode::AggStep, 0, 0, 3, P4::FuncDef(AggregateKind::Count), 0), // 1
+                inst_with(Opcode::AggStep, 0, 0, 3, P4::FuncDef(AggregateKind::Count), 0), // 2
+                inst_with(Opcode::AggStep, 0, 0, 3, P4::FuncDef(AggregateKind::Count), 0), // 3
+                inst_with(Opcode::AggValue, 3, 0, 4, P4::FuncDef(AggregateKind::Count), 0), // 4: r4 = 3
+                inst(Opcode::ResultRow, 4, 1, 0), // 5: emit 3
+                // inverse one
+                inst_with(Opcode::AggInverse, 1, 0, 3, P4::FuncDef(AggregateKind::Count), 0), // 6
+                inst_with(Opcode::AggValue, 3, 0, 4, P4::FuncDef(AggregateKind::Count), 0), // 7: r4 = 2
+                inst(Opcode::ResultRow, 4, 1, 0), // 8: emit 2
+                inst_with(Opcode::AggFinal, 3, 0, 0, P4::FuncDef(AggregateKind::Count), 0), // 9: r3 = 2
+                inst(Opcode::Halt, 0, 0, 0), // 10
+                inst(Opcode::Transaction, 0, 0, 0), // 11
+                inst(Opcode::Goto, 0, 1, 0), // 12
+            ],
+            num_registers: 5, num_cursors: 0,
+        };
+        let mut v = Vdbe::new(Arc::new(prog), None);
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        while let StepResult::Row = v.step().await.expect("step") {
+            let n = v.result_count();
+            rows.push((0..n).map(|i| v.result_value(i)).collect());
+        }
+        assert_eq!(rows, vec![vec![Value::Int(3)], vec![Value::Int(2)]]);
+    }
+
+    /// `group_concat` sliding window: step "a", "b" → "a,b"; inverse "a" → "b"; step "c" → "b,c".
+    #[tokio::test]
+    async fn agg_inverse_group_concat_sliding_window() {
+        // r2 = arg, r3 = accumulator, r4 = value-out
+        let prog = Program {
+            instructions: vec![
+                inst(Opcode::Init, 0, 15, 0), // 0: Init -> 15 (Transaction)
+                // step "a"
+                inst_with(Opcode::String8, 0, 2, 0, P4::Text("a".to_string()), 0), // 1
+                inst_with(Opcode::AggStep, 0, 2, 3, P4::FuncDef(AggregateKind::GroupConcat), 1), // 2
+                // step "b"
+                inst_with(Opcode::String8, 0, 2, 0, P4::Text("b".to_string()), 0), // 3
+                inst_with(Opcode::AggStep, 0, 2, 3, P4::FuncDef(AggregateKind::GroupConcat), 1), // 4
+                inst_with(Opcode::AggValue, 3, 0, 4, P4::FuncDef(AggregateKind::GroupConcat), 0), // 5: r4 = "a,b"
+                inst(Opcode::ResultRow, 4, 1, 0), // 6: emit "a,b"
+                // inverse "a"
+                inst_with(Opcode::String8, 0, 2, 0, P4::Text("a".to_string()), 0), // 7
+                inst_with(Opcode::AggInverse, 1, 2, 3, P4::FuncDef(AggregateKind::GroupConcat), 1), // 8
+                inst_with(Opcode::AggValue, 3, 0, 4, P4::FuncDef(AggregateKind::GroupConcat), 0), // 9: r4 = "b"
+                inst(Opcode::ResultRow, 4, 1, 0), // 10: emit "b"
+                // step "c"
+                inst_with(Opcode::String8, 0, 2, 0, P4::Text("c".to_string()), 0), // 11
+                inst_with(Opcode::AggStep, 0, 2, 3, P4::FuncDef(AggregateKind::GroupConcat), 1), // 12
+                inst_with(Opcode::AggFinal, 3, 0, 0, P4::FuncDef(AggregateKind::GroupConcat), 0), // 13: r3 = "b,c"
+                inst(Opcode::Halt, 0, 0, 0), // 14
+                inst(Opcode::Transaction, 0, 0, 0), // 15
+                inst(Opcode::Goto, 0, 1, 0), // 16
+            ],
+            num_registers: 5, num_cursors: 0,
+        };
+        let mut v = Vdbe::new(Arc::new(prog), None);
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        while let StepResult::Row = v.step().await.expect("step") {
+            let n = v.result_count();
+            rows.push((0..n).map(|i| v.result_value(i)).collect());
+        }
+        assert_eq!(
+            rows,
+            vec![vec![Value::Text("a,b".to_string())], vec![Value::Text("b".to_string())]]
+        );
+    }
+
+    /// `AggValue` on a fresh (never-stepped) accumulator yields the empty-group result
+    /// (matches `AggFinal` on an empty group: `count` → 0, `sum` → NULL).
+    #[tokio::test]
+    async fn agg_value_empty_accumulator() {
+        // r2 = count value, r3 = sum value (via SCopy from r4), r4 = sum value-out.
+        let prog = Program {
+            instructions: vec![
+                inst(Opcode::Init, 0, 7, 0), // 0: Init -> 7 (Transaction)
+                inst_with(Opcode::AggValue, 1, 0, 2, P4::FuncDef(AggregateKind::Count), 0), // 1: r2 = 0
+                inst_with(Opcode::AggValue, 3, 0, 4, P4::FuncDef(AggregateKind::Sum), 0), // 2: r4 = NULL
+                inst(Opcode::SCopy, 4, 3, 0), // 3: r3 = r4 (sum)
+                inst(Opcode::ResultRow, 2, 2, 0), // 4: emit r2..r3 (count, sum)
+                inst(Opcode::Halt, 0, 0, 0), // 5
+                inst(Opcode::Transaction, 0, 0, 0), // 6
+                inst(Opcode::Goto, 0, 1, 0), // 7
+            ],
+            num_registers: 5, num_cursors: 0,
+        };
+        let mut v = Vdbe::new(Arc::new(prog), None);
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        while let StepResult::Row = v.step().await.expect("step") {
+            let n = v.result_count();
+            rows.push((0..n).map(|i| v.result_value(i)).collect());
+        }
+        // count(empty) = 0, sum(empty) = NULL.
+        assert_eq!(rows, vec![vec![Value::Int(0), Value::Null]]);
+    }
+
+    /// `AggInverse` without a preceding `AggStep` on the accumulator raises an error
+    /// (mirrors upstream's `assert(pMem->uTemp == 0x1122e0e3)`).
+    #[tokio::test]
+    async fn agg_inverse_without_step_errors() {
+        let prog = Program {
+            instructions: vec![
+                inst(Opcode::Init, 0, 5, 0), // 0: Init -> 5
+                inst_with(Opcode::AggInverse, 1, 2, 3, P4::FuncDef(AggregateKind::Sum), 1), // 1
+                inst(Opcode::Halt, 0, 0, 0), // 2
+                inst(Opcode::Transaction, 0, 0, 0), // 3
+                inst(Opcode::Goto, 0, 1, 0), // 4
+            ],
+            num_registers: 4, num_cursors: 0,
+        };
+        let mut v = Vdbe::new(Arc::new(prog), None);
+        let res = v.step().await;
+        assert!(res.is_err(), "AggInverse without AggStep should error");
     }
 
     /// Hand-built program exercising `InitCoroutine` / `Yield` / `EndCoroutine` in the

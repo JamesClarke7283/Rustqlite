@@ -901,8 +901,15 @@ fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) 
             r(&mut inst.p2); // first arg reg
             r(&mut inst.p3); // accumulator reg
         }
+        AggInverse => {
+            r(&mut inst.p2); // first arg reg
+            r(&mut inst.p3); // accumulator reg
+        }
         AggFinal => {
             r(&mut inst.p1); // accumulator reg
+        }
+        AggValue => {
+            r(&mut inst.p3); // result reg
         }
         HaltIfNull => {
             r(&mut inst.p3);

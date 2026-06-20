@@ -1317,7 +1317,12 @@ fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) 
             r(&mut inst.p2);
             r(&mut inst.p3);
         }
+        AggInverse => {
+            r(&mut inst.p2);
+            r(&mut inst.p3);
+        }
         AggFinal => r(&mut inst.p1),
+        AggValue => r(&mut inst.p3),
         HaltIfNull => r(&mut inst.p3),
         Compare | Jump | Transaction | SetCookie | ParseSchema | CreateBtree | Halt => {}
         ResultRow => {

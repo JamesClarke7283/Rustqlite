@@ -250,6 +250,158 @@ impl Accumulator {
             }
         }
     }
+
+    /// Remove one row's arguments from the accumulator — the window-frame "inverse step"
+    /// that slides the frame start forward. Mirrors upstream's `xInverse` for the built-in
+    /// aggregates (`count`/`sum`/`total`/`avg`/`group_concat`); `min`/`max` never emit `AggInverse`
+    /// (their non-default-frame path uses VDBE instructions, not the accumulator inverse).
+    ///
+    /// `args` / `is_count_star` match [`step`]. The caller guarantees `step` has been called at
+    /// least once with this row's arguments before `inverse` is called with them (upstream
+    /// asserts this with `pMem->uTemp == 0x1122e0e3`).
+    pub fn inverse(&mut self, args: &[Value], is_count_star: bool) {
+        if self.finalized {
+            return;
+        }
+        match self.kind {
+            AggregateKind::Count => {
+                if is_count_star {
+                    self.count -= 1;
+                } else if let Some(arg) = args.first() {
+                    if !arg.is_null() {
+                        self.count -= 1;
+                    }
+                }
+            }
+            AggregateKind::Sum | AggregateKind::Total | AggregateKind::Avg => {
+                let arg = match args.first() {
+                    Some(v) if !v.is_null() => v,
+                    _ => return, // NULL inputs were skipped by step; inverse skips too.
+                };
+                self.count -= 1;
+                if self.has_real {
+                    self.sum_r -= arg.as_f64();
+                } else if let Value::Int(i) = arg {
+                    match self.sum_i.checked_sub(*i) {
+                        Some(new_i) => self.sum_i = new_i,
+                        None => {
+                            // Promote to REAL on overflow (matches the oracle's relaxed path).
+                            self.sum_r = self.sum_i as f64 - *i as f64;
+                            self.has_real = true;
+                            self.overflowed = true;
+                        }
+                    }
+                } else if let Value::Real(r) = arg {
+                    self.sum_r = self.sum_i as f64 - *r;
+                    self.has_real = true;
+                } else {
+                    // TEXT/BLOB: coerce via SQLite's leading-numeric-prefix rule.
+                    let n = arg.as_f64();
+                    if n.fract() == 0.0 && !self.has_real {
+                        match self.sum_i.checked_sub(n as i64) {
+                            Some(new_i) => self.sum_i = new_i,
+                            None => {
+                                self.sum_r = self.sum_i as f64 - n;
+                                self.has_real = true;
+                                self.overflowed = true;
+                            }
+                        }
+                    } else {
+                        self.sum_r = if self.has_real {
+                            self.sum_r - n
+                        } else {
+                            self.sum_i as f64 - n
+                        };
+                        self.has_real = true;
+                    }
+                }
+            }
+            AggregateKind::Min | AggregateKind::Max => {
+                // min/max do not support xInverse; the codegen path never emits AggInverse
+                // for them. Reach this only via a hand-built (buggy) program.
+                self.count = self.count.saturating_sub(1);
+            }
+            AggregateKind::GroupConcat => {
+                let arg = match args.first() {
+                    Some(v) if !v.is_null() => v,
+                    _ => return, // NULL inputs were skipped by step; inverse skips too.
+                };
+                let text = arg.to_text().unwrap_or_default();
+                if let Some(cur) = &mut self.concat {
+                    // Upstream inserts the separator *before* each non-first value, so the
+                    // accumulated string is `v0 [sep v1] [sep v2] ...`. The frame start advances
+                    // in FIFO order, so the value being removed is the OLDEST one — at the
+                    // front. Drop `text` from the front, plus the separator that followed it
+                    // (if any remaining bytes). If only one value was accumulated, drop
+                    // everything.
+                    let cur_len = cur.len();
+                    let text_len = text.len();
+                    if cur_len <= text_len {
+                        // Only the value (or less) remains — clear it.
+                        cur.clear();
+                    } else {
+                        // Drop `text` from the front; if anything remains, also drop the
+                        // separator that followed it.
+                        let sep_len = self.sep.len();
+                        let drop_len = if cur_len >= text_len + sep_len {
+                            text_len + sep_len
+                        } else {
+                            // The separator wasn't yet appended (single value case) — drop
+                            // just the value.
+                            cur_len
+                        };
+                        cur.drain(..drop_len);
+                    }
+                    if cur.is_empty() {
+                        self.concat = None;
+                    }
+                }
+                self.count = self.count.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Read out the accumulator's current value *without* consuming it (so a window function
+    /// can keep stepping after reading the current frame's value). Mirrors upstream's `xValue`.
+    /// The result matches what [`finalize_accumulator`](super::super::vdbe::exec::finalize_accumulator)
+    /// would produce, but leaves the accumulator in place.
+    pub fn value(&self) -> Value {
+        match self.kind {
+            AggregateKind::Count => Value::Int(self.count),
+            AggregateKind::Sum => {
+                if self.count == 0 {
+                    Value::Null
+                } else if self.has_real {
+                    Value::Real(self.sum_r)
+                } else {
+                    Value::Int(self.sum_i)
+                }
+            }
+            AggregateKind::Total => {
+                if self.has_real {
+                    Value::Real(self.sum_r)
+                } else {
+                    Value::Real(self.sum_i as f64)
+                }
+            }
+            AggregateKind::Avg => {
+                if self.count == 0 {
+                    Value::Null
+                } else {
+                    let total = if self.has_real {
+                        self.sum_r
+                    } else {
+                        self.sum_i as f64
+                    };
+                    Value::Real(total / self.count as f64)
+                }
+            }
+            AggregateKind::Min | AggregateKind::Max => self.best.clone().unwrap_or(Value::Null),
+            AggregateKind::GroupConcat => {
+                self.concat.clone().map(Value::Text).unwrap_or(Value::Null)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -432,5 +584,164 @@ mod tests {
         acc.step(&[Value::Null], false);
         assert_eq!(acc.count, 1);
         assert_eq!(acc.sum_i, 2);
+    }
+
+    // ---- inverse / value (M11.3) ----
+
+    #[test]
+    fn count_inverse_decrements() {
+        let mut acc = Accumulator::new(AggregateKind::Count);
+        acc.step(&[Value::Null], true);
+        acc.step(&[Value::Null], true);
+        acc.step(&[Value::Null], true);
+        assert_eq!(acc.count, 3);
+        assert_eq!(acc.value(), Value::Int(3));
+        acc.inverse(&[Value::Null], true);
+        assert_eq!(acc.count, 2);
+        assert_eq!(acc.value(), Value::Int(2));
+    }
+
+    #[test]
+    fn count_expr_inverse_skips_nulls() {
+        let mut acc = Accumulator::new(AggregateKind::Count);
+        acc.step(&[i(5)], false);
+        acc.step(&[Value::Null], false);
+        acc.step(&[t("x")], false);
+        assert_eq!(acc.count, 2);
+        // Inversing a NULL arg should not decrement (matches step's NULL-skip).
+        acc.inverse(&[Value::Null], false);
+        assert_eq!(acc.count, 2);
+        acc.inverse(&[i(5)], false);
+        assert_eq!(acc.count, 1);
+    }
+
+    #[test]
+    fn sum_inverse_subtracts() {
+        let mut acc = Accumulator::new(AggregateKind::Sum);
+        acc.step(&[i(10)], false);
+        acc.step(&[i(20)], false);
+        acc.step(&[i(30)], false);
+        assert_eq!(acc.value(), Value::Int(60));
+        acc.inverse(&[i(10)], false);
+        assert_eq!(acc.value(), Value::Int(50));
+        acc.inverse(&[i(20)], false);
+        assert_eq!(acc.value(), Value::Int(30));
+    }
+
+    #[test]
+    fn sum_inverse_promotes_to_real_on_overflow() {
+        let mut acc = Accumulator::new(AggregateKind::Sum);
+        acc.step(&[i(i64::MIN)], false);
+        // Inverse a positive value that would underflow i64 if subtracted in i64 space.
+        // i64::MIN - 1 underflows → promotes to REAL.
+        acc.inverse(&[i(1)], false);
+        assert!(acc.has_real);
+        assert!(acc.overflowed);
+        // i64::MIN - 1 = -9223372036854775809 (exactly representable as f64).
+        assert!((acc.sum_r - (i64::MIN as f64 - 1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn total_inverse_subtracts() {
+        let mut acc = Accumulator::new(AggregateKind::Total);
+        acc.step(&[i(10)], false);
+        acc.step(&[i(20)], false);
+        // total() is always REAL even when inputs are integers.
+        assert_eq!(acc.value(), Value::Real(30.0));
+        acc.inverse(&[i(10)], false);
+        assert_eq!(acc.value(), Value::Real(20.0));
+    }
+
+    #[test]
+    fn avg_inverse_updates_count_and_sum() {
+        let mut acc = Accumulator::new(AggregateKind::Avg);
+        acc.step(&[i(10)], false);
+        acc.step(&[i(20)], false);
+        acc.step(&[i(30)], false);
+        assert_eq!(acc.value(), Value::Real(20.0)); // (10+20+30)/3 = 20
+        acc.inverse(&[i(10)], false);
+        assert_eq!(acc.value(), Value::Real(25.0)); // (20+30)/2 = 25
+    }
+
+    #[test]
+    fn sum_inverse_null_arg_is_noop() {
+        let mut acc = Accumulator::new(AggregateKind::Sum);
+        acc.step(&[i(5)], false);
+        acc.inverse(&[Value::Null], false);
+        assert_eq!(acc.count, 1);
+        assert_eq!(acc.value(), Value::Int(5));
+    }
+
+    #[test]
+    fn group_concat_inverse_drops_oldest() {
+        let mut acc = Accumulator::new(AggregateKind::GroupConcat);
+        acc.step(&[t("a")], false);
+        acc.step(&[t("b")], false);
+        acc.step(&[t("c")], false);
+        assert_eq!(acc.value(), Value::Text("a,b,c".to_string()));
+        // Inverse drops the OLDEST value ("a") — the frame start advances forward.
+        acc.inverse(&[t("a")], false);
+        assert_eq!(acc.value(), Value::Text("b,c".to_string()));
+        acc.inverse(&[t("b")], false);
+        assert_eq!(acc.value(), Value::Text("c".to_string()));
+        // Inverse of the last value leaves an empty (NULL) accumulator.
+        acc.inverse(&[t("c")], false);
+        assert_eq!(acc.value(), Value::Null);
+    }
+
+    #[test]
+    fn group_concat_inverse_with_custom_separator() {
+        let mut acc = Accumulator::new(AggregateKind::GroupConcat);
+        acc.step(&[t("a"), t("--")], false);
+        acc.step(&[t("b"), t("--")], false);
+        acc.step(&[t("c"), t("--")], false);
+        assert_eq!(acc.value(), Value::Text("a--b--c".to_string()));
+        acc.inverse(&[t("a")], false);
+        assert_eq!(acc.value(), Value::Text("b--c".to_string()));
+    }
+
+    #[test]
+    fn value_does_not_consume_accumulator() {
+        // The key window-function invariant: `value()` reads the current state without
+        // finalizing, so a subsequent `step()` continues accumulating.
+        let mut acc = Accumulator::new(AggregateKind::Sum);
+        acc.step(&[i(1)], false);
+        assert_eq!(acc.value(), Value::Int(1));
+        acc.step(&[i(2)], false);
+        assert_eq!(acc.value(), Value::Int(3));
+        acc.step(&[i(3)], false);
+        assert_eq!(acc.value(), Value::Int(6));
+    }
+
+    #[test]
+    fn value_empty_accumulator_matches_finalize() {
+        assert_eq!(
+            Accumulator::new(AggregateKind::Count).value(),
+            Value::Int(0)
+        );
+        assert_eq!(
+            Accumulator::new(AggregateKind::Sum).value(),
+            Value::Null
+        );
+        assert_eq!(
+            Accumulator::new(AggregateKind::Total).value(),
+            Value::Real(0.0)
+        );
+        assert_eq!(
+            Accumulator::new(AggregateKind::Avg).value(),
+            Value::Null
+        );
+        assert_eq!(
+            Accumulator::new(AggregateKind::Min).value(),
+            Value::Null
+        );
+        assert_eq!(
+            Accumulator::new(AggregateKind::Max).value(),
+            Value::Null
+        );
+        assert_eq!(
+            Accumulator::new(AggregateKind::GroupConcat).value(),
+            Value::Null
+        );
     }
 }

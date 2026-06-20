@@ -245,7 +245,7 @@ list every granular item needed.
 
 - [x] **11.1** Parser: `OVER (PARTITION BY … ORDER BY … frame_spec)` and `FILTER (WHERE …)`
 - [x] **11.2** Parser: named window definitions (`WINDOW w AS (…)`)
-- [ ] **11.3** VDBE: window-function accumulator state (`AggInverse`, `AggValue` opcodes)
+- [x] **11.3** VDBE: window-function accumulator state (`AggInverse`, `AggValue` opcodes)
 - [ ] **11.4** Built-in window functions: `row_number()`, `rank()`, `dense_rank()`, `percent_rank()`, `cume_dist()`, `ntile(N)`
 - [ ] **11.5** Built-in window functions: `first_value(expr)`, `last_value(expr)`, `nth_value(expr, N)`
 - [ ] **11.6** Built-in window functions: `lead(expr [, offset [, default]])`, `lag(expr [, offset [, default]])`
