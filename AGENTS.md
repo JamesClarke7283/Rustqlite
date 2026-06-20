@@ -217,5 +217,11 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   row match flag tracks whether any inner row matched; after the inner loop, if the flag is 0,
   the right cursor is set to a NULL row and one row is emitted (re-applying the WHERE clause,
   which filters out NULL-filled rows when it tests right-table columns). Differential-tested
-  vs the C oracle (LEFT JOIN cases in `cross_and_inner_joins`). Still M7+: right/full outer
-  joins, natural join, `USING`, self-joins, join-order selection, aggregates over joins.
+  vs the C oracle (LEFT JOIN cases in `cross_and_inner_joins`). **7.8 right join** ✅:
+  `RIGHT JOIN` is implemented by swapping the tables and emitting a LEFT JOIN (the original
+  right table becomes the outer loop, the original left table becomes the inner). `SELECT *`
+  expands in the original FROM order. Still M7+: full outer joins, natural join, `USING`,
+  self-joins, join-order selection, aggregates over joins. Known divergence: the row order
+  of a RIGHT JOIN differs from the oracle's specialized RIGHT-JOIN path (which scans the
+  left table first); both are correct for an unordered result, test cases use ORDER BY for
+  determinism.

@@ -192,7 +192,7 @@ list every granular item needed.
 - [x] **7.5** Codegen: inner join — nested-loop with `NotExists`/`Found` on inner table
 - [x] **7.6** Codegen: left outer join — emit NULL row when inner match fails (`IfNullRow` opcode)
 - [x] **7.7** VDBE: `NullRow` opcode — set cursor to all-NULL row for LEFT JOIN miss
-- [ ] **7.8** Right join (implemented as left join with swapped tables)
+- [x] **7.8** Right join (implemented as left join with swapped tables)
 - [ ] **7.9** Full outer join (left + right with NULL fill)
 - [ ] **7.10** Natural join: USING columns → deduped projection + coalesced ON condition
 - [ ] **7.11** Self-join: table aliases, `OpenDup` for same-table join

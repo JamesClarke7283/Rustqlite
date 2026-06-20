@@ -34,23 +34,29 @@ use super::builder::ProgramBuilder;
 use super::expr::{compile_expr, compile_jump, Ctx, JoinTable};
 use super::select::{eval_limit_offset, expand_columns_with_tables, resolve_order_term};
 
-/// Compile a two-table cross / inner / left join. `tables` is the resolved pair (left, right)
-/// with their cursor numbers (0, 1). The `ON` predicate (if any) is evaluated inside the inner
-/// loop before the projection; the `WHERE` clause is evaluated after the `ON`. When
-/// `left_join` is true, a left-outer join is emitted: if no inner row matches, a NULL-filled
-/// right-table row is emitted via `OP_NullRow`.
+/// Compile a two-table cross / inner / left / right join. `tables` is in the JOIN order
+/// (the first table is the outer/left loop, the second is the inner/right loop). `from_order`
+/// is the ORIGINAL FROM order (for `SELECT *` expansion and bare-column resolution). For a
+/// non-RIGHT join these are the same; for a RIGHT JOIN `tables` is swapped while `from_order`
+/// keeps the original order. When `left_join` is true, a left-outer join is emitted (NULL-fill
+/// the inner table on no match).
 #[allow(clippy::too_many_arguments)]
 pub fn compile_cross_join(
     select: &SelectStmt,
     tables: &[(&Table, &str); 2],
+    from_order: &[(&Table, &str); 2],
     on_predicate: Option<&Expr>,
     left_join: bool,
 ) -> Result<(Program, Vec<String>)> {
     let (limit, offset) = eval_limit_offset(select)?;
-    let outputs = expand_columns_with_tables(select, tables)?;
+    let outputs = expand_columns_with_tables(select, from_order)?;
     let names: Vec<String> = outputs.iter().map(|(_, n)| n.clone()).collect();
     let ncol = outputs.len() as i32;
 
+    // `join_tables` is in the JOIN order (`tables`), so column resolution maps each table to
+    // its actual cursor (0 for the outer loop, 1 for the inner). For a RIGHT JOIN the tables
+    // are swapped: the original right table is on cursor 0, the original left table on cursor
+    // 1; `join_tables` reflects this so `t1.col` resolves to the right cursor.
     let join_tables: [JoinTable; 2] = [
         JoinTable {
             table: tables[0].0,
@@ -299,7 +305,7 @@ fn flatten_into<'a>(
                 // Handle CROSS, INNER, and LEFT joins. RIGHT/FULL/NATURAL are rejected by
                 // `validate_join`.
                 match j.op {
-                    JoinOp::Cross | JoinOp::Inner | JoinOp::Left | JoinOp::LeftOuter => {}
+                    JoinOp::Cross | JoinOp::Inner | JoinOp::Left | JoinOp::LeftOuter | JoinOp::Right | JoinOp::RightOuter => {}
                     _ => {
                         out.clear();
                         return;
@@ -335,6 +341,32 @@ pub fn is_left_join(from: &[TableOrJoin]) -> bool {
     }
 }
 
+/// True when the FROM clause's top-level join is a RIGHT (OUTER) join. The M7 first slice
+/// implements RIGHT JOIN by swapping the tables and emitting a LEFT JOIN.
+pub fn is_right_join(from: &[TableOrJoin]) -> bool {
+    if let Some(TableOrJoin::Join(j)) = from.first() {
+        matches!(j.op, JoinOp::Right | JoinOp::RightOuter)
+    } else {
+        false
+    }
+}
+
+/// For a RIGHT JOIN, return the table list with the tables swapped (so the original right
+/// table is first, becoming the outer/left loop of the LEFT JOIN emulation). For other joins,
+/// return the list as-is.
+pub fn swap_for_right_join<'a>(
+    tables: Vec<(&'a Table, &'a str)>,
+    from: &[TableOrJoin],
+) -> Vec<(&'a Table, &'a str)> {
+    if is_right_join(from) {
+        let mut swapped = tables;
+        swapped.reverse();
+        swapped
+    } else {
+        tables
+    }
+}
+
 /// Reject unsupported join features that `flatten_cross_join` accepts but the codegen can't
 /// handle yet (USING, etc.). Returns an error message for the first unsupported feature.
 pub fn validate_join(from: &[TableOrJoin]) -> Result<()> {
@@ -343,8 +375,8 @@ pub fn validate_join(from: &[TableOrJoin]) -> Result<()> {
             if matches!(j.constraint, Some(rustqlite_parser::JoinConstraint::Using(_))) {
                 return Err(Error::msg("USING clause is not supported yet (M7.10)"));
             }
-            if matches!(j.op, JoinOp::Right | JoinOp::RightOuter | JoinOp::Full | JoinOp::FullOuter | JoinOp::Natural) {
-                return Err(Error::msg("RIGHT/FULL/NATURAL joins are not supported yet (M7.8-M7.10)"));
+            if matches!(j.op, JoinOp::Full | JoinOp::FullOuter | JoinOp::Natural) {
+                return Err(Error::msg("FULL/NATURAL joins are not supported yet (M7.9-M7.10)"));
             }
             validate_join(std::slice::from_ref(&*j.left))?;
         }

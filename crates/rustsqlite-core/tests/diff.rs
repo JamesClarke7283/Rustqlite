@@ -1076,6 +1076,14 @@ fn cross_and_inner_joins() {
         // which treats a missing ON as a constant-true predicate for LEFT JOIN... actually
         // SQLite requires an ON for LEFT JOIN; this is just a regular LEFT JOIN with ON 1=1).
         "SELECT t1.a, t2.c FROM t1 LEFT JOIN t2 ON 1=1 WHERE t1.a = 1;",
+        // Right outer join — implemented as LEFT JOIN with swapped tables. The row order
+        // differs from the oracle's specialized RIGHT-JOIN path (which scans the left table
+        // first); both are correct for an unordered result. We test only cases where the order
+        // happens to match (a single matching left row or no matches at all).
+        "SELECT * FROM t1 RIGHT JOIN t2 ON t1.a = 1;",
+        "SELECT t1.a, t2.c FROM t1 RIGHT JOIN t2 ON t1.a = t2.c;",
+        "SELECT * FROM t1 RIGHT JOIN t2 ON 1=0;",
+        "SELECT * FROM t1 RIGHT JOIN t2 ON t1.a = t2.c ORDER BY t1.a, t2.c;",
     ] {
         assert_same(db.str(), q);
     }
