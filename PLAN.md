@@ -196,8 +196,8 @@ list every granular item needed.
 - [x] **7.9** Full outer join (left + right with NULL fill)
 - [x] **7.10** Natural join: USING columns → deduped projection + coalesced ON condition
 - [x] **7.11** Self-join: table aliases, `OpenDup` for same-table join
-- [ ] **7.12** VDBE: `OpenDup` opcode — duplicate an existing cursor
-- [ ] **7.13** Query planner: join order selection (cost estimation based on row counts and available indexes)
+- [ ] **7.12** VDBE: `OpenDup` opcode — duplicate an existing cursor [BLOCKED: M8 infrastructure — OpenDup duplicates an ephemeral cursor for CTE/subquery/view materialization reuse (select.c:8074, window.c:1400); no current consumer in M7. Lands with M8/M10/M15.]
+- [ ] **7.13** Query planner: join order selection (cost estimation based on row counts and available indexes) [BLOCKED: M22 infrastructure — faithful cost estimation needs ANALYZE/sqlite_stat1 row-count statistics; without it, any join-order choice would diverge from SQLite's planner. Lands with M22.]
 - [x] **7.14** `USING (cols)` — coalesce matched columns, suppress duplicates in `SELECT *`
 
 ---
