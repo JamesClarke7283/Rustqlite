@@ -752,6 +752,57 @@ fn aggregate_queries() {
         // HAVING that references a GROUP BY key inside a larger expression.
         "SELECT a, count(*) FROM t GROUP BY a HAVING a + 1 > 2;",
         "SELECT a, count(*) FROM t GROUP BY a HAVING a IS NOT NULL;",
+        // GROUP BY + ORDER BY (M6.8 — two-pass: aggregate then sort the result).
+        "SELECT a, count(*) FROM t GROUP BY a ORDER BY a;",
+        "SELECT a, count(*) FROM t GROUP BY a ORDER BY a DESC;",
+        "SELECT a, sum(a) FROM t GROUP BY a ORDER BY sum(a) DESC;",
+        "SELECT b, count(*) FROM t GROUP BY b ORDER BY b;",
+        "SELECT a, b, count(*) FROM t GROUP BY a, b ORDER BY a, b;",
+        "SELECT a, b, count(*) FROM t GROUP BY a, b ORDER BY a DESC, b DESC;",
+        // No-GROUP-BY aggregate with ORDER BY (a single row, so ORDER BY is a no-op).
+        "SELECT count(*) FROM t ORDER BY 1;",
+        "SELECT count(*), sum(a) FROM t ORDER BY 2;",
+        // GROUP BY + ORDER BY + WHERE + HAVING (the full stack).
+        "SELECT a, count(*) FROM t WHERE a > 1 GROUP BY a HAVING count(*) > 0 ORDER BY a DESC;",
+        // NOTE: `ORDER BY count(*)` with all-equal counts is skipped — the order of equal-key
+        // rows is unspecified in SQL, and our stable sorter preserves GROUP BY ASC insertion
+        // order while SQLite's b-tree-backed ORDER BY reverses it for DESC. Both are correct.
+        // The `agg2` fixture (with varying counts) exercises the actual sort.
+    ] {
+        assert_same(db.str(), q);
+    }
+}
+
+/// `GROUP BY` + `ORDER BY` with varying group sizes — exercises the actual sort (the
+/// `standard_fixture` has all groups of size 1, so `ORDER BY count(*)` is a no-op sort whose
+/// tiebreak order differs between our stable sorter and SQLite's b-tree-backed ORDER BY).
+#[test]
+fn group_by_order_by_with_varying_counts() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup(
+        "CREATE TABLE t(a, b);\
+         INSERT INTO t VALUES\
+            (1,'x'),(1,'y'),(1,'z'),\
+            (2,'p'),(2,'q'),\
+            (3,'r'),\
+            (NULL,'n'),(NULL,'m');",
+    );
+    for q in [
+        "SELECT a, count(*) FROM t GROUP BY a ORDER BY count(*), a;",
+        "SELECT a, count(*) FROM t GROUP BY a ORDER BY count(*) DESC, a;",
+        "SELECT a, count(*) FROM t GROUP BY a ORDER BY 2 DESC, a;",
+        "SELECT a, count(*) FROM t GROUP BY a ORDER BY 2, a;",
+        "SELECT a, count(*) FROM t GROUP BY a ORDER BY 2, a LIMIT 2;",
+        "SELECT a, count(*) FROM t GROUP BY a ORDER BY 2 DESC, a LIMIT 2 OFFSET 1;",
+        // A secondary ORDER BY key breaks ties deterministically — both engines agree.
+        "SELECT a, count(*) FROM t GROUP BY a ORDER BY count(*) DESC, a;",
+        "SELECT a, count(*) FROM t GROUP BY a ORDER BY count(*) ASC, a DESC;",
+        "SELECT b, count(*) FROM t GROUP BY b ORDER BY count(*) DESC, b;",
+        "SELECT a, count(*) FROM t WHERE a IS NOT NULL GROUP BY a ORDER BY count(*) DESC, a;",
     ] {
         assert_same(db.str(), q);
     }

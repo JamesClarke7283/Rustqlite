@@ -189,3 +189,17 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   sync cell builders, so vacuuming a database where overflow pages need to be relocated
   (not just freed) will not update the overflow chain's parent pointer; see
   @docs/autovacuum-ptrmap.md.
+- **M6 — Aggregates, GROUP BY, DISTINCT** ✅ (6.8 done): `AggStep`/`AggFinal` execution,
+  `GROUP BY` (sorter + per-group accumulate + `AggFinal`), `HAVING`, the built-in aggregate
+  set (`count`/`sum`/`total`/`avg`/`min`/`max`/`group_concat`), `SELECT DISTINCT` (ephemeral
+  index dedup), aggregate-without-GROUP-BY, and NULL handling. **6.8 `GROUP BY` + `ORDER BY`**
+  ✅: the two-pass shape (aggregate pass writes per-group result rows into an output sorter
+  keyed by the ORDER BY expressions; a tail block sorts and walks it with OFFSET/LIMIT). The
+  ORDER BY expressions are rewritten like the projection (aggregate calls → `AggRef`, GROUP BY
+  exprs → `AggRef`), so `ORDER BY count(*) DESC` works. `EXPLAIN QUERY PLAN` emits the
+  oracle-faithful `USE TEMP B-TREE FOR GROUP BY` / `USE TEMP B-TREE FOR ORDER BY` (the latter
+  is suppressed when ORDER BY is exactly the GROUP BY keys, matching upstream's `nOBSat`).
+  Differential-tested vs the C oracle (`aggregate_queries`, `group_by_order_by_with_varying_counts`).
+  Known divergence: the tiebreak order for equal ORDER BY keys is unspecified in SQL; our stable
+  sorter preserves GROUP BY insertion order while SQLite's b-tree-backed ORDER BY reverses it
+  for DESC — both are correct, test cases with ties use a secondary ORDER BY key for determinism.

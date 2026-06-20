@@ -220,12 +220,30 @@ pub fn query_plan_rows(
             None => details.push("SCAN CONSTANT ROW".to_string()),
         }
     }
+    // The GROUP BY pass sorts the input by the group key. Upstream renders this as a sibling
+    // of the SCAN (parent 0), before the ORDER BY row if any.
+    let group_by_present = !select.group_by.is_empty();
+    if group_by_present {
+        details.push("USE TEMP B-TREE FOR GROUP BY".to_string());
+    }
     if !select.order_by.is_empty() && index_plan.map_or(true, |i| !i.order_by_satisfied) {
         // The index scan already yields rows in the ORDER BY order when
         // `order_by_satisfied` is true, so no temp b-tree is needed. Otherwise the engine
         // materializes ORDER BY through the in-memory sorter; this row is honest. It renders
         // as a sibling of the SCAN (parent 0), matching the oracle's tree.
-        details.push("USE TEMP B-TREE FOR ORDER BY".to_string());
+        // When the ORDER BY is exactly the GROUP BY keys (in the same direction), the GROUP BY
+        // sorter already produces the requested order, so no separate ORDER BY b-tree is
+        // needed — matching upstream's `nOBSat` optimization.
+        let order_by_is_group_by = group_by_present
+            && select.group_by.len() == select.order_by.len()
+            && select
+                .order_by
+                .iter()
+                .zip(select.group_by.iter())
+                .all(|(ot, gt)| ot.desc == false && ot.expr == *gt);
+        if !order_by_is_group_by {
+            details.push("USE TEMP B-TREE FOR ORDER BY".to_string());
+        }
     }
 
     details

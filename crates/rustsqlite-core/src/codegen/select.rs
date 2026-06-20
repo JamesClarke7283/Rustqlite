@@ -19,7 +19,7 @@ use crate::util::fp::fp_to_text;
 use crate::vdbe::program::{Program, P4};
 use crate::vdbe::{KeyField, Opcode};
 
-use super::builder::ProgramBuilder;
+use super::builder::{Label, ProgramBuilder};
 use super::expr::{compile_expr, compile_jump, Ctx};
 use super::index_planner::{pick_index, IndexPlan};
 
@@ -154,6 +154,20 @@ fn compile_aggregate(
     };
     let offset_reg = (offset > 0).then(|| emit_int(&mut b, offset));
 
+    // (C') When the query has an ORDER BY, the aggregate pass writes its per-group result rows
+    // into an output sorter (keyed by the ORDER BY expressions) rather than emitting them
+    // directly. After the aggregate pass, a tail block sorts the output sorter and walks it
+    // with OFFSET/LIMIT to emit the final ResultRows. This is the two-pass shape upstream
+    // uses for `GROUP BY ... ORDER BY` (aggregate, then sort the result).
+    let has_order_by = !select.order_by.is_empty();
+    let norder = select.order_by.len() as i32;
+    // The output sorter cursor number. The no-GROUP-BY path uses cursor 0 (table) and sorter 1
+    // (unused there but reserved for symmetry); the GROUP BY path uses cursor 0 (table), sorter
+    // 1 (group sorter). The output sorter is the next free cursor: 2 in the GROUP BY path, 1
+    // in the no-GROUP-BY path (which doesn't open a group sorter). We compute it per-path
+    // below; the tail block reads it back.
+    let output_sorter: i32 = if nkey > 0 { 2 } else { 1 };
+
     // (C) Allocate the per-aggregate accumulator registers and build the lookup table that
     // `rewrite_aggregates` uses to replace each call with an `AggRef(reg)`.
     let agg_reg_base = if n_agg > 0 { b.alloc_regs(n_agg) } else { 0 };
@@ -193,12 +207,48 @@ fn compile_aggregate(
         .as_ref()
         .map(|h| rewrite_projection_expr(h, &reg_of, &group_key_of));
 
+    // Rewrite the ORDER BY expressions the same way as the projection: aggregate calls →
+    // `AggRef(agg_reg)`, GROUP BY expression matches → `AggRef(i_amem)`. An ordinal `ORDER BY
+    // n` selects the n-th output column (which is already rewritten); resolve it here so the
+    // output sorter key is the output column value.
+    let rewritten_order_by: Vec<(Expr, bool)> = if has_order_by {
+        select
+            .order_by
+            .iter()
+            .map(|term| {
+                let expr = resolve_order_term(term, outputs)?;
+                Ok((
+                    rewrite_projection_expr(&expr, &reg_of, &group_key_of),
+                    term.desc,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+
     // (D) Open the table cursor.
     let open = b.emit(Opcode::OpenRead, cursor, table.rootpage as i32, 0);
     if table.without_rowid {
         b.set_p4(open, P4::KeyInfo(table.without_rowid_key_info()));
     } else {
         b.set_p4(open, P4::Int(table.columns.len() as i64));
+    }
+
+    // (D') Open the output sorter when ORDER BY is present. The record layout is
+    // `[order_by_keys..., projection_columns...]`; the KeyInfo carries the ORDER BY
+    // directions and BINARY collation (a future task threads through explicit COLLATE).
+    if has_order_by {
+        let keyinfo: Vec<KeyField> = select
+            .order_by
+            .iter()
+            .map(|t| KeyField {
+                desc: t.desc,
+                collation: crate::types::Collation::Binary,
+            })
+            .collect();
+        let so = b.emit(Opcode::SorterOpen, output_sorter, norder + ncol, 0);
+        b.set_p4(so, P4::KeyInfo(keyinfo));
     }
 
     if nkey == 0 {
@@ -254,16 +304,41 @@ fn compile_aggregate(
         if let Some(having) = &rewritten_having {
             compile_jump(&mut b, having, emit_end, false, true, ctx)?;
         }
-        if let Some(oreg) = offset_reg {
-            b.emit_jump(Opcode::IfPos, oreg, emit_end, 1);
-        }
         let result_reg = b.alloc_regs(ncol);
         for (j, (expr, _)) in rewritten_outputs.iter().enumerate() {
             compile_expr(&mut b, expr, result_reg + j as i32, ctx)?;
         }
-        b.emit(Opcode::ResultRow, result_reg, ncol, 0);
-        if let Some(lreg) = limit_reg {
-            b.emit_jump(Opcode::DecrJumpZero, lreg, emit_end, 0);
+        if has_order_by {
+            // Insert the single aggregated row into the output sorter, then run the sort tail.
+            let block = b.alloc_regs(norder + ncol);
+            for (k, (expr, _)) in rewritten_order_by.iter().enumerate() {
+                compile_expr(&mut b, expr, block + k as i32, ctx)?;
+            }
+            for j in 0..ncol {
+                b.emit(Opcode::SCopy, result_reg + j, block + norder + j, 0);
+            }
+            let rec = b.alloc_reg();
+            b.emit(Opcode::MakeRecord, block, norder + ncol, rec);
+            b.emit(Opcode::SorterInsert, output_sorter, rec, 0);
+            // Fall through to the sort tail.
+            emit_sort_tail(
+                &mut b,
+                output_sorter,
+                norder,
+                ncol,
+                limit_reg,
+                offset_reg,
+                emit_end,
+            );
+        } else {
+            // No ORDER BY: emit the single row directly with OFFSET/LIMIT.
+            if let Some(oreg) = offset_reg {
+                b.emit_jump(Opcode::IfPos, oreg, emit_end, 1);
+            }
+            b.emit(Opcode::ResultRow, result_reg, ncol, 0);
+            if let Some(lreg) = limit_reg {
+                b.emit_jump(Opcode::DecrJumpZero, lreg, emit_end, 0);
+            }
         }
         b.resolve(emit_end);
         b.emit(Opcode::Halt, 0, 0, 0);
@@ -459,6 +534,20 @@ fn compile_aggregate(
     // After the loop: emit the final group's row.
     b.emit_jump(Opcode::Gosub, reg_output_row, addr_output_row, 0);
 
+    // When ORDER BY is present, the output sorter has been populated by the output
+    // subroutine; run the sort tail now to emit the final ResultRows with OFFSET/LIMIT.
+    if has_order_by {
+        emit_sort_tail(
+            &mut b,
+            output_sorter,
+            norder,
+            ncol,
+            limit_reg,
+            offset_reg,
+            addr_end,
+        );
+    }
+
     // Jump past the subroutines to `addr_end`.
     b.emit_jump(Opcode::Goto, 0, addr_end, 0);
 
@@ -494,16 +583,32 @@ fn compile_aggregate(
         b.emit(Opcode::MakeRecord, result_reg, ncol, rec);
         b.emit(Opcode::IdxInsert, dc, rec, 0);
     }
-    // Apply OFFSET/LIMIT.
-    let row_end = b.new_label();
-    if let Some(oreg) = offset_reg {
-        b.emit_jump(Opcode::IfPos, oreg, row_end, 1);
+    if has_order_by {
+        // ORDER BY present: insert the group's row into the output sorter (keyed by the
+        // ORDER BY expressions). The OFFSET/LIMIT and ResultRow emission happen in the sort
+        // tail after the aggregate pass completes.
+        let block = b.alloc_regs(norder + ncol);
+        for (k, (expr, _)) in rewritten_order_by.iter().enumerate() {
+            compile_expr(&mut b, expr, block + k as i32, ctx)?;
+        }
+        for j in 0..ncol {
+            b.emit(Opcode::SCopy, result_reg + j, block + norder + j, 0);
+        }
+        let rec = b.alloc_reg();
+        b.emit(Opcode::MakeRecord, block, norder + ncol, rec);
+        b.emit(Opcode::SorterInsert, output_sorter, rec, 0);
+    } else {
+        // No ORDER BY: emit the row directly with OFFSET/LIMIT.
+        let row_end = b.new_label();
+        if let Some(oreg) = offset_reg {
+            b.emit_jump(Opcode::IfPos, oreg, row_end, 1);
+        }
+        b.emit(Opcode::ResultRow, result_reg, ncol, 0);
+        if let Some(lreg) = limit_reg {
+            b.emit_jump(Opcode::DecrJumpZero, lreg, addr_end, 0);
+        }
+        b.resolve(row_end);
     }
-    b.emit(Opcode::ResultRow, result_reg, ncol, 0);
-    if let Some(lreg) = limit_reg {
-        b.emit_jump(Opcode::DecrJumpZero, lreg, addr_end, 0);
-    }
-    b.resolve(row_end);
     b.resolve(output_skip);
     b.emit(Opcode::Return, reg_output_row, 0, 0);
 
@@ -525,6 +630,45 @@ fn compile_aggregate(
     b.emit(Opcode::Transaction, 0, 0, 0);
     b.emit(Opcode::Goto, 0, after_init, 0);
     Ok(b.finish())
+}
+
+/// Emit the sort-and-walk tail for an output sorter populated by the aggregate pass. The
+/// sorter record layout is `[order_by_keys..., projection_columns...]` (the first `norder`
+/// columns are the ORDER BY keys, the remaining `ncol` are the projection). This sorts the
+/// sorter, walks it in sorted order, applies OFFSET/LIMIT, and emits a `ResultRow` per row.
+/// `end_label` is resolved to the instruction after the walk (the caller emits the Halt there
+/// or jumps past it).
+fn emit_sort_tail(
+    b: &mut ProgramBuilder,
+    sorter: i32,
+    norder: i32,
+    ncol: i32,
+    limit_reg: Option<i32>,
+    offset_reg: Option<i32>,
+    end_label: Label,
+) {
+    // Sort the sorter and position at the first record, or jump to `end_label` if empty.
+    b.emit_jump(Opcode::SorterSort, sorter, end_label, 0);
+    let out_top = b.cur_addr();
+    let sort_next = b.new_label();
+    b.emit(Opcode::SorterData, sorter, 0, 0);
+    // OFFSET gate.
+    if let Some(oreg) = offset_reg {
+        b.emit_jump(Opcode::IfPos, oreg, sort_next, 1);
+    }
+    // Read the projection columns from the sorter record (after the ORDER BY keys).
+    let result_reg = b.alloc_regs(ncol);
+    for j in 0..ncol {
+        b.emit(Opcode::Column, sorter, norder + j, result_reg + j);
+    }
+    b.emit(Opcode::ResultRow, result_reg, ncol, 0);
+    if let Some(lreg) = limit_reg {
+        b.emit_jump(Opcode::DecrJumpZero, lreg, end_label, 0);
+    }
+    b.resolve(sort_next);
+    b.emit(Opcode::SorterNext, sorter, out_top, 0);
+    // Fall through to `end_label` (the caller resolves it).
+    let _ = end_label;
 }
 
 /// `true` if two aggregate calls are syntactically identical (same name, same args). Used to
@@ -855,23 +999,6 @@ fn reject_unsupported(select: &SelectStmt) -> Result<()> {
     }
     if select.from.iter().any(|t| t.table().is_none() && t.subquery().is_none()) {
         return Err(Error::msg("joins are not supported"));
-    }
-    // ORDER BY on an aggregate query is handled by M6.8 (two-pass: aggregate then sort). Until
-    // that lands, reject it so we don't silently produce wrong-order output.
-    if !select.group_by.is_empty() && !select.order_by.is_empty() {
-        return Err(Error::msg(
-            "GROUP BY with ORDER BY is not supported yet (M6.8)",
-        ));
-    }
-    if !select.order_by.is_empty()
-        && select
-            .order_by
-            .iter()
-            .any(|t| contains_aggregate(&t.expr))
-    {
-        return Err(Error::msg(
-            "ORDER BY on an aggregate expression is not supported yet (M6.8)",
-        ));
     }
     Ok(())
 }
