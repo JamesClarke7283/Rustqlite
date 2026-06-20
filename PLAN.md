@@ -194,11 +194,11 @@ list every granular item needed.
 - [x] **7.7** VDBE: `NullRow` opcode — set cursor to all-NULL row for LEFT JOIN miss
 - [x] **7.8** Right join (implemented as left join with swapped tables)
 - [x] **7.9** Full outer join (left + right with NULL fill)
-- [ ] **7.10** Natural join: USING columns → deduped projection + coalesced ON condition
+- [x] **7.10** Natural join: USING columns → deduped projection + coalesced ON condition
 - [ ] **7.11** Self-join: table aliases, `OpenDup` for same-table join
 - [ ] **7.12** VDBE: `OpenDup` opcode — duplicate an existing cursor
 - [ ] **7.13** Query planner: join order selection (cost estimation based on row counts and available indexes)
-- [ ] **7.14** `USING (cols)` — coalesce matched columns, suppress duplicates in `SELECT *`
+- [x] **7.14** `USING (cols)` — coalesce matched columns, suppress duplicates in `SELECT *`
 
 ---
 

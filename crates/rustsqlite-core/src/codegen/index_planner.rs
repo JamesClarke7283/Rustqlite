@@ -480,6 +480,10 @@ fn collect_columns(expr: &Expr, table: &Table, push: &mut impl FnMut(usize)) {
             collect_columns(right, table, push);
         }
         Expr::Row(es) => es.iter().for_each(|e| collect_columns(e, table, push)),
+        Expr::Coalesce2 { left, right } => {
+            collect_columns(left, table, push);
+            collect_columns(right, table, push);
+        }
         Expr::Function { args, .. } => {
             if let rustqlite_parser::FunctionArgs::List(v) = args {
                 for a in v {

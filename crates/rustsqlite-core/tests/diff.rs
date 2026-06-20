@@ -1100,3 +1100,131 @@ fn cross_and_inner_joins() {
         assert_same(db.str(), q);
     }
 }
+
+/// `USING (cols)` and `NATURAL JOIN` (M7.10 / M7.14). The join codegen rewrites the
+/// AST before emitting the nested loop: the USING columns become an `AND` chain of
+/// equality predicates (the synthetic ON), bare shared-column references in the
+/// projection / WHERE / ORDER BY coalesce both sides (preserved side first), and
+/// `SELECT *` suppresses the duplicate copy of each USING column from the second
+/// table. NATURAL is `USING(common columns in left-table column order)`.
+#[test]
+fn using_and_natural_joins() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup(
+        "CREATE TABLE t1(a INT, b TEXT, c INT);\
+         CREATE TABLE t2(a INT, b TEXT, d INT);\
+         INSERT INTO t1 VALUES (1,'x',10),(2,'y',20),(NULL,'z',30),(3,'w',40);\
+         INSERT INTO t2 VALUES (1,'x',100),(2,NULL,200),(5,'q',300),(3,'w',400);\
+         CREATE TABLE x1(b, a, c);\
+         CREATE TABLE x2(d, a, e);\
+         INSERT INTO x1 VALUES (2, 1, 3);\
+         INSERT INTO x2 VALUES (4, 1, 5);",
+    );
+    let qs = [
+        // USING single column.
+        "SELECT * FROM t1 JOIN t2 USING(a);",
+        "SELECT * FROM t1 INNER JOIN t2 USING(a);",
+        // SELECT explicit cols: shared non-using cols must be table-qualified.
+        "SELECT a, t1.b, t2.b, c, d FROM t1 JOIN t2 USING(a);",
+        "SELECT t1.a, t2.a, t1.b, t2.b FROM t1 JOIN t2 USING(a);",
+        // USING two columns (both shared cols are using cols).
+        "SELECT * FROM t1 JOIN t2 USING(a, b);",
+        "SELECT a, b, c, d FROM t1 JOIN t2 USING(a, b);",
+        "SELECT t1.a, t2.a FROM t1 JOIN t2 USING(a, b);",
+        // USING with WHERE on bare shared column (coalesced).
+        "SELECT a, t1.b, c, d FROM t1 JOIN t2 USING(a) WHERE a = 1;",
+        "SELECT a, t1.b, c, d FROM t1 JOIN t2 USING(a) WHERE a > 1 ORDER BY a;",
+        // USING with ORDER BY on bare shared column.
+        "SELECT a, c, d FROM t1 JOIN t2 USING(a) ORDER BY a DESC;",
+        "SELECT a, c, d FROM t1 JOIN t2 USING(a) ORDER BY a;",
+        // LEFT JOIN with USING.
+        "SELECT * FROM t1 LEFT JOIN t2 USING(a);",
+        "SELECT a, t1.b, c, d FROM t1 LEFT JOIN t2 USING(a) ORDER BY a;",
+        "SELECT a, c, d FROM t1 LEFT JOIN t2 USING(a) WHERE d IS NULL ORDER BY a;",
+        // RIGHT JOIN with USING (implemented as LEFT JOIN with swapped tables).
+        "SELECT * FROM t1 RIGHT JOIN t2 USING(a) ORDER BY a;",
+        "SELECT a, t1.b, c, d FROM t1 RIGHT JOIN t2 USING(a) ORDER BY a;",
+        "SELECT a, d FROM t1 RIGHT JOIN t2 USING(a) ORDER BY a;",
+        // FULL JOIN with USING.
+        "SELECT * FROM t1 FULL JOIN t2 USING(a) ORDER BY a;",
+        "SELECT a, c, d FROM t1 FULL JOIN t2 USING(a) ORDER BY a;",
+        // NATURAL JOIN (shared cols: a and b — both must match).
+        "SELECT * FROM t1 NATURAL JOIN t2;",
+        "SELECT a, b, c, d FROM t1 NATURAL JOIN t2;",
+        // NATURAL outer joins. RIGHT/FULL JOIN row order differs from the oracle's
+        // specialized path (see AGENTS.md RIGHT JOIN note); ORDER BY makes it
+        // deterministic.
+        "SELECT * FROM t1 NATURAL LEFT JOIN t2;",
+        "SELECT * FROM t1 NATURAL RIGHT JOIN t2 ORDER BY a;",
+        "SELECT * FROM t1 NATURAL FULL JOIN t2 ORDER BY a;",
+        // Column order in `SELECT *` follows the FROM (left then right) order.
+        "SELECT * FROM x1 JOIN x2 USING(a);",
+        "SELECT * FROM x1 NATURAL JOIN x2;",
+    ];
+    for q in qs {
+        assert_same(db.str(), q);
+    }
+}
+
+/// USING/NATURAL error-message parity: SQLite raises "cannot join using column X -
+/// column not present in both tables", "ambiguous column name: X", and "a NATURAL
+/// join may not have an ON or USING clause". We match those.
+#[test]
+fn using_and_natural_errors() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup("CREATE TABLE t1(a, b); CREATE TABLE t2(a, d);");
+    // Each query: (sql, oracle_error_substring, our_error_substring).
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "SELECT * FROM t1 JOIN t2 USING(c);",
+            "column not present in both tables",
+            "column not present in both tables",
+        ),
+        (
+            "SELECT * FROM t1 NATURAL JOIN t2 USING(a);",
+            "NATURAL join may not",
+            "NATURAL join may not",
+        ),
+        (
+            "SELECT * FROM t1 NATURAL JOIN t2 ON t1.a = t2.a;",
+            "NATURAL join may not",
+            "NATURAL join may not",
+        ),
+    ];
+    for (q, oracle_sub, our_sub) in cases {
+        // Oracle should error with the expected substring.
+        let oracle_out = std::process::Command::new("sqlite3")
+            .arg("-batch")
+            .arg(db.str())
+            .arg(q)
+            .output()
+            .expect("run sqlite3");
+        let oracle_err = String::from_utf8_lossy(&oracle_out.stderr);
+        assert!(
+            oracle_err.contains(oracle_sub),
+            "oracle did not error as expected for {q}: {oracle_err}"
+        );
+        // Our engine should also error, with a matching substring.
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let res = sqlite3_prepare_v2(&mut conn, q);
+        match res {
+            Ok(_) => panic!("expected error for: {q}"),
+            Err(e) => {
+                assert!(
+                    e.message.contains(our_sub),
+                    "error mismatch for {q}: got {:?}, expected substring {:?}",
+                    e.message,
+                    our_sub
+                );
+            }
+        }
+    }
+}

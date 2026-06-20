@@ -24,7 +24,7 @@
 
 use rustqlite_parser::{Expr, JoinOp, SelectStmt, TableOrJoin};
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::schema::Table;
 use crate::vdbe::program::{P4, Program};
 use crate::vdbe::{KeyField, Opcode};
@@ -410,16 +410,14 @@ fn flatten_into<'a>(
                 return;
             }
             TableOrJoin::Join(j) => {
-                // Handle CROSS, INNER, LEFT, RIGHT, and FULL joins. NATURAL is rejected by
-                // `validate_join`.
+                // Handle CROSS, INNER, LEFT, RIGHT, FULL, and NATURAL joins. NATURAL
+                // is rewritten to a synthetic USING in the compile_select path; here
+                // it is treated as an inner join (the rewrite supplies the ON).
                 match j.op {
                     JoinOp::Cross | JoinOp::Inner | JoinOp::Left | JoinOp::LeftOuter
                     | JoinOp::Right | JoinOp::RightOuter
-                    | JoinOp::Full | JoinOp::FullOuter => {}
-                    _ => {
-                        out.clear();
-                        return;
-                    }
+                    | JoinOp::Full | JoinOp::FullOuter | JoinOp::Natural
+                    | JoinOp::NaturalLeft | JoinOp::NaturalRight | JoinOp::NaturalFull => {}
                 }
                 // Recurse into the left side.
                 flatten_into(std::slice::from_ref(&*j.left), out);
@@ -445,7 +443,7 @@ pub fn on_predicate(constraint: Option<&rustqlite_parser::JoinConstraint>) -> Op
 /// only handles a single join level; a chain of joins is deferred.
 pub fn is_left_join(from: &[TableOrJoin]) -> bool {
     if let Some(TableOrJoin::Join(j)) = from.first() {
-        matches!(j.op, JoinOp::Left | JoinOp::LeftOuter)
+        matches!(j.op, JoinOp::Left | JoinOp::LeftOuter | JoinOp::NaturalLeft)
     } else {
         false
     }
@@ -455,7 +453,7 @@ pub fn is_left_join(from: &[TableOrJoin]) -> bool {
 /// implements RIGHT JOIN by swapping the tables and emitting a LEFT JOIN.
 pub fn is_right_join(from: &[TableOrJoin]) -> bool {
     if let Some(TableOrJoin::Join(j)) = from.first() {
-        matches!(j.op, JoinOp::Right | JoinOp::RightOuter)
+        matches!(j.op, JoinOp::Right | JoinOp::RightOuter | JoinOp::NaturalRight)
     } else {
         false
     }
@@ -478,20 +476,10 @@ pub fn swap_for_right_join<'a>(
 }
 
 /// Reject unsupported join features that `flatten_cross_join` accepts but the codegen can't
-/// handle yet (USING, NATURAL, etc.). Returns an error message for the first unsupported
-/// feature.
-pub fn validate_join(from: &[TableOrJoin]) -> Result<()> {
-    for item in from {
-        if let TableOrJoin::Join(j) = item {
-            if matches!(j.constraint, Some(rustqlite_parser::JoinConstraint::Using(_))) {
-                return Err(Error::msg("USING clause is not supported yet (M7.10)"));
-            }
-            if matches!(j.op, JoinOp::Natural) {
-                return Err(Error::msg("NATURAL joins are not supported yet (M7.10)"));
-            }
-            validate_join(std::slice::from_ref(&*j.left))?;
-        }
-    }
+/// handle yet. As of M7.10, USING and NATURAL joins are supported via AST rewriting in
+/// `codegen::join_using`, so this is now a no-op for the top-level join. (Self-joins and
+/// join chains with USING remain to be handled.)
+pub fn validate_join(_from: &[TableOrJoin]) -> Result<()> {
     Ok(())
 }
 
@@ -500,7 +488,7 @@ pub fn validate_join(from: &[TableOrJoin]) -> Result<()> {
 /// for right rows that had no left match).
 pub fn is_full_join(from: &[TableOrJoin]) -> bool {
     if let Some(TableOrJoin::Join(j)) = from.first() {
-        matches!(j.op, JoinOp::Full | JoinOp::FullOuter)
+        matches!(j.op, JoinOp::Full | JoinOp::FullOuter | JoinOp::NaturalFull)
     } else {
         false
     }

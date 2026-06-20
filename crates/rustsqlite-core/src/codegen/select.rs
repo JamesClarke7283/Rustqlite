@@ -1037,6 +1037,7 @@ fn contains_aggregate(e: &Expr) -> bool {
             contains_aggregate(left) || contains_aggregate(right)
         }
         Expr::Row(es) => es.iter().any(contains_aggregate),
+        Expr::Coalesce2 { left, right } => contains_aggregate(left) || contains_aggregate(right),
         // Plain leaves — no aggregate hidden inside.
         Expr::Literal(_)
         | Expr::Column { .. }
@@ -1123,7 +1124,8 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggCall>) {
         }
         Expr::Row(es) => es.iter().for_each(|e| collect_aggregates(e, out)),
         Expr::Literal(_) | Expr::Column { .. } | Expr::BindParam(_)
-        | Expr::Exists(_) | Expr::Subquery(_) | Expr::AggRef(_) | Expr::Function { .. } => {}
+        | Expr::Exists(_) | Expr::Subquery(_) | Expr::AggRef(_) | Expr::Function { .. }
+        | Expr::Coalesce2 { .. } => {}
     }
 }
 
@@ -1611,20 +1613,19 @@ pub(crate) fn expand_columns_with_tables(
     for rc in &select.columns {
         match rc {
             ResultColumn::Star => {
-                for (t, _) in tables {
+                for (t, tname) in tables {
                     for col in &t.columns {
-                        out.push((column_expr(&col.name), col.name.clone()));
+                        out.push((column_expr_for(tname, &col.name), col.name.clone()));
                     }
                 }
             }
             ResultColumn::TableStar(qname) => {
-                let t = tables
+                let (t, tname) = tables
                     .iter()
                     .find(|(_, name)| name.eq_ignore_ascii_case(qname))
-                    .map(|(t, _)| *t)
                     .ok_or_else(|| Error::msg(format!("no such table: {qname}")))?;
                 for col in &t.columns {
-                    out.push((column_expr(&col.name), col.name.clone()));
+                    out.push((column_expr_for(tname, &col.name), col.name.clone()));
                 }
             }
             ResultColumn::Expr { expr, alias } => {
@@ -1637,6 +1638,14 @@ pub(crate) fn expand_columns_with_tables(
         return Err(Error::msg("no result columns"));
     }
     Ok(out)
+}
+
+fn column_expr_for(table: &str, name: &str) -> Expr {
+    Expr::Column {
+        schema: None,
+        table: Some(table.to_string()),
+        name: name.to_string(),
+    }
 }
 
 fn column_expr(name: &str) -> Expr {
@@ -1787,6 +1796,9 @@ pub fn expr_to_text(e: &Expr) -> String {
             format!("({inner})")
         }
         Expr::AggRef(r) => format!("agg#{r}"),
+        Expr::Coalesce2 { left, right } => {
+            format!("coalesce({}, {})", expr_to_text(left), expr_to_text(right))
+        }
     }
 }
 

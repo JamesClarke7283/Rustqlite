@@ -402,7 +402,14 @@ pub enum IndexedBy {
 pub enum JoinOp {
     Inner,
     Cross,
+    /// `NATURAL JOIN` (implicit INNER with shared-column equality).
     Natural,
+    /// `NATURAL LEFT [OUTER] JOIN`.
+    NaturalLeft,
+    /// `NATURAL RIGHT [OUTER] JOIN`.
+    NaturalRight,
+    /// `NATURAL FULL [OUTER] JOIN`.
+    NaturalFull,
     Left,
     LeftOuter,
     Right,
@@ -458,18 +465,30 @@ impl JoinOp {
         }
 
         // Invalid combinations per upstream sqlite3JoinType.
+        // Invalid combinations per upstream sqlite3JoinType. `NATURAL FULL` is
+        // allowed (the `full` keyword sets both left and right), so the
+        // `natural && left && right` check must exclude the `full` case.
+        let has_full = keywords.iter().any(|kw| kw.eq_ignore_ascii_case("full"));
         let invalid = ((cross || inner) && outer)
             || (cross && (left || right))
             || (cross && natural && inner)
             || (outer && !(left || right))
-            || (natural && left && right)
+            || (natural && left && right && !has_full)
             || (inner && (left || right));
         if invalid {
             return Err(keywords.join(" "));
         }
 
         let op = if natural {
-            Natural
+            if left && right {
+                NaturalFull
+            } else if left {
+                NaturalLeft
+            } else if right {
+                NaturalRight
+            } else {
+                Natural
+            }
         } else if left && right && outer {
             FullOuter
         } else if left && right {
@@ -900,6 +919,14 @@ pub enum Expr {
     /// `count(*)` in `SELECT g, count(*) FROM t GROUP BY g` reads from the accumulator register
     /// instead of trying to evaluate the function call during the per-group output pass.
     AggRef(i32),
+    /// A codegen-only synthetic 2-argument COALESCE: `IF left IS NOT NULL THEN left ELSE right`.
+    /// Emitted by the USING/NATURAL JOIN rewrite (`codegen::join_using`) to model the bare
+    /// shared-column reference that resolves to the preserved side first. Never produced by
+    /// the parser.
+    Coalesce2 {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -232,5 +232,22 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   so NULL join keys don't spuriously count as matches. WHERE is re-applied on the NULL-filled
   left row (a WHERE on left-table columns filters it out since NULL comparisons are
   UNKNOWN). LIMIT applies across both passes (the second pass decrements the same limit
-  register). `validate_join` now accepts `Full`/`FullOuter` and rejects only `NATURAL` and
+  register).   `validate_join` now accepts `Full`/`FullOuter` and rejects only `NATURAL` and
   `USING`. Differential-tested vs the C oracle (FULL JOIN cases in `cross_and_inner_joins`).
+  **7.10 natural join + 7.14 USING** ✅: `USING (cols)` and `NATURAL [LEFT|RIGHT|FULL] JOIN`
+  are implemented by rewriting the AST before join codegen runs (`codegen::join_using`).
+  For each shared column the rewrite synthesizes an `ON l.col = r.col AND …` predicate
+  (NATURAL picks the columns common to both tables in left-table declared order) and
+  replaces bare references to a USING column (in projection / WHERE / ORDER BY / GROUP BY
+  / HAVING) with a synthetic 2-arg coalesce `Expr::Coalesce2 { left, right }` = `IF outer.col
+  IS NOT NULL THEN outer.col ELSE inner.col` (in JOIN order, so the preserved side wins for
+  LEFT/RIGHT/FULL). `SELECT *` expands in FROM order with the USING cols suppressed from
+  the second table; the using col itself appears once, coalesced. Non-using cols that exist
+  in both tables are table-qualified to avoid ambiguity. Error-message parity: "cannot join
+  using column X - column not present in both tables", "ambiguous column name: X", "a
+  NATURAL join may not have an ON or USING clause". `validate_join` is now a no-op for
+  USING/NATURAL (the rewrite handles them); it still rejects only unsupported join chains.
+  Differential-tested vs the C oracle (`using_and_natural_joins`,
+  `using_and_natural_errors`). Still M7+: self-joins, join-order selection, aggregates
+  over joins, join chains (multiple ON levels). Known divergence: same RIGHT/FULL JOIN
+  row-order note as above; test cases use ORDER BY for determinism.

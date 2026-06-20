@@ -141,6 +141,15 @@ pub fn compile_expr(b: &mut ProgramBuilder, e: &Expr, target: i32, ctx: Ctx) -> 
             // filled by `AggFinal` during the per-group output pass.
             b.emit(Opcode::SCopy, *reg, target, 0);
         }
+        Expr::Coalesce2 { left, right } => {
+            // `IF left IS NOT NULL THEN left ELSE right`. Emit the left value, test it
+            // for NULL, and on NULL overwrite the target with the right value.
+            compile_expr(b, left, target, ctx)?;
+            let not_null = b.new_label();
+            b.emit_jump(Opcode::NotNull, target, not_null, 0);
+            compile_expr(b, right, target, ctx)?;
+            b.resolve(not_null);
+        }
     }
     Ok(())
 }

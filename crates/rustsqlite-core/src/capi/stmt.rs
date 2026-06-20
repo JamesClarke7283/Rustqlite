@@ -570,6 +570,81 @@ struct CompiledSelect {
     index_plan_info: Option<crate::vdbe::explain::IndexPlanInfo>,
 }
 
+/// Apply the USING/NATURAL JOIN rewrite to `select` if its top-level FROM join is a
+/// USING/NATURAL join. Returns `(rewritten_select, on_predicate)` where `on_predicate`
+/// is the existing ON clause (if any) possibly combined with the synthetic
+/// `l.col = r.col AND ...` predicate. For a plain ON/cross join, returns the select
+/// unchanged and the original ON predicate.
+///
+/// `flat` is the flattened FROM clause (top-level first). `from_order` is the canonical
+/// FROM order (left, right); `join_order` is the outer/inner loop order (which may be
+/// swapped for a RIGHT JOIN). The rewrite uses JOIN-order names for the coalesce (so
+/// the preserved side wins) and FROM-order tables for the `SELECT *` dedup.
+fn rewrite_using_or_natural(
+    select: &SelectStmt,
+    flat: &[(&rustqlite_parser::TableRef, Option<&rustqlite_parser::JoinConstraint>)],
+    from_order: &[(&Table, &str); 2],
+    join_order: &[(&Table, &str); 2],
+) -> Result<(SelectStmt, Option<rustqlite_parser::Expr>)> {
+    use rustqlite_parser::{JoinConstraint, TableOrJoin};
+    let _ = flat;
+
+    // Extract the top-level join's op and constraint.
+    let (op, constraint) = match select.from.first() {
+        Some(TableOrJoin::Join(j)) => (j.op, j.constraint.as_ref()),
+        _ => return Ok((select.clone(), None)),
+    };
+    let on_expr = match constraint {
+        Some(JoinConstraint::On(e)) => Some(e.clone()),
+        _ => None,
+    };
+    let using_cols = codegen::join_using::resolve_using_cols(
+        join_order[0].0,
+        join_order[1].0,
+        constraint,
+        op,
+    )?;
+    let Some(using_cols) = using_cols else {
+        // Plain ON or cross join — no rewrite.
+        return Ok((select.clone(), on_expr));
+    };
+    if on_expr.is_some() && matches!(constraint, Some(JoinConstraint::Using(_))) {
+        // USING and ON together is a syntax error in SQLite (parser catches the ordering);
+        // we never reach here because the parser already accepted the shape, but guard
+        // anyway.
+        return Err(Error::msg("ON clause may not be used with USING"));
+    }
+
+    let outer_name = join_order[0].1;
+    let inner_name = join_order[1].1;
+    let outer_t = join_order[0].0;
+    let inner_t = join_order[1].0;
+
+    let mut sel = select.clone();
+    // Projection `*` dedup uses FROM-order tables (left, right) — the SECOND table in
+    // FROM order loses the using cols.
+    sel.columns = codegen::join_using::rewrite_projection(
+        &sel,
+        &using_cols,
+        outer_name,
+        inner_name,
+        from_order[0].0,
+        from_order[1].0,
+        from_order[0].1,
+        from_order[1].1,
+    )?;
+    codegen::join_using::rewrite_select_clauses(
+        &mut sel,
+        &using_cols,
+        outer_name,
+        inner_name,
+        outer_t,
+        inner_t,
+    )?;
+    let synthetic_on = codegen::join_using::synthetic_on(&using_cols, outer_name, inner_name);
+    Ok((sel, synthetic_on.or(on_expr)))
+}
+
 /// Resolve the single FROM table (if any) from the catalog and compile the SELECT. Shared by the
 /// Resolve the single FROM table (if any) from the catalog and compile the SELECT. Shared by the
 /// normal SELECT path and the EXPLAIN path.
@@ -593,8 +668,9 @@ fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelec
                     resolved.push((table, name));
                 }
                 // The ON predicate for the first join level (the M7 first slice handles one
-                // ON predicate; a chain of joins with multiple ONs is deferred).
-                let on_predicate = flat
+                // ON predicate; a chain of joins with multiple ONs is deferred). The
+                // USING/NATURAL rewrite may replace or augment this with a synthetic ON.
+                let _on_predicate = flat
                     .iter()
                     .find_map(|(_, c)| codegen::join::on_predicate(*c));
                 let table_refs: Vec<(&Table, &str)> =
@@ -614,8 +690,23 @@ fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelec
                 };
                 let from_order: [(&Table, &str); 2] = table_refs[..2].try_into().unwrap();
                 let join_order_arr: [(&Table, &str); 2] = join_order[..2].try_into().unwrap();
-                let (program, column_names) =
-                    codegen::join::compile_cross_join(select, &join_order_arr, &from_order, on_predicate, left_join, full_join)?;
+
+                // USING/NATURAL: rewrite the SELECT's projection, WHERE, ORDER BY, GROUP BY,
+                // and HAVING to coalesce bare shared-column refs and dedup `SELECT *`. The
+                // synthetic ON predicate (`l.col = r.col AND ...`) replaces the USING clause.
+                // The rewrite runs against the JOIN-order tables (outer first, inner second)
+                // so the coalesce picks the preserved side first (matching SQLite).
+                let (select_for_codegen, on_for_codegen) =
+                    rewrite_using_or_natural(select, &flat, &from_order, &join_order_arr)?;
+
+                let (program, column_names) = codegen::join::compile_cross_join(
+                    &select_for_codegen,
+                    &join_order_arr,
+                    &from_order,
+                    on_for_codegen.as_ref(),
+                    left_join,
+                    full_join,
+                )?;
                 return Ok(CompiledSelect {
                     program,
                     column_names,

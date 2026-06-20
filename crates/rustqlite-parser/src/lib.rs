@@ -4277,7 +4277,7 @@ mod tests {
         let TableOrJoin::Join(j) = &s.from[0] else {
             panic!()
         };
-        assert_eq!(j.op, JoinOp::Natural);
+        assert_eq!(j.op, JoinOp::NaturalLeft);
         assert!(j.constraint.is_none());
 
         // RIGHT and FULL OUTER are parsed (execution is later).
