@@ -8,6 +8,7 @@
 //! path and the planner's index selection arrive in later milestones.
 
 pub mod builder;
+pub mod compound;
 pub mod create;
 pub mod delete;
 pub mod drop;

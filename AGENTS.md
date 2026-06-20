@@ -387,3 +387,23 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   emit `OP_Program` (no trigger/view sub-programs compiled yet) — these opcodes are the
   runtime infrastructure for M15 views, M16 triggers, and M8.13 correlated-subquery
   re-materialization.
+
+- **M9 — Compound SELECT** ✅: `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT` via the merge
+  algorithm with coroutines (`codegen::compound`, mirrors `multiSelectByMerge` in `select.c`).
+  Two shapes: `UNION ALL` without `ORDER BY` uses the simple chain path (left arm then right
+  arm, shared LIMIT/OFFSET counters); everything else uses the merge algorithm — each arm is
+  compiled as a coroutine (synthesized `ORDER BY 1, 2, … ncol` when the user didn't supply
+  one, matching upstream's "invent one first" step), the main loop runs both coroutines in
+  parallel, `OP_Compare` + `OP_Jump` route to `AltB`/`AeqB`/`AgtB`/`EofA`/`EofB` handlers
+  implementing the operator-specific logic, and duplicate removal for `UNION`/`INTERSECT`/
+  `EXCEPT` runs inside `outA`/`outB` subroutines via a `regPrev` block + `OP_Compare`/`OP_Jump`
+  skip-if-equal. `EXPLAIN QUERY PLAN` emits the oracle-faithful `COMPOUND QUERY` /
+  `LEFT-MOST SUBQUERY` / `<OP> [USING TEMP B-TREE]` tree (no ORDER BY) or `MERGE (<OP>)` /
+  `LEFT` / `RIGHT` tree (with ORDER BY). Multi-arm compounds (3+ arms) lower
+  left-associatively: the left sub-compound is compiled recursively and materialized into a
+  sorter that serves as the outer merge's "A" coroutine. The `Program` struct gained a
+  `num_cursors` field so the outer builder can advance `next_cursor` past an inlined arm's
+  cursors (both arms' cursors are open simultaneously during the merge). Differential-tested
+  vs the C oracle (`compound_select`, `compound_select_column_count_mismatch` — all four
+  operators, ORDER BY / LIMIT / OFFSET, multi-arm, cross-table, NULL handling, and
+  column-count-mismatch error parity).

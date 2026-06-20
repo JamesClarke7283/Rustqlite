@@ -183,6 +183,7 @@ impl ProgramBuilder {
         Program {
             instructions: self.insts,
             num_registers: self.next_reg as usize,
+            num_cursors: self.next_cursor as usize,
         }
     }
 }

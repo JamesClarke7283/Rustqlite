@@ -37,6 +37,12 @@ pub fn compile(
     indexes: &[IndexObject],
     subquery_resolver: Option<&dyn SubqueryResolver>,
 ) -> Result<(Program, Vec<String>)> {
+    // A compound SELECT (UNION/UNION ALL/INTERSECT/EXCEPT) is lowered by the dedicated
+    // `codegen::compound` module, which mirrors `multiSelect`/`multiSelectByMerge` in
+    // `select.c`. The non-compound path continues below.
+    if !select.compound.is_empty() {
+        return super::compound::compile_compound(select, table, indexes, subquery_resolver);
+    }
     reject_unsupported(select)?;
 
     let outputs = expand_columns(select, table)?;

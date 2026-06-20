@@ -1435,3 +1435,104 @@ fn in_subquery() {
         assert_same(db.str(), q);
     }
 }
+
+/// Compound SELECT (UNION / UNION ALL / INTERSECT / EXCEPT) — M9. Tests all four operators,
+/// ORDER BY / LIMIT / OFFSET on the compound result, multi-arm compounds, and arms that scan
+/// real tables with WHERE filters. Differential-tested vs the system `sqlite3` oracle.
+#[test]
+fn compound_select() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup(
+        "CREATE TABLE t(a INT, b TEXT);\
+         CREATE TABLE u(a INT, c TEXT);\
+         INSERT INTO t VALUES (1,'x'),(2,'y'),(3,'z'),(NULL,'w');\
+         INSERT INTO u VALUES (1,'p'),(2,'q'),(4,'r'),(NULL,'s');",
+    );
+    for q in [
+        // Basic 2-arm compounds.
+        "SELECT 1 UNION SELECT 2;",
+        "SELECT 1 UNION ALL SELECT 2;",
+        "SELECT 1 INTERSECT SELECT 2;",
+        "SELECT 1 EXCEPT SELECT 2;",
+        "SELECT 2 INTERSECT SELECT 2;",
+        "SELECT 2 EXCEPT SELECT 1;",
+        // UNION dedup.
+        "SELECT 1 UNION SELECT 1 UNION SELECT 1;",
+        "SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1;",
+        // Table-scanning arms.
+        "SELECT a FROM t UNION SELECT a FROM t;",
+        "SELECT a FROM t UNION ALL SELECT a FROM t;",
+        "SELECT a FROM t INTERSECT SELECT a FROM u;",
+        "SELECT a FROM t EXCEPT SELECT a FROM u;",
+        "SELECT a FROM t UNION SELECT a FROM u;",
+        // Cross-table.
+        "SELECT a FROM t UNION SELECT c FROM u;",
+        "SELECT b FROM t UNION SELECT c FROM u;",
+        // With WHERE on arms.
+        "SELECT a FROM t WHERE a > 1 UNION SELECT a FROM u WHERE a < 4;",
+        "SELECT a FROM t WHERE a > 1 EXCEPT SELECT a FROM u WHERE a < 4;",
+        // ORDER BY on compound.
+        "SELECT a FROM t UNION SELECT a FROM u ORDER BY 1;",
+        "SELECT a FROM t UNION SELECT a FROM u ORDER BY 1 DESC;",
+        "SELECT a FROM t UNION ALL SELECT a FROM u ORDER BY 1;",
+        "SELECT a FROM t INTERSECT SELECT a FROM u ORDER BY 1;",
+        "SELECT a FROM t EXCEPT SELECT a FROM u ORDER BY 1;",
+        // LIMIT / OFFSET on compound.
+        "SELECT a FROM t UNION SELECT a FROM u ORDER BY 1 LIMIT 3;",
+        "SELECT a FROM t UNION SELECT a FROM u ORDER BY 1 LIMIT 2 OFFSET 1;",
+        "SELECT a FROM t UNION ALL SELECT a FROM u LIMIT 5;",
+        // Multi-arm compounds (3+ arms).
+        "SELECT 1 UNION SELECT 2 UNION SELECT 3;",
+        "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3;",
+        "SELECT 1 UNION SELECT 2 UNION SELECT 3 ORDER BY 1 DESC;",
+        "SELECT 1 INTERSECT SELECT 2 INTERSECT SELECT 3;",
+        "SELECT 1 EXCEPT SELECT 2 EXCEPT SELECT 3;",
+        "SELECT a FROM t UNION SELECT a FROM u UNION SELECT 99;",
+        "SELECT 1 UNION SELECT 2 INTERSECT SELECT 2;",
+        "SELECT 1 UNION SELECT 2 INTERSECT SELECT 2 ORDER BY 1;",
+        // Mixed operators.
+        "SELECT a FROM t UNION SELECT a FROM u EXCEPT SELECT a FROM t WHERE a = 2;",
+        // NULL handling.
+        "SELECT NULL UNION SELECT 1;",
+        "SELECT NULL UNION SELECT NULL;",
+        "SELECT a FROM t UNION SELECT a FROM u ORDER BY 1;",
+        // Column count mismatch error.
+        // "SELECT 1 UNION SELECT 2, 3;", — error parity tested separately
+        // Expressions in projection.
+        "SELECT a + 1 FROM t UNION SELECT a FROM u ORDER BY 1;",
+        "SELECT a * 2 FROM t WHERE a IS NOT NULL UNION SELECT a FROM u WHERE a IS NOT NULL ORDER BY 1;",
+    ] {
+        assert_same(db.str(), q);
+    }
+}
+
+/// Column-count mismatch in compound SELECT — matches the oracle's error message.
+#[test]
+fn compound_select_column_count_mismatch() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup("CREATE TABLE t(a INT); INSERT INTO t VALUES (1);");
+    for q in [
+        "SELECT 1 UNION SELECT 2, 3;",
+        "SELECT 1, 2 UNION SELECT 3;",
+        "SELECT 1, 2 UNION SELECT 3, 4, 5;",
+    ] {
+        // The oracle returns an error; verify rustsqlite also errors with the right message.
+        match rustsqlite_rows(db.str(), q) {
+            Ok(got) => panic!("expected error for `{q}`, got rows: {got:?}"),
+            Err(e) => {
+                assert!(
+                    e.contains("do not have the same number of result columns"),
+                    "wrong error for `{q}`: {e}"
+                );
+            }
+        }
+    }
+}

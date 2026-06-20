@@ -90,6 +90,10 @@ pub struct Program {
     pub instructions: Vec<Instruction>,
     /// Number of registers the program needs.
     pub num_registers: usize,
+    /// Number of cursor slots the program needs (the highest cursor number + 1). Used by the
+    /// codegen to advance the outer builder's `next_cursor` after inlining a sub-program so a
+    /// subsequent inlined sub-program's cursors land in a free range.
+    pub num_cursors: usize,
 }
 
 impl Program {

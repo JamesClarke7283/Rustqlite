@@ -2048,7 +2048,7 @@ mod tests {
         // We use a simpler countdown shape: emit 3 explicit AggStep calls.
         let mut prog = Program {
             instructions: Vec::new(),
-            num_registers: 4,
+            num_registers: 4, num_cursors: 0,
         };
         prog.instructions.push(inst(Opcode::Init, 0, 8, 0));
         // Setup: load the literal 1 into r2 (the per-row argument).
@@ -2134,7 +2134,7 @@ mod tests {
                 inst(Opcode::Transaction, 0, 0, 0),
                 inst(Opcode::Goto, 0, 1, 0),
             ],
-            num_registers: 2,
+            num_registers: 2, num_cursors: 0,
         };
         let mut v = Vdbe::new(Arc::new(prog), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -2171,7 +2171,7 @@ mod tests {
                 inst(Opcode::Transaction, 0, 0, 0),
                 inst(Opcode::Goto, 0, 1, 0),
             ],
-            num_registers: 3,
+            num_registers: 3, num_cursors: 0,
         };
         let mut v = Vdbe::new(Arc::new(prog), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -2266,7 +2266,7 @@ mod tests {
                 inst(Opcode::Transaction, 0, 0, 0),   // 14: setup
                 inst(Opcode::Goto, 0, 1, 0),          // 15: enter program
             ],
-            num_registers: 5,
+            num_registers: 5, num_cursors: 0,
         };
         let mut v = Vdbe::new(Arc::new(prog), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -2318,7 +2318,7 @@ mod tests {
                 inst(Opcode::Transaction, 0, 0, 0),  // 10: setup
                 inst(Opcode::Goto, 0, 1, 0),          // 11: enter program
             ],
-            num_registers: 5,
+            num_registers: 5, num_cursors: 0,
         };
         let mut v = Vdbe::new(Arc::new(prog), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -2348,7 +2348,7 @@ mod tests {
                 inst(Opcode::ResultRow, 2, 1, 0),
                 inst(Opcode::Halt, 0, 0, 0),
             ],
-            num_registers: 3,
+            num_registers: 3, num_cursors: 0,
         };
         // Parent layout (6 instructions, 4 registers):
         //   0 Init    0  6 0          ; -> 6 (setup)
@@ -2375,7 +2375,7 @@ mod tests {
                 inst(Opcode::Transaction, 0, 0, 0),
                 inst(Opcode::Goto, 0, 1, 0),
             ],
-            num_registers: 4,
+            num_registers: 4, num_cursors: 0,
         };
         let mut v = Vdbe::new(Arc::new(parent), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -2401,7 +2401,7 @@ mod tests {
             instructions: vec![
                 inst(Opcode::Halt, 0, 5, 0), // p1=OK, p2=OE_Ignore
             ],
-            num_registers: 1,
+            num_registers: 1, num_cursors: 0,
         };
         // Parent layout:
         //   0 Init    0  6 0
@@ -2425,7 +2425,7 @@ mod tests {
                 inst(Opcode::Transaction, 0, 0, 0),
                 inst(Opcode::Goto, 0, 1, 0),
             ],
-            num_registers: 3,
+            num_registers: 3, num_cursors: 0,
         };
         let mut v = Vdbe::new(Arc::new(parent), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -2456,7 +2456,7 @@ mod tests {
                 inst(Opcode::ResultRow, 1, 1, 0),
                 inst(Opcode::Halt, 0, 0, 0),
             ],
-            num_registers: 2,
+            num_registers: 2, num_cursors: 0,
         };
         let inner_arc = Arc::new(inner);
         let outer = Program {
@@ -2466,7 +2466,7 @@ mod tests {
                 inst_with(Opcode::Program, 0, 0, 2, P4::SubProgram(inner_arc), 7),
                 inst(Opcode::Halt, 0, 0, 0),
             ],
-            num_registers: 3,
+            num_registers: 3, num_cursors: 0,
         };
         let outer_arc = Arc::new(outer);
         let parent = Program {
@@ -2477,7 +2477,7 @@ mod tests {
                 inst(Opcode::Transaction, 0, 0, 0),
                 inst(Opcode::Goto, 0, 1, 0),
             ],
-            num_registers: 2,
+            num_registers: 2, num_cursors: 0,
         };
         let mut v = Vdbe::new(Arc::new(parent), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();

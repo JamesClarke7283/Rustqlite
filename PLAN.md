@@ -220,14 +220,14 @@ list every granular item needed.
 
 ## M9 — Compound SELECT
 
-- [ ] **9.1** Parser: `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`
-- [ ] **9.2** Codegen: compound SELECT via ephemeral b-tree (merge-sort or dedup approach)
-- [ ] **9.3** `UNION ALL` — append all rows from each arm
-- [ ] **9.4** `UNION` — deduplicate rows across arms
-- [ ] **9.5** `INTERSECT` — keep only rows appearing in both arms
-- [ ] **9.6** `EXCEPT` — keep rows from first arm not appearing in second
-- [ ] **9.7** `ORDER BY` / `LIMIT` on compound result
-- [ ] **9.8** VDBE: `OpenEphemeral` with `Sorter` flag for compound dedup
+- [x] **9.1** Parser: `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`
+- [x] **9.2** Codegen: compound SELECT via ephemeral b-tree (merge-sort or dedup approach)
+- [x] **9.3** `UNION ALL` — append all rows from each arm
+- [x] **9.4** `UNION` — deduplicate rows across arms
+- [x] **9.5** `INTERSECT` — keep only rows appearing in both arms
+- [x] **9.6** `EXCEPT` — keep rows from first arm not appearing in second
+- [x] **9.7** `ORDER BY` / `LIMIT` on compound result
+- [x] **9.8** VDBE: `OpenEphemeral` with `Sorter` flag for compound dedup
 
 ---
 

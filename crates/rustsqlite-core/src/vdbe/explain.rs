@@ -184,6 +184,11 @@ pub fn query_plan_rows(
     table_name: Option<&str>,
     index_plan: Option<&IndexPlanInfo>,
 ) -> Vec<Vec<Value>> {
+    // A compound SELECT (UNION/UNION ALL/INTERSECT/EXCEPT) gets its own rendering via the
+    // compound codegen module, which mirrors upstream's `COMPOUND QUERY` / `MERGE (<OP>)` tree.
+    if !select.compound.is_empty() {
+        return crate::codegen::compound::explain_compound_rows(select, table_name, index_plan);
+    }
     let mut details: Vec<String> = Vec::new();
     if !select.values.is_empty() {
         // Upstream says "SCAN n-ROW VALUES CLAUSE" for multi-row VALUES, otherwise
