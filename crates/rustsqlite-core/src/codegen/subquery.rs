@@ -781,9 +781,17 @@ fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) 
             c(&mut inst.p1); // cursor
         }
         // Cursors / scans.
-        OpenRead | OpenWrite | OpenWriteReg | OpenEphemeral | Close => {
+        OpenRead | OpenWrite | OpenWriteReg | OpenEphemeral | OpenPseudo | Close => {
             c(&mut inst.p1); // cursor number
             // OpenEphemeral p2 = column count; OpenRead p2 = rootpage; not rebased.
+            // OpenPseudo p2 = source register; rebased below.
+            if inst.opcode == OpenPseudo {
+                r(&mut inst.p2);
+            }
+        }
+        RowData => {
+            c(&mut inst.p1); // source cursor
+            r(&mut inst.p2); // destination register
         }
         Column => {
             c(&mut inst.p1); // cursor

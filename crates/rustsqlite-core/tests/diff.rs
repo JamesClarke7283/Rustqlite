@@ -166,6 +166,43 @@ fn non_recursive_ctes() {
     }
 }
 
+/// Recursive CTEs (M10.3). `WITH RECURSIVE name AS (setup UNION [ALL] recursive)` uses the
+/// queue-based iterative algorithm (`generateWithRecursiveQuery` in `select.c`): the setup
+/// query fills a Queue ephemeral; the loop pulls rows from the Queue, appends them to the
+/// CTE result ephemeral, runs the recursive query (with the CTE name bound to the single
+/// "Current" row via a pseudo-cursor), and appends the recursive results back to the Queue;
+/// the loop continues until the Queue is empty. Tests cover: a simple counter, a counter
+/// with a projection expression, LIMIT, UNION (no dedup needed for monotonic queries), a
+/// VALUES setup, and a recursive CTE over a real table.
+#[test]
+fn recursive_ctes() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = standard_fixture();
+    for q in [
+        // Simple counter.
+        "WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x WHERE n<5) SELECT n FROM x ORDER BY n;",
+        "WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x WHERE n<5) SELECT n FROM x;",
+        // Multi-column projection.
+        "WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x WHERE n<10) SELECT n, n*n FROM x ORDER BY n;",
+        // LIMIT.
+        "WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x WHERE n<100) SELECT n FROM x LIMIT 5;",
+        "WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x WHERE n<100) SELECT n FROM x LIMIT 5 OFFSET 2;",
+        // UNION (no dedup needed for monotonic queries).
+        "WITH RECURSIVE x(n) AS (SELECT 1 UNION SELECT n+1 FROM x WHERE n<5) SELECT n FROM x ORDER BY n;",
+        // VALUES setup.
+        "WITH RECURSIVE cnt(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM cnt WHERE x<5) SELECT x FROM cnt ORDER BY x;",
+        // Recursive CTE over a real table (single-table scan in the setup).
+        "WITH RECURSIVE x(a) AS (SELECT a FROM t WHERE a > 1 UNION ALL SELECT a+1 FROM x WHERE a < 10) SELECT a FROM x ORDER BY a;",
+        // Explicit column list.
+        "WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x WHERE n<3) SELECT n FROM x ORDER BY n;",
+    ] {
+        assert_same(db.str(), q);
+    }
+}
+
 /// Assert rustsqlite and sqlite3 produce identical rows for `query` against `db`.
 fn assert_same(db: &str, query: &str) {
     let expected = sqlite3_rows(db, query);

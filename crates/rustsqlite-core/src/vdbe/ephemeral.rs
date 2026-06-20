@@ -148,4 +148,29 @@ impl Ephemeral {
             .and_then(|vals| vals.get(i).cloned())
             .unwrap_or(Value::Null)
     }
+
+    /// The current iteration position (the index into `records` of the row the cursor is on).
+    /// Used by `OP_RowData` to fetch the raw record bytes.
+    pub fn current_position(&self) -> usize {
+        self.pos
+    }
+
+    /// The raw record bytes at position `pos`, or `None` if out of range.
+    pub fn record_at(&self, pos: usize) -> Option<Vec<u8>> {
+        self.records.get(pos).cloned()
+    }
+
+    /// Remove the record at the current position, shifting subsequent records down. Used by
+    /// the recursive CTE loop to drain the Queue as rows are processed.
+    pub fn delete_current(&mut self) {
+        if self.pos < self.records.len() {
+            self.records.remove(self.pos);
+            self.current = None;
+        }
+    }
+
+    /// Whether the ephemeral is empty (no records).
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
 }

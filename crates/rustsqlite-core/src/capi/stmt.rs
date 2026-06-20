@@ -700,7 +700,19 @@ fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelec
     // rewritten SELECT has its `with_clause` cleared, so this is a one-shot rewrite and
     // downstream codegen sees a plain `FROM (subquery) AS alias` shape that the existing
     // `codegen::subquery::compile_from_subquery` infrastructure handles. Recursive CTEs
-    // (M10.3) are not yet supported and surface as a codegen error here.
+    // (M10.3) use a dedicated queue-based codegen path (`codegen::cte::compile_recursive`).
+    if let Some(with) = select.with_clause.as_ref() {
+        if codegen::cte::is_recursive(with) {
+            let cte = codegen::cte::compile_recursive(db, select)?;
+            return Ok(CompiledSelect {
+                program: cte.program,
+                column_names: cte.column_names,
+                pager: cte.pager,
+                table: None,
+                index_plan_info: None,
+            });
+        }
+    }
     let select_owned: SelectStmt;
     let select: &SelectStmt = if codegen::cte::has_ctes(select) {
         select_owned = codegen::cte::rewrite_with_ctes(select)?;

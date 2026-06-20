@@ -68,6 +68,15 @@ impl ProgramBuilder {
         self.next_reg
     }
 
+    /// Advance the register high-water mark to at least `min_next` (no-op if already past it).
+    /// Used after inlining a sub-program to ensure the final program's `num_registers` covers
+    /// the inlined code's rebased register operands.
+    pub fn advance_regs(&mut self, min_next: i32) {
+        if min_next > self.next_reg {
+            self.next_reg = min_next;
+        }
+    }
+
     /// Record that the outer program has opened (or will open) a cursor with number `c`,
     /// bumping [`Self::next_cursor`] past it. Callers that hardcode cursor numbers (the scan
     /// codegen uses cursor 0, the sorter 1, the distinct dedup 2, etc.) call this so a later
@@ -78,9 +87,9 @@ impl ProgramBuilder {
         }
     }
 
-    /// The next cursor number that is guaranteed free (past every cursor the outer program
-    /// has opened or noted so far). Used by sub-program inlining to offset the sub-program's
-    /// cursor numbers.
+    /// The next cursor number that will be handed out (one past the highest cursor noted so
+    /// far). Used by callers that need to rebase an inlined sub-program's cursor numbers past
+    /// the outer program's already-allocated cursors.
     pub fn next_cursor(&self) -> i32 {
         self.next_cursor
     }

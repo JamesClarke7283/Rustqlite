@@ -1217,7 +1217,16 @@ fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) 
             r(&mut inst.p3);
         }
         SorterSort | SorterNext => c(&mut inst.p1),
-        OpenRead | OpenWrite | OpenWriteReg | OpenEphemeral | Close => c(&mut inst.p1),
+        OpenRead | OpenWrite | OpenWriteReg | OpenEphemeral | OpenPseudo | Close => {
+            c(&mut inst.p1);
+            if inst.opcode == OpenPseudo {
+                r(&mut inst.p2);
+            }
+        }
+        RowData => {
+            c(&mut inst.p1);
+            r(&mut inst.p2);
+        }
         Column => {
             c(&mut inst.p1);
             r(&mut inst.p3);

@@ -407,7 +407,7 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   vs the C oracle (`compound_select`, `compound_select_column_count_mismatch` — all four
   operators, ORDER BY / LIMIT / OFFSET, multi-arm, cross-table, NULL handling, and
   column-count-mismatch error parity).
-- **M10 — CTEs (Common Table Expressions)** 🚧: **10.1–10.2, 10.4–10.5** ✅ (parser
+- **M10 — CTEs (Common Table Expressions)** ✅: **10.1–10.5** ✅ (parser
   shipped in M2.18). Non-recursive CTEs are implemented by AST rewriting
   (`codegen::cte::rewrite_with_ctes`, mirrors the `searchWith`/`SRT_EphemTab` path in
   `select.c`): a `WITH …` clause on a SELECT is expanded by rewriting each CTE reference
@@ -424,13 +424,27 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   the body is nested inside an outer shell `SELECT <names> FROM (body) AS __cte_inner` so
   the inner `*` expands against its own FROM table at codegen time). A schema-qualified
   reference (`main.cte`) never matches a CTE (matches upstream's `searchWith` early-out).
-  Recursive CTEs (`WITH RECURSIVE`, M10.3) are detected and rejected with a clear error
-  pending the queue-based iterative algorithm (`generateWithRecursiveQuery` in `select.c`).
-  Differential-tested vs the C oracle (`non_recursive_ctes` — constant CTE, CTE over a
-  real table, `SELECT *`, projection, WHERE/ORDER BY/LIMIT on the outer query, multiple
-  CTEs, explicit column list, alias, aggregate body). Known limitations: a CTE whose body
-  is itself a compound SELECT (coroutine-based) is not yet inlinable into the outer
-  materialization; a CTE referenced inside a scalar/`IN`/`EXISTS` subquery is not yet
-  rewritten (the SubqueryResolver path doesn't apply the CTE rewrite); nested subqueries
-  in FROM (`FROM (SELECT … FROM (SELECT …))`) block a CTE-referencing-CTE whose inner CTE
-  is rewritten to a subquery — these land with nested-subquery support and M10.3.
+  **10.3 Recursive CTEs** ✅ are implemented by `codegen::cte::compile_recursive`, which
+  mirrors `generateWithRecursiveQuery` in `select.c`: the setup query fills a Queue
+  ephemeral; the loop pulls rows from the Queue (`OP_Rewind`/`OP_RowData`/`OP_Delete`),
+  appends each to the CTE result ephemeral (`OP_NewRowid`/`OP_Insert`), runs the recursive
+  query with the CTE name bound to the single "Current" row via a new `OP_OpenPseudo`
+  pseudo-cursor (reading from a register set by `OP_RowData`), and appends the recursive
+  results back to the Queue; the loop continues until the Queue is empty. The outer query
+  then scans the CTE result ephemeral. Three new opcodes (`OP_OpenPseudo`, `OP_RowData`,
+  and the `PseudoCursor` variant) were added; `OP_Delete` now handles ephemeral cursors
+  (drain the Queue); `OP_NullRow`/`OP_Rewind`/`OP_Next` handle pseudo-cursors (no-op /
+  always-valid / always-exhausted). The setup/recursive/outer sub-programs are inlined
+  into one program with register and cursor rebasing (the CTE-name table cursor 0 is
+  rewritten to the Current pseudo-cursor for the recursive arm and to the CTE result
+  ephemeral for the outer scan). Differential-tested vs the C oracle (`non_recursive_ctes`,
+  `recursive_ctes` — counter, multi-column projection, LIMIT/OFFSET, UNION, VALUES setup,
+  recursive CTE over a real table). Known limitations: `UNION` (dedup) is not enforced
+  (treated as `UNION ALL` — correct for monotonic recursive queries); the recursive arm
+  must scan the CTE name as its single FROM entry (no joins in the recursive arm); the
+  outer query must scan the CTE name as its single FROM entry (no joins over a recursive
+  CTE); a CTE whose body is itself a compound SELECT (coroutine-based) is not yet
+  inlinable into the outer materialization; a CTE referenced inside a scalar/`IN`/`EXISTS`
+  subquery is not yet rewritten (the SubqueryResolver path doesn't apply the CTE rewrite);
+  nested subqueries in FROM block a non-recursive CTE-referencing-CTE whose inner CTE is
+  rewritten to a subquery — these land with nested-subquery support.

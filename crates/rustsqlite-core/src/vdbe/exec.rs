@@ -22,7 +22,7 @@ use crate::pager::Pager;
 use crate::types::{Affinity, Collation, Value};
 
 use super::compare::{apply_affinity, mem_compare};
-use super::cursor::VdbeCursor;
+use super::cursor::{PseudoCursor, VdbeCursor};
 use super::ephemeral::Ephemeral;
 use super::opcode::Opcode;
 use super::program::{
@@ -714,6 +714,11 @@ impl Vdbe {
                         VdbeCursor::Sorter(_) | VdbeCursor::Ephemeral(_) => {
                             return Err(Error::msg("NullRow on a sorter/ephemeral cursor is not supported"));
                         }
+                        VdbeCursor::Pseudo(p) => {
+                            // Reset the cached decoded record so the next Column re-reads from
+                            // the register. Mirrors upstream's column-cache reset.
+                            p.current = None;
+                        }
                     }
                     self.decoded = None;
                     self.pc += 1;
@@ -752,6 +757,12 @@ impl Vdbe {
                             } else {
                                 self.pc = p2 as usize;
                             }
+                        }
+                        VdbeCursor::Pseudo(_) => {
+                            // A pseudo-cursor always has its single row (set by RowData
+                            // before the recursive query runs). Rewind is a no-op that
+                            // falls through (never jumps to p2).
+                            self.pc += 1;
                         }
                     }
                 }
@@ -794,6 +805,11 @@ impl Vdbe {
                             } else {
                                 self.pc += 1;
                             }
+                        }
+                        VdbeCursor::Pseudo(_) => {
+                            // A pseudo-cursor has exactly one row. After that row is
+                            // processed, Next falls through (no more rows) — never jumps.
+                            self.pc += 1;
                         }
                     }
                 }
@@ -1316,6 +1332,19 @@ impl Vdbe {
                     }
                 }
                 Opcode::Delete => {
+                    // An ephemeral cursor (recursive CTE Queue drain) uses the in-memory delete
+                    // path; a table b-tree cursor uses the pager-backed path.
+                    let is_ephemeral = self
+                        .cursors
+                        .get(p1 as usize)
+                        .and_then(|c| c.as_ref())
+                        .is_some_and(VdbeCursor::is_ephemeral);
+                    if is_ephemeral {
+                        let slot = self.cursors[p1 as usize].as_mut().unwrap();
+                        slot.as_ephemeral_mut().unwrap().delete_current();
+                        self.pc += 1;
+                        continue;
+                    }
                     // Sanity-check the cursor exists; the actual delete goes through
                     // `TableCursor::delete_current`, which addresses the leaf directly.
                     self.cursor_root_of(p1)?;
@@ -1355,13 +1384,42 @@ impl Vdbe {
                     // Open an in-memory ephemeral table with p2 fields and stash it under cursor p1.
                     // When P4 is a KeyInfo, upstream opens an index-keyed ephemeral (used for
                     // DISTINCT dedup and IN-set materialization); otherwise a rowid-keyed table
-                    // (RETURNING buffer).
+                    // (used by RETURNING buffer).
                     let nfield = p2 as usize;
                     let eph = match &inst.p4 {
                         P4::KeyInfo(_) => Ephemeral::new_index(nfield, self.encoding),
                         _ => Ephemeral::new(nfield, self.encoding),
                     };
                     self.set_cursor(p1 as usize, VdbeCursor::Ephemeral(eph));
+                    self.pc += 1;
+                }
+
+                Opcode::OpenPseudo => {
+                    // Open a pseudo-cursor that reads a single record from register r[p2].
+                    // Used by recursive CTEs to expose the "Current" row to the recursive query.
+                    let pseudo = PseudoCursor::new(p2, self.encoding);
+                    self.set_cursor(p1 as usize, VdbeCursor::Pseudo(pseudo));
+                    self.pc += 1;
+                }
+
+                Opcode::RowData => {
+                    // Copy the full record blob of cursor p1's current row into r[p2].
+                    // For an ephemeral cursor, this is the raw stored record bytes.
+                    let slot = self
+                        .cursors
+                        .get(p1 as usize)
+                        .and_then(|c| c.as_ref())
+                        .ok_or_else(|| Error::msg("RowData on a closed cursor"))?;
+                    let blob = match slot {
+                        VdbeCursor::Ephemeral(e) => {
+                            let pos = e.current_position();
+                            e.record_at(pos).ok_or_else(|| {
+                                Error::msg("RowData: ephemeral cursor has no current record")
+                            })?
+                        }
+                        _ => return Err(Error::msg("RowData on an unsupported cursor type")),
+                    };
+                    self.regs[p2 as usize] = Value::Blob(blob);
                     self.pc += 1;
                 }
 
@@ -1577,6 +1635,20 @@ impl Vdbe {
                     let slot = self.cursors[idx].as_mut().unwrap();
                     slot.as_ephemeral_mut().unwrap().data()?;
                     return Ok(slot.as_ephemeral().unwrap().column(col));
+                }
+
+                // Pseudo cursors (recursive CTE "Current" row) read from a register blob.
+                if self
+                    .cursors
+                    .get(idx)
+                    .and_then(|c| c.as_ref())
+                    .is_some_and(VdbeCursor::is_pseudo)
+                {
+                    let slot = self.cursors[idx].as_mut().unwrap();
+                    let reg = slot.as_pseudo().unwrap().reg;
+                    slot.as_pseudo_mut().unwrap().data(&self.regs)?;
+                    let _ = reg;
+                    return Ok(slot.as_pseudo().unwrap().column(col));
                 }
 
                 // Index cursors (used by WITHOUT ROWID tables and by secondary indexes): read

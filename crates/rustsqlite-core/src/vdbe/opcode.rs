@@ -304,6 +304,15 @@ pub enum Opcode {
     /// row, then rewind and emit them after the write transaction completes. `NewRowid` allocates
     /// a unique key and `Insert` stores the buffered record.
     OpenEphemeral,
+    /// `OpenPseudo p1 p2 p3`: open a pseudo-cursor `p1` that reads a single record stored in
+    /// register `r[p2]`. `p3` is the column count. `Column` on a pseudo-cursor decodes a field
+    /// from the register's record blob. Used by recursive CTEs to expose the single "Current"
+    /// row to the recursive query's scan. Mirrors `OP_OpenPseudo` in `vdbe.c`.
+    OpenPseudo,
+    /// `RowData p1 p2`: copy the full record blob of cursor `p1`'s current row into `r[p2]`.
+    /// Used by recursive CTEs to transfer a row from the Queue ephemeral into the Current
+    /// pseudo-cursor's register. Mirrors `OP_RowData` in `vdbe.c`.
+    RowData,
 
     // --- LIMIT / OFFSET ---
     /// `DecrJumpZero p1 p2`: decrement `r[p1]`; if it becomes 0, jump to `p2` (LIMIT).
@@ -415,6 +424,8 @@ impl Opcode {
             Opcode::SorterData => "SorterData",
             Opcode::SorterNext => "SorterNext",
             Opcode::OpenEphemeral => "OpenEphemeral",
+            Opcode::OpenPseudo => "OpenPseudo",
+            Opcode::RowData => "RowData",
             Opcode::DecrJumpZero => "DecrJumpZero",
             Opcode::IfPos => "IfPos",
             Opcode::AggStep => "AggStep",
