@@ -149,10 +149,18 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   index keys (concatenated indexed columns + trailing rowid), per-row `IdxInsert`/`IdxDelete`
   maintenance from `INSERT`/`UPDATE`/`DELETE`, and indexed prefix-equality `SELECT`
   (`WHERE col1 = ? AND col2 = ? …`). Index b-tree page splits and interior-page traversal
-  were already in place from the M5.1 follow-up work. Differential-tested vs the C oracle
-  (`multi_column_index_select`, `multi_column_index_maintained_on_writes`) and the in-process
-  slt harness (`our/multi-column-index.slt`). Still M5+: `KeyInfo` per-column collation,
-  enforced `UNIQUE`, partial/expression indexes, `ORDER BY` via index ordering hints.
+  were already in place from the M5.1 follow-up work. **5.2.12–5.2.14 covering/ORDER BY index
+  scans** ✅: the planner now picks an index for three benefits — a WHERE equality prefix
+  (seek), a covering index (index-only scan, no table lookup), and an ORDER BY prefix (no
+  sorter) — which compose on a single index (`SELECT a,b FROM t WHERE a=? ORDER BY b` on
+  `INDEX(a,b)` seeks to `a=?` and walks in `b` order). The covering path reads projection /
+  WHERE / ORDER BY columns directly from the index cursor via a `Ctx.index_read` column-
+  position map (the rowid-alias column maps to the trailing rowid at `nkey_fields`). `EXPLAIN
+  QUERY PLAN` emits the oracle-faithful `SCAN/SEARCH t USING [COVERING] INDEX <name>
+  [(<col>=? ...)]`. Differential-tested vs the C oracle (`covering_and_orderby_index_scans`,
+  `eqp_index_plan_details_match_oracle`). Still M5+: `KeyInfo` per-column collation,
+  enforced `UNIQUE`, partial/expression indexes, reverse (DESC) index scans, multi-column
+  ORDER BY with mixed ASC/DESC.
 - **M5.3 — B-Tree Robustness & WITHOUT ROWID** 🚧: page merging on delete, interior-page
   balancing, `Clear` opcode, freelist reuse/walking all landed. **5.3.6 `WITHOUT ROWID`
   tables** ✅: `CREATE TABLE … (…, PRIMARY KEY(…)) WITHOUT ROWID` opens a blob-keyed

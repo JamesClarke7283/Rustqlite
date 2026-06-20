@@ -827,9 +827,9 @@ list every granular item needed.
 
 ### M5.2 — Index (Additional Items)
 
-- [ ] **5.2.12** Covering index / index-only scan: satisfy `SELECT` columns from index without table lookup
-- [ ] **5.2.13** Index scan for ORDER BY (avoid sorter when index provides ordering)
-- [ ] **5.2.14** Index scan for both WHERE + ORDER BY (prefix for WHERE, suffix for ORDER BY)
+- [x] **5.2.12** Covering index / index-only scan: satisfy `SELECT` columns from index without table lookup
+- [x] **5.2.13** Index scan for ORDER BY (avoid sorter when index provides ordering)
+- [x] **5.2.14** Index scan for both WHERE + ORDER BY (prefix for WHERE, suffix for ORDER BY)
 
 ### M5.3 — B-Tree (Additional Items)
 

@@ -528,7 +528,7 @@ fn prepare_explain(
                 .collect(),
         ),
         ExplainKind::QueryPlan => (
-            explain::query_plan_rows(&select, table_name),
+            explain::query_plan_rows(&select, table_name, compiled.index_plan_info.as_ref()),
             explain::QUERY_PLAN_HEADER
                 .iter()
                 .map(|s| s.to_string())
@@ -565,6 +565,9 @@ struct CompiledSelect {
     column_names: Vec<String>,
     pager: Option<Arc<Pager>>,
     table: Option<Table>,
+    /// The index-plan summary for `EXPLAIN QUERY PLAN`. `None` for a table scan / VALUES /
+    /// constant SELECT.
+    index_plan_info: Option<crate::vdbe::explain::IndexPlanInfo>,
 }
 
 /// Resolve the single FROM table (if any) from the catalog and compile the SELECT. Shared by the
@@ -611,11 +614,13 @@ fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelec
     };
 
     let (program, column_names) = codegen::compile_select(select, table.as_ref(), &indexes)?;
+    let index_plan_info = codegen::select_index_plan_info(select, table.as_ref(), &indexes);
     Ok(CompiledSelect {
         program,
         column_names,
         pager,
         table,
+        index_plan_info,
     })
 }
 

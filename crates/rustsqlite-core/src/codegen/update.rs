@@ -129,7 +129,7 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
 
     let cursor = 0i32;
     let sorter = 1i32;
-    let ctx = Ctx { table, cursor, register_base: None };
+    let ctx = Ctx { table, cursor, register_base: None, index_read: None };
     let mut b = ProgramBuilder::new();
 
     let returning = upd
@@ -290,7 +290,7 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
         let skip_delete_label = if let Some(pred) = &idx.where_clause {
             validate_partial_pred_on_update(pred, table, &target_col)?;
             let skip = b.new_label();
-            let pred_ctx = Ctx { table, cursor, register_base: None };
+            let pred_ctx = Ctx { table, cursor, register_base: None, index_read: None };
             compile_pred_jump(&mut b, pred, skip, table, reg_new, indexed_cis.as_slice(), pred_ctx)?;
             Some(skip)
         } else {
@@ -306,6 +306,7 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
                     table,
                     cursor,
                     register_base: Some(reg_old),
+                    index_read: None,
                 };
                 compile_expr(&mut b, expr, target, expr_ctx)?;
             } else {
@@ -357,7 +358,7 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
         let skip_insert_label = if let Some(pred) = &idx.where_clause {
             validate_partial_pred_on_update(pred, table, &target_col)?;
             let skip = b.new_label();
-            let pred_ctx = Ctx { table, cursor, register_base: None };
+            let pred_ctx = Ctx { table, cursor, register_base: None, index_read: None };
             compile_pred_jump(&mut b, pred, skip, table, reg_new, indexed_cis.as_slice(), pred_ctx)?;
             Some(skip)
         } else {
@@ -374,6 +375,7 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
                     table,
                     cursor,
                     register_base: Some(reg_new),
+                    index_read: None,
                 };
                 compile_expr(&mut b, expr, target, expr_ctx)?;
             } else {

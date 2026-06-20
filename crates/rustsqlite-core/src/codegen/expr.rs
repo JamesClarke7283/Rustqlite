@@ -27,6 +27,29 @@ pub struct Ctx<'a> {
     /// Used for partial-index predicate evaluation during INSERT/UPDATE index maintenance,
     /// where the row values already sit in a contiguous register block.
     pub register_base: Option<i32>,
+    /// When set, column references read from the index cursor at the mapped record position
+    /// instead of the table cursor. Used for covering-index scans, where the projection /
+    /// WHERE / ORDER BY are satisfied entirely by the index b-tree and no table cursor is
+    /// opened. The map translates a table-column index to the position of that column's
+    /// value in the index key record (`[indexed cols..., rowid]`); the rowid-alias column
+    /// maps to `nkey_fields` (the trailing rowid).
+    pub index_read: Option<IndexRead<'a>>,
+}
+
+/// Covering-index read context: the cursor number of the open index and a map from
+/// table-column index to position in the index key record. The map is dense over the
+/// table's columns (every column the query might reference has an entry); unmapped columns
+/// (which should not occur for a validated covering plan) read as NULL.
+#[derive(Clone, Copy)]
+pub struct IndexRead<'a> {
+    /// The index cursor number to read from.
+    pub cursor: i32,
+    /// `table_column_index -> position in the index key record`. Length == table.columns.len();
+    /// an entry of `usize::MAX` means "not in the index" (should not happen for a covering plan
+    /// but defensive).
+    pub column_positions: &'a [usize],
+    /// The position of the trailing rowid in the index key record (`nkey_fields`).
+    pub rowid_position: usize,
 }
 
 /// Emit code computing `e` into register `target`.
@@ -173,6 +196,9 @@ fn compile_column(
                 } else {
                     b.emit(Opcode::Rowid, ctx.cursor, target, 0);
                 }
+            } else if let Some(ir) = ctx.index_read {
+                // Covering-index scan: the rowid is the trailing value of the index key record.
+                b.emit(Opcode::Column, ir.cursor, ir.rowid_position as i32, target);
             } else {
                 b.emit(Opcode::Rowid, ctx.cursor, target, 0);
             }
@@ -180,6 +206,23 @@ fn compile_column(
         Some(ColumnRef::Index(i)) => {
             if let Some(base) = ctx.register_base {
                 b.emit(Opcode::SCopy, base + i as i32, target, 0);
+            } else if let Some(ir) = ctx.index_read {
+                // Covering-index scan: read the column from the index key record at the
+                // mapped position. The position was computed by the planner from the index's
+                // column list; the rowid-alias column maps to the trailing rowid.
+                let pos = ir.column_positions.get(i).copied().unwrap_or(usize::MAX);
+                if pos == usize::MAX {
+                    // Not in the index — a covering plan should never reach here. Emit a NULL
+                    // so the program is still well-formed if it does.
+                    b.emit(Opcode::Null, 0, target, 0);
+                } else {
+                    b.emit(Opcode::Column, ir.cursor, pos as i32, target);
+                    // REAL-affinity columns stored via the index keep their on-disk type; realify
+                    // so integer-valued REAL columns read back as REAL (same as the table path).
+                    if ctx.table.columns[i].affinity == Affinity::Real {
+                        b.emit(Opcode::RealAffinity, target, 0, 0);
+                    }
+                }
             } else {
                 // A WITHOUT ROWID table is stored as an index b-tree keyed by the PK record;
                 // the on-disk column position is the storage index, not the table column index.
@@ -191,11 +234,11 @@ fn compile_column(
                     i as i32
                 };
                 b.emit(Opcode::Column, ctx.cursor, col_pos, target);
-            }
-            // A REAL-affinity column may store integer-valued rows as integers on disk; realify
-            // so they read back as REAL (matches upstream's OP_RealAffinity after OP_Column).
-            if ctx.table.columns[i].affinity == Affinity::Real {
-                b.emit(Opcode::RealAffinity, target, 0, 0);
+                // A REAL-affinity column may store integer-valued rows as integers on disk; realify
+                // so they read back as REAL (matches upstream's OP_RealAffinity after OP_Column).
+                if ctx.table.columns[i].affinity == Affinity::Real {
+                    b.emit(Opcode::RealAffinity, target, 0, 0);
+                }
             }
         }
         None => {

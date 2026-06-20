@@ -41,6 +41,29 @@ pub fn compile_select(
     select::compile(select, table, indexes)
 }
 
+/// Compute the `EXPLAIN QUERY PLAN` index-plan summary for `select` against `table` with its
+/// `indexes`, if the planner picks an index. Returns `None` when the plan is a table scan.
+/// This recomputes the plan (the compile path already computed it once); the cost is cheap
+/// (catalog read + a prefix match) and avoids threading the plan through every compile
+/// return type.
+pub fn select_index_plan_info(
+    select: &SelectStmt,
+    table: Option<&Table>,
+    indexes: &[IndexObject],
+) -> Option<crate::vdbe::explain::IndexPlanInfo> {
+    table.and_then(|t| index_planner::pick_index(select, t, indexes)).map(|plan| {
+        let equality_columns: Vec<String> = plan.equality.iter().map(|e| e.column.clone()).collect();
+        let has_where_equality = !plan.equality.is_empty();
+        crate::vdbe::explain::IndexPlanInfo {
+            index_name: plan.index.name.clone(),
+            covering: plan.covering,
+            has_where_equality,
+            equality_columns,
+            order_by_satisfied: plan.order_by_satisfied,
+        }
+    })
+}
+
 /// Compile a `CREATE TABLE` into a VDBE write program. `sql_text` is stored verbatim in the new
 /// `sqlite_schema` row; `schema_cookie` is the current cookie (the program bumps it by one).
 pub fn compile_create_table(

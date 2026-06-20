@@ -142,6 +142,25 @@ fn synopsis(inst: &Instruction) -> String {
     }
 }
 
+/// A summary of an index plan for `EXPLAIN QUERY PLAN` rendering. Produced by the codegen's
+/// index planner; consumed by [`query_plan_rows`] to emit the
+/// `SCAN/SEARCH t USING [COVERING] INDEX <name> [(<col>=? ...)]` detail strings.
+#[derive(Clone, Debug)]
+pub struct IndexPlanInfo {
+    /// The index name.
+    pub index_name: String,
+    /// `true` when the index covers all columns the query needs (index-only scan).
+    pub covering: bool,
+    /// `true` when the plan has a WHERE equality prefix (a `SeekGE`+`IdxGT` search, not a
+    /// full index scan).
+    pub has_where_equality: bool,
+    /// The WHERE equality column names, in index order. Empty when there is no equality
+    /// prefix. Rendered as `(a=? AND b=?)`.
+    pub equality_columns: Vec<String>,
+    /// `true` when the index scan ordering satisfies the ORDER BY clause (no sorter).
+    pub order_by_satisfied: bool,
+}
+
 /// Render the `EXPLAIN QUERY PLAN` rows reflecting OUR actual plan for `select`. `table_name` is
 /// the resolved single-FROM table's name, or `None` for a FROM-less (constant) SELECT.
 ///
@@ -149,7 +168,11 @@ fn synopsis(inst: &Instruction) -> String {
 /// every plan node is a sibling at the root (parent 0) with a sequential id starting at 1 — this
 /// reproduces the oracle's RENDERED tree for the shapes we support (a lone `SCAN`, and `SCAN`
 /// followed by `USE TEMP B-TREE FOR ORDER BY` as a sibling, not nested). `notused` is always 0.
-pub fn query_plan_rows(select: &SelectStmt, table_name: Option<&str>) -> Vec<Vec<Value>> {
+pub fn query_plan_rows(
+    select: &SelectStmt,
+    table_name: Option<&str>,
+    index_plan: Option<&IndexPlanInfo>,
+) -> Vec<Vec<Value>> {
     let mut details: Vec<String> = Vec::new();
     if !select.values.is_empty() {
         // Upstream says "SCAN n-ROW VALUES CLAUSE" for multi-row VALUES, otherwise
@@ -161,13 +184,47 @@ pub fn query_plan_rows(select: &SelectStmt, table_name: Option<&str>) -> Vec<Vec
         }
     } else {
         match table_name {
-            Some(name) => details.push(format!("SCAN {name}")),
+            Some(name) => {
+                if let Some(info) = index_plan {
+                    // An index-based plan. Upstream's wording:
+                    //   SEARCH t USING [COVERING] INDEX <name> (<col>=? AND <col>=?)
+                    //   SCAN  t USING [COVERING] INDEX <name>
+                    // The SEARCH form is used when there is a WHERE equality prefix (a
+                    // SeekGE+IdxGT search); the SCAN form is a full index walk (covering-only
+                    // or ORDER-BY-only plans). The "(<col>=? ...)" suffix lists the equality
+                    // columns; it is omitted for a SCAN.
+                    let verb = if info.has_where_equality {
+                        "SEARCH"
+                    } else {
+                        "SCAN"
+                    };
+                    let covering = if info.covering { "COVERING " } else { "" };
+                    let mut detail = format!(
+                        "{verb} {name} USING {covering}INDEX {}",
+                        info.index_name
+                    );
+                    if info.has_where_equality && !info.equality_columns.is_empty() {
+                        let cols = info
+                            .equality_columns
+                            .iter()
+                            .map(|c| format!("{c}=?"))
+                            .collect::<Vec<_>>()
+                            .join(" AND ");
+                        detail.push_str(&format!(" ({cols})"));
+                    }
+                    details.push(detail);
+                } else {
+                    details.push(format!("SCAN {name}"));
+                }
+            }
             None => details.push("SCAN CONSTANT ROW".to_string()),
         }
     }
-    if !select.order_by.is_empty() {
-        // Our engine always materializes ORDER BY through the in-memory sorter, so this row is
-        // honest. It renders as a sibling of the SCAN (parent 0), matching the oracle's tree.
+    if !select.order_by.is_empty() && index_plan.map_or(true, |i| !i.order_by_satisfied) {
+        // The index scan already yields rows in the ORDER BY order when
+        // `order_by_satisfied` is true, so no temp b-tree is needed. Otherwise the engine
+        // materializes ORDER BY through the in-memory sorter; this row is honest. It renders
+        // as a sibling of the SCAN (parent 0), matching the oracle's tree.
         details.push("USE TEMP B-TREE FOR ORDER BY".to_string());
     }
 
@@ -210,7 +267,7 @@ mod tests {
 
     #[test]
     fn query_plan_scan_table() {
-        let rows = query_plan_rows(&select("SELECT * FROM t;"), Some("t"));
+        let rows = query_plan_rows(&select("SELECT * FROM t;"), Some("t"), None);
         assert_eq!(details(&rows), vec!["SCAN t"]);
         // id=1, parent=0, notused=0.
         assert_eq!(rows[0][0], Value::Int(1));
@@ -220,7 +277,7 @@ mod tests {
 
     #[test]
     fn query_plan_scan_with_order_by() {
-        let rows = query_plan_rows(&select("SELECT * FROM t ORDER BY a;"), Some("t"));
+        let rows = query_plan_rows(&select("SELECT * FROM t ORDER BY a;"), Some("t"), None);
         assert_eq!(
             details(&rows),
             vec!["SCAN t", "USE TEMP B-TREE FOR ORDER BY"]
@@ -234,14 +291,14 @@ mod tests {
 
     #[test]
     fn query_plan_constant_row() {
-        let rows = query_plan_rows(&select("SELECT 1;"), None);
+        let rows = query_plan_rows(&select("SELECT 1;"), None, None);
         assert_eq!(details(&rows), vec!["SCAN CONSTANT ROW"]);
     }
 
     #[test]
     fn query_plan_where_does_not_change_plan() {
         // A WHERE clause does not change our plan (still a full scan).
-        let rows = query_plan_rows(&select("SELECT * FROM t WHERE a = 1;"), Some("t"));
+        let rows = query_plan_rows(&select("SELECT * FROM t WHERE a = 1;"), Some("t"), None);
         assert_eq!(details(&rows), vec!["SCAN t"]);
     }
 

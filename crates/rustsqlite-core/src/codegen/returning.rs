@@ -185,6 +185,7 @@ impl Returning {
         table,
         cursor,
         register_base: Some(register_base),
+        index_read: None,
     };
     compile_expr(b, expr, target, ctx)
 }

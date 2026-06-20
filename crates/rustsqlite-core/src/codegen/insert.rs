@@ -95,6 +95,7 @@ fn compile_insert_values(
         table,
         cursor,
         register_base: None,
+        index_read: None,
     };
     let mut b = ProgramBuilder::new();
 
@@ -268,6 +269,7 @@ fn compile_insert_without_rowid(
         table,
         cursor,
         register_base: None,
+        index_read: None,
     };
     let mut b = ProgramBuilder::new();
 
@@ -423,6 +425,7 @@ fn emit_index_inserts_without_rowid(
                 table,
                 cursor: 0,
                 register_base: None,
+                index_read: None,
             };
             compile_pred_jump(
                 b,
@@ -447,6 +450,7 @@ fn emit_index_inserts_without_rowid(
                     table,
                     cursor: 0,
                     register_base: Some(col_start),
+                    index_read: None,
                 };
                 compile_expr(b, expr, target, expr_ctx)?;
             } else {
@@ -510,6 +514,7 @@ fn compile_insert_default_values(
         table,
         cursor,
         register_base: None,
+        index_read: None,
     };
     let mut b = ProgramBuilder::new();
 
@@ -836,6 +841,7 @@ fn emit_index_inserts(
                 table,
                 cursor: 0,
                 register_base: None,
+                index_read: None,
             };
             compile_pred_jump(
                 b,
@@ -860,6 +866,7 @@ fn emit_index_inserts(
                     table,
                     cursor: 0,
                     register_base: Some(rec_start),
+                    index_read: None,
                 };
                 compile_expr(b, expr, target, expr_ctx)?;
             } else {

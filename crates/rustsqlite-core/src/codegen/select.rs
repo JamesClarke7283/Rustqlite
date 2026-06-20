@@ -132,6 +132,7 @@ fn compile_aggregate(
         table,
         cursor,
         register_base: None,
+        index_read: None,
     };
     let mut b = ProgramBuilder::new();
 
@@ -611,13 +612,20 @@ fn rewrite_aggregates_with_group_keys(
     }
 }
 
-/// An indexed-equality codegen. Opens a read cursor on the index b-tree (with `KeyInfo`
-/// marking it as an index), opens a read cursor on the table, `SeekGE`s the index for the
-/// first entry `>=` the search key prefix, then `IdxGT`s to verify the prefix is still equal
-/// (jumping past the body on a non-match). The body pulls the rowid from the index, seeks
-/// the table, re-checks the `WHERE` (defensive: when the WHERE is exactly the indexed
-/// equalities this is a tautology), projects the result columns, and `Next`-iterates the
-/// index.
+/// An indexed codegen. The shape depends on the plan's benefits:
+///
+/// * **WHERE equality prefix** (the `equality` list is non-empty): `SeekGE` the index to the
+///   first entry `>=` the search key, then `IdxGT` at the top of every iteration to verify the
+///   prefix is still equal. The body pulls the rowid, seeks the table (unless covering), and
+///   projects.
+/// * **ORDER BY only** (no WHERE equality, but `order_by_satisfied`): `Rewind` the index and
+///   walk forward — the index order is the requested ORDER BY order, so no sorter is needed.
+/// * **Covering** (`covering`): no table cursor is opened and no `IdxRowid`/`NotExists` pair
+///   is emitted; projection / WHERE / ORDER BY read directly from the index cursor at the
+///   mapped record positions.
+///
+/// The three compose: a covering ORDER-BY-only plan is the simplest (`Rewind` + project from
+/// the index); a non-covering WHERE-equality plan is the M5.1 shape (seek + table lookup).
 #[allow(clippy::too_many_arguments)]
 fn compile_indexed_select(
     select: &SelectStmt,
@@ -627,13 +635,29 @@ fn compile_indexed_select(
     limit: Option<i64>,
     offset: i64,
 ) -> Result<Program> {
-    let cursor = 0i32;
-    let idx_cursor = 1i32;
+    let idx_cursor = 0i32;
+    let table_cursor = 1i32;
     let ncol = outputs.len() as i32;
+    let nkey_fields = plan.index.nkey_fields();
+
+    // Build the covering-index column-position map: table_column_index → position in the
+    // index key record. The index record is `[indexed cols..., rowid]`; the rowid-alias
+    // column (if any) maps to `nkey_fields` (the trailing rowid).
+    let column_positions: Vec<usize> = build_index_column_positions(table, &plan.index);
+    let covering = plan.covering;
+    let index_read = covering.then(|| super::expr::IndexRead {
+        cursor: idx_cursor,
+        column_positions: &column_positions,
+        rowid_position: nkey_fields,
+    });
+
+    // The Ctx used for projection / WHERE / ORDER BY evaluation. For a covering plan it
+    // points at the index cursor; otherwise at the table cursor (the rowid-seek target).
     let ctx = Ctx {
         table,
-        cursor,
+        cursor: if covering { idx_cursor } else { table_cursor },
         register_base: None,
+        index_read,
     };
     let mut b = ProgramBuilder::new();
 
@@ -656,12 +680,12 @@ fn compile_indexed_select(
     };
     let offset_reg = (offset > 0).then(|| emit_int(&mut b, offset));
 
-    // (1) Open the table cursor (read-only).
-    let open_table = b.emit(Opcode::OpenRead, cursor, table.rootpage as i32, 0);
-    b.set_p4(open_table, P4::Int(table.columns.len() as i64));
-
-    // (2) Open the index cursor with KeyInfo (one field per indexed column, carrying the
-    // per-column collation and DESC flag so the index cursor compares correctly).
+    // (1) Open cursors. A covering plan opens only the index; a non-covering plan also opens
+    // the table for the rowid seek.
+    if !covering {
+        let open_table = b.emit(Opcode::OpenRead, table_cursor, table.rootpage as i32, 0);
+        b.set_p4(open_table, P4::Int(table.columns.len() as i64));
+    }
     let open_idx = b.emit(Opcode::OpenRead, idx_cursor, plan.index.rootpage as i32, 0);
     let key_info: Vec<KeyField> = plan
         .index
@@ -674,35 +698,59 @@ fn compile_indexed_select(
         .collect();
     b.set_p4(open_idx, P4::KeyInfo(key_info));
 
-    // (3) Load the equality values into a contiguous register block; emit SeekGE.
+    // (2) Position the index. A WHERE-equality plan seeks to the first entry `>=` the search
+    // key prefix; an ORDER-BY-only (or covering-only) plan rewinds to the first entry.
     let nkey = plan.equality.len() as i32;
-    let key_reg = b.alloc_regs(nkey);
-    for (i, ek) in plan.equality.iter().enumerate() {
-        emit_value_load(&mut b, &ek.value, key_reg + i as i32);
-    }
+    let key_reg = if nkey > 0 {
+        let key_reg = b.alloc_regs(nkey);
+        for (i, ek) in plan.equality.iter().enumerate() {
+            emit_value_load(&mut b, &ek.value, key_reg + i as i32);
+        }
+        Some(key_reg)
+    } else {
+        None
+    };
     let end_seek = b.new_label();
-    let seek = b.emit_jump(Opcode::SeekGE, idx_cursor, end_seek, key_reg);
-    b.set_p4(seek, P4::Int(nkey as i64));
+    if nkey > 0 {
+        let seek = b.emit_jump(Opcode::SeekGE, idx_cursor, end_seek, key_reg.unwrap());
+        b.set_p4(seek, P4::Int(nkey as i64));
+    } else {
+        b.emit_jump(Opcode::Rewind, idx_cursor, end_seek, 0);
+    }
 
     // DISTINCT dedup cursor (opened before the loop so it survives across iterations).
+    let distinct_cursor_id = if covering { 1i32 } else { 2i32 };
     let distinct_cursor = select.distinct.then(|| {
-        let c = 2i32;
+        let c = distinct_cursor_id;
         let oe = b.emit(Opcode::OpenEphemeral, c, ncol, 0);
         b.set_p4(oe, P4::KeyInfo(Vec::new()));
         c
     });
 
-    // (5) Loop body: read the rowid, seek the table, project. The IdxGT boundary
-    // check is re-emitted at the top of every iteration so the loop terminates when the
-    // index key prefix no longer matches.
+    // (3) Loop body. The IdxGT boundary check is re-emitted at the top of every iteration
+    // (only for the WHERE-equality shape) so the loop terminates when the index key prefix
+    // no longer matches. A covering plan skips the IdxRowid + NotExists table lookup.
     let loop_top = b.new_label();
     b.resolve(loop_top);
-    let idx_gt = b.emit_jump(Opcode::IdxGT, idx_cursor, end_seek, key_reg);
-    b.set_p4(idx_gt, P4::Int(nkey as i64));
-    let rowid_reg = b.alloc_reg();
-    b.emit(Opcode::IdxRowid, idx_cursor, rowid_reg, 0);
+    if nkey > 0 {
+        let idx_gt = b.emit_jump(Opcode::IdxGT, idx_cursor, end_seek, key_reg.unwrap());
+        b.set_p4(idx_gt, P4::Int(nkey as i64));
+    }
     let idx_next = b.new_label();
-    b.emit_jump(Opcode::NotExists, cursor, idx_next, rowid_reg);
+    if !covering {
+        let rowid_reg = b.alloc_reg();
+        b.emit(Opcode::IdxRowid, idx_cursor, rowid_reg, 0);
+        b.emit_jump(Opcode::NotExists, table_cursor, idx_next, rowid_reg);
+    }
+
+    // Re-check the WHERE clause on the row. The SeekGE+IdxGT only verified the indexed-column
+    // equality prefix; a WHERE with additional terms (or a non-equality predicate that the
+    // planner couldn't turn into a prefix, like `IS NULL`) is re-evaluated here against the
+    // row's column values. For a covering plan the columns are read from the index cursor
+    // (via `ctx.index_read`); for a non-covering plan they're read from the table cursor.
+    if let Some(w) = &select.where_clause {
+        compile_jump(&mut b, w, idx_next, false, true, ctx)?;
+    }
 
     // OFFSET gate.
     if let Some(oreg) = offset_reg {
@@ -726,9 +774,11 @@ fn compile_indexed_select(
         b.emit_jump(Opcode::DecrJumpZero, lreg, end_seek, 0);
     }
 
-    // Advance: next index entry, jumping back to the top of the body.
-    b.emit_jump(Opcode::Next, idx_cursor, loop_top, 0);
+    // Advance: next index entry, jumping back to the top of the body. `idx_next` is the
+    // "skip this row" target — it lands on the `Next` so the cursor still advances (a skip
+    // must NOT terminate the scan). `end_seek` is the "stop the scan" target (Halt).
     b.resolve(idx_next);
+    b.emit_jump(Opcode::Next, idx_cursor, loop_top, 0);
     b.resolve(end_seek);
 
     b.emit(Opcode::Halt, 0, 0, 0);
@@ -736,6 +786,26 @@ fn compile_indexed_select(
     b.emit(Opcode::Transaction, 0, 0, 0);
     b.emit(Opcode::Goto, 0, after_init, 0);
     Ok(b.finish())
+}
+
+/// Build the covering-index column-position map: `column_positions[table_col_idx]` = position
+/// of that table column's value in the index key record. The index record is
+/// `[indexed cols..., rowid]`, so an indexed column at index position `j` maps to `j`, and the
+/// rowid-alias column (if any) maps to `nkey_fields` (the trailing rowid). Columns not in the
+/// index get `usize::MAX` (a covering plan will never read them, but the sentinel is
+/// defensive).
+fn build_index_column_positions(table: &Table, index: &IndexObject) -> Vec<usize> {
+    let nkey = index.nkey_fields();
+    let mut out = vec![usize::MAX; table.columns.len()];
+    for (j, ic) in index.columns.iter().enumerate() {
+        if let Some(ci) = table.column_index(&ic.name) {
+            out[ci] = j;
+        }
+    }
+    if let Some(alias) = table.rowid_alias {
+        out[alias] = nkey;
+    }
+    out
 }
 
 /// Emit a register load of a literal [`Value`] (used by the indexed path's constant-RHS).
@@ -1044,6 +1114,7 @@ fn compile_values(
         table: &empty,
         cursor: -1,
         register_base: None,
+        index_read: None,
     };
     let ncol_i32 = ncol as i32;
     let mut b = ProgramBuilder::new();
@@ -1153,6 +1224,7 @@ fn compile_scan(
         table,
         cursor,
         register_base: None,
+        index_read: None,
     };
     let mut b = ProgramBuilder::new();
 
@@ -1346,6 +1418,7 @@ fn compile_constant(
         table: &empty,
         cursor: -1,
         register_base: None,
+        index_read: None,
     };
     let ncol = outputs.len() as i32;
     let mut b = ProgramBuilder::new();
