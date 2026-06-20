@@ -24,10 +24,24 @@ pub enum Opcode {
     /// Mirrors `OP_Gosub` in `vdbe.c` — the subroutine-call opcode paired with `Return`.
     Gosub,
     /// `Return p1 p2 p3`: jump to the address stored in `r[p1]`. `p3 == 1` makes the jump
-    /// conditional on `r[p1]` being an integer (a no-op fall-through otherwise); `p3 == 0` is the
+    /// conditional on `r[p1]` being an integer (fall through if not); `p3 == 0` is the
     /// strict form (used after `Gosub`). `p2` is an EXPLAIN indentation hint, unused at runtime.
     /// Mirrors `OP_Return` in `vdbe.c`.
     Return,
+    /// `InitCoroutine p1 p2 p3`: set `r[p1] = p3 - 1` so that the first `Yield` to `r[p1]`
+    /// jumps to address `p3`. If `p2 != 0`, jump over the coroutine body to address `p2`
+    /// (the coroutine implementation immediately follows this opcode). Mirrors
+    /// `OP_InitCoroutine` in `vdbe.c` — used to set up a coroutine for `FROM (subquery)`,
+    /// `EXISTS`, and `IN (SELECT ...)` materialization.
+    InitCoroutine,
+    /// `EndCoroutine p1`: jump to the `p2` parameter of the `Yield` whose address is in
+    /// `r[p1]`, and leave `r[p1]` set so subsequent `Yield`s return to this instruction.
+    /// Mirrors `OP_EndCoroutine` in `vdbe.c`.
+    EndCoroutine,
+    /// `Yield p1 p2`: swap the program counter with the value in `r[p1]`. If the coroutine
+    /// ended via `EndCoroutine`, jump to `p2`; otherwise continue to the next instruction.
+    /// Mirrors `OP_Yield` in `vdbe.c`.
+    Yield,
     /// `Compare p1 p2 p3 p4=KeyInfo`: compare `n=p3` registers starting at `r[p1]` against
     /// `r[p2]` under the per-key collation in `p4`, leaving the result (`-1/0/+1`) in a hidden
     /// `last_compare` cell that the immediately following `Jump` reads. Mirrors `OP_Compare`.
@@ -294,6 +308,9 @@ impl Opcode {
             Opcode::Halt => "Halt",
             Opcode::Gosub => "Gosub",
             Opcode::Return => "Return",
+            Opcode::InitCoroutine => "InitCoroutine",
+            Opcode::EndCoroutine => "EndCoroutine",
+            Opcode::Yield => "Yield",
             Opcode::Compare => "Compare",
             Opcode::Jump => "Jump",
             Opcode::Transaction => "Transaction",

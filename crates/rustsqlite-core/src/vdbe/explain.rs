@@ -137,6 +137,9 @@ fn synopsis(inst: &Instruction) -> String {
         Function => format!("r[{p3}]={}(...)", render_p4(&inst.p4)),
         AggStep => format!("accum=r[{p3}] step(r[{p2}..])"),
         AggFinal => format!("accum=r[{p1}]"),
+        InitCoroutine => format!("r[{p1}]=coroutine at {p3}; jmp to {p2}"),
+        EndCoroutine => format!("end coroutine r[{p1}]"),
+        Yield => format!("yield r[{p1}]; on end jmp to {p2}"),
         // Cursor/scan/sorter/control opcodes have no concise value synopsis; leave blank.
         _ => String::new(),
     }

@@ -307,6 +307,74 @@ impl Vdbe {
                         }
                     }
                 }
+                Opcode::InitCoroutine => {
+                    // Set `r[p1] = p3` so the first `Yield` to `r[p1]` jumps to address `p3`
+                    // (the coroutine's first instruction). If `p2 != 0`, jump over the
+                    // coroutine body to address `p2`. Mirrors `OP_InitCoroutine` in `vdbe.c`,
+                    // adjusted for our direct-address PC convention (upstream stores `p3 - 1`
+                    // because its dispatch loop post-increments `pOp`).
+                    self.regs[p1 as usize] = Value::Int(p3 as i64);
+                    if p2 != 0 {
+                        self.pc = p2 as usize;
+                    } else {
+                        self.pc += 1;
+                    }
+                }
+                Opcode::EndCoroutine => {
+                    // The `Yield` that called this coroutine is at address `r[p1] - 1` (the
+                    // calling `Yield` stored `pc + 1` in `r[p1]`). Read that `Yield`'s `p2` and
+                    // jump to it (the "coroutine ended" continuation). Leave `r[p1]` set to
+                    // this `EndCoroutine`'s own address so subsequent `Yield`s jump back here
+                    // and re-jump to the same `p2` (the coroutine stays ended).
+                    match &self.regs[p1 as usize] {
+                        Value::Int(caller_yield_pc_plus_1) => {
+                            let caller_yield_pc = (*caller_yield_pc_plus_1 - 1) as usize;
+                            let caller = program
+                                .instructions
+                                .get(caller_yield_pc)
+                                .ok_or_else(|| Error::msg("OP_EndCoroutine: caller Yield not found"))?;
+                            if !matches!(caller.opcode, Opcode::Yield) {
+                                return Err(Error::msg(
+                                    "OP_EndCoroutine: caller is not a Yield",
+                                ));
+                            }
+                            self.regs[p1 as usize] = Value::Int(pc as i64);
+                            self.pc = caller.p2 as usize;
+                        }
+                        _ => {
+                            return Err(Error::msg(
+                                "OP_EndCoroutine: register does not hold a coroutine address",
+                            ));
+                        }
+                    }
+                }
+                Opcode::Yield => {
+                    // Swap the program counter with the value in `r[p1]`: jump to the saved
+                    // address, and store the address of the next instruction (the resume point
+                    // for the next `Yield`) in `r[p1]`. If the destination is an
+                    // `EndCoroutine`, the coroutine has ended: jump to this `Yield`'s `p2`
+                    // (the "coroutine ended" continuation) instead of re-entering the body.
+                    match &self.regs[p1 as usize] {
+                        Value::Int(dest) => {
+                            let dest_pc = *dest as usize;
+                            self.regs[p1 as usize] = Value::Int((pc + 1) as i64);
+                            let is_end_coroutine = program
+                                .instructions
+                                .get(dest_pc)
+                                .map_or(false, |i| matches!(i.opcode, Opcode::EndCoroutine));
+                            if is_end_coroutine {
+                                self.pc = p2 as usize;
+                            } else {
+                                self.pc = dest_pc;
+                            }
+                        }
+                        _ => {
+                            return Err(Error::msg(
+                                "OP_Yield: register does not hold a coroutine address",
+                            ));
+                        }
+                    }
+                }
                 Opcode::Compare => {
                     // Compare `n = p3` registers starting at `r[p1]` against `r[p2]` under the
                     // per-key collation carried by `p4 = KeyInfo`, leaving the ordering in
@@ -1928,5 +1996,151 @@ mod tests {
         }
         // sum of empty set is NULL, total of empty set is 0.0.
         assert_eq!(rows, vec![vec![Value::Null, Value::Real(0.0)]]);
+    }
+
+    /// Hand-built program exercising `InitCoroutine` / `Yield` / `EndCoroutine` in the
+    /// shape used by `FROM (subquery)` materialization: a main loop drives a coroutine
+    /// that yields 3 rows then ends. The test verifies the coroutine protocol:
+    ///   - `InitCoroutine` sets `r[1]` to the coroutine entry and jumps over the body.
+    ///   - Each `Yield` swaps PC with `r[1]`; the coroutine resumes after the previous
+    ///     `Yield`, and the main code resumes after its `Yield`.
+    ///   - When the coroutine runs off the end (here, via explicit `EndCoroutine`), the
+    ///     main `Yield` jumps to its `p2` continuation (the loop exit).
+    ///
+    /// Program layout (registers: r1 = coroutine reg, r2 = counter, r3 = output value):
+    /// ```text
+    ///   0  Init           1  9  6     ; r[1] = 6 (coroutine entry); jump to 9
+    ///   1  Integer        0  2  0     ; r2 = 0 (loop counter)        [main]
+    ///   2  Integer        0  3  0     ; r3 = 0 (output)              [main]
+    ///   3  Yield          1  8  0     ; swap PC with r[1]            [main loop top]
+    ///   4  Add            2  3  2     ; r2 = r2 + 1 (counter)        [coroutine body]
+    ///   5  Yield          1  8  0     ; swap back to main            [coroutine body]
+    ///   6  Goto           0  4  0     ; re-enter coroutine body      [coroutine entry]
+    ///   ... (unreachable: EndCoroutine at 7, but our coroutine never ends naturally;
+    ///        we drive it for 3 rows then bail out via Halt)
+    ///   8  Halt           0  0  0     ; coroutine-ended continuation
+    ///   9  Transaction    0  0  0     ; setup
+    ///  10  Goto           0  1  0     ; enter main
+    /// ```
+    /// We use a simpler coroutine body that runs a fixed number of iterations and then
+    /// jumps to an `EndCoroutine`. The main loop terminates when `Yield` jumps to its
+    /// `p2` (after `EndCoroutine`).
+    ///
+    /// Concrete shape (registers: r1 = coroutine reg, r2 = counter, r3 = limit, r4 = output):
+    /// ```text
+    ///   0  Init           1  11 3     ; r[1] = 3 (coroutine entry); jump to 11
+    ///   1  Integer        1  4  0     ; r4 = 1 (output value)        [main]
+    ///   2  Yield          1  9  0     ; swap PC with r[1] (start coro)  [main loop top]
+    ///   3  Add            4  4  4     ; r4 = r4 + r4 (double)         [coro body]
+    ///   4  Le             4  6  4    ; if r4 <= 8 jump back to 6     [coro body]
+    ///     -- (no: we want a counter; let's use r2 as counter, r3 as limit)
+    /// ```
+    /// Simpler: the coroutine yields exactly 3 rows by tracking a counter.
+    #[tokio::test]
+    async fn coroutine_init_yield_end_basic() {
+        // Registers: r1 = coroutine reg, r4 = output value.
+        //
+        // The standard SQLite pattern: the coroutine produces a row, then Yields back to
+        // main, which emits and loops. The 3rd Yield returns to main (emit 30), then main
+        // loops back to Yield which re-enters the coro at EndCoroutine → main's Yield p2.
+        //
+        // Layout:
+        //   0  Init           0 14 0      ; Init -> 14 (setup)
+        //   1  InitCoroutine  1  4 6      ; r[1] = 6 (coro entry); jump to 4 (main entry)
+        //   2  Yield          1 12 0      ; main loop: swap; on EndCoro -> 12
+        //   3  ResultRow      4 1 0       ; emit r4
+        //   4  Goto           0  2 0      ; main entry: loop back to Yield
+        //   5  Noop           0 0 0       ; (padding so coro entry is at 6)
+        //   6  Integer       10 4 0       ; coro entry: r4 = 10
+        //   7  Yield          1 0 0       ; yield back to main (returns to 3)
+        //   8  Integer       20 4 0       ; r4 = 20
+        //   9  Yield          1 0 0       ; yield back to main (returns to 3)
+        //  10  Integer       30 4 0       ; r4 = 30
+        //  11  Yield          1 0 0       ; yield back to main (returns to 3)
+        //  12  EndCoroutine   1 0 0        ; end coro -> main Yield's p2 (=12, which is Halt)
+        //  -- Wait, EndCoroutine at 12 and Halt at 12 collides. Let me use a separate slot.
+        //
+        // Rewritten: coroutine body ends with EndCoroutine as a separate instruction.
+        let prog = Program {
+            instructions: vec![
+                inst(Opcode::Init, 0, 14, 0),         // 0: Init -> 14
+                inst(Opcode::InitCoroutine, 1, 4, 6), // 1: r[1]=6; jump to 4
+                inst(Opcode::Yield, 1, 13, 0),       // 2: main loop Yield; EndCoro -> 13
+                inst(Opcode::ResultRow, 4, 1, 0),     // 3: emit r4
+                inst(Opcode::Goto, 0, 2, 0),          // 4: main entry
+                inst(Opcode::Goto, 0, 6, 0),          // 5: padding (jump to coro entry)
+                // coroutine body (entry at 6):
+                inst(Opcode::Integer, 10, 4, 0),      // 6: r4 = 10
+                inst(Opcode::Yield, 1, 0, 0),         // 7: yield back to main
+                inst(Opcode::Integer, 20, 4, 0),     // 8: r4 = 20
+                inst(Opcode::Yield, 1, 0, 0),         // 9: yield back to main
+                inst(Opcode::Integer, 30, 4, 0),      // 10: r4 = 30
+                inst(Opcode::Yield, 1, 0, 0),         // 11: yield back to main
+                inst(Opcode::EndCoroutine, 1, 0, 0), // 12: end coro -> main Yield p2 (=13)
+                inst(Opcode::Halt, 0, 0, 0),          // 13: halt
+                inst(Opcode::Transaction, 0, 0, 0),   // 14: setup
+                inst(Opcode::Goto, 0, 1, 0),          // 15: enter program
+            ],
+            num_registers: 5,
+        };
+        let mut v = Vdbe::new(Arc::new(prog), None);
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        while let StepResult::Row = v.step().await.expect("step") {
+            let n = v.result_count();
+            rows.push((0..n).map(|i| v.result_value(i)).collect());
+        }
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(10)],
+                vec![Value::Int(20)],
+                vec![Value::Int(30)],
+            ],
+            "coroutine should yield 3 rows in order"
+        );
+    }
+
+    /// A coroutine that immediately ends (0-row subquery): the main loop's first `Yield`
+    /// jumps to the coroutine entry which is an `EndCoroutine`. The main's `Yield` `p2`
+    /// continuation fires and no `ResultRow` is emitted.
+    #[tokio::test]
+    async fn coroutine_empty() {
+        // Layout:
+        //   0  Init           0 10 0      ; -> 10 (setup)
+        //   1  InitCoroutine  1  4 5      ; r[1] = 5 (coro entry); jump to 4
+        //   2  Yield          1  7 0       ; main loop: swap; on EndCoro -> 7
+        //   3  ResultRow      4 1 0       ; emit r4
+        //   4  Goto           0  2 0       ; main entry
+        //   5  EndCoroutine   1  0 0      ; coro entry: immediately end
+        //   6  Halt           0  0 0       ; (unreachable padding)
+        //   7  Halt           0  0 0       ; main continuation (after coro end)
+        //   8  Halt           0  0 0       ; (padding)
+        //   9  Halt           0  0 0       ; (padding)
+        //  10  Transaction    0  0 0       ; setup
+        //  11  Goto           0  1 0       ; enter program
+        let prog = Program {
+            instructions: vec![
+                inst(Opcode::Init, 0, 10, 0),         // 0
+                inst(Opcode::InitCoroutine, 1, 4, 5), // 1
+                inst(Opcode::Yield, 1, 7, 0),          // 2: EndCoro -> 7
+                inst(Opcode::ResultRow, 4, 1, 0),     // 3
+                inst(Opcode::Goto, 0, 2, 0),           // 4
+                inst(Opcode::EndCoroutine, 1, 0, 0),  // 5: coro entry = end
+                inst(Opcode::Halt, 0, 0, 0),          // 6 (unreachable)
+                inst(Opcode::Halt, 0, 0, 0),          // 7: main continuation
+                inst(Opcode::Halt, 0, 0, 0),          // 8 (padding)
+                inst(Opcode::Halt, 0, 0, 0),          // 9 (padding)
+                inst(Opcode::Transaction, 0, 0, 0),  // 10: setup
+                inst(Opcode::Goto, 0, 1, 0),          // 11: enter program
+            ],
+            num_registers: 5,
+        };
+        let mut v = Vdbe::new(Arc::new(prog), None);
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        while let StepResult::Row = v.step().await.expect("step") {
+            let n = v.result_count();
+            rows.push((0..n).map(|i| v.result_value(i)).collect());
+        }
+        assert!(rows.is_empty(), "empty coroutine should emit no rows");
     }
 }

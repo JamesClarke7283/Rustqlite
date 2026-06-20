@@ -258,3 +258,19 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   CTEs / window functions / subqueries in M8/M11), not self-joins. USING and NATURAL
   work on self-joins too (the AST rewrite resolves column references via the alias names).
   Differential-tested vs the C oracle (`self_joins`).
+
+- **M8 — Subqueries & Correlated Scans** 🚧: **8.1–8.4** ✅ (subquery / `EXISTS` /
+  `IN (SELECT …)` / scalar-subquery parser support shipped in M2). **8.5 coroutine
+  opcodes** ✅: `OP_InitCoroutine`, `OP_EndCoroutine`, and `OP_Yield` are implemented in
+  the VDBE (`vdbe::exec`) using a direct-address PC convention (upstream stores `addr - 1`
+  because its dispatch loop post-increments `pOp`; we store `addr` directly). `InitCoroutine
+  p1 p2 p3` sets `r[p1] = p3` (the coroutine entry) and jumps to `p2` (skipping the
+  coroutine body). `Yield p1 p2` swaps the PC with `r[p1]` (saving the next instruction's
+  address so the coroutine resumes there); if the destination is an `EndCoroutine`, the
+  coroutine has ended and `Yield` jumps to its own `p2` (the "coroutine ended"
+  continuation). `EndCoroutine p1` reads the calling `Yield`'s `p2` from the instruction
+  at `r[p1] - 1` and jumps there, leaving `r[p1]` set to its own address so subsequent
+  `Yield`s re-end. Unit-tested with a 3-row coroutine (`coroutine_init_yield_end_basic`)
+  and an empty coroutine (`coroutine_empty`). Still M8+: `FROM (subquery)`
+  materialization, scalar subquery / `EXISTS` / `IN (SELECT …)` codegen, `OpenDup`
+  (M7.12 BLOCKED), `Program` / `Param` opcodes for correlated subqueries.
