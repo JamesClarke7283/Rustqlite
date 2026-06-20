@@ -140,6 +140,7 @@ fn synopsis(inst: &Instruction) -> String {
         InitCoroutine => format!("r[{p1}]=coroutine at {p3}; jmp to {p2}"),
         EndCoroutine => format!("end coroutine r[{p1}]"),
         Yield => format!("yield r[{p1}]; on end jmp to {p2}"),
+        Once => format!("once jmp to {p2}"),
         // Cursor/scan/sorter/control opcodes have no concise value synopsis; leave blank.
         _ => String::new(),
     }

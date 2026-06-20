@@ -23,6 +23,8 @@ pub mod select;
 pub mod subquery;
 pub mod update;
 
+pub use expr::SubqueryResolver;
+
 use crate::error::Result;
 use crate::schema::{IndexObject, Table};
 use crate::vdbe::Program;
@@ -36,12 +38,17 @@ use rustqlite_parser::{
 /// with no `FROM`. `indexes` is the list of indexes attached to `table`; the M5.1 first
 /// slice uses them to route indexed-equality lookups (see [`index_planner`]) — an empty slice
 /// is the M3a default.
+///
+/// `subquery_resolver`, when set, lets expression codegen compile scalar subqueries /
+/// `EXISTS` / `IN (SELECT ...)` against the catalog. `None` leaves those expression kinds
+/// raising "unsupported" (the pre-M8.7 behavior).
 pub fn compile_select(
     select: &SelectStmt,
     table: Option<&Table>,
     indexes: &[IndexObject],
+    subquery_resolver: Option<&dyn SubqueryResolver>,
 ) -> Result<(Program, Vec<String>)> {
-    select::compile(select, table, indexes)
+    select::compile(select, table, indexes, subquery_resolver)
 }
 
 /// Compute the `EXPLAIN QUERY PLAN` index-plan summary for `select` against `table` with its

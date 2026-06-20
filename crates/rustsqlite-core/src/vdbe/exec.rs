@@ -175,6 +175,11 @@ pub struct Vdbe {
     /// `OP_Jump`. Mirrors the `iCompare` global in `vdbe.c`. `None` means no `Compare` has run
     /// yet (a defensive default; the codegen always emits `Jump` right after `Compare`).
     last_compare: Ordering,
+    /// Addresses of `OP_Once` instructions that have already fired in the current run. A repeat
+    /// encounter of a listed address jumps to its `p2`; an unlisted address falls through and is
+    /// added. Cleared by [`Self::reset`]. Mirrors the `aOp[0].p1`-cookie trick in `vdbe.c`'s
+    /// `OP_Once` but using an explicit set keyed by instruction address for clarity.
+    once_done: std::collections::HashSet<usize>,
 }
 
 impl Vdbe {
@@ -200,6 +205,7 @@ impl Vdbe {
             write_txn: false,
             aggregates: HashMap::new(),
             last_compare: Ordering::Equal,
+            once_done: std::collections::HashSet::new(),
         }
     }
 
@@ -232,6 +238,7 @@ impl Vdbe {
         self.write_txn = false;
         self.aggregates.clear();
         self.last_compare = Ordering::Equal;
+        self.once_done.clear();
     }
 
     /// Number of columns in the current result row.
@@ -284,6 +291,16 @@ impl Vdbe {
             match inst.opcode {
                 Opcode::Init => self.pc = p2 as usize,
                 Opcode::Goto => self.pc = p2 as usize,
+                Opcode::Once => {
+                    // First encounter in this run: fall through (after recording the address so
+                    // a repeat encounter jumps to `p2`). Mirrors `OP_Once` in `vdbe.c`.
+                    if self.once_done.contains(&pc) {
+                        self.pc = p2 as usize;
+                    } else {
+                        self.once_done.insert(pc);
+                        self.pc += 1;
+                    }
+                }
                 Opcode::Gosub => {
                     // Store the address of the *next* instruction in `r[p1]` and jump to `p2`.
                     self.regs[p1 as usize] = Value::Int((pc + 1) as i64);

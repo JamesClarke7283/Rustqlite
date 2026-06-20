@@ -293,3 +293,30 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   flattening). Differential-tested vs the C oracle (`from_subquery_materialization`).
   Still M8+: scalar subquery / `EXISTS` / `IN (SELECT …)` codegen, `OpenDup`
   (M7.12 BLOCKED), `Program` / `Param` opcodes for correlated subqueries.
+  **8.7 scalar subquery in expressions** ✅: `Expr::Subquery` is compiled by
+  `codegen::subquery::compile_scalar_subquery` (mirrors `sqlite3CodeSubselect` in `expr.c`
+  for the `TK_SELECT` case). The subquery body is compiled as a sub-program via
+  `select::compile`, then inlined into the outer program as a subroutine wrapped in
+  `OP_Once` (new opcode) + `OP_Gosub`/`OP_Return`: `Once` caches the result across
+  encounters so a non-correlated subquery runs only once per statement; the subroutine
+  pre-fills `result_reg` with NULL (the no-rows case), then runs the inlined scan; each
+  `ResultRow` is rewritten to `SCopy <col0>, result_reg` + `Goto subroutine_end` (the
+  `LIMIT 1` equivalent); the body's `Halt` becomes the `Return`. Because the inlined body
+  shares the outer program's register/cursor space, every register operand is rebased by
+  `reg_offset = next_reg() - 1` and every cursor operand by `cursor_offset = next_cursor()`
+  (new `ProgramBuilder::note_cursor`/`next_cursor` API lets the outer scan/sorter/DISTINCT
+  codegen record the cursor numbers they open so the inlined subquery offsets past them —
+  avoiding the cursor-0 collision between an outer table scan and an inner table scan).
+  Multi-column scalar subqueries raise "sub-select returns more than one column (N)"
+  matching the oracle. A `SubqueryResolver` trait (implemented by
+  `CatalogSubqueryResolver` in `capi::stmt`) gives the expression codegen pager-based
+  catalog access so the subquery's `FROM` table is resolved; threaded through `Ctx` as
+  `Option<&dyn SubqueryResolver>` (None at every non-SELECT codegen site). Supports:
+  constant subquery, subquery over a real table (with `WHERE`/`ORDER BY`/`LIMIT`),
+  aggregate subquery (`max`/`min`/`count`/`sum`/`avg`/`total`), subquery in arithmetic /
+  concatenation / `WHERE` / multiple subqueries in one query. Differential-tested vs the
+  C oracle (`scalar_subquery_in_expressions`). Known limitation: the `Once` wrapping
+  assumes the subquery is non-correlated — a correlated subquery (referencing outer
+  columns) caches the first row's result and replays it for every outer row (wrong but
+  non-crashing); correlation support needs M8.11 `Param` + M8.13 re-materialization,
+  plus name resolution (M2.74) to detect `EP_VarSelect`.

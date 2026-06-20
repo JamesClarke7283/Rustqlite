@@ -6,16 +6,29 @@
 //! * [`compile_jump`] compiles a boolean expression as a conditional jump, short-circuiting
 //!   `AND`/`OR` and treating NULL as false (the form a `WHERE` clause needs).
 
-use rustqlite_parser::{BinaryOp, Expr, FunctionArgs, Literal, UnaryOp};
+use rustqlite_parser::{BinaryOp, Expr, FunctionArgs, Literal, SelectStmt, UnaryOp};
 
 use crate::error::{Error, Result};
 use crate::func;
-use crate::schema::{ColumnRef, Table};
+use crate::schema::{ColumnRef, IndexObject, Table};
 use crate::types::Affinity;
 use crate::vdbe::program::{aff_to_p5, P4, P5_JUMPIFNULL, P5_NULLEQ, P5_STOREP2};
 use crate::vdbe::Opcode;
 
 use super::builder::{Label, ProgramBuilder};
+
+/// Resolves the source table (and its indexes) for a subquery's `FROM` clause, so that a
+/// scalar subquery / `EXISTS` / `IN (SELECT ...)` expression encountered inside
+/// [`compile_expr`] can compile its body against the catalog. The C-API implementation reads
+/// the catalog via the pager; the codegen itself stays pager-free.
+///
+/// Returns `(None, [])` for a constant / `VALUES` subquery (no `FROM`). The `SelectStmt` is
+/// the subquery body; the resolver returns the resolved `Table` (owned, so the subquery
+/// codegen can hold a stable reference to it for the lifetime of the compile) and the indexes
+/// attached to that table.
+pub trait SubqueryResolver {
+    fn resolve(&self, subquery: &SelectStmt) -> Result<(Option<Table>, Vec<IndexObject>)>;
+}
 
 /// Code-generation context for expressions over a single table scan.
 #[derive(Clone, Copy)]
@@ -40,6 +53,10 @@ pub struct Ctx<'a> {
     /// still populated (with the first table) for backward compatibility with code that
     /// reads them directly.
     pub join_tables: Option<&'a [JoinTable<'a>]>,
+    /// When set, scalar subquery / `EXISTS` / `IN (SELECT ...)` expressions encountered inside
+    /// [`compile_expr`] compile their body against the catalog via this resolver. When `None`,
+    /// those expression kinds raise an "unsupported" error (matching the pre-M8.7 behavior).
+    pub subquery_resolver: Option<&'a dyn SubqueryResolver>,
 }
 
 /// One table in a join: the resolved `Table`, the cursor number it's open on, and the name
@@ -112,10 +129,30 @@ pub fn compile_expr(b: &mut ProgramBuilder, e: &Expr, target: i32, ctx: Ctx) -> 
             return Err(Error::msg("IN subquery is not supported by the executor yet"))
         }
         Expr::Exists(_) => return Err(Error::msg("EXISTS is not supported by the executor yet")),
-        Expr::Subquery(_) => {
-            return Err(Error::msg(
-                "subqueries are not supported by the executor yet",
-            ))
+        Expr::Subquery(s) => {
+            // Scalar subquery `(SELECT …)`: evaluate to the first column of the first row, or
+            // NULL if the subquery returns no rows. The subquery body is compiled via
+            // [`super::subquery::compile_scalar_subquery`], which inlines it as a subroutine
+            // (`Gosub`/`Return`) wrapped in `OP_Once` (the M8.7 first slice assumes the
+            // subquery is non-correlated — `Once` caches the result across encounters; outer
+            // column references inside the subquery will fail column resolution with "no such
+            // column", which is the right error for unsupported correlation until M8.11/M8.13).
+            let Some(resolver) = ctx.subquery_resolver else {
+                return Err(Error::msg(
+                    "subqueries are not supported by the executor yet",
+                ));
+            };
+            let (sub_table, sub_indexes) = resolver.resolve(s)?;
+            // Stash the resolved table/indexes in a place that outlives the subroutine call.
+            // The resolver returns owned values; we keep them on the stack here.
+            let result_reg = super::subquery::compile_scalar_subquery(
+                b,
+                s,
+                sub_table.as_ref(),
+                &sub_indexes,
+            )?;
+            // Move the scalar result into the caller's target register.
+            b.emit(Opcode::SCopy, result_reg, target, 0);
         }
         Expr::Cast { .. } => return Err(Error::msg("CAST is not supported by the executor yet")),
         Expr::Case { .. } => return Err(Error::msg("CASE is not supported by the executor yet")),
@@ -206,6 +243,7 @@ fn compile_column(
                     register_base: ctx.register_base,
                     index_read: None,
                     join_tables: None,
+                    subquery_resolver: ctx.subquery_resolver,
                 };
                 (sub, t.name)
             })
@@ -222,6 +260,7 @@ fn compile_column(
                     register_base: ctx.register_base,
                     index_read: None,
                     join_tables: None,
+                    subquery_resolver: ctx.subquery_resolver,
                 };
                 (sub, t.name)
             })

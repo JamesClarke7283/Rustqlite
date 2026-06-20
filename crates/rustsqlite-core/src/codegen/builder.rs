@@ -18,6 +18,11 @@ pub struct Label(usize);
 pub struct ProgramBuilder {
     insts: Vec<Instruction>,
     next_reg: i32,
+    /// The next cursor number to hand out. Tracked so a sub-program inlined into this builder
+    /// can offset its cursor numbers past whatever the outer program is already using, avoiding
+    /// cursor-number collisions (e.g. an outer table scan on cursor 0 vs. an inlined scalar
+    /// subquery that also wants cursor 0).
+    next_cursor: i32,
     /// Resolved address of each label (filled by `resolve`).
     label_addr: Vec<Option<i32>>,
     /// `(instruction index, label)` pairs whose `p2` must be patched to the label's address.
@@ -29,6 +34,7 @@ impl ProgramBuilder {
         ProgramBuilder {
             insts: Vec::new(),
             next_reg: 1, // register 0 is reserved
+            next_cursor: 0,
             label_addr: Vec::new(),
             fixups: Vec::new(),
         }
@@ -51,6 +57,32 @@ impl ProgramBuilder {
     /// The address the next emitted instruction will have.
     pub fn cur_addr(&self) -> i32 {
         self.insts.len() as i32
+    }
+
+    /// The next register number that will be handed out by [`Self::alloc_reg`] /
+    /// [`Self::alloc_regs`]. Used by callers that need to reserve a contiguous block above the
+    /// current high-water mark before inlining a sub-program whose own register allocation
+    /// starts at 1 (so the sub-program's register N maps to `next_reg() - 1 + N` in the outer
+    /// program).
+    pub fn next_reg(&self) -> i32 {
+        self.next_reg
+    }
+
+    /// Record that the outer program has opened (or will open) a cursor with number `c`,
+    /// bumping [`Self::next_cursor`] past it. Callers that hardcode cursor numbers (the scan
+    /// codegen uses cursor 0, the sorter 1, the distinct dedup 2, etc.) call this so a later
+    /// inlined sub-program can offset its cursors past them.
+    pub fn note_cursor(&mut self, c: i32) {
+        if c + 1 > self.next_cursor {
+            self.next_cursor = c + 1;
+        }
+    }
+
+    /// The next cursor number that is guaranteed free (past every cursor the outer program
+    /// has opened or noted so far). Used by sub-program inlining to offset the sub-program's
+    /// cursor numbers.
+    pub fn next_cursor(&self) -> i32 {
+        self.next_cursor
     }
 
     /// The current number of emitted instructions (alias of [`Self::cur_addr`] as a count).

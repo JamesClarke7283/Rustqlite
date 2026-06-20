@@ -42,6 +42,12 @@ pub enum Opcode {
     /// ended via `EndCoroutine`, jump to `p2`; otherwise continue to the next instruction.
     /// Mirrors `OP_Yield` in `vdbe.c`.
     Yield,
+    /// `Once p1 p2`: jump to `p2` on the second and subsequent encounters (within one run of
+    /// the program). The first time `Once` is reached it falls through and records `p1` (the
+    /// "cookie" slot) in the program's `aOp[0].p1` so future hits with the same `p1` jump.
+    /// Used to wrap non-correlated scalar subquery code so it runs only once per statement.
+    /// Mirrors `OP_Once` in `vdbe.c`.
+    Once,
     /// `Compare p1 p2 p3 p4=KeyInfo`: compare `n=p3` registers starting at `r[p1]` against
     /// `r[p2]` under the per-key collation in `p4`, leaving the result (`-1/0/+1`) in a hidden
     /// `last_compare` cell that the immediately following `Jump` reads. Mirrors `OP_Compare`.
@@ -311,6 +317,7 @@ impl Opcode {
             Opcode::InitCoroutine => "InitCoroutine",
             Opcode::EndCoroutine => "EndCoroutine",
             Opcode::Yield => "Yield",
+            Opcode::Once => "Once",
             Opcode::Compare => "Compare",
             Opcode::Jump => "Jump",
             Opcode::Transaction => "Transaction",

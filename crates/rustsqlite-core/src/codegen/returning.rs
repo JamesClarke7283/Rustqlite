@@ -186,6 +186,7 @@ impl Returning {
         cursor,
         register_base: Some(register_base), join_tables: None,
         index_read: None,
+        subquery_resolver: None,
     };
     compile_expr(b, expr, target, ctx)
 }

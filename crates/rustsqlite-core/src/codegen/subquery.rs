@@ -102,6 +102,7 @@ pub fn compile_from_subquery(
         register_base: None,
         index_read: None,
         join_tables: None,
+        subquery_resolver: None,
     };
     let mut b = ProgramBuilder::new();
 
@@ -122,6 +123,7 @@ pub fn compile_from_subquery(
     // `inner_ncol` columns matching the subquery's projection.
     let oe = b.emit(Opcode::OpenEphemeral, ephemeral_cursor, inner_ncol, 0);
     // No KeyInfo → table variant (rowid-keyed), matching the default in `OP_OpenEphemeral`.
+    b.note_cursor(ephemeral_cursor);
     let _ = oe;
 
     // --- Materialize the subquery into the ephemeral. ---
@@ -137,7 +139,7 @@ pub fn compile_from_subquery(
     // (`sub_addr -> inlined_addr`) as we inline, then patch every jump's `p2` using it. Jumps
     // targeting the subquery's `Halt` (the scan-end label) are redirected to `after_sub` so an
     // empty subquery or scan exhaustion falls through to the outer scan.
-    let (sub_program, _sub_names) = select::compile(subquery, subquery_table, subquery_indexes)?;
+    let (sub_program, _sub_names) = select::compile(subquery, subquery_table, subquery_indexes, None)?;
 
     // The address at which the inlined subquery scan code begins (after `Init` + `OpenEphemeral`
     // in the outer program). Used to bound the jump-patch loop below.
@@ -297,6 +299,7 @@ fn compile_outer_scan_unordered(
         let c = 2i32;
         let oe = b.emit(Opcode::OpenEphemeral, c, ncol, 0);
         b.set_p4(oe, P4::KeyInfo(Vec::new()));
+        b.note_cursor(c);
         c
     });
     let end = b.new_label();
@@ -421,6 +424,378 @@ fn is_absolute_jump(inst: &Instruction) -> bool {
             | Le | Gt | Ge | Rewind | Next | NotExists | SeekGE | SeekGT | SeekLE | SeekLT
             | IdxGE | IdxGT | IdxLE | IdxLT | Found | NotFound | SorterSort | SorterNext
     )
+}
+
+/// Compile a scalar subquery `(SELECT …)` used as an expression, returning the register that
+/// holds the scalar result (the first column of the first row, or NULL if no rows). Mirrors
+/// `sqlite3CodeSubselect` in `expr.c` for the `TK_SELECT` case: the subquery body is compiled
+/// as a subroutine (`OP_Gosub`/`OP_Return`), wrapped in `OP_Once` so a non-correlated
+/// subquery runs only once per statement even if the expression is evaluated many times.
+///
+/// Each `ResultRow` in the inlined subquery body is rewritten into `SCopy <col0>, result_reg`
+/// followed by `Goto <end_of_subroutine>` — i.e. the first yielded row's first column is
+/// captured into `result_reg` and the subroutine returns immediately (the equivalent of
+/// upstream's `LIMIT 1` injection). The body's `Halt` (the scan-end label) is rewritten to
+/// the subroutine's `Return`.
+///
+/// The M8.7 first slice assumes the subquery is **non-correlated** — it must not reference
+/// outer-query columns. The `OP_Once` wrapping caches the first row's result across all
+/// encounters; a correlated subquery would need to re-run on each outer row (M8.11 `Param` +
+/// M8.13 re-materialization). If a correlated reference is present, column resolution inside
+/// the inlined body fails with "no such column" — the right error for unsupported correlation.
+///
+/// `subquery_table`/`subquery_indexes` describe the subquery's own FROM table (or `None` for
+/// a constant / `VALUES` subquery), resolved by the caller via a [`super::expr::SubqueryResolver`].
+pub fn compile_scalar_subquery(
+    b: &mut ProgramBuilder,
+    subquery: &SelectStmt,
+    subquery_table: Option<&Table>,
+    subquery_indexes: &[IndexObject],
+) -> Result<i32> {
+    // A scalar subquery must produce exactly one column. Upstream raises
+    // "sub-select returns more than one column" for multi-column scalar subqueries; we surface
+    // the same error here.
+    let inner_outputs = expand_columns(subquery, subquery_table)?;
+    let ncol = inner_outputs.len();
+    if ncol != 1 {
+        return Err(Error::msg(format!(
+            "sub-select returns more than one column ({ncol})"
+        )));
+    }
+
+    // Compile the subquery body first so we know its register count. The inlined body uses
+    // registers 1..N (its own `ProgramBuilder` allocation); our `result_reg`/`return_reg` must
+    // live ABOVE that range to avoid being clobbered by the subquery's `Column`/`Integer`/
+    // comparison-register writes. We compile into a throwaway builder, extract the program,
+    // then allocate our registers in the OUTER builder past the subquery's high-water mark.
+    let (sub_program, _sub_names) = select::compile(subquery, subquery_table, subquery_indexes, None)?;
+    let sub_num_regs = sub_program.num_registers as i32;
+
+    // Cursor offset: the subquery's `select::compile` hardcodes cursor 0 for its table scan
+    // (and 1 for a sorter, 2 for DISTINCT dedup). The outer program may already be using
+    // those cursor numbers for its own scan. Offset the subquery's cursor numbers by the
+    // outer builder's `next_cursor()` so they land in a free range.
+    let cursor_offset = b.next_cursor();
+
+    // Allocate the scalar-result register and the subroutine return-address register ABOVE the
+    // subquery's register range. The result register is pre-filled with NULL so a subquery
+    // that yields no rows leaves it NULL (matching SQLite's "NULL if the subquery returns no
+    // rows" semantics).
+    //
+    // We reserve a contiguous block of size `sub_num_regs + 2` in the outer builder so the
+    // inlined subquery body (which writes to registers 1..sub_num_regs) lands in that block
+    // and our two extra registers (result, return) sit just past it. The block starts at the
+    // outer builder's current `next_reg`, which becomes the inlined body's register-1 offset.
+    let reg_offset = b.next_reg() - 1; // sub reg R -> outer reg reg_offset + R
+    let _ = b.alloc_regs(sub_num_regs); // reserve 1..sub_num_regs (offset to outer)
+    let result_reg = b.alloc_reg(); // = reg_offset + sub_num_regs + 1
+    let return_reg = b.alloc_reg(); // = reg_offset + sub_num_regs + 2
+
+    // `OP_Once` wraps the subroutine call so a non-correlated subquery runs only once. On a
+    // repeat encounter, `Once` jumps past the subroutine body to the caller's continuation
+    // (bound to `after_sub` below), so the cached `result_reg` is reused.
+    let after_sub = b.new_label();
+    b.emit_jump(Opcode::Once, 0, after_sub, 0);
+
+    // Pre-fill the result with NULL (the no-rows case). The subroutine body will overwrite
+    // this on the first yielded row.
+    b.emit(Opcode::Null, 0, result_reg, 0);
+
+    // Call the subroutine. The subroutine address is bound when `subroutine_start` is resolved
+    // below (after the `Gosub`'s `Goto` is emitted, so the subroutine body physically follows
+    // the `Goto`). The `Gosub` stores `pc + 1` in `r[return_reg]` — i.e. the address of the
+    // `Goto after_sub` emitted next — so when the subroutine's `Return` reads `r[return_reg]`
+    // it lands on that `Goto`, which skips over the subroutine body to the caller's
+    // continuation.
+    let subroutine_start = b.new_label();
+    b.emit_jump(Opcode::Gosub, return_reg, subroutine_start, 0);
+    b.emit_jump(Opcode::Goto, 0, after_sub, 0);
+
+    // The caller copies `result_reg` into its own target register after this function returns;
+    // those instructions land at `after_sub` (resolved at the end of this function).
+
+    // --- Subroutine body: the inlined subquery scan. ---
+    b.resolve(subroutine_start);
+
+    // Find the Halt that terminates the scan code (the first Halt after the Init). Everything
+    // from the Halt onward is the subquery's setup block (Halt, Transaction?, Goto) — skip it,
+    // replacing the Halt with a `Return`.
+    let halt_idx = sub_program
+        .instructions
+        .iter()
+        .position(|i| i.opcode == Opcode::Halt)
+        .ok_or_else(|| Error::msg("scalar subquery program has no Halt"))?;
+
+    // The subroutine's return. `Return` with `p3 == 1` is the conditional form (jumps if
+    // `r[return_reg]` is an integer), which is what upstream uses after `Gosub`. We bind a
+    // label here so the inlined body's rewritten `ResultRow`s can `Goto` this address.
+    let subroutine_end = b.new_label();
+
+    // Address map: subquery_addr -> inlined_addr. Built as we inline each instruction so
+    // jumps inside the body can be rebased (same approach as `compile_from_subquery`).
+    let mut addr_map: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+    let sub_start = b.cur_addr();
+
+    // Inline scan code: indices 1..halt_idx (skipping the leading Init at index 0). Every
+    // register operand in the inlined instructions is rebased by `reg_offset` so the
+    // subquery's register N becomes the outer program's register `reg_offset + N`, landing in
+    // the block we reserved above (clear of `result_reg`/`return_reg`).
+    for idx in 1..halt_idx {
+        let inst = &sub_program.instructions[idx];
+        let sub_addr = idx as i32;
+        let inlined_addr = b.cur_addr();
+        addr_map.insert(sub_addr, inlined_addr);
+        match inst.opcode {
+            Opcode::ResultRow => {
+                // SRT_Mem rewrite: copy the first column of the yielded row into `result_reg`
+                // and jump to the subroutine's `Return`. The subquery's `ResultRow p1 p2 p3`
+                // has `p1` = result start register (in subquery register space) and `p2` =
+                // ncol (always 1 here, validated above); the first column is at
+                // `r[reg_offset + p1]`.
+                b.emit(Opcode::SCopy, reg_offset + inst.p1, result_reg, 0);
+                b.emit_jump(Opcode::Goto, 0, subroutine_end, 0);
+            }
+            _ => {
+                // Rebase every register operand by `reg_offset` and every cursor operand by
+                // `cursor_offset`. The opcodes that use p1/p2/p3 as register numbers get
+                // `reg_offset`; cursor-number operands get `cursor_offset`; jump targets
+                // (p2 of control-flow opcodes) are NOT rebased here (the patch loop below
+                // handles them via the address map). Per-opcode rules mirror the VDBE's
+                // operand-type conventions.
+                let mut new_inst = inst.clone();
+                rebase_operands(&mut new_inst, reg_offset, cursor_offset);
+                b.append(new_inst);
+            }
+        }
+    }
+
+    // Bind the subroutine's end (the `Return`). Jumps targeting the subquery's `Halt`
+    // (idx == halt_idx) are redirected here.
+    b.resolve(subroutine_end);
+    b.emit(Opcode::Return, return_reg, 0, 1);
+
+    // Bind `after_sub` to the next emitted instruction — the caller's continuation (the
+    // `SCopy result_reg, target` emitted by `compile_expr` after this function returns, plus
+    // any subsequent code). Both the `Once` repeat-encounter jump and the `Gosub`'s return
+    // land here.
+    b.resolve(after_sub);
+
+    // Patch every inlined jump's `p2` using the address map. Jumps targeting the subquery's
+    // `Halt` (idx == halt_idx) are redirected to `subroutine_end` (the `Return`).
+    let subroutine_end_addr = b.label_addr_of(subroutine_end);
+    for (i, inst) in b.iter_insts_mut().enumerate() {
+        let addr = i as i32;
+        if addr < sub_start || addr >= subroutine_end_addr {
+            continue;
+        }
+        if !is_absolute_jump(inst) {
+            continue;
+        }
+        let sub_target = inst.p2; // jump targets are NOT rebased by `rebase_regs`
+        if sub_target == halt_idx as i32 {
+            inst.p2 = subroutine_end_addr;
+        } else if let Some(&inlined) = addr_map.get(&sub_target) {
+            inst.p2 = inlined;
+        } else if sub_target == 0 {
+            // Jumps targeting the subquery's Init (idx 0): redirect to the subroutine start so
+            // a re-init doesn't escape into the outer program. (No well-formed subquery scan
+            // should target its own Init; this is defensive.)
+            inst.p2 = sub_start;
+        }
+        // else: unknown target — leave as-is defensively.
+    }
+
+    Ok(result_reg)
+}
+
+/// Rebase every register operand of `inst` by `reg_offset` and every cursor operand by
+/// `cursor_offset`, so an inlined sub-program's register N becomes the outer program's
+/// register `reg_offset + N` and its cursor C becomes `cursor_offset + C`. Per-opcode rules
+/// mirror the VDBE's operand-type conventions: which of `p1`/`p2`/`p3` are register numbers
+/// vs. cursor numbers vs. integer immediates vs. jump targets. Jump targets (`p2` of
+/// `Goto`/`If`/`Rewind`/`Next`/...) are NOT rebased here; the caller's jump-patch loop
+/// handles them via the address map.
+fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) {
+    use Opcode::*;
+    // Helper: rebase a register operand.
+    let r = |x: &mut i32| *x += reg_offset;
+    // Helper: rebase a cursor operand.
+    let c = |x: &mut i32| *x += cursor_offset;
+    match inst.opcode {
+        // Control flow — p2 is a jump target (NOT rebased here). p1/p3 are registers where
+        // applicable.
+        Goto | Init | Once => {} // no register/cursor operands
+        Gosub => {
+            r(&mut inst.p1); // return-address register
+        }
+        Return => {
+            r(&mut inst.p1);
+        }
+        If | IfNot | IsNull | NotNull => {
+            r(&mut inst.p1);
+        }
+        IfPos | DecrJumpZero => {
+            r(&mut inst.p1);
+        }
+        Eq | Ne | Lt | Le | Gt | Ge => {
+            r(&mut inst.p1);
+            r(&mut inst.p3);
+        }
+        Rewind | Next => {
+            c(&mut inst.p1); // cursor
+        }
+        NotExists => {
+            c(&mut inst.p1); // cursor
+            r(&mut inst.p3); // rowid register
+        }
+        SeekGE | SeekGT | SeekLE | SeekLT => {
+            c(&mut inst.p1); // cursor
+            r(&mut inst.p3); // key register
+        }
+        IdxGE | IdxGT | IdxLE | IdxLT => {
+            c(&mut inst.p1); // cursor
+            r(&mut inst.p3); // key register
+        }
+        Found | NotFound => {
+            c(&mut inst.p1); // cursor
+            r(&mut inst.p3); // record start register
+        }
+        SorterSort | SorterNext => {
+            c(&mut inst.p1); // cursor
+        }
+        // Cursors / scans.
+        OpenRead | OpenWrite | OpenWriteReg | OpenEphemeral | Close => {
+            c(&mut inst.p1); // cursor number
+            // OpenEphemeral p2 = column count; OpenRead p2 = rootpage; not rebased.
+        }
+        Column => {
+            c(&mut inst.p1); // cursor
+            r(&mut inst.p3); // target register
+        }
+        Rowid => {
+            c(&mut inst.p1);
+            r(&mut inst.p2); // target register
+        }
+        NullRow => {
+            c(&mut inst.p1);
+        }
+        Clear | Destroy => {
+            c(&mut inst.p1);
+        }
+        IdxInsert => {
+            c(&mut inst.p1);
+            r(&mut inst.p2); // record register
+        }
+        IdxDelete => {
+            c(&mut inst.p1);
+            r(&mut inst.p2); // key register
+        }
+        IdxRowid => {
+            c(&mut inst.p1);
+            r(&mut inst.p2); // target register
+        }
+        SorterOpen => {
+            c(&mut inst.p1); // cursor
+            // p2 = field count, not rebased.
+        }
+        SorterInsert => {
+            c(&mut inst.p1);
+            r(&mut inst.p2); // record register
+        }
+        SorterData => {
+            c(&mut inst.p1);
+            r(&mut inst.p2); // register
+        }
+        // Record building.
+        MakeRecord => {
+            r(&mut inst.p1); // source start
+            r(&mut inst.p3); // destination
+        }
+        NewRowid => {
+            c(&mut inst.p1);
+            r(&mut inst.p2); // output rowid register
+        }
+        Insert => {
+            c(&mut inst.p1);
+            r(&mut inst.p2); // record register
+            r(&mut inst.p3); // rowid register
+        }
+        Delete => {
+            c(&mut inst.p1);
+            r(&mut inst.p2); // rowid register (for index maintenance)
+        }
+        // Constants — p2 = destination register. p1 holds the immediate (Integer) or is 0.
+        Integer | Int64 | Real | String8 | Null | Blob => {
+            r(&mut inst.p2);
+            if inst.opcode == Null && inst.p3 > 0 {
+                r(&mut inst.p3); // register range end
+            }
+        }
+        // Arithmetic / bitwise / boolean — r[p3] = r[p2] OP r[p1].
+        Add | Subtract | Multiply | Divide | Remainder | Concat | BitAnd | BitOr
+        | ShiftLeft | ShiftRight => {
+            r(&mut inst.p1);
+            r(&mut inst.p2);
+            r(&mut inst.p3);
+        }
+        BitNot => {
+            r(&mut inst.p1);
+            r(&mut inst.p2);
+        }
+        Not => {
+            r(&mut inst.p1);
+            r(&mut inst.p2);
+        }
+        And | Or => {
+            r(&mut inst.p1);
+            r(&mut inst.p2);
+        }
+        // Register copies.
+        SCopy => {
+            r(&mut inst.p1);
+            r(&mut inst.p2);
+        }
+        Move | Copy => {
+            r(&mut inst.p1);
+            r(&mut inst.p2);
+        }
+        // Affinity / RealAffinity.
+        Affinity => {
+            r(&mut inst.p1);
+        }
+        RealAffinity => {
+            r(&mut inst.p1);
+        }
+        // Function — p2 = first arg register, p3 = result register.
+        Function => {
+            r(&mut inst.p2);
+            r(&mut inst.p3);
+        }
+        // Aggregate opcodes.
+        AggStep => {
+            r(&mut inst.p2); // first arg reg
+            r(&mut inst.p3); // accumulator reg
+        }
+        AggFinal => {
+            r(&mut inst.p1); // accumulator reg
+        }
+        HaltIfNull => {
+            r(&mut inst.p3);
+        }
+        // Opcodes that don't appear in a scalar subquery scan body — leave as-is.
+        Compare | Jump | Transaction | SetCookie | ParseSchema | CreateBtree | Halt
+        | ResultRow => {}
+        // Coroutine opcodes — p1 is a coroutine register.
+        InitCoroutine => {
+            r(&mut inst.p1);
+        }
+        EndCoroutine => {
+            r(&mut inst.p1);
+        }
+        Yield => {
+            r(&mut inst.p1);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -605,5 +980,61 @@ mod tests {
                 == 0,
             "LIMIT 0 program must not emit any ResultRow"
         );
+    }
+
+    /// A scalar subquery in a projection column: the subquery's first row's first column is
+    /// captured into a result register and emitted as the outer SELECT's result. Golden test
+    /// for `SELECT (SELECT 1)` — the canonical constant scalar subquery.
+    #[test]
+    fn golden_scalar_subquery_constant() {
+        let stmt = "SELECT 1";
+        let parsed = rustqlite_parser::parse(stmt).unwrap().into_iter().next().unwrap();
+        let rustqlite_parser::Stmt::Select(s) = parsed else { panic!("expected SELECT") };
+        let mut b = ProgramBuilder::new();
+        let setup = b.new_label();
+        b.emit_jump(Opcode::Init, 0, setup, 0);
+        let after_init = b.cur_addr();
+        let result_reg = compile_scalar_subquery(&mut b, &s, None, &[]).unwrap();
+        let target = b.alloc_reg();
+        b.emit(Opcode::SCopy, result_reg, target, 0);
+        b.emit(Opcode::ResultRow, target, 1, 0);
+        b.emit(Opcode::Halt, 0, 0, 0);
+        b.resolve(setup);
+        b.emit(Opcode::Transaction, 0, 0, 0);
+        b.emit(Opcode::Goto, 0, after_init, 0);
+        let prog = b.finish();
+        let got: Vec<String> = prog
+            .instructions
+            .iter()
+            .enumerate()
+            .map(|(addr, i)| {
+                format!(
+                    "{addr} {} {} {} {} {:?} {}",
+                    i.opcode.name(),
+                    i.p1,
+                    i.p2,
+                    i.p3,
+                    i.p4,
+                    i.p5
+                )
+            })
+            .collect();
+        let expected = vec![
+            "0 Init 0 12 0 None 0",
+            "1 Once 0 9 0 None 0",
+            "2 Null 0 3 0 None 0",
+            "3 Gosub 4 5 0 None 0",
+            "4 Goto 0 9 0 None 0",
+            "5 Integer 1 1 0 None 0",
+            "6 SCopy 1 3 0 None 0",
+            "7 Goto 0 8 0 None 0",
+            "8 Return 4 0 1 None 0",
+            "9 SCopy 3 5 0 None 0",
+            "10 ResultRow 5 1 0 None 0",
+            "11 Halt 0 0 0 None 0",
+            "12 Transaction 0 0 0 None 0",
+            "13 Goto 0 1 0 None 0",
+        ];
+        assert_eq!(got, expected);
     }
 }

@@ -15,6 +15,7 @@ use rustqlite_parser::{
 
 use crate::codegen;
 use crate::codegen::returning::Returning;
+use crate::codegen::SubqueryResolver;
 use crate::error::{Error, Result, ResultCode};
 use crate::pager::Pager;
 use crate::schema::{read_catalog, schema_cookie, IndexObject, Table};
@@ -23,6 +24,51 @@ use crate::vdbe::{explain, Instruction, Opcode, Program, StepResult, Vdbe};
 
 use super::connection::{ChangeCounts, Sqlite3};
 use super::runtime::block_on;
+
+/// A [`SubqueryResolver`] that reads the catalog via the pager. Used by `compile_select` to
+/// give the expression codegen the table/index info it needs to compile scalar subqueries /
+/// `EXISTS` / `IN (SELECT ...)` against the database. The pager is held as `Arc` so the
+/// resolver can outlive the borrow of the `Sqlite3` connection (the codegen pass mutates the
+/// `ProgramBuilder`, not the connection, so the pager clone is safe).
+struct CatalogSubqueryResolver {
+    pager: Arc<Pager>,
+}
+
+impl SubqueryResolver for CatalogSubqueryResolver {
+    fn resolve(&self, subquery: &SelectStmt) -> Result<(Option<Table>, Vec<IndexObject>)> {
+        // Mirrors `resolve_subquery_source` but without returning the pager (the codegen
+        // expression path only needs the table + indexes; the pager is already wired into the
+        // outer VDBE for cursor access).
+        if !subquery.values.is_empty() || subquery.from.is_empty() {
+            // A VALUES or constant SELECT subquery has no real FROM table.
+            return Ok((None, Vec::new()));
+        }
+        if subquery.from.len() > 1 {
+            return Err(Error::msg("joins inside a scalar subquery are not supported yet"));
+        }
+        let Some(table_ref) = subquery.from[0].table() else {
+            return Err(Error::msg("nested FROM subqueries are not supported yet"));
+        };
+        if table_ref.name.eq_ignore_ascii_case("sqlite_schema")
+            || table_ref.name.eq_ignore_ascii_case("sqlite_master")
+        {
+            let table = resolve_sqlite_schema(&self.pager)?;
+            return Ok((Some(table), Vec::new()));
+        }
+        let catalog = block_on(read_catalog(&self.pager))?;
+        let obj = catalog
+            .find_table(&table_ref.name)
+            .ok_or_else(|| Error::msg(format!("no such table: {}", table_ref.name)))?;
+        let table = Table::from_schema_object(obj)?;
+        let mut indexes = Vec::new();
+        for obj in catalog.indexes() {
+            if obj.tbl_name.eq_ignore_ascii_case(&table_ref.name) {
+                indexes.push(IndexObject::from_schema_object(obj)?);
+            }
+        }
+        Ok((Some(table), indexes))
+    }
+}
 
 /// How a prepared statement produces its result rows.
 enum Backing {
@@ -781,8 +827,27 @@ fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelec
         (None, None, Vec::new())
     };
 
-    let (program, column_names) = codegen::compile_select(select, table.as_ref(), &indexes)?;
+    // Build a subquery resolver over the connection's pager so expression codegen can compile
+    // scalar subqueries / EXISTS / IN (SELECT ...) against the catalog. Even a FROM-less outer
+    // SELECT (e.g. `SELECT (SELECT a FROM t)`) may have a subquery that scans a real table, so
+    // we obtain the pager even when the outer SELECT itself has no FROM. Only fall back to the
+    // no-DB resolver when the connection truly has no open database (a `:memory:` that was
+    // never written to, or a real `Sqlite3` with no pager — both rare).
+    let (resolver, resolver_pager): (Box<dyn SubqueryResolver>, Option<Arc<Pager>>) =
+        match db.pager_arc() {
+            Ok(p) => (Box::new(CatalogSubqueryResolver { pager: p.clone() }), Some(p)),
+            Err(_) => (Box::new(NoDbSubqueryResolver), None),
+        };
+    let (program, column_names) =
+        codegen::compile_select(select, table.as_ref(), &indexes, Some(resolver.as_ref()))?;
     let index_plan_info = codegen::select_index_plan_info(select, table.as_ref(), &indexes);
+    // If the outer SELECT itself has no FROM, its `pager` is `None` — but a scalar subquery in
+    // its projection may have needed the pager to scan a real table. The inlined subquery body
+    // emits `OpenRead` opcodes that the VDBE must be able to satisfy, so when the resolver
+    // obtained a pager, attach it to the VDBE even when the outer SELECT's own `pager` is
+    // `None`. (When both are `Some`, they are the same pager; when both are `None`, the
+    // statement truly needs no database.)
+    let pager = pager.or(resolver_pager);
     Ok(CompiledSelect {
         program,
         column_names,
@@ -790,6 +855,23 @@ fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelec
         table,
         index_plan_info,
     })
+}
+
+/// A [`SubqueryResolver`] for a FROM-less (constant) outer SELECT — the only subqueries it can
+/// resolve are themselves constant / `VALUES` (no `FROM`), so it returns `(None, [])` for those
+/// and errors with "no such table" for anything that tries to reference a real table. This
+/// keeps `SELECT (SELECT 1)` working without an open database.
+struct NoDbSubqueryResolver;
+
+impl SubqueryResolver for NoDbSubqueryResolver {
+    fn resolve(&self, subquery: &SelectStmt) -> Result<(Option<Table>, Vec<IndexObject>)> {
+        if !subquery.values.is_empty() || subquery.from.is_empty() {
+            return Ok((None, Vec::new()));
+        }
+        // A subquery that references a real table can't be resolved without a pager. Surface
+        // a clear error rather than panicking.
+        Err(Error::msg("no such table: database is not open"))
+    }
 }
 
 /// Resolve the inner FROM table (if any) for a `FROM (subquery)` subquery, so the subquery

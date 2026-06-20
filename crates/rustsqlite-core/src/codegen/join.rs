@@ -77,6 +77,7 @@ pub fn compile_cross_join(
         register_base: None,
         index_read: None,
         join_tables: Some(&join_tables),
+        subquery_resolver: None,
     };
 
     let mut b = ProgramBuilder::new();
@@ -106,6 +107,7 @@ pub fn compile_cross_join(
         } else {
             b.set_p4(open, P4::Int(t.columns.len() as i64));
         }
+        b.note_cursor(i as i32);
     }
 
     // ORDER BY: the cross join doesn't use an index for ordering, so fall back to the sorter

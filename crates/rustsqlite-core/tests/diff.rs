@@ -1304,3 +1304,51 @@ fn from_subquery_materialization() {
         assert_same(db.str(), q);
     }
 }
+
+#[test]
+fn scalar_subquery_in_expressions() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = standard_fixture();
+    for q in [
+        // Constant scalar subquery.
+        "SELECT (SELECT 1);",
+        "SELECT (SELECT 1), (SELECT 2), (SELECT 3);",
+        // Scalar subquery over a real table — aggregates.
+        "SELECT (SELECT max(a) FROM t);",
+        "SELECT (SELECT min(a) FROM t);",
+        "SELECT (SELECT count(*) FROM t);",
+        "SELECT (SELECT sum(a) FROM t);",
+        "SELECT (SELECT avg(a) FROM t);",
+        "SELECT (SELECT total(a) FROM t);",
+        // Scalar subquery over a real table — plain column, first row.
+        "SELECT (SELECT a FROM t);",
+        "SELECT (SELECT a FROM t ORDER BY a);",
+        "SELECT (SELECT a FROM t ORDER BY a DESC);",
+        "SELECT (SELECT a FROM t ORDER BY a LIMIT 1);",
+        "SELECT (SELECT a FROM t ORDER BY a DESC LIMIT 1);",
+        // Scalar subquery with WHERE.
+        "SELECT (SELECT a FROM t WHERE a > 5);",
+        "SELECT (SELECT a FROM t WHERE b = 'apple');",
+        "SELECT (SELECT a FROM t WHERE a > 100);", // no rows → NULL
+        // Scalar subquery in arithmetic.
+        "SELECT 1 + (SELECT max(a) FROM t);",
+        "SELECT (SELECT max(a) FROM t) * 2;",
+        "SELECT (SELECT count(*) FROM t) || ' rows';",
+        // Scalar subquery in WHERE clause.
+        "SELECT a FROM t WHERE a = (SELECT max(a) FROM t);",
+        "SELECT a FROM t WHERE a < (SELECT avg(a) FROM t);",
+        "SELECT a FROM t WHERE a > (SELECT min(a) FROM t) ORDER BY a;",
+        "SELECT a FROM t WHERE (SELECT count(*) FROM t) > 0 ORDER BY a;",
+        "SELECT a FROM t WHERE (SELECT count(*) FROM t WHERE a > 5) = 0 ORDER BY a;",
+        // Multiple scalar subqueries in one query.
+        "SELECT (SELECT max(a) FROM t), (SELECT min(a) FROM t);",
+        "SELECT (SELECT count(*) FROM t), (SELECT sum(a) FROM t);",
+        // Scalar subquery in ORDER BY context (projection with subquery + order).
+        "SELECT (SELECT a FROM t WHERE a = id) FROM t ORDER BY id;",
+    ] {
+        assert_same(db.str(), q);
+    }
+}

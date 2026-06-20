@@ -20,17 +20,22 @@ use crate::vdbe::program::{Program, P4};
 use crate::vdbe::{KeyField, Opcode};
 
 use super::builder::{Label, ProgramBuilder};
-use super::expr::{compile_expr, compile_jump, Ctx};
+use super::expr::{compile_expr, compile_jump, Ctx, SubqueryResolver};
 use super::index_planner::{pick_index, IndexPlan};
 
 /// Compile a single-table (or constant) `SELECT`, returning the program and the result column
 /// names. `table` is the resolved table when there is exactly one `FROM` entry, else `None`.
 /// `indexes` is the list of indexes attached to `table`; when an indexed equality prefix
 /// is present in the `WHERE`, the M5.2 planner routes through the index.
+///
+/// `subquery_resolver`, when set, lets expression codegen compile scalar subqueries /
+/// `EXISTS` / `IN (SELECT ...)` against the catalog. `None` leaves those expression kinds
+/// raising "unsupported" (the pre-M8.7 behavior).
 pub fn compile(
     select: &SelectStmt,
     table: Option<&Table>,
     indexes: &[IndexObject],
+    subquery_resolver: Option<&dyn SubqueryResolver>,
 ) -> Result<(Program, Vec<String>)> {
     reject_unsupported(select)?;
 
@@ -46,19 +51,19 @@ pub fn compile(
     let (limit, offset) = eval_limit_offset(select)?;
 
     let program = if !select.values.is_empty() {
-        compile_values(select, &outputs, limit, offset)?
+        compile_values(select, &outputs, limit, offset, subquery_resolver)?
     } else {
         match table {
             Some(t) => {
                 if is_aggregate_query(select, &outputs) {
-                    compile_aggregate(select, t, &outputs, limit, offset)?
+                    compile_aggregate(select, t, &outputs, limit, offset, subquery_resolver)?
                 } else if let Some(plan) = pick_index(select, t, indexes) {
-                    compile_indexed_select(select, t, &plan, &outputs, limit, offset)?
+                    compile_indexed_select(select, t, &plan, &outputs, limit, offset, subquery_resolver)?
                 } else {
-                    compile_scan(select, t, &outputs, limit, offset)?
+                    compile_scan(select, t, &outputs, limit, offset, subquery_resolver)?
                 }
             }
-            None => compile_constant(select, &outputs, limit, offset)?,
+            None => compile_constant(select, &outputs, limit, offset, subquery_resolver)?,
         }
     };
     Ok((program, names))
@@ -87,6 +92,7 @@ fn compile_aggregate(
     outputs: &[(Expr, String)],
     limit: Option<i64>,
     offset: i64,
+    subquery_resolver: Option<&dyn SubqueryResolver>,
 ) -> Result<Program> {
     // (A) Collect every aggregate call from the projection list and the HAVING clause. Both
     // sites share one set of accumulator registers (matching upstream's `AggInfo` which walks
@@ -130,6 +136,7 @@ fn compile_aggregate(
         cursor,
         register_base: None, join_tables: None,
         index_read: None,
+        subquery_resolver,
     };
     let mut b = ProgramBuilder::new();
 
@@ -226,6 +233,7 @@ fn compile_aggregate(
 
     // (D) Open the table cursor.
     let open = b.emit(Opcode::OpenRead, cursor, table.rootpage as i32, 0);
+    b.note_cursor(cursor);
     if table.without_rowid {
         b.set_p4(open, P4::KeyInfo(table.without_rowid_key_info()));
     } else {
@@ -246,6 +254,7 @@ fn compile_aggregate(
             .collect();
         let so = b.emit(Opcode::SorterOpen, output_sorter, norder + ncol, 0);
         b.set_p4(so, P4::KeyInfo(keyinfo));
+        b.note_cursor(output_sorter);
     }
 
     if nkey == 0 {
@@ -375,6 +384,7 @@ fn compile_aggregate(
     let sorter = 1i32;
     let so = b.emit(Opcode::SorterOpen, sorter, n_sorter_fields, 0);
     b.set_p4(so, P4::KeyInfo(keyinfo));
+    b.note_cursor(sorter);
 
     // ---- Scan loop: filter, evaluate group keys + agg args, build record, sorter insert. ----
     let end_scan = b.new_label();
@@ -775,6 +785,7 @@ fn compile_indexed_select(
     outputs: &[(Expr, String)],
     limit: Option<i64>,
     offset: i64,
+    subquery_resolver: Option<&dyn SubqueryResolver>,
 ) -> Result<Program> {
     let idx_cursor = 0i32;
     let table_cursor = 1i32;
@@ -799,6 +810,7 @@ fn compile_indexed_select(
         cursor: if covering { idx_cursor } else { table_cursor },
         register_base: None, join_tables: None,
         index_read,
+        subquery_resolver,
     };
     let mut b = ProgramBuilder::new();
 
@@ -826,8 +838,10 @@ fn compile_indexed_select(
     if !covering {
         let open_table = b.emit(Opcode::OpenRead, table_cursor, table.rootpage as i32, 0);
         b.set_p4(open_table, P4::Int(table.columns.len() as i64));
+        b.note_cursor(table_cursor);
     }
     let open_idx = b.emit(Opcode::OpenRead, idx_cursor, plan.index.rootpage as i32, 0);
+    b.note_cursor(idx_cursor);
     let key_info: Vec<KeyField> = plan
         .index
         .columns
@@ -862,9 +876,10 @@ fn compile_indexed_select(
     // DISTINCT dedup cursor (opened before the loop so it survives across iterations).
     let distinct_cursor_id = if covering { 1i32 } else { 2i32 };
     let distinct_cursor = select.distinct.then(|| {
-        let c = distinct_cursor_id;
+        let c = 2i32;
         let oe = b.emit(Opcode::OpenEphemeral, c, ncol, 0);
         b.set_p4(oe, P4::KeyInfo(Vec::new()));
+        b.note_cursor(c);
         c
     });
 
@@ -1212,6 +1227,7 @@ fn compile_values(
     outputs: &[(Expr, String)],
     limit: Option<i64>,
     offset: i64,
+    subquery_resolver: Option<&dyn SubqueryResolver>,
 ) -> Result<Program> {
     // Validate arity: every row must have the same number of columns as the expansion result set.
     let ncol = outputs.len();
@@ -1238,6 +1254,7 @@ fn compile_values(
         cursor: -1,
         register_base: None, join_tables: None,
         index_read: None,
+        subquery_resolver,
     };
     let ncol_i32 = ncol as i32;
     let mut b = ProgramBuilder::new();
@@ -1285,6 +1302,7 @@ fn compile_values(
             let nkey = select.order_by.len() as i32;
             let so = b.emit(Opcode::SorterOpen, sorter, nkey + ncol_i32, 0);
             b.set_p4(so, P4::KeyInfo(keyinfo));
+            b.note_cursor(sorter);
 
             for row in &select.values {
                 if let Some(w) = &select.where_clause {
@@ -1340,6 +1358,7 @@ fn compile_scan(
     outputs: &[(Expr, String)],
     limit: Option<i64>,
     offset: i64,
+    subquery_resolver: Option<&dyn SubqueryResolver>,
 ) -> Result<Program> {
     let cursor = 0i32;
     let ncol = outputs.len() as i32;
@@ -1348,6 +1367,7 @@ fn compile_scan(
         cursor,
         register_base: None, join_tables: None,
         index_read: None,
+        subquery_resolver,
     };
     let mut b = ProgramBuilder::new();
 
@@ -1372,6 +1392,7 @@ fn compile_scan(
     let offset_reg = (offset > 0).then(|| emit_int(&mut b, offset));
 
     let open = b.emit(Opcode::OpenRead, cursor, table.rootpage as i32, 0);
+    b.note_cursor(cursor);
     if table.without_rowid {
         // A WITHOUT ROWID table is an index b-tree keyed by the PK record; open it with the
         // table's KeyInfo so the IndexCursor compares correctly during ordered scans.
@@ -1411,6 +1432,7 @@ fn compile_scan_unordered(
         let c = 2i32;
         let oe = b.emit(Opcode::OpenEphemeral, c, ncol, 0);
         b.set_p4(oe, P4::KeyInfo(Vec::new()));
+        b.note_cursor(c);
         c
     });
     let end = b.new_label();
@@ -1471,6 +1493,7 @@ fn compile_scan_ordered(
         .collect();
     let so = b.emit(Opcode::SorterOpen, sorter, nkey + ncol, 0);
     b.set_p4(so, P4::KeyInfo(keyinfo));
+    b.note_cursor(sorter);
 
     // --- scan loop: filter, build [keys..., outputs...] records, insert into the sorter ---
     let end_scan = b.new_label();
@@ -1527,6 +1550,7 @@ fn compile_constant(
     outputs: &[(Expr, String)],
     limit: Option<i64>,
     offset: i64,
+    subquery_resolver: Option<&dyn SubqueryResolver>,
 ) -> Result<Program> {
     // No table: column references resolve against an empty table and therefore error.
     let empty = Table {
@@ -1542,6 +1566,7 @@ fn compile_constant(
         cursor: -1,
         register_base: None, join_tables: None,
         index_read: None,
+        subquery_resolver,
     };
     let ncol = outputs.len() as i32;
     let mut b = ProgramBuilder::new();
@@ -1876,7 +1901,7 @@ mod tests {
         let Stmt::Select(s) = parse(select_sql).unwrap().into_iter().next().unwrap() else {
             panic!("expected SELECT")
         };
-        compile(&s, Some(&table), &[]).unwrap()
+        compile(&s, Some(&table), &[], None).unwrap()
     }
 
     #[test]
