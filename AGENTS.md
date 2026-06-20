@@ -250,4 +250,11 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   Differential-tested vs the C oracle (`using_and_natural_joins`,
   `using_and_natural_errors`). Still M7+: self-joins, join-order selection, aggregates
   over joins, join chains (multiple ON levels). Known divergence: same RIGHT/FULL JOIN
-  row-order note as above; test cases use ORDER BY for determinism.
+  row-order note as above; test cases use ORDER BY for determinism. **7.11 self-joins** ✅:
+  a table joined with itself via aliases (`FROM t a, t b`) is handled by the existing
+  join codegen — the same root page is opened on two distinct cursors (cursor 0 and
+  cursor 1), so each alias scans independently. `OpenDup` (M7.12) is NOT needed for
+  self-joins on regular tables; that opcode is for sharing an ephemeral cursor (used by
+  CTEs / window functions / subqueries in M8/M11), not self-joins. USING and NATURAL
+  work on self-joins too (the AST rewrite resolves column references via the alias names).
+  Differential-tested vs the C oracle (`self_joins`).

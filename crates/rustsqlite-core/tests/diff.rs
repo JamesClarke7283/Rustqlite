@@ -1101,6 +1101,45 @@ fn cross_and_inner_joins() {
     }
 }
 
+/// Self-joins (M7.11): a table joined with itself via aliases. The join codegen opens
+/// the same root page on two distinct cursors (cursor 0 and cursor 1), so each alias
+/// scans independently. `OpenDup` is not needed — that opcode is for sharing an ephemeral
+/// cursor (used by CTEs / window functions / subqueries), not for self-joins on regular
+/// tables.
+#[test]
+fn self_joins() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup(
+        "CREATE TABLE t1(x INT, y TEXT);\
+         INSERT INTO t1 VALUES (1,'a'),(2,'b'),(1,'c'),(3,'d'),(NULL,'e');",
+    );
+    for q in [
+        // Comma self-join (cross product of a table with itself).
+        "SELECT * FROM t1 a, t1 b;",
+        "SELECT a.x, a.y, b.y FROM t1 a, t1 b;",
+        // Inner self-join on equality.
+        "SELECT * FROM t1 a, t1 b WHERE a.x = b.x;",
+        "SELECT * FROM t1 a JOIN t1 b ON a.x = b.x;",
+        "SELECT a.x, a.y, b.y FROM t1 a JOIN t1 b ON a.x = b.x ORDER BY a.y, b.y;",
+        // Self-join with WHERE filter in addition to the ON predicate.
+        "SELECT a.x, b.x FROM t1 a JOIN t1 b ON a.x = b.x WHERE a.y <> b.y ORDER BY a.y, b.y;",
+        // Self-join with aliases that share column names; bare col must be ambiguous.
+        // (Skip the ambiguous case — error parity is covered by using_and_natural_errors.)
+        // LEFT self-join.
+        "SELECT * FROM t1 a LEFT JOIN t1 b ON a.x = b.x AND a.y <> b.y ORDER BY a.y, b.y;",
+        // Self-join with USING (both aliases share column names).
+        "SELECT * FROM t1 a JOIN t1 b USING(x) ORDER BY a.y, b.y;",
+        // Self-join with NATURAL.
+        "SELECT * FROM t1 a NATURAL JOIN t1 b ORDER BY a.y, b.y;",
+    ] {
+        assert_same(db.str(), q);
+    }
+}
+
 /// `USING (cols)` and `NATURAL JOIN` (M7.10 / M7.14). The join codegen rewrites the
 /// AST before emitting the nested loop: the USING columns become an `AND` chain of
 /// equality predicates (the synthetic ON), bare shared-column references in the
