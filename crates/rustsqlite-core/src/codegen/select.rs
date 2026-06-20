@@ -38,6 +38,13 @@ pub fn compile(
     }
 
     let outputs = expand_columns(select, table)?;
+    // HAVING is only valid on an aggregate query (one with a GROUP BY or an aggregate function
+    // call in the projection list). Mirrors the `resolve.c` check that raises
+    // "HAVING clause on a non-aggregate query". A HAVING on a non-aggregate query is a semantic
+    // error, not a "not supported" limitation — the message matches the oracle.
+    if select.having.is_some() && !is_aggregate_query(select, &outputs) {
+        return Err(Error::msg("HAVING clause on a non-aggregate query"));
+    }
     let names: Vec<String> = outputs.iter().map(|(_, n)| n.clone()).collect();
     let (limit, offset) = eval_limit_offset(select)?;
 
@@ -84,10 +91,15 @@ fn compile_aggregate(
     limit: Option<i64>,
     offset: i64,
 ) -> Result<Program> {
-    // (A) Collect every aggregate call from the projection list (and, in future, HAVING).
+    // (A) Collect every aggregate call from the projection list and the HAVING clause. Both
+    // sites share one set of accumulator registers (matching upstream's `AggInfo` which walks
+    // pEList and pHaving together via `sqlite3ExprAnalyzeAggList` + `sqlite3ExprAnalyzeAggregates`).
     let mut agg_calls: Vec<AggCall> = Vec::new();
     for (e, _) in outputs {
         collect_aggregates(e, &mut agg_calls);
+    }
+    if let Some(having) = &select.having {
+        collect_aggregates(having, &mut agg_calls);
     }
     // Deduplicate by syntactic identity (name + args) so the same call appearing twice shares
     // one accumulator. Matches upstream's `AggInfo` deduplication.
@@ -173,6 +185,12 @@ fn compile_aggregate(
         .iter()
         .map(|(e, n)| (rewrite_projection_expr(e, &reg_of, &group_key_of), n.clone()))
         .collect();
+    // Rewrite the HAVING expression the same way: aggregate calls → `AggRef(agg_reg)`, GROUP BY
+    // key subexpressions → `AggRef(i_amem)`. Emitted in the output subroutine after `AggFinal`.
+    let rewritten_having = select
+        .having
+        .as_ref()
+        .map(|h| rewrite_projection_expr(h, &reg_of, &group_key_of));
 
     // (D) Open the table cursor.
     let open = b.emit(Opcode::OpenRead, cursor, table.rootpage as i32, 0);
@@ -229,6 +247,12 @@ fn compile_aggregate(
         // Emit the single result row. OFFSET/LIMIT apply to the result of an aggregate without
         // GROUP BY (the LIMIT of a `SELECT count(*) FROM t LIMIT 0` is zero rows).
         let emit_end = b.new_label();
+        // HAVING: filter the single aggregated row. `sqlite3ExprIfFalse(pHaving, addrEnd,
+        // SQLITE_JUMPIFNULL)` — false or NULL jumps past the emission to `emit_end` (which
+        // resolves to the Halt). This matches the upstream no-GROUP-BY path.
+        if let Some(having) = &rewritten_having {
+            compile_jump(&mut b, having, emit_end, false, true, ctx)?;
+        }
         if let Some(oreg) = offset_reg {
             b.emit_jump(Opcode::IfPos, oreg, emit_end, 1);
         }
@@ -438,6 +462,12 @@ fn compile_aggregate(
     for (i, kind) in kinds.iter().enumerate() {
         let idx = b.emit(Opcode::AggFinal, agg_reg_base + i as i32, 0, 0);
         b.set_p4(idx, P4::FuncDef(*kind));
+    }
+    // HAVING: filter this group's row. `sqlite3ExprIfFalse(pHaving, addrOutputRow+1,
+    // SQLITE_JUMPIFNULL)` — false or NULL jumps past the projection emission to `output_skip`
+    // (which resolves just before the `Return`, matching upstream's `addrOutputRow+1` = OP_Return).
+    if let Some(having) = &rewritten_having {
+        compile_jump(&mut b, having, output_skip, false, true, ctx)?;
     }
     // Evaluate the projection (now containing `AggRef`s to the finalized registers and plain
     // column refs that read from the sorter's group-key columns).
@@ -717,9 +747,6 @@ fn reject_unsupported(select: &SelectStmt) -> Result<()> {
     }
     if select.from.iter().any(|t| t.table().is_none() && t.subquery().is_none()) {
         return Err(Error::msg("joins are not supported"));
-    }
-    if select.having.is_some() {
-        return Err(Error::msg("HAVING is not supported yet"));
     }
     // ORDER BY on an aggregate query is handled by M6.8 (two-pass: aggregate then sort). Until
     // that lands, reject it so we don't silently produce wrong-order output.

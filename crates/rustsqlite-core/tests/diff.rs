@@ -723,6 +723,35 @@ fn aggregate_queries() {
         "SELECT count(*), sum(a), total(a), avg(a), min(a), max(a) FROM t WHERE 0;",
         // Multiple aggregates of different kinds in one query.
         "SELECT count(*), count(a), count(b), sum(a), total(a), avg(a), min(a), max(a), group_concat(b, ',') FROM t;",
+        // HAVING (no GROUP BY) — filters the single aggregated row.
+        "SELECT count(*) FROM t HAVING count(*) > 0;",
+        "SELECT count(*) FROM t HAVING count(*) > 100;",
+        "SELECT count(*) FROM t WHERE 0 HAVING count(*) > 0;",
+        "SELECT count(*), sum(a) FROM t HAVING sum(a) IS NULL;",
+        "SELECT count(*) FROM t HAVING 1=0;",
+        "SELECT count(*) FROM t HAVING 1=1;",
+        // HAVING (GROUP BY) — filters groups after AggFinal.
+        "SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 0;",
+        "SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 1;",
+        "SELECT a, count(*) FROM t GROUP BY a HAVING count(*) >= 1;",
+        "SELECT a, count(*) FROM t GROUP BY a HAVING a > 1;",
+        "SELECT a, count(*) FROM t GROUP BY a HAVING a > 1 AND count(*) >= 1;",
+        "SELECT a, count(*) FROM t GROUP BY a HAVING sum(a) > 1;",
+        "SELECT a, count(*) FROM t GROUP BY a HAVING min(b) IS NOT NULL;",
+        "SELECT b, count(*) FROM t GROUP BY b HAVING count(*) > 0;",
+        "SELECT b, count(*) FROM t GROUP BY b HAVING b IS NULL;",
+        "SELECT b, count(*) FROM t GROUP BY b HAVING b IS NOT NULL;",
+        "SELECT a, group_concat(b) FROM t GROUP BY a HAVING count(*) > 1;",
+        // Aggregate referenced only in HAVING (not in projection).
+        "SELECT a FROM t GROUP BY a HAVING count(*) > 0;",
+        "SELECT a FROM t GROUP BY a HAVING sum(a) > 0;",
+        // HAVING with WHERE and GROUP BY.
+        "SELECT a, count(*) FROM t WHERE a > 1 GROUP BY a HAVING count(*) > 0;",
+        // HAVING with LIMIT.
+        "SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 0 LIMIT 1;",
+        // HAVING that references a GROUP BY key inside a larger expression.
+        "SELECT a, count(*) FROM t GROUP BY a HAVING a + 1 > 2;",
+        "SELECT a, count(*) FROM t GROUP BY a HAVING a IS NOT NULL;",
     ] {
         assert_same(db.str(), q);
     }

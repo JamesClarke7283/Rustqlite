@@ -1,0 +1,121 @@
+# Hand-rolled sqllogictest corpus for HAVING (M6.4). Exercises:
+#   * HAVING on a no-GROUP-BY aggregate query (filters the single aggregated row).
+#   * HAVING on a GROUP BY query (filters groups after AggFinal).
+#   * Aggregate calls referenced only in HAVING (not in the projection list).
+#   * HAVING referencing a GROUP BY key inside a larger expression.
+#   * HAVING that is always false / always true / NULL-valued.
+# The `sqllogictest` crate joins result columns with a single space when validating.
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t1 VALUES(1, 'pear'), (1, 'apple'), (2, 'banana'), (2, NULL), (3, 'cherry'), (NULL, NULL)
+
+# HAVING without GROUP BY: filters the single aggregated row.
+
+query I
+SELECT count(*) FROM t1 HAVING count(*) > 0
+----
+6
+
+query I
+SELECT count(*) FROM t1 HAVING count(*) > 100
+----
+
+query I
+SELECT count(*) FROM t1 WHERE 0 HAVING count(*) > 0
+----
+
+# HAVING with GROUP BY: filters groups after AggFinal.
+
+query II rowsort
+SELECT a, count(*) FROM t1 GROUP BY a HAVING count(*) > 1
+----
+1 2
+2 2
+
+query II rowsort
+SELECT a, count(*) FROM t1 GROUP BY a HAVING count(*) >= 1
+----
+1 2
+2 2
+3 1
+NULL 1
+
+query II rowsort
+SELECT a, count(*) FROM t1 GROUP BY a HAVING a > 1
+----
+2 2
+3 1
+
+query II rowsort
+SELECT a, count(*) FROM t1 GROUP BY a HAVING a IS NOT NULL
+----
+1 2
+2 2
+3 1
+
+# Aggregate referenced only in HAVING (not in projection).
+
+query I rowsort
+SELECT a FROM t1 GROUP BY a HAVING count(*) > 0
+----
+1
+2
+3
+NULL
+
+query I rowsort
+SELECT a FROM t1 GROUP BY a HAVING sum(a) > 0
+----
+1
+2
+3
+
+# HAVING referencing a GROUP BY key inside a larger expression.
+
+query II rowsort
+SELECT a, count(*) FROM t1 GROUP BY a HAVING a + 1 > 2
+----
+2 2
+3 1
+
+# HAVING with WHERE and GROUP BY.
+
+query II rowsort
+SELECT a, count(*) FROM t1 WHERE a > 1 GROUP BY a HAVING count(*) > 0
+----
+2 2
+3 1
+
+# HAVING with LIMIT.
+
+query II rowsort
+SELECT a, count(*) FROM t1 GROUP BY a HAVING count(*) > 0 LIMIT 1
+----
+NULL 1
+
+# HAVING with min/max on a NULL-containing column.
+
+query II rowsort
+SELECT a, count(b) FROM t1 GROUP BY a HAVING count(b) > 0
+----
+1 2
+2 1
+3 1
+
+query II rowsort
+SELECT a, min(b) FROM t1 GROUP BY a HAVING min(b) IS NOT NULL
+----
+1 apple
+2 banana
+3 cherry
+
+# HAVING on a group whose aggregate yields NULL (sum over all-NULL b yields NULL).
+
+query II rowsort
+SELECT a, sum(b IS NULL) FROM t1 GROUP BY a HAVING sum(b IS NULL) > 0
+----
+2 1
+NULL 1

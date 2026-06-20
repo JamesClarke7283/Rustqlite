@@ -43,3 +43,6 @@ our/multi-column-index.slt
 # skipif-onlyif dependencies that the rest of the slt_lang_*.test family
 # rely on.
 evidence/slt_lang_dropindex.test
+
+# M6.4 — HAVING (filter after AggFinal) on aggregate queries with/without GROUP BY.
+our/having.slt
