@@ -185,9 +185,9 @@ list every granular item needed.
 
 ## M7 — Joins
 
-- [ ] **7.1** Parser: `FROM` clause with `[INNER|CROSS|LEFT|RIGHT|FULL] [NATURAL] JOIN … ON expr / USING (cols)`
-- [ ] **7.2** VDBE: `OpenEphemeral` opcode — open an ephemeral b-tree for intermediate results
-- [ ] **7.3** VDBE: `NotFound` / `Found` opcodes — index existence check
+- [x] **7.1** Parser: `FROM` clause with `[INNER|CROSS|LEFT|RIGHT|FULL] [NATURAL] JOIN … ON expr / USING (cols)`
+- [x] **7.2** VDBE: `OpenEphemeral` opcode — open an ephemeral b-tree for intermediate results
+- [x] **7.3** VDBE: `NotFound` / `Found` opcodes — index existence check
 - [ ] **7.4** Codegen: cross join (cartesian product, nested loop)
 - [ ] **7.5** Codegen: inner join — nested-loop with `NotExists`/`Found` on inner table
 - [ ] **7.6** Codegen: left outer join — emit NULL row when inner match fails (`IfNullRow` opcode)
