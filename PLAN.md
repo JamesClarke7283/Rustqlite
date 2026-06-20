@@ -209,7 +209,7 @@ list every granular item needed.
 - [x] **8.3** Parser: `EXISTS (SELECT …)`
 - [x] **8.4** Parser: `IN (SELECT …)` / `NOT IN (SELECT …)`
 - [x] **8.5** VDBE: coroutine opcodes — `InitCoroutine`, `EndCoroutine`, `Yield`
-- [ ] **8.6** Codegen: `FROM (subquery)` — materialize subquery into ephemeral table, then scan
+- [x] **8.6** Codegen: `FROM (subquery)` — materialize subquery into ephemeral table, then scan
 - [ ] **8.7** Codegen: scalar subquery in expressions — `Program` opcode or coroutine
 - [ ] **8.8** Codegen: `EXISTS (subquery)` — materialize, check if any row exists
 - [ ] **8.9** Codegen: `IN (subquery)` — ephemeral index or sorter for the subquery result set

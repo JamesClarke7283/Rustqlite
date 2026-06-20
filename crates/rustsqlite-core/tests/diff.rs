@@ -1267,3 +1267,40 @@ fn using_and_natural_errors() {
         }
     }
 }
+
+/// `FROM (subquery) AS alias` materialization (M8.6). The subquery's result rows are
+/// materialized into an ephemeral table and the outer SELECT scans that table. The oracle
+/// is the system `sqlite3`. Tests cover: a constant subquery, a subquery over a real table
+/// (with WHERE), `SELECT *`, projection of specific columns, WHERE on the outer query,
+/// ORDER BY on the outer query, LIMIT on the outer query, and a `VALUES` subquery.
+#[test]
+fn from_subquery_materialization() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = standard_fixture();
+    for q in [
+        // Constant subquery.
+        "SELECT * FROM (SELECT 1 AS x, 2 AS y) AS sq;",
+        "SELECT x, y FROM (SELECT 1 AS x, 2 AS y) AS sq;",
+        "SELECT x + y FROM (SELECT 1 AS x, 2 AS y) AS sq;",
+        // Subquery over a real table.
+        "SELECT * FROM (SELECT a, b FROM t WHERE a > 1) AS sq;",
+        "SELECT a FROM (SELECT a, b FROM t WHERE a > 1) AS sq;",
+        "SELECT * FROM (SELECT a, b FROM t WHERE a > 1) AS sq WHERE a < 10;",
+        "SELECT a FROM (SELECT a, b FROM t WHERE a > 1) AS sq ORDER BY a;",
+        "SELECT a FROM (SELECT a, b FROM t WHERE a > 1) AS sq ORDER BY a DESC;",
+        "SELECT a FROM (SELECT a, b FROM t WHERE a > 1) AS sq LIMIT 2;",
+        "SELECT a FROM (SELECT a, b FROM t WHERE a > 1) AS sq LIMIT 2 OFFSET 1;",
+        // Subquery with computed projection.
+        "SELECT a_plus FROM (SELECT a + 1 AS a_plus, b FROM t) AS sq WHERE a_plus > 2;",
+        // VALUES as a subquery in FROM.
+        "SELECT * FROM (VALUES (1, 'x'), (2, 'y')) AS sq;",
+        "SELECT column1 FROM (VALUES (1, 'x'), (2, 'y')) AS sq WHERE column1 > 1;",
+        // A subquery selecting a single column referenced in the outer query.
+        "SELECT count FROM (SELECT count(*) AS count FROM t) AS sq;",
+    ] {
+        assert_same(db.str(), q);
+    }
+}

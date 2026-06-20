@@ -649,6 +649,30 @@ fn rewrite_using_or_natural(
 /// Resolve the single FROM table (if any) from the catalog and compile the SELECT. Shared by the
 /// normal SELECT path and the EXPLAIN path.
 fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelect> {
+    // `FROM (subquery) AS alias` path: materialize the subquery into an ephemeral table and
+    // scan it. Single-entry FROM with a subquery (no joins). M8.6.
+    if !select.from.is_empty() && select.values.is_empty() && select.from.len() == 1 {
+        if let rustqlite_parser::TableOrJoin::Subquery { query, alias } = &select.from[0] {
+            // Resolve the subquery's own FROM table (if any) so the inner body can be compiled.
+            // A subquery with a join in its own FROM is not yet supported (M7+).
+            let (sub_table, sub_indexes, pager) = resolve_subquery_source(db, query)?;
+            let (program, column_names) = codegen::compile_from_subquery(
+                select,
+                query,
+                alias,
+                sub_table.as_ref(),
+                &sub_indexes,
+            )?;
+            return Ok(CompiledSelect {
+                program,
+                column_names,
+                pager,
+                table: None,
+                index_plan_info: None,
+            });
+        }
+    }
+
     // Multi-table (join) path: when the FROM clause is a cross/inner join of plain tables,
     // resolve each table from the catalog and compile via the join codegen. This returns
     // early; the single-table path below handles the rest.
@@ -766,6 +790,53 @@ fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelec
         table,
         index_plan_info,
     })
+}
+
+/// Resolve the inner FROM table (if any) for a `FROM (subquery)` subquery, so the subquery
+/// body can be compiled. Returns `(table, indexes, pager)` where `table` is `None` for a
+/// constant / `VALUES` subquery (no FROM) and `pager` is `None` only in that case.
+///
+/// The M8.6 first slice supports a subquery with zero or one plain-table FROM entries. A
+/// subquery with a join in its own FROM is rejected here; it lands with later M7/M8 work.
+fn resolve_subquery_source(
+    db: &mut Sqlite3,
+    subquery: &SelectStmt,
+) -> Result<(Option<Table>, Vec<IndexObject>, Option<Arc<Pager>>)> {
+    if !subquery.values.is_empty() {
+        // A VALUES subquery has no real FROM table.
+        return Ok((None, Vec::new(), None));
+    }
+    if subquery.from.is_empty() {
+        // A constant SELECT (no FROM) — no source table needed.
+        return Ok((None, Vec::new(), None));
+    }
+    if subquery.from.len() > 1 {
+        return Err(Error::msg("joins inside a FROM subquery are not supported yet"));
+    }
+    let Some(table_ref) = subquery.from[0].table() else {
+        return Err(Error::msg("nested subqueries in FROM are not supported yet"));
+    };
+    // The implicit `sqlite_schema` table — synthesize it directly (no catalog row).
+    if table_ref.name.eq_ignore_ascii_case("sqlite_schema")
+        || table_ref.name.eq_ignore_ascii_case("sqlite_master")
+    {
+        let pager = db.pager_arc()?;
+        let table = resolve_sqlite_schema(&pager)?;
+        return Ok((Some(table), Vec::new(), Some(pager)));
+    }
+    let pager = db.pager_arc()?;
+    let catalog = block_on(read_catalog(&pager))?;
+    let obj = catalog
+        .find_table(&table_ref.name)
+        .ok_or_else(|| Error::msg(format!("no such table: {}", table_ref.name)))?;
+    let table = Table::from_schema_object(obj)?;
+    let mut indexes = Vec::new();
+    for obj in catalog.indexes() {
+        if obj.tbl_name.eq_ignore_ascii_case(&table_ref.name) {
+            indexes.push(IndexObject::from_schema_object(obj)?);
+        }
+    }
+    Ok((Some(table), indexes, Some(pager)))
 }
 
 impl Sqlite3Stmt {

@@ -53,6 +53,30 @@ impl ProgramBuilder {
         self.insts.len() as i32
     }
 
+    /// The current number of emitted instructions (alias of [`Self::cur_addr`] as a count).
+    pub fn insts_len(&self) -> usize {
+        self.insts.len()
+    }
+
+    /// Register a label fixup for an already-appended instruction at index `idx`, patching
+    /// its `p2` operand to `label`'s resolved address at `finish` time. Mirrors what
+    /// [`Self::emit_jump`] does for freshly-emitted jumps; this entry point lets a caller
+    /// append a jump instruction directly via [`Self::append`] and still defer its target.
+    pub fn add_fixup(&mut self, idx: usize, label: Label) {
+        self.fixups.push((idx, label));
+    }
+
+    /// The resolved address of `label`, or `None` if it has not been resolved yet.
+    pub fn label_addr_of(&self, label: Label) -> i32 {
+        self.label_addr[label.0].unwrap_or(0)
+    }
+
+    /// Iterate over all emitted instructions mutably, so callers can post-process them
+    /// (e.g. patch jump targets after a sub-program is inlined).
+    pub fn iter_insts_mut(&mut self) -> impl Iterator<Item = &mut Instruction> {
+        self.insts.iter_mut()
+    }
+
     /// Emit `opcode p1 p2 p3` and return its address.
     pub fn emit(&mut self, opcode: Opcode, p1: i32, p2: i32, p3: i32) -> usize {
         self.insts.push(Instruction::new(opcode, p1, p2, p3));

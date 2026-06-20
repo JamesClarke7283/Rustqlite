@@ -185,6 +185,13 @@ pub fn query_plan_rows(
         } else {
             details.push(format!("SCAN {}-ROW VALUES CLAUSE", select.values.len()));
         }
+    } else if let Some(subq_alias) = subquery_from_alias(select) {
+        // `FROM (subquery) AS alias` materialization (M8.6). The outer SELECT scans the
+        // materialized ephemeral. Upstream renders a `CO-ROUTINE <alias>` line for the
+        // subquery body and a `SCAN <alias>` line for the outer scan; we emit only the outer
+        // `SCAN <alias>` for the first slice (the inner body's plan is not summarized yet —
+        // that lands with M8.10 `Program` opcode for proper sub-program planning).
+        details.push(format!("SCAN {subq_alias}"));
     } else {
         match table_name {
             Some(name) => {
@@ -261,6 +268,20 @@ pub fn query_plan_rows(
             ]
         })
         .collect()
+}
+
+/// If the SELECT's FROM clause is a single subquery entry (`FROM (subquery) AS alias`),
+/// return the alias. Used by [`query_plan_rows`] to label the outer scan over the
+/// materialized ephemeral table. Returns `None` for any other FROM shape.
+fn subquery_from_alias(select: &SelectStmt) -> Option<&str> {
+    use rustqlite_parser::TableOrJoin;
+    if select.from.len() != 1 {
+        return None;
+    }
+    match &select.from[0] {
+        TableOrJoin::Subquery { alias, .. } => Some(alias.as_str()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

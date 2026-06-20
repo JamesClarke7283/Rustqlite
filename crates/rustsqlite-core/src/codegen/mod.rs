@@ -20,6 +20,7 @@ pub mod join;
 pub mod join_using;
 pub mod returning;
 pub mod select;
+pub mod subquery;
 pub mod update;
 
 use crate::error::Result;
@@ -149,4 +150,19 @@ pub fn compile_drop_index(
 /// `IdxDelete` + `IdxInsert` maintenance for each single-column index on the table.
 pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) -> Result<Program> {
     update::compile_update(upd, table, indexes)
+}
+
+/// Compile a `SELECT ... FROM (subquery) AS alias [...]` by materializing the subquery into an
+/// in-memory ephemeral table and then scanning it. `subquery` is the inner `SELECT`;
+/// `subquery_table`/`subquery_indexes` describe the inner FROM table (or `None` for a
+/// constant/VALUES subquery). Returns the program and the outer result column names.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_from_subquery(
+    outer: &SelectStmt,
+    subquery: &SelectStmt,
+    alias: &str,
+    subquery_table: Option<&Table>,
+    subquery_indexes: &[IndexObject],
+) -> Result<(Program, Vec<String>)> {
+    subquery::compile_from_subquery(outer, subquery, alias, subquery_table, subquery_indexes)
 }

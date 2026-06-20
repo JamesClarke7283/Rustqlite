@@ -271,6 +271,25 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   continuation). `EndCoroutine p1` reads the calling `Yield`'s `p2` from the instruction
   at `r[p1] - 1` and jumps there, leaving `r[p1]` set to its own address so subsequent
   `Yield`s re-end. Unit-tested with a 3-row coroutine (`coroutine_init_yield_end_basic`)
-  and an empty coroutine (`coroutine_empty`). Still M8+: `FROM (subquery)`
-  materialization, scalar subquery / `EXISTS` / `IN (SELECT …)` codegen, `OpenDup`
+  and an empty coroutine (`coroutine_empty`). **8.6 `FROM (subquery)` materialization** ✅:
+  `FROM (subquery) AS alias` is compiled by `codegen::subquery::compile_from_subquery`
+  (mirrors the `SRT_EphemTab` path in `select.c`). The subquery body is compiled as a
+  sub-program, then inlined into the outer program: its `Init` and `Halt`-onward setup
+  block are dropped (the outer program keeps its own canonical setup); each `ResultRow`
+  is rewritten into `MakeRecord + NewRowid + Insert` into a high-numbered ephemeral
+  cursor (cursor 10, clear of any subquery/outer-scan cursor). Because `ResultRow`
+  expands to multiple instructions, the inlined addresses do NOT map 1:1 with a constant
+  offset — an address map (`sub_addr -> inlined_addr`) is built during inlining and every
+  jump's `p2` is patched using it; jumps that targeted the subquery's `Halt` (the
+  scan-end label) are redirected to `after_sub` (the outer scan's first opcode). The
+  outer SELECT is compiled against a synthesized `Table` whose columns match the
+  subquery's output column names (BLOB affinity — no coercion, like SQLite); the outer
+  scan reads from the ephemeral via `Rewind`/`Next`/`Column`. Supports: constant
+  subquery, subquery over a real table (with `WHERE`), `SELECT *`, projection, outer
+  `WHERE`, outer `ORDER BY`, outer `LIMIT`/`OFFSET`, `VALUES` subquery, and a subquery
+  with an aggregate. `EXPLAIN QUERY PLAN` emits `SCAN <alias>` for the outer scan (the
+  oracle's `CO-ROUTINE <alias>` + `SCAN <alias>` shape for non-flattenable subqueries,
+  and the `SCAN t` flattening for simple subqueries, land with M8.12 subquery
+  flattening). Differential-tested vs the C oracle (`from_subquery_materialization`).
+  Still M8+: scalar subquery / `EXISTS` / `IN (SELECT …)` codegen, `OpenDup`
   (M7.12 BLOCKED), `Program` / `Param` opcodes for correlated subqueries.
