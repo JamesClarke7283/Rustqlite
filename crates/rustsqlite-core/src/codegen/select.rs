@@ -363,6 +363,15 @@ fn compile_aggregate(
     // upstream's `OP_Gosub regReset, addrReset`).
     b.emit_jump(Opcode::Gosub, reg_reset, addr_reset, 0);
 
+    // DISTINCT dedup cursor (one per output pass). Opened here so it survives across the
+    // whole output walk; each emitted group row is checked for novelty against it.
+    let distinct_cursor = select.distinct.then(|| {
+        let c = 2i32;
+        let oe = b.emit(Opcode::OpenEphemeral, c, ncol, 0);
+        b.set_p4(oe, P4::KeyInfo(Vec::new()));
+        c
+    });
+
     // Sort the sorter and position at the first record, or jump to `addr_end` if empty.
     b.emit_jump(Opcode::SorterSort, sorter, addr_end, 0);
     let loop_top = b.new_label();
@@ -474,6 +483,15 @@ fn compile_aggregate(
     let result_reg = b.alloc_regs(ncol);
     for (j, (expr, _)) in rewritten_outputs.iter().enumerate() {
         compile_expr(&mut b, expr, result_reg + j as i32, ctx)?;
+    }
+    // DISTINCT dedup: skip this group's row if its output has been seen before; otherwise
+    // record it. Mirrors the unordered scan's `Found`+`IdxInsert` pair.
+    if let Some(dc) = distinct_cursor {
+        let found = b.emit_jump(Opcode::Found, dc, output_skip, result_reg);
+        b.set_p4(found, P4::Int(ncol as i64));
+        let rec = b.alloc_reg();
+        b.emit(Opcode::MakeRecord, result_reg, ncol, rec);
+        b.emit(Opcode::IdxInsert, dc, rec, 0);
     }
     // Apply OFFSET/LIMIT.
     let row_end = b.new_label();
@@ -602,7 +620,7 @@ fn rewrite_aggregates_with_group_keys(
 /// index.
 #[allow(clippy::too_many_arguments)]
 fn compile_indexed_select(
-    _select: &SelectStmt,
+    select: &SelectStmt,
     table: &Table,
     plan: &IndexPlan,
     outputs: &[(Expr, String)],
@@ -666,6 +684,14 @@ fn compile_indexed_select(
     let seek = b.emit_jump(Opcode::SeekGE, idx_cursor, end_seek, key_reg);
     b.set_p4(seek, P4::Int(nkey as i64));
 
+    // DISTINCT dedup cursor (opened before the loop so it survives across iterations).
+    let distinct_cursor = select.distinct.then(|| {
+        let c = 2i32;
+        let oe = b.emit(Opcode::OpenEphemeral, c, ncol, 0);
+        b.set_p4(oe, P4::KeyInfo(Vec::new()));
+        c
+    });
+
     // (5) Loop body: read the rowid, seek the table, project. The IdxGT boundary
     // check is re-emitted at the top of every iteration so the loop terminates when the
     // index key prefix no longer matches.
@@ -687,6 +713,13 @@ fn compile_indexed_select(
     let result_reg = b.alloc_regs(ncol);
     for (j, (expr, _)) in outputs.iter().enumerate() {
         compile_expr(&mut b, expr, result_reg + j as i32, ctx)?;
+    }
+    if let Some(dc) = distinct_cursor {
+        let found = b.emit_jump(Opcode::Found, dc, idx_next, result_reg);
+        b.set_p4(found, P4::Int(ncol as i64));
+        let rec = b.alloc_reg();
+        b.emit(Opcode::MakeRecord, result_reg, ncol, rec);
+        b.emit(Opcode::IdxInsert, dc, rec, 0);
     }
     b.emit(Opcode::ResultRow, result_reg, ncol, 0);
     if let Some(lreg) = limit_reg {
@@ -742,8 +775,13 @@ fn reject_unsupported(select: &SelectStmt) -> Result<()> {
             "compound SELECT (UNION/INTERSECT/EXCEPT) is not supported by the executor yet",
         ));
     }
-    if select.distinct {
-        return Err(Error::msg("SELECT DISTINCT is not supported yet"));
+    if select.distinct && !select.order_by.is_empty() {
+        // The DISTINCT+ORDER BY combination needs the WHERE_DISTINCT_ORDERED path (a
+        // single sorted pass with prev-row comparison). M6.6 ships the UNORDERED path
+        // (ephemeral index); the combined case lands with M6.8 (GROUP BY + ORDER BY).
+        return Err(Error::msg(
+            "DISTINCT with ORDER BY is not supported yet (M6.8)",
+        ));
     }
     if select.from.iter().any(|t| t.table().is_none() && t.subquery().is_none()) {
         return Err(Error::msg("joins are not supported"));
@@ -1170,6 +1208,16 @@ fn compile_scan_unordered(
     offset_reg: Option<i32>,
 ) -> Result<()> {
     let cursor = ctx.cursor;
+    // DISTINCT dedup cursor: an ephemeral index keyed by the result row record. Allocated
+    // lazily so non-DISTINCT scans don't pay for it. The check runs *before* OFFSET/LIMIT
+    // (matching upstream's `codeDistinct` preceding `codeOffset`): a row that's a duplicate
+    // is skipped entirely and never counts toward the OFFSET/LIMIT counters.
+    let distinct_cursor = select.distinct.then(|| {
+        let c = 2i32;
+        let oe = b.emit(Opcode::OpenEphemeral, c, ncol, 0);
+        b.set_p4(oe, P4::KeyInfo(Vec::new()));
+        c
+    });
     let end = b.new_label();
     b.emit_jump(Opcode::Rewind, cursor, end, 0);
     let loop_top = b.cur_addr();
@@ -1178,13 +1226,19 @@ fn compile_scan_unordered(
     if let Some(w) = &select.where_clause {
         compile_jump(b, w, next_label, false, true, ctx)?;
     }
-    if let Some(oreg) = offset_reg {
-        b.emit_jump(Opcode::IfPos, oreg, next_label, 1);
-    }
-
     let result_reg = b.alloc_regs(ncol);
     for (j, (expr, _)) in outputs.iter().enumerate() {
         compile_expr(b, expr, result_reg + j as i32, ctx)?;
+    }
+    if let Some(dc) = distinct_cursor {
+        let found = b.emit_jump(Opcode::Found, dc, next_label, result_reg);
+        b.set_p4(found, P4::Int(ncol as i64));
+        let rec = b.alloc_reg();
+        b.emit(Opcode::MakeRecord, result_reg, ncol, rec);
+        b.emit(Opcode::IdxInsert, dc, rec, 0);
+    }
+    if let Some(oreg) = offset_reg {
+        b.emit_jump(Opcode::IfPos, oreg, next_label, 1);
     }
     b.emit(Opcode::ResultRow, result_reg, ncol, 0);
     if let Some(lreg) = limit_reg {

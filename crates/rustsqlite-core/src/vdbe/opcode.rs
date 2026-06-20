@@ -146,6 +146,14 @@ pub enum Opcode {
     /// `IdxLT`: jump to `p2` when the entry's prefix is `>=` the search key. Together with
     /// `SeekGE` implements `< key`.
     IdxLT,
+    /// `Found p1 p2 p3 p4=Int(n)`: search cursor `p1` for the record formed by
+    /// `r[p3..p3+n]`; jump to `p2` if found, fall through if not. Currently operates on
+    /// ephemeral index cursors (used by `SELECT DISTINCT` dedup), matching `OP_Found` on an
+    /// `OP_OpenEphemeral`-opened index. Mirrors `OP_Found` in `vdbe.c`.
+    Found,
+    /// `NotFound p1 p2 p3 p4=Int(n)`: the inverse of `Found` — jump to `p2` when the record
+    /// is *not* present on cursor `p1`. Mirrors `OP_NotFound`.
+    NotFound,
 
     // --- value loads ---
     /// `Integer p1 p2`: `r[p2]` = the integer `p1`.
@@ -303,6 +311,8 @@ impl Opcode {
             Opcode::IdxGT => "IdxGT",
             Opcode::IdxLE => "IdxLE",
             Opcode::IdxLT => "IdxLT",
+            Opcode::Found => "Found",
+            Opcode::NotFound => "NotFound",
             Opcode::NotExists => "NotExists",
             Opcode::Rowid => "Rowid",
             Opcode::Column => "Column",

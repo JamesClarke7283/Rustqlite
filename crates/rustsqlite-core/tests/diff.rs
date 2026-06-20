@@ -756,3 +756,86 @@ fn aggregate_queries() {
         assert_same(db.str(), q);
     }
 }
+
+#[test]
+fn distinct_queries() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = standard_fixture();
+    for q in [
+        // Single-column DISTINCT.
+        "SELECT DISTINCT a FROM t;",
+        "SELECT DISTINCT b FROM t;",
+        "SELECT DISTINCT c FROM t;",
+        // Multi-column DISTINCT.
+        "SELECT DISTINCT a, b FROM t;",
+        "SELECT DISTINCT a, b, c FROM t;",
+        "SELECT DISTINCT a, c FROM t;",
+        // DISTINCT with WHERE.
+        "SELECT DISTINCT a FROM t WHERE a > 1;",
+        "SELECT DISTINCT a FROM t WHERE a IS NULL;",
+        "SELECT DISTINCT a FROM t WHERE b IS NOT NULL;",
+        "SELECT DISTINCT b FROM t WHERE a > 0;",
+        // DISTINCT with LIMIT.
+        "SELECT DISTINCT a FROM t LIMIT 2;",
+        "SELECT DISTINCT a FROM t LIMIT 100;",
+        "SELECT DISTINCT a FROM t LIMIT 0;",
+        // DISTINCT with OFFSET (the dedup runs before OFFSET, so duplicates don't consume
+        // offset slots).
+        "SELECT DISTINCT a FROM t LIMIT 100 OFFSET 1;",
+        // DISTINCT over all columns (no duplicates possible since rowid is unique, but the
+        // path still executes).
+        "SELECT DISTINCT id, a, b, c FROM t;",
+        // DISTINCT on a single value (one row out).
+        "SELECT DISTINCT 1 FROM t;",
+        "SELECT DISTINCT a FROM t WHERE 0;",
+        // DISTINCT with a function in the projection.
+        "SELECT DISTINCT a + 1 FROM t;",
+        "SELECT DISTINCT typeof(a) FROM t;",
+        "SELECT DISTINCT a IS NULL FROM t;",
+        // DISTINCT combined with GROUP BY: dedup the group output rows.
+        "SELECT DISTINCT a, count(*) FROM t GROUP BY a;",
+        "SELECT DISTINCT count(*) FROM t GROUP BY a;",
+        "SELECT DISTINCT a FROM t GROUP BY a;",
+    ] {
+        assert_same(db.str(), q);
+    }
+}
+
+#[test]
+fn distinct_indexed_queries() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    // A fixture with a secondary index so the indexed-equality path (SeekGE+IdxGT) is taken,
+    // exercising DISTINCT dedup on the indexed scan path.
+    let db = TempDb::new();
+    db.setup(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b TEXT);\
+         CREATE INDEX idx_a ON t(a);\
+         INSERT INTO t(a,b) VALUES\
+            (3,'pear'),(1,'apple'),(2,'banana'),(1,'apple'),(2,'banana'),\
+            (NULL,''),(10,'Cherry'),(-5,NULL),(3,'pear'),(3,'pear');",
+    );
+    for q in [
+        // Indexed equality + DISTINCT — exercises the Found/IdxInsert path in
+        // `compile_indexed_select` (one distinct row out of multiple equal-key rows).
+        "SELECT DISTINCT a FROM t WHERE a = 3;",
+        "SELECT DISTINCT a, b FROM t WHERE a = 3;",
+        "SELECT DISTINCT a FROM t WHERE a = 1;",
+        "SELECT DISTINCT a, b FROM t WHERE a = 1;",
+        "SELECT DISTINCT a FROM t WHERE a = 2 LIMIT 1;",
+        "SELECT DISTINCT a, b FROM t WHERE a = 2 LIMIT 100;",
+        // No duplicates in the equal-key range — DISTINCT is a no-op but still executes.
+        "SELECT DISTINCT a FROM t WHERE a = 10;",
+        "SELECT DISTINCT a FROM t WHERE a = -5;",
+        "SELECT DISTINCT a, b FROM t WHERE a = -5;",
+        // DISTINCT over the NULL-keyed rows (NULL is a single distinct value).
+        "SELECT DISTINCT a FROM t WHERE a IS NULL;",
+    ] {
+        assert_same(db.str(), q);
+    }
+}

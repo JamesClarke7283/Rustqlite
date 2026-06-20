@@ -617,6 +617,25 @@ impl Vdbe {
                     self.pc += 1;
                 }
                 Opcode::IdxInsert => {
+                    // Ephemeral index cursor (DISTINCT dedup): insert the record blob as a
+                    // dedup key; the opcode is a no-op if the key is already present (no
+                    // uniqueness error — `OP_Found` already filtered duplicates upstream of
+                    // this insert in the DISTINCT path, but be defensive).
+                    if self
+                        .cursors
+                        .get(p1 as usize)
+                        .and_then(|c| c.as_ref())
+                        .is_some_and(VdbeCursor::is_ephemeral)
+                    {
+                        let record = match &self.regs[p2 as usize] {
+                            Value::Blob(b) => b.clone(),
+                            _ => return Err(Error::msg("IdxInsert expects a record blob in p2")),
+                        };
+                        let slot = self.cursors.get_mut(p1 as usize).unwrap().as_mut().unwrap();
+                        let eph = slot.as_ephemeral_mut().unwrap();
+                        eph.idx_insert(&record)?;
+                        self.pc += 1;
+                    } else {
                     let pager = self
                         .pager
                         .clone()
@@ -644,6 +663,7 @@ impl Vdbe {
                         self.ctx.total_changes += 1;
                     }
                     self.pc += 1;
+                    }
                 }
                 Opcode::IdxDelete => {
                     let pager = self
@@ -662,6 +682,32 @@ impl Vdbe {
                         }
                     }
                     self.pc += 1;
+                }
+
+                Opcode::Found | Opcode::NotFound => {
+                    // Search the ephemeral index cursor `p1` for the record formed by
+                    // `r[p3..p3+n]` (n = p4). Jump to `p2` on a found/not-found match.
+                    let n = p4_len(&inst.p4) as usize;
+                    let values: Vec<Value> =
+                        self.regs[p3 as usize..p3 as usize + n].to_vec();
+                    let found = {
+                        let slot = self.cursors.get(p1 as usize)
+                            .and_then(|c| c.as_ref())
+                            .ok_or_else(|| Error::msg("cursor is not open"))?;
+                        let eph = slot.as_ephemeral()
+                            .ok_or_else(|| Error::msg("Found/NotFound requires an ephemeral index cursor"))?;
+                        eph.find_values(&values)?
+                    };
+                    let jump = match inst.opcode {
+                        Opcode::Found => found,
+                        Opcode::NotFound => !found,
+                        _ => unreachable!(),
+                    };
+                    if jump {
+                        self.pc = p2 as usize;
+                    } else {
+                        self.pc += 1;
+                    }
                 }
 
                 Opcode::ResultRow => {
@@ -1034,8 +1080,15 @@ impl Vdbe {
 
                 Opcode::OpenEphemeral => {
                     // Open an in-memory ephemeral table with p2 fields and stash it under cursor p1.
+                    // When P4 is a KeyInfo, upstream opens an index-keyed ephemeral (used for
+                    // DISTINCT dedup and IN-set materialization); otherwise a rowid-keyed table
+                    // (RETURNING buffer).
                     let nfield = p2 as usize;
-                    self.set_cursor(p1 as usize, VdbeCursor::Ephemeral(Ephemeral::new(nfield, self.encoding)));
+                    let eph = match &inst.p4 {
+                        P4::KeyInfo(_) => Ephemeral::new_index(nfield, self.encoding),
+                        _ => Ephemeral::new(nfield, self.encoding),
+                    };
+                    self.set_cursor(p1 as usize, VdbeCursor::Ephemeral(eph));
                     self.pc += 1;
                 }
 

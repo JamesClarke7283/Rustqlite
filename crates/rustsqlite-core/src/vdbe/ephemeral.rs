@@ -1,24 +1,40 @@
-//! In-memory ephemeral table for `RETURNING` (mirrors the ephemeral b-tree used upstream).
+//! In-memory ephemeral table for `RETURNING` and `SELECT DISTINCT` (mirrors the ephemeral
+//! b-tree used upstream).
 //!
-//! Upstream `OP_OpenEphemeral` creates a transient, rowid-keyed b-tree that is automatically
-//! dropped when the statement ends. We model the same semantics with a simple `Vec`-backed
-//! buffer: records are inserted with an auto-incremented integer key, then rewound and read
-//! back sequentially via `Column`. No journaling or sorting is needed for RETURNING.
+//! Upstream `OP_OpenEphemeral` creates a transient b-tree that is automatically dropped when
+//! the statement ends. When `P4` is a `KeyInfo` the ephemeral is an *index* keyed by the
+//! record (used for `DISTINCT` dedup and `IN (SELECT ...)` sets); otherwise it's a rowid-keyed
+//! *table* (used by `RETURNING` to buffer rows). We model both with a `Vec`-backed buffer:
+//! the table variant stores records with an auto-incremented rowid and reads them back
+//! sequentially via `Column`; the index variant stores record blobs as dedup keys, supports
+//! `find` for `OP_Found`, and is never read back via `Column`.
 
 use crate::error::Result;
-use crate::format::{decode_record, TextEncoding};
+use crate::format::{decode_record, encode_record, TextEncoding};
 use crate::types::Value;
 
-/// A rowid-keyed in-memory table.
+/// Whether the ephemeral behaves as a rowid-keyed table or a record-keyed index.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EphemeralKind {
+    /// Rowid-keyed table: `Insert` with `NewRowid`, read back via `Rewind`/`Next`/`Column`.
+    /// Used by `RETURNING`.
+    Table,
+    /// Record-keyed index: `IdxInsert` of a record blob; `Found` checks membership. Used by
+    /// `SELECT DISTINCT` dedup (and future `IN (SELECT ...)` sets).
+    Index,
+}
+
+/// A rowid-keyed in-memory table or a record-keyed in-memory index.
 pub struct Ephemeral {
     records: Vec<Vec<u8>>,
-    /// Rowid of the next insert (starts at 1, like upstream's `NewRowid`).
+    /// Rowid of the next insert (starts at 1, like upstream's `NewRowid`). Table variant only.
     next_rowid: i64,
     /// Iteration position after [`rewind`](Self::rewind).
     pos: usize,
     /// Decoded current record for `Column` reads.
     current: Option<Vec<Value>>,
     encoding: TextEncoding,
+    kind: EphemeralKind,
 }
 
 impl Ephemeral {
@@ -30,22 +46,73 @@ impl Ephemeral {
             pos: 0,
             current: None,
             encoding,
+            kind: EphemeralKind::Table,
         }
     }
 
-    /// Allocate and return the next integer rowid, advancing the cursor.
+    /// Open an ephemeral index (record-keyed, dedup) — mirrors upstream's `OP_OpenEphemeral`
+    /// with a non-null `P4` KeyInfo. `_nfield` is the column count of the key record.
+    pub fn new_index(_nfield: usize, encoding: TextEncoding) -> Ephemeral {
+        Ephemeral {
+            records: Vec::new(),
+            next_rowid: 1,
+            pos: 0,
+            current: None,
+            encoding,
+            kind: EphemeralKind::Index,
+        }
+    }
+
+    /// Which kind of ephemeral this is.
+    pub fn kind(&self) -> EphemeralKind {
+        self.kind
+    }
+
+    /// Allocate and return the next integer rowid, advancing the cursor. Table variant only.
     pub fn next_rowid(&mut self) -> i64 {
         let rowid = self.next_rowid;
         self.next_rowid += 1;
         rowid
     }
 
-    /// Insert a record (the BLOB from `MakeRecord`) keyed by `rowid`.
+    /// Insert a record (the BLOB from `MakeRecord`) keyed by `rowid`. Table variant.
     pub fn insert(&mut self, rowid: i64, record: Vec<u8>) {
         // The ephemeral table is append-only; callers always pass the rowid that was just
         // returned by `next_rowid`.
         let _ = rowid;
         self.records.push(record);
+    }
+
+    /// Insert a record blob as a dedup key (mirrors `OP_IdxInsert` on an ephemeral index).
+    /// Returns `true` if the key was new (inserted), `false` if it was already present.
+    /// The comparison matches `OP_Found` semantics: equal under BINARY collation with
+    /// NULL-equality (NULL == NULL), so each row of values is compared element-wise.
+    pub fn idx_insert(&mut self, record: &[u8]) -> Result<bool> {
+        if self.find_record(record)? {
+            return Ok(false);
+        }
+        self.records.push(record.to_vec());
+        Ok(true)
+    }
+
+    /// Search the index for a record equal to `values` under BINARY collation with NULL-equality.
+    /// Used by `OP_Found` on an ephemeral index. Returns `true` if a matching record is present.
+    pub fn find_values(&self, values: &[Value]) -> Result<bool> {
+        let needle = encode_record(values);
+        self.find_record(&needle)
+    }
+
+    /// Internal: linear-scan for a stored record byte-equal to `needle`. Encoding a record is
+    /// canonical, so byte-equality of the encoded blob is equivalent to element-wise value
+    /// equality with NULL-equality (NULL serializes as serial type 0, and any two NULLs encode
+    /// identically). This matches `OP_Found` on an ephemeral index under BINARY collation.
+    fn find_record(&self, needle: &[u8]) -> Result<bool> {
+        for rec in &self.records {
+            if rec.as_slice() == needle {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Position at the first record. Return `true` if there is at least one row.

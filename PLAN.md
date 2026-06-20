@@ -176,7 +176,7 @@ list every granular item needed.
 - [x] **6.3** Codegen: `GROUP BY` — sorter on group key + `AggStep` per row + `AggFinal` per group
 - [x] **6.4** Codegen: `HAVING` — filter after `AggFinal`
 - [x] **6.5** Aggregate functions: `count(*)`, `count(expr)`, `sum(expr)`, `total(expr)`, `avg(expr)`, `min(expr)`, `max(expr)`, `group_concat(expr [, sep])`
-- [ ] **6.6** `SELECT DISTINCT` — ephemeral sorter/b-tree deduplication (`OpenEphemeral` + `Found`/`NotFound`)
+- [x] **6.6** `SELECT DISTINCT` — ephemeral sorter/b-tree deduplication (`OpenEphemeral` + `Found`/`NotFound`)
 - [x] **6.7** Codegen: aggregate without GROUP BY (single-row result for `SELECT count(*) FROM t`)
 - [ ] **6.8** Codegen: `GROUP BY` + `ORDER BY` — two-pass (aggregate then sort result)
 - [x] **6.9** `NULL` handling in aggregates (NULL group keys, NULL exclusion from `sum`/`avg`, `count(*)` vs `count(col)`)
