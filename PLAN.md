@@ -193,7 +193,7 @@ list every granular item needed.
 - [x] **7.6** Codegen: left outer join — emit NULL row when inner match fails (`IfNullRow` opcode)
 - [x] **7.7** VDBE: `NullRow` opcode — set cursor to all-NULL row for LEFT JOIN miss
 - [x] **7.8** Right join (implemented as left join with swapped tables)
-- [ ] **7.9** Full outer join (left + right with NULL fill)
+- [x] **7.9** Full outer join (left + right with NULL fill)
 - [ ] **7.10** Natural join: USING columns → deduped projection + coalesced ON condition
 - [ ] **7.11** Self-join: table aliases, `OpenDup` for same-table join
 - [ ] **7.12** VDBE: `OpenDup` opcode — duplicate an existing cursor

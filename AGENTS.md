@@ -224,4 +224,13 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   self-joins, join-order selection, aggregates over joins. Known divergence: the row order
   of a RIGHT JOIN differs from the oracle's specialized RIGHT-JOIN path (which scans the
   left table first); both are correct for an unordered result, test cases use ORDER BY for
-  determinism.
+  determinism. **7.9 full outer join** ✅: `FULL [OUTER] JOIN` is implemented as a LEFT JOIN
+  followed by a second pass that scans the (original) right table and, for each right row
+  with no left match (ON predicate is never TRUE under strict 3-valued logic — NULL
+  comparisons are UNKNOWN, not matches), emits a NULL-filled left row + the right row. The
+  second pass uses a per-right-row nested scan over the left cursor with `jump_if_null=false`
+  so NULL join keys don't spuriously count as matches. WHERE is re-applied on the NULL-filled
+  left row (a WHERE on left-table columns filters it out since NULL comparisons are
+  UNKNOWN). LIMIT applies across both passes (the second pass decrements the same limit
+  register). `validate_join` now accepts `Full`/`FullOuter` and rejects only `NATURAL` and
+  `USING`. Differential-tested vs the C oracle (FULL JOIN cases in `cross_and_inner_joins`).

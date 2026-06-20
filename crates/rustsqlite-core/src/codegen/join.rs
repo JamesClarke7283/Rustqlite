@@ -1,6 +1,5 @@
-//! Multi-table (join) codegen. The M7 first slice implements the cross join (cartesian
-//! product) and the inner join with an `ON` predicate — both as a simple nested loop.
-//! Left/right/full joins, natural joins, and `USING` arrive in later M7 tasks.
+//! Multi-table (join) codegen. Implements the two-table cross / inner / left / right / full
+//! joins as a nested loop. Natural joins and `USING` arrive in later M7 tasks.
 //!
 //! The codegen shape for a two-table cross/inner join is:
 //! ```text
@@ -34,12 +33,14 @@ use super::builder::ProgramBuilder;
 use super::expr::{compile_expr, compile_jump, Ctx, JoinTable};
 use super::select::{eval_limit_offset, expand_columns_with_tables, resolve_order_term};
 
-/// Compile a two-table cross / inner / left / right join. `tables` is in the JOIN order
-/// (the first table is the outer/left loop, the second is the inner/right loop). `from_order`
-/// is the ORIGINAL FROM order (for `SELECT *` expansion and bare-column resolution). For a
-/// non-RIGHT join these are the same; for a RIGHT JOIN `tables` is swapped while `from_order`
-/// keeps the original order. When `left_join` is true, a left-outer join is emitted (NULL-fill
-/// the inner table on no match).
+/// Compile a two-table cross / inner / left / right / full join. `tables` is in the JOIN
+/// order (the first table is the outer/left loop, the second is the inner/right loop).
+/// `from_order` is the ORIGINAL FROM order (for `SELECT *` expansion and bare-column
+/// resolution). For a non-RIGHT join these are the same; for a RIGHT JOIN `tables` is swapped
+/// while `from_order` keeps the original order. When `left_join` is true, a left-outer join is
+/// emitted (NULL-fill the inner table on no match). When `full_join` is true, a second pass
+/// scans the (original) right table and emits NULL-filled left rows for right rows that had no
+/// left match; `left_join` is implied.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_cross_join(
     select: &SelectStmt,
@@ -47,6 +48,7 @@ pub fn compile_cross_join(
     from_order: &[(&Table, &str); 2],
     on_predicate: Option<&Expr>,
     left_join: bool,
+    full_join: bool,
 ) -> Result<(Program, Vec<String>)> {
     let (limit, offset) = eval_limit_offset(select)?;
     let outputs = expand_columns_with_tables(select, from_order)?;
@@ -244,6 +246,112 @@ pub fn compile_cross_join(
     // Advance outer loop.
     b.resolve(next_a);
     b.emit_jump(Opcode::Next, 0, loop_a, 0);
+
+    // FULL JOIN second pass: scan the (original) right table again and emit NULL-filled left
+    // rows for any right row that had no left match. The check is a nested loop: for each
+    // right row, walk every left row and test the ON predicate; if none match, this right row
+    // is "unmatched" and gets a NULL-filled left row.
+    //
+    // The WHERE clause is re-applied on the NULL-filled left row (a WHERE on left-table
+    // columns will filter it out since NULL comparisons yield UNKNOWN). This mirrors SQLite's
+    // FULL JOIN semantics.
+    //
+    // LIMIT applies globally to the FULL JOIN result, so the second pass decrements the same
+    // limit register. When the limit is exhausted we jump to `end`, skipping the remaining
+    // right rows (matching SQLite, which stops once the limit is reached).
+    if full_join {
+        // `right_cursor` is the cursor of the original right table — cursor 1 in the JOIN
+        // order (for a non-RIGHT FULL JOIN the tables are not swapped).
+        let right_cursor = 1i32;
+        let left_cursor = 0i32;
+
+        // The "found a match" flag for the current right row.
+        let rj_match = b.alloc_reg();
+        // Reuse the right-table scan cursor (already open). Rewind it again for the second
+        // pass; jump to `end` if empty.
+        let end_rj = b.new_label();
+        b.emit_jump(Opcode::Rewind, right_cursor, end_rj, 0);
+        let rj_outer = b.new_label();
+        b.resolve(rj_outer);
+
+        // For each right row, scan all left rows and test the ON predicate. If any left row
+        // matches, set `rj_match=1`. The left cursor is rewound for each right row.
+        b.emit(Opcode::Integer, 0, rj_match, 0);
+        let left_empty = b.new_label();
+        b.emit_jump(Opcode::Rewind, left_cursor, left_empty, 0);
+        let rj_inner = b.new_label();
+        b.resolve(rj_inner);
+        // ON predicate: on match, set rj_match=1 and break out of the inner scan.
+        if let Some(on) = on_predicate {
+            let on_match = b.new_label();
+            // `jump_if_null=false`: a NULL operand makes the comparison UNKNOWN, which is
+            // neither true nor false. We don't jump on NULL — instead the next instruction
+            // (Next) advances to the next left row. This matches SQL 3-valued logic for the
+            // ON predicate so a right row whose ON comparison is always UNKNOWN (e.g. a
+            // NULL join key) has no left match and is emitted as a NULL-filled left row.
+            compile_jump(&mut b, on, on_match, true, false, ctx)?;
+            // ON predicate false: advance to the next left row. If the left cursor is
+            // exhausted, fall through to `left_empty` (no match for this right row).
+            b.emit_jump(Opcode::Next, left_cursor, rj_inner, 0);
+            b.emit_jump(Opcode::Goto, 0, left_empty, 0);
+            b.resolve(on_match);
+            b.emit(Opcode::Integer, 1, rj_match, 0);
+            // Jump out of the inner scan after a match (no need to check remaining left rows).
+            b.emit_jump(Opcode::Goto, 0, left_empty, 0);
+        } else {
+            // No ON predicate: every right row matches every left row (cross join), so all
+            // right rows are matched. Mark matched and skip.
+            b.emit(Opcode::Integer, 1, rj_match, 0);
+            b.emit_jump(Opcode::Goto, 0, left_empty, 0);
+        }
+        b.resolve(left_empty);
+
+        // If the right row matched at least one left row, skip NULL-row emission.
+        let rj_skip = b.new_label();
+        b.emit_jump(Opcode::If, rj_match, rj_skip, 0);
+
+        // Emit a NULL-filled left row + the current right row. Set the left cursor to a NULL
+        // row so reads from left-table columns return NULL.
+        b.emit(Opcode::NullRow, left_cursor, 0, 0);
+
+        // Re-apply the WHERE clause on the NULL-filled row.
+        if let Some(w) = &select.where_clause {
+            compile_jump(&mut b, w, rj_skip, false, true, ctx)?;
+        }
+
+        // Project the NULL-filled left + current right row.
+        let rj_result_reg = b.alloc_regs(ncol);
+        for (j, (expr, _)) in outputs.iter().enumerate() {
+            compile_expr(&mut b, expr, rj_result_reg + j as i32, ctx)?;
+        }
+        if has_order_by {
+            let block = b.alloc_regs(norder + ncol);
+            for (k, term) in select.order_by.iter().enumerate() {
+                let key_expr = resolve_order_term(term, &outputs)?;
+                compile_expr(&mut b, &key_expr, block + k as i32, ctx)?;
+            }
+            for j in 0..ncol {
+                b.emit(Opcode::SCopy, rj_result_reg + j, block + norder + j, 0);
+            }
+            let rec = b.alloc_reg();
+            b.emit(Opcode::MakeRecord, block, norder + ncol, rec);
+            b.emit(Opcode::SorterInsert, sorter, rec, 0);
+        } else {
+            if let Some(oreg) = offset_reg {
+                b.emit_jump(Opcode::IfPos, oreg, rj_skip, 1);
+            }
+            b.emit(Opcode::ResultRow, rj_result_reg, ncol, 0);
+            if let Some(lreg) = limit_reg {
+                b.emit_jump(Opcode::DecrJumpZero, lreg, end, 0);
+            }
+        }
+        b.resolve(rj_skip);
+
+        // Advance to the next right row.
+        b.emit_jump(Opcode::Next, right_cursor, rj_outer, 0);
+        b.resolve(end_rj);
+    }
+
     b.resolve(end);
 
     // ORDER BY sort tail.
@@ -302,10 +410,12 @@ fn flatten_into<'a>(
                 return;
             }
             TableOrJoin::Join(j) => {
-                // Handle CROSS, INNER, and LEFT joins. RIGHT/FULL/NATURAL are rejected by
+                // Handle CROSS, INNER, LEFT, RIGHT, and FULL joins. NATURAL is rejected by
                 // `validate_join`.
                 match j.op {
-                    JoinOp::Cross | JoinOp::Inner | JoinOp::Left | JoinOp::LeftOuter | JoinOp::Right | JoinOp::RightOuter => {}
+                    JoinOp::Cross | JoinOp::Inner | JoinOp::Left | JoinOp::LeftOuter
+                    | JoinOp::Right | JoinOp::RightOuter
+                    | JoinOp::Full | JoinOp::FullOuter => {}
                     _ => {
                         out.clear();
                         return;
@@ -368,18 +478,30 @@ pub fn swap_for_right_join<'a>(
 }
 
 /// Reject unsupported join features that `flatten_cross_join` accepts but the codegen can't
-/// handle yet (USING, etc.). Returns an error message for the first unsupported feature.
+/// handle yet (USING, NATURAL, etc.). Returns an error message for the first unsupported
+/// feature.
 pub fn validate_join(from: &[TableOrJoin]) -> Result<()> {
     for item in from {
         if let TableOrJoin::Join(j) = item {
             if matches!(j.constraint, Some(rustqlite_parser::JoinConstraint::Using(_))) {
                 return Err(Error::msg("USING clause is not supported yet (M7.10)"));
             }
-            if matches!(j.op, JoinOp::Full | JoinOp::FullOuter | JoinOp::Natural) {
-                return Err(Error::msg("FULL/NATURAL joins are not supported yet (M7.9-M7.10)"));
+            if matches!(j.op, JoinOp::Natural) {
+                return Err(Error::msg("NATURAL joins are not supported yet (M7.10)"));
             }
             validate_join(std::slice::from_ref(&*j.left))?;
         }
     }
     Ok(())
+}
+
+/// True when the FROM clause's top-level join is a FULL (OUTER) join. A FULL JOIN is
+/// implemented as a LEFT JOIN followed by a right anti-join pass (emit NULL-filled left rows
+/// for right rows that had no left match).
+pub fn is_full_join(from: &[TableOrJoin]) -> bool {
+    if let Some(TableOrJoin::Join(j)) = from.first() {
+        matches!(j.op, JoinOp::Full | JoinOp::FullOuter)
+    } else {
+        false
+    }
 }

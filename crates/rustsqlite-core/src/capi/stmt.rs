@@ -600,12 +600,22 @@ fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelec
                 let table_refs: Vec<(&Table, &str)> =
                     resolved.iter().map(|(t, n)| (t, n.as_str())).collect();
                 let right_join = codegen::join::is_right_join(&select.from);
-                let left_join = codegen::join::is_left_join(&select.from) || right_join;
-                let join_order = codegen::join::swap_for_right_join(table_refs.clone(), &select.from);
+                let full_join = codegen::join::is_full_join(&select.from);
+                // A FULL JOIN is LEFT JOIN (first pass) + a right anti-join (second pass). A
+                // RIGHT JOIN is emulated as a LEFT JOIN with swapped tables. `left_join` is
+                // true for LEFT/RIGHT/FULL joins (all need NULL-fill on no-match).
+                let left_join = codegen::join::is_left_join(&select.from) || right_join || full_join;
+                // For a FULL JOIN we do NOT swap tables (it is symmetric). For a RIGHT JOIN we
+                // swap so the original right table becomes the outer/left loop.
+                let join_order = if full_join {
+                    table_refs.clone()
+                } else {
+                    codegen::join::swap_for_right_join(table_refs.clone(), &select.from)
+                };
                 let from_order: [(&Table, &str); 2] = table_refs[..2].try_into().unwrap();
                 let join_order_arr: [(&Table, &str); 2] = join_order[..2].try_into().unwrap();
                 let (program, column_names) =
-                    codegen::join::compile_cross_join(select, &join_order_arr, &from_order, on_predicate, left_join)?;
+                    codegen::join::compile_cross_join(select, &join_order_arr, &from_order, on_predicate, left_join, full_join)?;
                 return Ok(CompiledSelect {
                     program,
                     column_names,

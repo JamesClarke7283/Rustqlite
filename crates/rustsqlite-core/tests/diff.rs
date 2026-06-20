@@ -1084,6 +1084,18 @@ fn cross_and_inner_joins() {
         "SELECT t1.a, t2.c FROM t1 RIGHT JOIN t2 ON t1.a = t2.c;",
         "SELECT * FROM t1 RIGHT JOIN t2 ON 1=0;",
         "SELECT * FROM t1 RIGHT JOIN t2 ON t1.a = t2.c ORDER BY t1.a, t2.c;",
+        // Full outer join — LEFT JOIN + a right anti-join pass that emits NULL-filled left
+        // rows for right rows that had no left match. Cases use ORDER BY for determinism
+        // (the FULL JOIN result order is unspecified without it).
+        "SELECT * FROM t1 FULL JOIN t2 ON t1.a = t2.c ORDER BY t1.a, t2.c;",
+        "SELECT * FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c ORDER BY t1.a, t2.c;",
+        "SELECT * FROM t1 FULL JOIN t2 ON 1=0 ORDER BY t1.a, t2.c;",
+        "SELECT * FROM t1 FULL JOIN t2 ON 1=1 ORDER BY t1.a, t2.c;",
+        "SELECT t1.a, t2.c FROM t1 FULL JOIN t2 ON t1.a = t2.c ORDER BY t1.a, t2.c;",
+        "SELECT t1.a, t2.c FROM t1 FULL JOIN t2 ON t1.a = 1 ORDER BY t1.a, t2.c;",
+        "SELECT t1.a, t2.c FROM t1 FULL JOIN t2 ON t1.a = 2 WHERE t2.c IS NULL ORDER BY t1.a;",
+        "SELECT t1.a, t2.c FROM t1 FULL JOIN t2 ON t1.a = 1 WHERE t2.c > 15 ORDER BY t2.c;",
+        "SELECT * FROM t1 FULL JOIN t2 ON t1.a = t2.c WHERE t1.a IS NULL ORDER BY t2.c;",
     ] {
         assert_same(db.str(), q);
     }
