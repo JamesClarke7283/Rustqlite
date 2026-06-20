@@ -233,11 +233,11 @@ list every granular item needed.
 
 ## M10 — CTEs (Common Table Expressions)
 
-- [ ] **10.1** Parser: `WITH [RECURSIVE] name (cols) AS (SELECT …) SELECT …`
-- [ ] **10.2** Codegen: non-recursive CTE — materialize into ephemeral table, reference by name
+- [x] **10.1** Parser: `WITH [RECURSIVE] name (cols) AS (SELECT …) SELECT …`
+- [x] **10.2** Codegen: non-recursive CTE — materialize into ephemeral table, reference by name
 - [ ] **10.3** Codegen: recursive CTE — initial query → ephemeral table, then iterated recursive query until no new rows
-- [ ] **10.4** Multiple CTEs in a single `WITH` clause
-- [ ] **10.5** CTE column name resolution (explicit column list vs inferred from SELECT)
+- [x] **10.4** Multiple CTEs in a single `WITH` clause
+- [x] **10.5** CTE column name resolution (explicit column list vs inferred from SELECT)
 
 ---
 

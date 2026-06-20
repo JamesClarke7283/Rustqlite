@@ -695,6 +695,20 @@ fn rewrite_using_or_natural(
 /// Resolve the single FROM table (if any) from the catalog and compile the SELECT. Shared by the
 /// normal SELECT path and the EXPLAIN path.
 fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelect> {
+    // CTE rewriting: a `WITH …` clause on the outer SELECT is expanded by rewriting each
+    // CTE reference in the FROM clause into a `TableOrJoin::Subquery` (M10.2–M10.5). The
+    // rewritten SELECT has its `with_clause` cleared, so this is a one-shot rewrite and
+    // downstream codegen sees a plain `FROM (subquery) AS alias` shape that the existing
+    // `codegen::subquery::compile_from_subquery` infrastructure handles. Recursive CTEs
+    // (M10.3) are not yet supported and surface as a codegen error here.
+    let select_owned: SelectStmt;
+    let select: &SelectStmt = if codegen::cte::has_ctes(select) {
+        select_owned = codegen::cte::rewrite_with_ctes(select)?;
+        &select_owned
+    } else {
+        select
+    };
+
     // `FROM (subquery) AS alias` path: materialize the subquery into an ephemeral table and
     // scan it. Single-entry FROM with a subquery (no joins). M8.6.
     if !select.from.is_empty() && select.values.is_empty() && select.from.len() == 1 {

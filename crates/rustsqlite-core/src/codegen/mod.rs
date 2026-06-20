@@ -10,6 +10,7 @@
 pub mod builder;
 pub mod compound;
 pub mod create;
+pub mod cte;
 pub mod delete;
 pub mod drop;
 pub mod drop_index;

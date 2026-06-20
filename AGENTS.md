@@ -407,3 +407,30 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   vs the C oracle (`compound_select`, `compound_select_column_count_mismatch` — all four
   operators, ORDER BY / LIMIT / OFFSET, multi-arm, cross-table, NULL handling, and
   column-count-mismatch error parity).
+- **M10 — CTEs (Common Table Expressions)** 🚧: **10.1–10.2, 10.4–10.5** ✅ (parser
+  shipped in M2.18). Non-recursive CTEs are implemented by AST rewriting
+  (`codegen::cte::rewrite_with_ctes`, mirrors the `searchWith`/`SRT_EphemTab` path in
+  `select.c`): a `WITH …` clause on a SELECT is expanded by rewriting each CTE reference
+  in the FROM clause (and in the FROM clauses of compound arms) into a
+  `TableOrJoin::Subquery` whose body is the CTE's SELECT. The rewritten SELECT has its
+  `with_clause` cleared, so this is a one-shot rewrite and downstream codegen sees a plain
+  `FROM (subquery) AS alias` shape that the existing `codegen::subquery::compile_from_subquery`
+  infrastructure materializes into an ephemeral table and scans (the `SRT_EphemTab` shape
+  upstream uses for a CTE referenced once). Multiple CTEs in one `WITH` are processed in
+  declared order so a later CTE may reference an earlier one (the prefix is carried as a
+  scope and rewritten into the later CTE's body before the later CTE itself is published).
+  An explicit CTE column list (`name (cols) AS (…)`) wraps the body's projection so each
+  output column carries the declared name as its alias (for a `SELECT *` or `VALUES` body,
+  the body is nested inside an outer shell `SELECT <names> FROM (body) AS __cte_inner` so
+  the inner `*` expands against its own FROM table at codegen time). A schema-qualified
+  reference (`main.cte`) never matches a CTE (matches upstream's `searchWith` early-out).
+  Recursive CTEs (`WITH RECURSIVE`, M10.3) are detected and rejected with a clear error
+  pending the queue-based iterative algorithm (`generateWithRecursiveQuery` in `select.c`).
+  Differential-tested vs the C oracle (`non_recursive_ctes` — constant CTE, CTE over a
+  real table, `SELECT *`, projection, WHERE/ORDER BY/LIMIT on the outer query, multiple
+  CTEs, explicit column list, alias, aggregate body). Known limitations: a CTE whose body
+  is itself a compound SELECT (coroutine-based) is not yet inlinable into the outer
+  materialization; a CTE referenced inside a scalar/`IN`/`EXISTS` subquery is not yet
+  rewritten (the SubqueryResolver path doesn't apply the CTE rewrite); nested subqueries
+  in FROM (`FROM (SELECT … FROM (SELECT …))`) block a CTE-referencing-CTE whose inner CTE
+  is rewritten to a subquery — these land with nested-subquery support and M10.3.
