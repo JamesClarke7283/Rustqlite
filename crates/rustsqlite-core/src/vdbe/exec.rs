@@ -283,6 +283,19 @@ impl Vdbe {
                     self.halted = true;
                     return Ok(StepResult::Done);
                 }
+                Opcode::HaltIfNull => {
+                    // p3 names a register; p4 carries the constraint message. If the register
+                    // is NULL, abort the statement with a NOT NULL constraint error (the
+                    // in-flight write transaction is rolled back by `Halt` semantics).
+                    if self.regs[p3 as usize].is_null() {
+                        let msg = match &inst.p4 {
+                            P4::Text(s) => s.clone(),
+                            _ => "NOT NULL constraint failed".to_string(),
+                        };
+                        return Err(Error::new(crate::error::ResultCode::Constraint, msg));
+                    }
+                    self.pc += 1;
+                }
                 Opcode::Transaction => {
                     // p2 != 0 opens a WRITE transaction (the rollback journal). A read
                     // transaction is implicit in our engine, so p2 == 0 is a no-op marker.
@@ -1132,6 +1145,30 @@ impl Vdbe {
                     let slot = self.cursors[idx].as_mut().unwrap();
                     slot.as_ephemeral_mut().unwrap().data()?;
                     return Ok(slot.as_ephemeral().unwrap().column(col));
+                }
+
+                // Index cursors (used by WITHOUT ROWID tables and by secondary indexes): read
+                // the `col`-th value from the current key record. The cursor caches its
+                // payload already (IndexCursor::refresh_payload keeps it current), so this is
+                // a straight decode.
+                if self
+                    .cursors
+                    .get(idx)
+                    .and_then(|c| c.as_ref())
+                    .is_some_and(VdbeCursor::is_index)
+                {
+                    let payload = self.cursors[idx]
+                        .as_ref()
+                        .unwrap()
+                        .as_index()
+                        .unwrap()
+                        .payload()
+                        .to_vec();
+                    if payload.is_empty() {
+                        return Ok(Value::Null);
+                    }
+                    let vals = decode_record(&payload, self.encoding)?;
+                    return Ok(vals.get(col).cloned().unwrap_or(Value::Null));
                 }
 
         let rowid = self.table_cursor(idx as i32)?.rowid()?;

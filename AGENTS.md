@@ -72,6 +72,9 @@ Error types in the core are hand-rolled (no `thiserror`) to keep the dependency 
 
 Check these before web searching (load with Read tool as needed):
 - @docs/version-oracle-drift.md - system `sqlite3` version drift vs. the pinned `VERSION` target
+- @docs/without-rowid-storage.md - WITHOUT ROWID table on-disk layout and `convertToWithoutRowidTable` shape
+- @docs/row-value-expressions.md - SQLite `TK_VECTOR` grammar, row-value comparisons, and `IN (subquery)` forms
+- @docs/autovacuum-ptrmap.md - auto-vacuum/ptrmap page math, header meta[] layout, and Rustqlite implementation notes
 
 ## Build / run / test
 - Build: `cargo build`
@@ -93,6 +96,11 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
 - **M2 — Parser**: 🚧 a working subset grammar (`SELECT`/`CREATE TABLE`/`INSERT` + the full expression
   atom/operator set, including `IS NOT` and **JOIN syntax**); full `parse.y` port pending. Known gap: a bare integer literal
   larger than `i64` (e.g. the exact `-9223372036854775808`) is parsed as REAL rather than special-cased.
+  Most M2 tasks (2.1–2.72) are now done; remaining: 2.73 AST walker, 2.74 name resolution. Note:
+  `build_qualified_name`
+  preserves quoted-identifier quotes (e.g. `"col"` stays `"col"`, not unquoted to `col`); unquoting
+  is deferred to the full parse.y port. `INDEXED`/`MATCH`/`REGEXP` etc. are reserved in our grammar
+  (upstream uses `%fallback ID` so they're contextually reserved); this is a minor divergence.
 - **M3a — Read query path (single-table SELECT)**: ✅ a faithful register VDBE (executor + opcode set),
   code generator (projection, `WHERE` with 3-valued logic, `ORDER BY` via an in-memory sorter,
   `LIMIT`/`OFFSET`, rowid-alias substitution), value comparison + type affinity, the byte-faithful REAL→text
@@ -145,3 +153,31 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   (`multi_column_index_select`, `multi_column_index_maintained_on_writes`) and the in-process
   slt harness (`our/multi-column-index.slt`). Still M5+: `KeyInfo` per-column collation,
   enforced `UNIQUE`, partial/expression indexes, `ORDER BY` via index ordering hints.
+- **M5.3 — B-Tree Robustness & WITHOUT ROWID** 🚧: page merging on delete, interior-page
+  balancing, `Clear` opcode, freelist reuse/walking all landed. **5.3.6 `WITHOUT ROWID`
+  tables** ✅: `CREATE TABLE … (…, PRIMARY KEY(…)) WITHOUT ROWID` opens a blob-keyed
+  (index) b-tree keyed by the PK record (PK columns followed by the remaining columns,
+  matching upstream's `convertToWithoutRowidTable` covering-index shape). `INSERT` builds
+  the storage-order record, enforces implicit `NOT NULL` on PK columns via `OP_HaltIfNull`,
+  and `IdxInsert`s it with `P5_UNIQUE` for the PK uniqueness constraint; `SELECT` opens
+  the table as an index cursor and the `Column` opcode reads values by storage position.
+  Differential-tested vs the C oracle (`without_rowid_*_roundtrip_and_c_oracle` — single
+  INTEGER PK, single non-INTEGER PK, and composite PK — plus the CLI reads C-SQLite-written
+  WITHOUT ROWID databases and C-SQLite's `PRAGMA integrity_check` passes on
+  Rustqlite-written ones). **5.3.7 Auto-vacuum / ptrmap** ✅: `PRAGMA auto_vacuum =
+  NONE|FULL|INCREMENTAL` (0/1/2) and `PRAGMA incremental_vacuum(N)`; pointer-map pages
+  (`btree/ptrmap.rs`) with the `PTRMAP_*` type codes and `ptrmapPageno`/`is_ptrmap_page` math;
+  auto-vacuum-aware root-page allocation (`create_table_btree_autovac` /
+  `create_index_btree_autovac` place roots at `meta[4]+1` and update meta[4]); the full
+  `autoVacuumCommit` + `incrVacuumStep` + `relocatePage` + `modifyPagePointer` page-move logic
+  (`btree/autovac.rs`); `Pager::allocate_page` skips ptrmap/pending-byte pages; `Pager::free_page`
+  records FREEPAGE ptrmap entries; b-tree splits write BTREE ptrmap entries for new children.
+  Differential-tested vs the C oracle (`auto_vacuum_full_shrinks_file_after_delete_all`,
+  `auto_vacuum_incremental_shrinks_file_step_by_step` — C `sqlite3` `PRAGMA integrity_check`
+  passes on Rustqlite-written auto-vacuum databases). Still M5.3+: 5.3.8 `PRAGMA
+  integrity_check` backend, 5.3.9 `Destroy` freelist reuse; `DELETE`/`UPDATE` on WITHOUT
+  ROWID tables (deferred to a follow-up that reuses the storage-order key-record helpers).
+  Known gap: overflow-page ptrmap entries (OVERFLOW1/OVERFLOW2) are not yet recorded by the
+  sync cell builders, so vacuuming a database where overflow pages need to be relocated
+  (not just freed) will not update the overflow chain's parent pointer; see
+  @docs/autovacuum-ptrmap.md.

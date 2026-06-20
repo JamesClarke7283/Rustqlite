@@ -24,7 +24,10 @@ use crate::vdbe::compare::mem_compare;
 use crate::vdbe::KeyField;
 
 use super::balance;
-use super::cell::{build_index_leaf_cell, parse_index_interior_cell, parse_index_leaf_cell};
+use super::cell::{
+    build_index_leaf_cell, build_index_leaf_cell_with_host, parse_index_interior_cell,
+    parse_index_leaf_cell,
+};
 use super::index_cursor::{IndexCursor, SeekOp};
 use super::page::{self, PageHeader, PageType};
 
@@ -172,7 +175,11 @@ async fn insert_into_index_leaf(
         pager.text_encoding(),
     )?;
 
-    let cell = build_index_leaf_cell(pager, key_record, usable);
+    let cell = if pager.auto_vacuum() {
+        build_index_leaf_cell_with_host(pager, key_record, usable, Some(leaf_pgno))
+    } else {
+        build_index_leaf_cell(pager, key_record, usable)
+    };
     let mut leaf = pager.read_page_for_write(leaf_pgno).await?;
     match page::insert_leaf_cell(&mut leaf, base, idx, &cell) {
         Ok(()) => {

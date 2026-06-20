@@ -116,6 +116,8 @@ impl Table {
             rootpage: 0,
             columns: Vec::new(),
             rowid_alias: None,
+            without_rowid: false,
+            pk_columns: Vec::new(),
         }
     }
 }

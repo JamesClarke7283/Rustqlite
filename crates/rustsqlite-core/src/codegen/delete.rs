@@ -31,6 +31,14 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
     if del.schema.is_some() {
         return Err(Error::msg("schema-qualified DELETE is not yet supported"));
     }
+    if table.without_rowid {
+        // DELETE on a WITHOUT ROWID table requires the IdxDelete path (the table is an index
+        // b-tree keyed by the PK). M5.3.6 ships INSERT + SELECT; DELETE/UPDATE land in a
+        // follow-up that reuses the same storage-order key record helper.
+        return Err(Error::msg(
+            "DELETE on a WITHOUT ROWID table is not supported yet",
+        ));
+    }
     let cursor = 0i32;
     let ctx = Ctx { table, cursor, register_base: None };
     let ncol = table.columns.len();

@@ -196,6 +196,38 @@ impl Pager {
         self.state.lock().unwrap().header.text_encoding
     }
 
+    /// Whether auto-vacuum is enabled on this database (header meta[4] != 0, the
+    /// `largest_root_page` field reused as the auto-vacuum flag). Mirrors `pBt->autoVacuum`.
+    pub fn auto_vacuum(&self) -> bool {
+        self.state.lock().unwrap().header.largest_root_page != 0
+    }
+
+    /// Whether incremental-vacuum mode is enabled (header meta[7] != 0). Mirrors `pBt->incrVacuum`.
+    pub fn incr_vacuum(&self) -> bool {
+        self.state.lock().unwrap().header.incremental_vacuum != 0
+    }
+
+    /// Set the auto-vacuum mode: 0 = NONE, 1 = FULL, 2 = INCREMENTAL. Writes header meta[4]
+    /// (the `largest_root_page` field, reused as the autoVacuum flag) and meta[7]
+    /// (`incremental_vacuum`). Mirrors `sqlite3BtreeSetAutoVacuum`. Upstream refuses to change
+    /// the mode once the database has been written (`BTS_PAGESIZE_FIXED`); we refuse if any
+    /// pages beyond page 1 have been allocated, which is the practical equivalent. The header
+    /// change is also stamped into page 1's overlay so a subsequent commit persists it.
+    pub fn set_auto_vacuum(&self, mode: u8) -> Result<()> {
+        if self.page_count() > 1 {
+            return Err(Error::msg(
+                "cannot change auto_vacuum mode after the database has been written",
+            ));
+        }
+        let av = mode != 0;
+        let incr = mode == 2;
+        self.with_header_mut(|h| {
+            h.largest_root_page = if av { 1 } else { 0 };
+            h.incremental_vacuum = if incr { 1 } else { 0 };
+        });
+        Ok(())
+    }
+
     /// The byte offset within a page at which its b-tree header begins. Page 1 reserves the
     /// first 100 bytes for the database header.
     pub fn btree_header_offset(&self, pgno: u32) -> usize {
@@ -379,7 +411,11 @@ impl Pager {
     /// Allocate a new page. If the freelist is non-empty, reuse the first freelist page
     /// (trunk or leaf) and update the freelist head/count in the database header. Otherwise
     /// extend the file by one page. Mirrors `allocateBtreePage` in `btree.c` (BTALLOC_ANY
-    /// mode without auto-vacuum).
+    /// mode). When auto-vacuum is on, a freshly extended page that lands on a pointer-map
+    /// page or the PENDING_BYTE page is skipped: the skipped page is reserved (zeroed), and
+    /// an extra page is allocated beyond it, matching upstream's
+    /// `if (autoVacuum && PTRMAP_ISPAGE(pBt, pBt->nPage)) { ... pBt->nPage++ ... }` and the
+    /// pending-byte skip `if (pBt->nPage==PENDING_BYTE_PAGE(pBt)) pBt->nPage++`.
     pub fn allocate_page(&self) -> u32 {
         let mut st = self.state.lock().unwrap();
         if st.header.freelist_count > 0 && st.header.first_freelist_trunk != 0 {
@@ -388,10 +424,24 @@ impl Pager {
             drop(st);
             return self.allocate_from_freelist(trunk_pgno);
         }
-        st.page_count += 1;
-        let pgno = st.page_count;
-        st.dirty.insert(pgno, Arc::new(vec![0u8; self.page_size]));
-        pgno
+        loop {
+            st.page_count += 1;
+            let pgno = st.page_count;
+            // Skip the PENDING_BYTE page (reserved for file locking).
+            if crate::btree::ptrmap::is_pending_byte_page(self.usable_size, pgno) {
+                st.dirty.insert(pgno, Arc::new(vec![0u8; self.page_size]));
+                continue;
+            }
+            // When auto-vacuum is on, skip pointer-map pages: zero them and allocate another.
+            if st.header.largest_root_page != 0
+                && crate::btree::ptrmap::is_ptrmap_page(self.usable_size, pgno)
+            {
+                st.dirty.insert(pgno, Arc::new(vec![0u8; self.page_size]));
+                continue;
+            }
+            st.dirty.insert(pgno, Arc::new(vec![0u8; self.page_size]));
+            return pgno;
+        }
     }
 
     /// Mutate the cached database header (e.g. to bump the schema cookie on DDL). The change is
@@ -431,12 +481,33 @@ impl Pager {
             h.first_freelist_trunk = pgno;
             h.freelist_count = h.freelist_count.wrapping_add(1);
         });
+
+        // Auto-vacuum: record the freed page in the pointer map.
+        if self.auto_vacuum() {
+            crate::btree::ptrmap::ptrmap_put(
+                self,
+                pgno,
+                crate::btree::ptrmap::PtrMapType::FreePage,
+                0,
+            )
+            .await?;
+        }
         Ok(())
     }
 
     /// Whether a write transaction is currently open.
     pub fn in_write_txn(&self) -> bool {
         self.txn.lock().unwrap().is_some()
+    }
+
+    /// Drop every cached page with number > `n_fin` and shrink the in-memory page count to
+    /// `n_fin`. Used by the auto-vacuum commit path after relocating the tail pages into the
+    /// head of the file and truncating the database image.
+    pub fn truncate_image(&self, n_fin: u32) {
+        let mut st = self.state.lock().unwrap();
+        st.cache.retain(|&p, _| p <= n_fin);
+        st.dirty.retain(|&p, _| p <= n_fin);
+        st.page_count = n_fin;
     }
 
     /// Begin a write transaction: take the writer lock, snapshot the database size, and create the
@@ -490,6 +561,19 @@ impl Pager {
         // Stamp page 1's header: the change counter advances on every write transaction, and the
         // in-header size / version-valid-for travel with it (`pager_write_changecounter`). The
         // schema cookie was already bumped by the DDL path via `with_header_mut`, if applicable.
+
+        // Auto-vacuum commit (mirrors `autoVacuumCommit` in `btree.c`): when `PRAGMA auto_vacuum =
+        // FULL` is set and the freelist is non-empty, relocate the tail pages into freed pages
+        // near the front and shrink the database image. Must run BEFORE the header is stamped
+        // and the journal synced so the moved pages' pre-images are captured for rollback.
+        let did_autovac = self.auto_vacuum() && !self.incr_vacuum() && {
+            let h = self.header();
+            h.freelist_count > 0
+        };
+        if did_autovac {
+            crate::btree::autovac::auto_vacuum_commit(self).await?;
+        }
+
         let page_count = self.page_count();
         self.with_header_mut(|h| {
             h.file_change_counter = h.file_change_counter.wrapping_add(1);

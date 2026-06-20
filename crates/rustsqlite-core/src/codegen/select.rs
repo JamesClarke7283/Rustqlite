@@ -245,6 +245,8 @@ fn compile_values(
         rootpage: 0,
         columns: Vec::new(),
         rowid_alias: None,
+        without_rowid: false,
+        pk_columns: Vec::new(),
     };
     let ctx = Ctx {
         table: &empty,
@@ -383,7 +385,13 @@ fn compile_scan(
     let offset_reg = (offset > 0).then(|| emit_int(&mut b, offset));
 
     let open = b.emit(Opcode::OpenRead, cursor, table.rootpage as i32, 0);
-    b.set_p4(open, P4::Int(table.columns.len() as i64));
+    if table.without_rowid {
+        // A WITHOUT ROWID table is an index b-tree keyed by the PK record; open it with the
+        // table's KeyInfo so the IndexCursor compares correctly during ordered scans.
+        b.set_p4(open, P4::KeyInfo(table.without_rowid_key_info()));
+    } else {
+        b.set_p4(open, P4::Int(table.columns.len() as i64));
+    }
 
     if select.order_by.is_empty() {
         compile_scan_unordered(&mut b, select, ctx, outputs, ncol, limit_reg, offset_reg)?;
@@ -523,6 +531,8 @@ fn compile_constant(
         rootpage: 0,
         columns: Vec::new(),
         rowid_alias: None,
+        without_rowid: false,
+        pk_columns: Vec::new(),
     };
     let ctx = Ctx {
         table: &empty,
@@ -721,6 +731,7 @@ pub fn expr_to_text(e: &Expr) -> String {
         Expr::BindParam(s) => s.clone(),
         Expr::Between { .. } => "between".to_string(),
         Expr::In { .. } => "in".to_string(),
+        Expr::InSubquery { .. } => "in".to_string(),
         Expr::Exists(_) => "exists".to_string(),
         Expr::Subquery(_) => "subquery".to_string(),
         Expr::Cast { .. } => "cast".to_string(),
@@ -730,6 +741,10 @@ pub fn expr_to_text(e: &Expr) -> String {
             format!("{} COLLATE {}", s, collation)
         }
         Expr::IsDistinctFrom { .. } => "is_distinct".to_string(),
+        Expr::Row(es) => {
+            let inner = es.iter().map(expr_to_text).collect::<Vec<_>>().join(", ");
+            format!("({inner})")
+        }
     }
 }
 
@@ -754,6 +769,8 @@ fn binary_symbol(op: rustqlite_parser::BinaryOp) -> &'static str {
         IsNot => " IS NOT ",
         Like => " LIKE ",
         Glob => " GLOB ",
+        Regexp => " REGEXP ",
+        Match => " MATCH ",
         BitAnd => " & ",
         BitOr => " | ",
         ShiftLeft => " << ",

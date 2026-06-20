@@ -256,8 +256,65 @@ fn is_page_full(e: &Error) -> bool {
 /// (which needs to be boxed, since Rust's async recursion cannot be statically sized).
 pub async fn table_insert(pager: &Pager, root: u32, rowid: i64, payload: &[u8]) -> Result<()> {
     let usable = pager.usable_size();
+    // When auto-vacuum is on, the cell's overflow chain (if any) needs the host leaf page as
+    // its OVERFLOW1 ptrmap parent. We don't know the host leaf until we descend, so for the
+    // autovac case we build the cell *inside* the descent (in `insert_with_splitting`) once
+    // the leaf is known. For the common non-overflow/non-autovac path this is equivalent.
+    if pager.auto_vacuum() {
+        return insert_with_splitting_autovac(pager, root, rowid, payload, &mut Vec::new())
+            .await;
+    }
     let cell = super::cell::build_table_leaf_cell(pager, rowid, payload, usable);
     insert_with_splitting(pager, root, rowid, &cell, &mut Vec::new()).await
+}
+
+/// Auto-vacuum-aware insertion: descends the b-tree without first building the cell, then
+/// builds the cell at the leaf (passing the leaf pgno as the overflow chain's host). This is
+/// only used when auto-vacuum is on, since the overflow ptrmap entry needs the host leaf.
+fn insert_with_splitting_autovac<'a>(
+    pager: &'a Pager,
+    pgno: u32,
+    rowid: i64,
+    payload: &'a [u8],
+    path: &'a mut Vec<(u32, usize)>,
+) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+        let base = pager.btree_header_offset(pgno);
+        let buf = pager.get_page(pgno).await?;
+        let hdr = PageHeader::parse(&buf, base)?;
+        match hdr.page_type {
+            PageType::LeafTable => {
+                let usable = pager.usable_size();
+                let cell = super::cell::build_table_leaf_cell_with_host(
+                    pager,
+                    rowid,
+                    payload,
+                    usable,
+                    Some(pgno),
+                );
+                let idx = leaf_insert_index(&buf, &hdr, rowid)?;
+                let mut leaf = pager.read_page_for_write(pgno).await?;
+                match page::insert_leaf_cell(&mut leaf, base, idx, &cell) {
+                    Ok(()) => {
+                        pager.write_page(pgno, leaf)?;
+                        Ok(())
+                    }
+                    Err(e) if is_page_full(&e) => {
+                        drop(leaf);
+                        let parent = path.pop();
+                        balance_leaf(pager, pgno, parent, path, rowid, &cell).await
+                    }
+                    Err(other) => Err(other),
+                }
+            }
+            PageType::InteriorTable => {
+                let child = pick_child(&buf, &hdr, rowid)?;
+                path.push((pgno, base));
+                insert_with_splitting_autovac(pager, child, rowid, payload, path).await
+            }
+            _ => Err(Error::corrupt("table_insert: not a table b-tree page")),
+        }
+    })
 }
 
 /// The largest rowid currently stored in the table b-tree rooted at `root` (0 if the table is

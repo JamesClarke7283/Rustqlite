@@ -36,7 +36,17 @@ pub struct Table {
     pub rootpage: i64,
     pub columns: Vec<Column>,
     /// Index into `columns` of the `INTEGER PRIMARY KEY` rowid-alias column, if there is one.
+    /// Always `None` for a WITHOUT ROWID table (no rowid is stored).
     pub rowid_alias: Option<usize>,
+    /// `true` when the table was declared `WITHOUT ROWID` — the b-tree is then an index b-tree
+    /// keyed by the primary-key record (PK columns followed by the remaining columns), and no
+    /// rowid is allocated or stored. M5.3.6.
+    pub without_rowid: bool,
+    /// The PRIMARY KEY columns of a WITHOUT ROWID table, in declared order: `(column index in
+    /// self.columns, DESC flag)`. Empty for ordinary rowid tables. The b-tree key record stores
+    /// these columns first (in this order) and then the remaining non-PK columns in table column
+    /// order — matching how upstream's `convertToWithoutRowidTable` makes the PK a covering index.
+    pub pk_columns: Vec<(usize, bool)>,
 }
 
 impl Default for Table {
@@ -46,6 +56,8 @@ impl Default for Table {
             rootpage: 0,
             columns: Vec::new(),
             rowid_alias: None,
+            without_rowid: false,
+            pk_columns: Vec::new(),
         }
     }
 }
@@ -141,14 +153,6 @@ impl Table {
             .sql
             .as_deref()
             .ok_or_else(|| Error::msg(format!("table \"{}\" has no CREATE statement", obj.name)))?;
-        // The current grammar does not parse `WITHOUT ROWID`; give a precise unsupported error
-        // rather than a confusing parse failure.
-        if sql.to_ascii_uppercase().contains("WITHOUT ROWID") {
-            return Err(Error::msg(format!(
-                "WITHOUT ROWID tables are not supported yet (table \"{}\")",
-                obj.name
-            )));
-        }
         let stmts = parse(sql)
             .map_err(|e| Error::msg(format!("cannot parse schema for \"{}\": {e}", obj.name)))?;
         let ct = match stmts.into_iter().next() {
@@ -196,9 +200,30 @@ impl Table {
             });
         }
 
+        // Table-level `PRIMARY KEY (cols)` overrides any column-level PK only in the sense that
+        // it establishes the PK set. Upstream disallows mixing; we follow the same rule by
+        // taking whichever was declared (the table-level wins when both are present, matching
+        // `sqlite3AddPrimaryKey`'s behavior of erroring on a duplicate, which we approximate).
+        for c in &ct.constraints {
+            if let rustqlite_parser::TableConstraintBody::PrimaryKey { columns } = &c.body {
+                pk_cols.clear();
+                for pkc in columns {
+                    if let Some(idx) = ct
+                        .columns
+                        .iter()
+                        .position(|cd| cd.name.eq_ignore_ascii_case(&pkc.name))
+                    {
+                        pk_cols.push((idx, pkc.desc));
+                    }
+                }
+            }
+        }
+
         // The rowid alias is a *single-column* PRIMARY KEY whose declared type is exactly
-        // "INTEGER" (not "INT") and which is ASC. AUTOINCREMENT is allowed.
-        let rowid_alias = if pk_cols.len() == 1 {
+        // "INTEGER" (not "INT") and which is ASC. AUTOINCREMENT is allowed. A WITHOUT ROWID
+        // table never has a rowid alias even when its PK is a single INTEGER column.
+        let without_rowid = ct.without_rowid;
+        let rowid_alias = if !without_rowid && pk_cols.len() == 1 {
             let (idx, desc) = pk_cols[0];
             let is_integer = ct.columns[idx]
                 .type_name
@@ -209,11 +234,22 @@ impl Table {
             None
         };
 
+        // For a WITHOUT ROWID table, every PRIMARY KEY column is implicitly NOT NULL (upstream's
+        // `convertToWithoutRowidTable` step 1), and the table has no rowid alias. We also record
+        // the PK column list so the codegen can build the key record in the right order.
+        if without_rowid {
+            for &(idx, _) in &pk_cols {
+                columns[idx].notnull = true;
+            }
+        }
+
         Table {
             name: ct.name.clone(),
             rootpage,
             columns,
             rowid_alias,
+            without_rowid,
+            pk_columns: if without_rowid { pk_cols } else { Vec::new() },
         }
     }
 
@@ -226,7 +262,9 @@ impl Table {
 
     /// Resolve a bare column name to either the rowid or a stored column index, applying the
     /// rowid-alias rule and the magic names `rowid`/`_rowid_`/`oid` (which name the rowid only
-    /// when no real column shadows them).
+    /// when no real column shadows them). A WITHOUT ROWID table has no rowid at all, so the
+    /// magic names are not valid references on it (matching upstream's "no such column: rowid"
+    /// error for `SELECT rowid FROM <without-rowid-table>`).
     pub fn resolve_column(&self, name: &str) -> Option<ColumnRef> {
         if let Some(i) = self.column_index(name) {
             if Some(i) == self.rowid_alias {
@@ -234,10 +272,100 @@ impl Table {
             }
             return Some(ColumnRef::Index(i));
         }
-        if is_rowid_name(name) {
+        if !self.without_rowid && is_rowid_name(name) {
             return Some(ColumnRef::Rowid);
         }
         None
+    }
+
+    /// For a WITHOUT ROWID table, the storage position of the column at table-column index
+    /// `col_idx` within the b-tree key record. The record layout is `[pk_cols in declared
+    /// order..., remaining non-PK cols in table column order...]` — matching upstream's
+    /// `convertToWithoutRowidTable` covering-index shape.
+    ///
+    /// Returns `None` for a rowid table (no storage reordering) or when the column is a
+    /// generated/virtual column that is not stored (deferred until M34).
+    pub fn without_rowid_storage_index(&self, col_idx: usize) -> Option<usize> {
+        if !self.without_rowid {
+            return None;
+        }
+        // PK columns are at the front, in their declared order.
+        for (pos, &(c, _)) in self.pk_columns.iter().enumerate() {
+            if c == col_idx {
+                return Some(pos);
+            }
+        }
+        // Non-PK columns follow, in table column order, skipping PK columns.
+        let n_pk = self.pk_columns.len();
+        let mut storage = n_pk;
+        for i in 0..self.columns.len() {
+            if self.pk_columns.iter().any(|&(c, _)| c == i) {
+                continue;
+            }
+            if i == col_idx {
+                return Some(storage);
+            }
+            storage += 1;
+        }
+        None
+    }
+
+    /// For a WITHOUT ROWID table, the table-column index that lives at storage position
+    /// `storage_idx` in the b-tree key record. The inverse of [`without_rowid_storage_index`].
+    pub fn without_rowid_table_index(&self, storage_idx: usize) -> Option<usize> {
+        if !self.without_rowid {
+            return None;
+        }
+        let n_pk = self.pk_columns.len();
+        if storage_idx < n_pk {
+            return Some(self.pk_columns[storage_idx].0);
+        }
+        let mut target = storage_idx - n_pk;
+        for i in 0..self.columns.len() {
+            if self.pk_columns.iter().any(|&(c, _)| c == i) {
+                continue;
+            }
+            if target == 0 {
+                return Some(i);
+            }
+            target -= 1;
+        }
+        None
+    }
+
+    /// The total number of stored columns in the b-tree key record for a WITHOUT ROWID table
+    /// (all columns today; generated-virtual columns are deferred to M34).
+    pub fn without_rowid_storage_width(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// The `KeyInfo` for the WITHOUT ROWID table's b-tree: one entry per stored column, in
+    /// storage order. PK columns carry their declared DESC flag; non-PK columns are ASC. All
+    /// columns use BINARY collation today (per-column COLLATE on PK columns is deferred).
+    pub fn without_rowid_key_info(&self) -> Vec<crate::vdbe::KeyField> {
+        self.without_rowid_key_info_with_collation()
+    }
+
+    /// Build the KeyInfo with per-column collation resolved from the columns' declared
+    /// collation. (Public so the codegen can hand a copy to `OpenRead`/`OpenWrite`.)
+    pub fn without_rowid_key_info_with_collation(&self) -> Vec<crate::vdbe::KeyField> {
+        let mut out = Vec::with_capacity(self.without_rowid_storage_width());
+        for &(c, desc) in &self.pk_columns {
+            out.push(crate::vdbe::KeyField {
+                desc,
+                collation: self.columns[c].collation,
+            });
+        }
+        for i in 0..self.columns.len() {
+            if self.pk_columns.iter().any(|&(c, _)| c == i) {
+                continue;
+            }
+            out.push(crate::vdbe::KeyField {
+                desc: false,
+                collation: self.columns[i].collation,
+            });
+        }
+        out
     }
 }
 
@@ -301,6 +429,8 @@ impl IndexObject {
                 rootpage: 0,
                 columns: Vec::new(),
                 rowid_alias: None,
+                without_rowid: false,
+                pk_columns: Vec::new(),
             });
         Ok(IndexObject::from_create(
             &ci,
@@ -453,15 +583,45 @@ mod tests {
     }
 
     #[test]
-    fn without_rowid_is_unsupported() {
-        let obj = SchemaObject {
-            rowid: 1,
-            obj_type: "table".into(),
-            name: "t".into(),
-            tbl_name: "t".into(),
-            rootpage: 2,
-            sql: Some("CREATE TABLE t(a PRIMARY KEY, b) WITHOUT ROWID".into()),
-        };
-        assert!(Table::from_schema_object(&obj).is_err());
+    fn without_rowid_single_column_pk() {
+        let t = table_from_sql("CREATE TABLE t(a PRIMARY KEY, b) WITHOUT ROWID");
+        assert!(t.without_rowid);
+        assert_eq!(t.rowid_alias, None);
+        assert_eq!(t.pk_columns, vec![(0, false)]);
+        // PK column a is implicitly NOT NULL; b is nullable.
+        assert!(t.columns[0].notnull);
+        assert!(!t.columns[1].notnull);
+        // Storage order: a (pk) at 0, b (non-pk) at 1.
+        assert_eq!(t.without_rowid_storage_index(0), Some(0));
+        assert_eq!(t.without_rowid_storage_index(1), Some(1));
+        assert_eq!(t.without_rowid_table_index(0), Some(0));
+        assert_eq!(t.without_rowid_table_index(1), Some(1));
+    }
+
+    #[test]
+    fn without_rowid_composite_pk_reorders_storage() {
+        // CREATE TABLE t(a, b TEXT PRIMARY KEY, c) WITHOUT ROWID, PRIMARY KEY(b)
+        let t = table_from_sql(
+            "CREATE TABLE t(a, b TEXT, c, PRIMARY KEY(b)) WITHOUT ROWID",
+        );
+        assert!(t.without_rowid);
+        assert_eq!(t.pk_columns, vec![(1, false)]);
+        // Storage: b (pk) at 0, a at 1, c at 2.
+        assert_eq!(t.without_rowid_storage_index(1), Some(0));
+        assert_eq!(t.without_rowid_storage_index(0), Some(1));
+        assert_eq!(t.without_rowid_storage_index(2), Some(2));
+        assert_eq!(t.without_rowid_table_index(0), Some(1));
+        assert_eq!(t.without_rowid_table_index(1), Some(0));
+        assert_eq!(t.without_rowid_table_index(2), Some(2));
+    }
+
+    #[test]
+    fn without_rowid_integer_pk_is_not_rowid_alias() {
+        // A single INTEGER PRIMARY KEY WITHOUT ROWID table has no rowid alias — the integer
+        // is stored as the leading key field, not as the rowid.
+        let t = table_from_sql("CREATE TABLE t(id INTEGER PRIMARY KEY, v) WITHOUT ROWID");
+        assert!(t.without_rowid);
+        assert_eq!(t.rowid_alias, None);
+        assert_eq!(t.pk_columns, vec![(0, false)]);
     }
 }

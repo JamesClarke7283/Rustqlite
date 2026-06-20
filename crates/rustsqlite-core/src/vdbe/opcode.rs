@@ -251,6 +251,10 @@ pub enum Opcode {
     AggStep,
     /// `AggFinal`: finalize an aggregate (unimplemented in M3a).
     AggFinal,
+    /// `HaltIfNull p3 p4=Text(msg)`: if `r[p3]` is NULL, halt the program with a constraint
+    /// error whose message is `p4`. Used by WITHOUT ROWID inserts to enforce the implicit
+    /// NOT NULL on PRIMARY KEY columns. Mirrors `OP_HaltIfNull` in `vdbe.c`.
+    HaltIfNull,
 }
 
 impl Opcode {
@@ -337,6 +341,7 @@ impl Opcode {
             Opcode::IfPos => "IfPos",
             Opcode::AggStep => "AggStep",
             Opcode::AggFinal => "AggFinal",
+            Opcode::HaltIfNull => "HaltIfNull",
         }
     }
 }

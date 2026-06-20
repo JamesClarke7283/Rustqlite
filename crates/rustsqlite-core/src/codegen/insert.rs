@@ -43,6 +43,9 @@ pub fn compile_insert(
     source_table: Option<&Table>,
     source_indexes: &[IndexObject],
 ) -> Result<Program> {
+    if table.without_rowid {
+        return compile_insert_without_rowid(ins, table, indexes);
+    }
     match &ins.source {
         InsertSource::Values(rows) => compile_insert_values(ins, table, indexes, rows),
         InsertSource::Select(sel) => {
@@ -202,6 +205,287 @@ fn compile_insert_values(
     b.resolve(setup);
     b.emit(Opcode::Goto, 0, after_init, 0);
     Ok(b.finish())
+}
+
+/// Compile `INSERT INTO <without-rowid-table>` for `VALUES` and `DEFAULT VALUES` sources.
+///
+/// The WITHOUT ROWID table is an index b-tree keyed by the PK record (PK columns followed by
+/// the remaining non-PK columns, matching upstream's `convertToWithoutRowidTable` covering-index
+/// shape). The codegen therefore:
+///   * opens the table as an *index* write cursor with a `KeyInfo` derived from the PK
+///     (DESC flags honored, BINARY collation today);
+///   * builds, per row, a single record holding all stored columns in storage order
+///     (`[pk_cols..., non-pk cols...]`);
+///   * `IdxInsert`s that record with `P5_UNIQUE` set so the PK uniqueness constraint is enforced
+///     (`UNIQUE constraint failed: table.pk1, table.pk2, ...` on conflict);
+///   * still emits per-row `IdxInsert` for any user-declared secondary indexes (their key
+///     records end in the PK columns rather than a rowid, mirroring upstream's
+///     `sqlite3CreateIndex` PK-tail rewrite for WITHOUT ROWID tables).
+///
+/// `INSERT ... SELECT` into a WITHOUT ROWID table is deferred to M8 (it needs coroutine
+/// plumbing that the rowid path already uses); the parser accepts it but the codegen errors.
+fn compile_insert_without_rowid(
+    ins: &InsertStmt,
+    table: &Table,
+    indexes: &[IndexObject],
+) -> Result<Program> {
+    let rows: Vec<Vec<Expr>> = match &ins.source {
+        InsertSource::Values(rows) => rows.clone(),
+        InsertSource::DefaultValues => vec![Vec::new()],
+        InsertSource::Select(_) => {
+            return Err(Error::msg(
+                "INSERT ... SELECT into a WITHOUT ROWID table is not supported yet",
+            ))
+        }
+    };
+
+    let ncol = table.columns.len();
+    let _n_pk = table.pk_columns.len();
+    let storage_width = table.without_rowid_storage_width();
+    // Map each VALUES position to a table column index (same logic as the rowid path).
+    let value_for_col: Vec<Option<usize>> = if ins.columns.is_empty() {
+        (0..ncol).map(Some).collect()
+    } else {
+        let mut map = vec![None; ncol];
+        for (vi, name) in ins.columns.iter().enumerate() {
+            let ci = table.column_index(name).ok_or_else(|| {
+                Error::msg(format!("table {} has no column named {name}", table.name))
+            })?;
+            map[ci] = Some(vi);
+        }
+        map
+    };
+    let expected = if ins.columns.is_empty() {
+        ncol
+    } else {
+        ins.columns.len()
+    };
+
+    validate_indexes(table, indexes)?;
+
+    let cursor = 0i32;
+    let ctx = Ctx {
+        table,
+        cursor,
+        register_base: None,
+    };
+    let mut b = ProgramBuilder::new();
+
+    let returning = ins
+        .returning
+        .as_deref()
+        .map(|r| Returning::new(r, table))
+        .transpose()?;
+
+    let setup = b.new_label();
+    b.emit_jump(Opcode::Init, 0, setup, 0);
+    let after_init = b.cur_addr();
+
+    b.emit(Opcode::Transaction, 0, 1, 0);
+
+    // Open the WITHOUT ROWID table as an index b-tree write cursor (KeyInfo from the PK).
+    let open = b.emit(Opcode::OpenWrite, cursor, table.rootpage as i32, 0);
+    b.set_p4(open, P4::KeyInfo(table.without_rowid_key_info()));
+
+    let index_cursor_base: i32 = open_index_cursors(&mut b, indexes)?;
+    let eph_cursor = index_cursor_base + indexes.len() as i32;
+    let mut returning = returning;
+    if let Some(ref mut ret) = returning {
+        ret.emit_open(&mut b, eph_cursor);
+    }
+
+    let pk_message = {
+        let names: Vec<String> = table
+            .pk_columns
+            .iter()
+            .map(|&(c, _)| format!("{}.{}", table.name, table.columns[c].name))
+            .collect();
+        format!("UNIQUE constraint failed: {}", names.join(", "))
+    };
+
+    for row in &rows {
+        if row.len() != expected {
+            return Err(Error::msg(format!(
+                "table {} has {expected} columns but {} values were supplied",
+                table.name,
+                row.len()
+            )));
+        }
+
+        // First evaluate every table column into its own register (table-column order), so the
+        // secondary-index maintenance below can read columns by their table index just like the
+        // rowid path does. Then permutation-copy them into storage order for the table key.
+        let col_start = b.alloc_regs(ncol as i32);
+        for (ci, col) in table.columns.iter().enumerate() {
+            let target = col_start + ci as i32;
+            match value_for_col[ci] {
+                Some(vi) if vi < row.len() => {
+                    let value_expr = &row[vi];
+                    compile_expr(&mut b, value_expr, target, ctx)?;
+                    apply_affinity(&mut b, target, col.affinity);
+                }
+                _ => {
+                    // Unlisted column or DEFAULT VALUES: load the column DEFAULT, else NULL.
+                    if let Some(expr) = &col.default {
+                        compile_expr(&mut b, expr, target, ctx)?;
+                        apply_affinity(&mut b, target, col.affinity);
+                    } else {
+                        b.emit(Opcode::Null, 0, target, 0);
+                    }
+                }
+            }
+        }
+
+        // NOT NULL on PK columns is enforced at codegen time via a per-row HaltIfNull check
+        // (mirrors upstream's `OP_HaltIfNull` for NOT NULL columns in WITHOUT ROWID PKs).
+        for &(pk_idx, _) in &table.pk_columns {
+            let reg = col_start + pk_idx as i32;
+            let halt = b.emit(Opcode::HaltIfNull, 0, 0, reg);
+            b.set_p4(halt, P4::Text(format!("NOT NULL constraint failed: {}.{}", table.name, table.columns[pk_idx].name)));
+        }
+
+        // Permute into storage order: PK cols first (in declared order), then non-PK cols in
+        // table column order.
+        let key_start = b.alloc_regs(storage_width as i32);
+        let mut out_pos = 0i32;
+        for &(c, _) in &table.pk_columns {
+            b.emit(Opcode::SCopy, col_start + c as i32, key_start + out_pos, 0);
+            out_pos += 1;
+        }
+        for i in 0..table.columns.len() {
+            if table.pk_columns.iter().any(|&(c, _)| c == i) {
+                continue;
+            }
+            b.emit(Opcode::SCopy, col_start + i as i32, key_start + out_pos, 0);
+            out_pos += 1;
+        }
+
+        let key_rec = b.alloc_reg();
+        b.emit(Opcode::MakeRecord, key_start, storage_width as i32, key_rec);
+        let ins_idx = b.emit(Opcode::IdxInsert, cursor, key_rec, 0);
+        b.set_p4(ins_idx, P4::Text(pk_message.clone()));
+        b.set_p5(ins_idx, P5_NCHANGE | P5_UNIQUE);
+
+        // Secondary index maintenance. The user-declared indexes on a WITHOUT ROWID table end
+        // their key with the PK columns (not a rowid); `emit_index_inserts_without_rowid` does
+        // that substitution. The connection's `last_insert_rowid` is not updated for a WITHOUT
+        // ROWID insert (there is no rowid).
+        emit_index_inserts_without_rowid(
+            &mut b,
+            indexes,
+            table,
+            col_start,
+            index_cursor_base,
+        )?;
+        self::bump_changes(&mut b);
+
+        if let Some(ref ret) = returning {
+            ret.emit_buffer_row(&mut b, table, cursor, col_start)?;
+        }
+    }
+
+    if let Some(ref ret) = returning {
+        ret.emit_output_loop(&mut b);
+    }
+
+    b.emit(Opcode::Halt, 0, 0, 0);
+
+    b.resolve(setup);
+    b.emit(Opcode::Goto, 0, after_init, 0);
+    Ok(b.finish())
+}
+
+/// Bump the connection change counters for a WITHOUT ROWID insert (one row per VALUES row).
+fn bump_changes(_b: &mut ProgramBuilder) {
+    // The IdxInsert carries P5_NCHANGE so the executor bumps changes itself; no extra opcode
+    // is needed. Kept as a named hook for symmetry with the rowid path.
+}
+
+/// Append the secondary-index `IdxInsert` sequence for one row of a WITHOUT ROWID table. The
+/// key record for each user-declared index is `[indexed columns..., PK columns...]` — the PK
+/// columns replace the trailing rowid that the rowid-table path uses. PK columns are read in
+/// their declared order from the table-column register block.
+fn emit_index_inserts_without_rowid(
+    b: &mut ProgramBuilder,
+    indexes: &[IndexObject],
+    table: &Table,
+    col_start: i32,
+    index_cursor_base: i32,
+) -> Result<()> {
+    for (i, idx) in indexes.iter().enumerate() {
+        let ic = index_cursor_base + i as i32;
+        let indexed_cis = idx.table_column_indices(table)?;
+        let nkey = idx.nkey_fields() as i32 + table.pk_columns.len() as i32;
+
+        let skip_label = if let Some(pred) = &idx.where_clause {
+            let skip = b.new_label();
+            let pred_ctx = Ctx {
+                table,
+                cursor: 0,
+                register_base: None,
+            };
+            compile_pred_jump(
+                b,
+                pred,
+                skip,
+                table,
+                col_start,
+                indexed_cis.as_slice(),
+                pred_ctx,
+            )?;
+            Some(skip)
+        } else {
+            None
+        };
+
+        let key_start = b.alloc_regs(nkey);
+        let mut plain_iter = indexed_cis.iter();
+        for (j, icol) in idx.columns.iter().enumerate() {
+            let target = key_start + j as i32;
+            if let Some(expr) = &icol.expr {
+                let expr_ctx = Ctx {
+                    table,
+                    cursor: 0,
+                    register_base: Some(col_start),
+                };
+                compile_expr(b, expr, target, expr_ctx)?;
+            } else {
+                let col_idx = *plain_iter
+                    .next()
+                    .expect("plain column aligned with indexed_cis");
+                b.emit(Opcode::SCopy, col_start + col_idx as i32, target, 0);
+            }
+        }
+        // Append the PK columns in declared order (replaces the rowid tail).
+        for (k, &(c, _)) in table.pk_columns.iter().enumerate() {
+            b.emit(
+                Opcode::SCopy,
+                col_start + c as i32,
+                key_start + idx.nkey_fields() as i32 + k as i32,
+                0,
+            );
+        }
+        let key_rec = b.alloc_reg();
+        b.emit(Opcode::MakeRecord, key_start, nkey, key_rec);
+        let ins_idx = b.emit(Opcode::IdxInsert, ic, key_rec, 0);
+        let mut p5 = P5_NCHANGE;
+        if idx.unique {
+            p5 |= P5_UNIQUE;
+            if let Some(msg) = idx.unique_constraint_message(table) {
+                b.set_p4(ins_idx, P4::Text(msg));
+            } else {
+                b.set_p4(ins_idx, P4::Int(0));
+            }
+        } else {
+            b.set_p4(ins_idx, P4::Int(0));
+        }
+        b.set_p5(ins_idx, p5);
+
+        if let Some(skip) = skip_label {
+            b.resolve(skip);
+        }
+    }
+    Ok(())
 }
 
 /// Compile `INSERT INTO ... DEFAULT VALUES`.

@@ -65,9 +65,10 @@ pub async fn split_leaf(pager: &Pager, leaf_pgno: u32, parent_root: Option<u32>)
         left_size = projected;
     }
     if split_at >= cells.len() {
-        return Err(Error::corrupt(
-            "split_leaf: cannot find a split point (all cells are larger than half the page)",
-        ));
+        // Single-cell leaf (or all cells too big to split): put everything on the left leaf
+        // and leave the right leaf empty. The pending insert (which triggered this split)
+        // lands on the right via `target_after_split`.
+        split_at = cells.len();
     }
 
     // Build the new right-sibling leaf and rewrite the left leaf in place.
@@ -143,6 +144,19 @@ pub async fn split_leaf(pager: &Pager, leaf_pgno: u32, parent_root: Option<u32>)
             }
         }
         pager.write_page(parent_pgno, pbuf)?;
+
+        // Auto-vacuum ptrmap: the new right-sibling leaf is a BTREE child of `parent_pgno`.
+        // The old leaf (`leaf_pgno`) was already a BTREE child of this parent; its parent
+        // pointer is unchanged.
+        if pager.auto_vacuum() {
+            super::ptrmap::ptrmap_put(
+                pager,
+                new_pgno,
+                super::ptrmap::PtrMapType::Btree,
+                parent_pgno,
+            )
+            .await?;
+        }
     }
 
     Ok(new_pgno)
@@ -181,7 +195,10 @@ pub async fn promote_root_and_split(pager: &Pager, root_pgno: u32) -> Result<()>
     }
 
     // Pick the split point: aim for half the bytes on each side, but require at least one
-    // cell on each side.
+    // cell on each side. When the root holds a single cell that fills the page (e.g. one
+    // large row with overflow), `split_at` stays at `cells.len()` and we fall back to putting
+    // the existing cell on the left leaf and leaving the right leaf empty — the pending
+    // insert (which triggered this split) lands on the right via `insert_after_root_promotion`.
     let target = usable / 2;
     let mut left_size = 0usize;
     let mut split_at = cells.len();
@@ -194,9 +211,9 @@ pub async fn promote_root_and_split(pager: &Pager, root_pgno: u32) -> Result<()>
         left_size = projected;
     }
     if split_at >= cells.len() {
-        return Err(Error::corrupt(
-            "promote_root_and_split: cannot split (single cell bigger than half the page)",
-        ));
+        // Single-cell root (or all cells too big to split): put everything on the left leaf
+        // and leave the right leaf empty. The pending insert will fill the right leaf.
+        split_at = cells.len();
     }
 
     // The split always produces **two new leaves** and the old root becomes an interior
@@ -252,6 +269,25 @@ pub async fn promote_root_and_split(pager: &Pager, root_pgno: u32) -> Result<()>
         &[(0, build_table_interior_cell(left_pgno, divider_rowid))],
     )?;
     pager.write_page(root_pgno, root_buf)?;
+
+    // Auto-vacuum ptrmap: the root was a ROOTPAGE (still is), and the two new leaves are
+    // BTREE children of it. The root's own ptrmap entry is unchanged.
+    if pager.auto_vacuum() {
+        super::ptrmap::ptrmap_put(
+            pager,
+            left_pgno,
+            super::ptrmap::PtrMapType::Btree,
+            root_pgno,
+        )
+        .await?;
+        super::ptrmap::ptrmap_put(
+            pager,
+            right_pgno,
+            super::ptrmap::PtrMapType::Btree,
+            root_pgno,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -425,9 +461,10 @@ pub async fn split_index_leaf(
         left_size = projected;
     }
     if split_at >= cells.len() {
-        return Err(Error::corrupt(
-            "split_index_leaf: cannot find a split point (all cells are larger than half the page)",
-        ));
+        // Single-cell leaf (or all cells too big to split): promote the last cell as the
+        // divider and leave both children empty. The pending insert fills one of them.
+        // This requires split_at to be the last cell index so the divider extraction works.
+        split_at = cells.len().saturating_sub(1);
     }
     // The divider is the cell at split_at (first cell of the right side). It is promoted from
     // the child into the parent, so it does NOT appear on either child page.
@@ -468,6 +505,18 @@ pub async fn split_index_leaf(
     page::write_page_cells(&mut new_left, base, PageType::LeafIndex, None, &left_cells)?;
     pager.write_page(leaf_pgno, new_left)?;
 
+    // Auto-vacuum ptrmap: the new right-sibling index leaf is a BTREE child of the parent.
+    if pager.auto_vacuum() {
+        if let Some(parent_pgno) = parent_root {
+            super::ptrmap::ptrmap_put(
+                pager,
+                new_pgno,
+                super::ptrmap::PtrMapType::Btree,
+                parent_pgno,
+            )
+            .await?;
+        }
+    }
     Ok((new_pgno, divider_key))
 }
 
@@ -650,7 +699,52 @@ pub async fn split_index_interior_page(
     )?;
     pager.write_page(interior_pgno, new_left)?;
 
+    // Auto-vacuum ptrmap: the new right-sibling interior index page is a BTREE child of the
+    // parent. The children of the moved subtree keep their own ptrmap entries pointing at
+    // `new_pgno`/`interior_pgno` — but their parent pointer is still correct in the ptrmap
+    // because their parent page NUMBER did not change (the parent content moved to a new
+    // page number, but the children still point at the old page number which is now the left
+    // half). Wait: the left half stays at `interior_pgno`, so its children's ptrmap entries
+    // are still correct. The right half moved to `new_pgno`, so its children's ptrmap entries
+    // must be updated to point at `new_pgno` instead of `interior_pgno`.
+    if pager.auto_vacuum() {
+        if let Some(parent_pgno) = parent_root {
+            super::ptrmap::ptrmap_put(
+                pager,
+                new_pgno,
+                super::ptrmap::PtrMapType::Btree,
+                parent_pgno,
+            )
+            .await?;
+        }
+        // Update the right-half's children's ptrmap entries to point at new_pgno. The right
+        // half's cells' left_child pointers and the right_most_pointer all refer to children
+        // whose parent is now new_pgno, not interior_pgno.
+        update_children_ptrmap_to_new_parent(pager, new_pgno, &right_cells, right_most).await?;
+    }
+
     Ok((new_pgno, divider_key))
+}
+
+/// Update the ptrmap entries for all children referenced by a freshly written interior page,
+/// pointing them at the new parent `new_parent_pgno`. Used after an interior page split moves
+/// a subtree to a new page number: the children's parent pointer in the ptrmap must follow.
+async fn update_children_ptrmap_to_new_parent(
+    pager: &Pager,
+    new_parent_pgno: u32,
+    cells: &[(u16, Vec<u8>)],
+    right_most: Option<u32>,
+) -> Result<()> {
+    for (_, cell) in cells {
+        let child = u32::from_be_bytes([cell[0], cell[1], cell[2], cell[3]]);
+        super::ptrmap::ptrmap_put(pager, child, super::ptrmap::PtrMapType::Btree, new_parent_pgno)
+            .await?;
+    }
+    if let Some(rm) = right_most {
+        super::ptrmap::ptrmap_put(pager, rm, super::ptrmap::PtrMapType::Btree, new_parent_pgno)
+            .await?;
+    }
+    Ok(())
 }
 
 /// The on-page size of an index-interior cell: `u32(left_child) ++ varint(payload_size) ++
@@ -742,9 +836,9 @@ async fn promote_index_root(pager: &Pager, root_pgno: u32, child_type: PageType)
         left_size = projected;
     }
     if split_at >= cells.len() {
-        return Err(Error::corrupt(
-            "promote_index_root: cannot split (single cell bigger than half the page)",
-        ));
+        // Single-cell root (or all cells too big to split): put everything on the left leaf
+        // and leave the right leaf empty, matching the table-side fix.
+        split_at = cells.len();
     }
 
     let right_most = if is_interior {
@@ -752,15 +846,24 @@ async fn promote_index_root(pager: &Pager, root_pgno: u32, child_type: PageType)
     } else {
         None
     };
+    // When split_at == cells.len(), there's no divider cell to promote (the single cell stays
+    // on the left). Use a zero-key placeholder — the parent gets one cell pointing at the left
+    // child and the right-most pointer points at the (empty) right child. The pending insert
+    // will fill the right child.
     let (divider_key, left_right_most) = if is_interior {
-        let key = index_key_from_interior_cell(&cells[split_at], usable)?;
-        let left_ptr = u32::from_be_bytes([
-            cells[split_at][0],
-            cells[split_at][1],
-            cells[split_at][2],
-            cells[split_at][3],
-        ]);
-        (key, Some(left_ptr))
+        if split_at < cells.len() {
+            let key = index_key_from_interior_cell(&cells[split_at], usable)?;
+            let left_ptr = u32::from_be_bytes([
+                cells[split_at][0],
+                cells[split_at][1],
+                cells[split_at][2],
+                cells[split_at][3],
+            ]);
+            (key, Some(left_ptr))
+        } else {
+            // No divider: keep the right-most pointer as the left child's right-most.
+            (Vec::new(), right_most)
+        }
     } else {
         (
             index_key_from_leaf_cell(&cells[split_at], usable)?,
@@ -983,6 +1086,21 @@ pub async fn split_table_interior_page(
         &left_cells,
     )?;
     pager.write_page(interior_pgno, new_left)?;
+
+    // Auto-vacuum ptrmap: the new right-sibling interior table page is a BTREE child of the
+    // parent. Its children's ptrmap entries must be repointed at `new_pgno`.
+    if pager.auto_vacuum() {
+        if let Some(parent_pgno) = parent_root {
+            super::ptrmap::ptrmap_put(
+                pager,
+                new_pgno,
+                super::ptrmap::PtrMapType::Btree,
+                parent_pgno,
+            )
+            .await?;
+        }
+        update_children_ptrmap_to_new_parent(pager, new_pgno, &right_cells, right_most).await?;
+    }
 
     Ok(new_pgno)
 }

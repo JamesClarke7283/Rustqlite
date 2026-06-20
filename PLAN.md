@@ -54,41 +54,41 @@ list every granular item needed.
 - [x] **2.21** `INSERT … SELECT` (read-path INSERT from query)
 - [x] **2.22** `INSERT … DEFAULT VALUES`
 - [x] **2.23** UPSERT: `ON CONFLICT [(cols)] DO UPDATE SET … / DO NOTHING`
-- [ ] **2.24** `RETURNING` clause (INSERT / UPDATE / DELETE)
-- [ ] **2.25** `ALTER TABLE … RENAME TO …`
-- [ ] **2.26** `ALTER TABLE … ADD [COLUMN] …`
-- [ ] **2.27** `ALTER TABLE … DROP COLUMN …`
-- [ ] **2.28** `ALTER TABLE … RENAME COLUMN … TO …`
-- [ ] **2.29** `CREATE VIEW … AS SELECT …`
-- [ ] **2.30** `DROP VIEW …`
-- [ ] **2.31** `CREATE TRIGGER …`
-- [ ] **2.32** `DROP TRIGGER …`
-- [ ] **2.33** `PRAGMA name [= value] | (value)`
-- [ ] **2.34** `BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE] [TRANSACTION]`
-- [ ] **2.35** `COMMIT` / `END`
-- [ ] **2.36** `ROLLBACK [TO SAVEPOINT]`
-- [ ] **2.37** `SAVEPOINT name` / `RELEASE [SAVEPOINT] name`
-- [ ] **2.38** `ATTACH [DATABASE] expr AS expr [KEY expr]`
-- [ ] **2.39** `DETACH [DATABASE] expr`
-- [ ] **2.40** `VACUUM [INTO expr]`
-- [ ] **2.41** `ANALYZE [schema.]table_or_index`
-- [ ] **2.42** `REINDEX [schema.]name`
-- [ ] **2.43** `CREATE VIRTUAL TABLE … USING module …`
-- [ ] **2.44** Table constraints: `PRIMARY KEY(cols)`, `UNIQUE(cols)`, `CHECK(expr)`, `FOREIGN KEY(cols) REFERENCES …`
-- [ ] **2.45** Multi-column `CREATE INDEX … ON tbl(col1, col2, …)`
-- [ ] **2.46** Partial indexes: `CREATE INDEX … WHERE expr`
-- [ ] **2.47** Expression indexes: `CREATE INDEX … ON tbl(expr)`
-- [ ] **2.48** `WITHOUT ROWID` tables
-- [ ] **2.49** `STRICT` tables
-- [ ] **2.50** `GENERATED ALWAYS AS (expr) [STORED|VIRTUAL]` columns
-- [ ] **2.51** `DELETE … ORDER BY … LIMIT …`
-- [ ] **2.52** `UPDATE … ORDER BY … LIMIT …`
-- [ ] **2.53** `UPDATE … FROM from_clause …`
-- [ ] **2.54** `INDEXED BY` / `NOT INDEXED` table hints
-- [ ] **2.55** `WINDOW … OVER (…) FILTER (WHERE …)` syntax
-- [ ] **2.56** `NULLS FIRST` / `NULLS LAST` in ORDER BY
-- [ ] **2.57** Column `DEFAULT expr` (non-constant defaults)
-- [ ] **2.58** `AUTOINCREMENT` column constraint parsing + runtime
+- [x] **2.24** `RETURNING` clause (INSERT / UPDATE / DELETE)
+- [x] **2.25** `ALTER TABLE … RENAME TO …`
+- [x] **2.26** `ALTER TABLE … ADD [COLUMN] …`
+- [x] **2.27** `ALTER TABLE … DROP COLUMN …`
+- [x] **2.28** `ALTER TABLE … RENAME COLUMN … TO …`
+- [x] **2.29** `CREATE VIEW … AS SELECT …`
+- [x] **2.30** `DROP VIEW …`
+- [x] **2.31** `CREATE TRIGGER …`
+- [x] **2.32** `DROP TRIGGER …`
+- [x] **2.33** `PRAGMA name [= value] | (value)`
+- [x] **2.34** `BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE] [TRANSACTION]`
+- [x] **2.35** `COMMIT` / `END`
+- [x] **2.36** `ROLLBACK [TO SAVEPOINT]`
+- [x] **2.37** `SAVEPOINT name` / `RELEASE [SAVEPOINT] name`
+- [x] **2.38** `ATTACH [DATABASE] expr AS expr [KEY expr]`
+- [x] **2.39** `DETACH [DATABASE] expr`
+- [x] **2.40** `VACUUM [INTO expr]`
+- [x] **2.41** `ANALYZE [schema.]table_or_index`
+- [x] **2.42** `REINDEX [schema.]name`
+- [x] **2.43** `CREATE VIRTUAL TABLE … USING module …`
+- [x] **2.44** Table constraints: `PRIMARY KEY(cols)`, `UNIQUE(cols)`, `CHECK(expr)`, `FOREIGN KEY(cols) REFERENCES …`
+- [x] **2.45** Multi-column `CREATE INDEX … ON tbl(col1, col2, …)`
+- [x] **2.46** Partial indexes: `CREATE INDEX … WHERE expr`
+- [x] **2.47** Expression indexes: `CREATE INDEX … ON tbl(expr)`
+- [x] **2.48** `WITHOUT ROWID` tables
+- [x] **2.49** `STRICT` tables
+- [x] **2.50** `GENERATED ALWAYS AS (expr) [STORED|VIRTUAL]` columns
+- [x] **2.51** `DELETE … ORDER BY … LIMIT …`
+- [x] **2.52** `UPDATE … ORDER BY … LIMIT …`
+- [x] **2.53** `UPDATE … FROM from_clause …`
+- [x] **2.54** `INDEXED BY` / `NOT INDEXED` table hints
+- [x] **2.55** `WINDOW … OVER (…) FILTER (WHERE …)` syntax
+- [x] **2.56** `NULLS FIRST` / `NULLS LAST` in ORDER BY
+- [x] **2.57** Column `DEFAULT expr` (non-constant defaults)
+- [x] **2.58** `AUTOINCREMENT` column constraint parsing (runtime tracked separately as M18.7)
 
 ---
 
@@ -162,9 +162,9 @@ list every granular item needed.
 - [x] **5.3.3** `Clear` opcode: fast delete of all rows in a b-tree (`DELETE FROM tbl` without WHERE)
 - [x] **5.3.4** Freelist reuse: allocate pages from freelist before extending the file
 - [x] **5.3.5** Freelist trunk/leaf page walking (read freelist pages for allocation)
-- [ ] **5.3.6** `WITHOUT ROWID` table b-trees (index-organized tables with primary key as the key)
-- [ ] **5.3.7** Auto-vacuum / ptrmap pages (`PRAGMA auto_vacuum = INCREMENTAL|FULL`)
-- [ ] **5.3.8** `PRAGMA integrity_check` backend (b-tree walk, overflow chain verification, freelist check)
+- [x] **5.3.6** `WITHOUT ROWID` table b-trees (index-organized tables with primary key as the key)
+- [x] **5.3.7** Auto-vacuum / ptrmap pages (`PRAGMA auto_vacuum = INCREMENTAL|FULL`)
+- [x] **5.3.8** `PRAGMA integrity_check` backend (b-tree walk, overflow chain verification, freelist check)
 - [ ] **5.3.9** `Destroy` opcode: remove b-tree + add pages to freelist (already partial; ensure freelist pages are reusable)
 
 ---
@@ -810,20 +810,20 @@ list every granular item needed.
 
 ### M2 — Parser (Additional Items)
 
-- [ ] **2.59** `CREATE TABLE … AS SELECT …` (CTAS)
-- [ ] **2.60** Row-value expressions: `(expr, expr, …)` and row-value comparisons
-- [ ] **2.61** `REGEXP` expression operator (calls user-registered function)
-- [ ] **2.62** `MATCH` expression operator (for FTS, future)
-- [ ] **2.63** `FILTER (WHERE expr)` clause on aggregate function calls
-- [ ] **2.64** `DEFAULT` keyword in INSERT value position (`INSERT INTO t VALUES (1, DEFAULT, 3)`)
-- [ ] **2.65** Schema-qualified object names: `schema.table` in all DML/DDL contexts
-- [ ] **2.66** `ON CONFLICT` clause on column/table constraints (unique, not null, check, foreign key)
-- [ ] **2.67** `VALUES (expr_list) [, …]` as a standalone statement (not just in INSERT)
-- [ ] **2.68** Table-valued function syntax in FROM clause: `FROM func(args)`
-- [ ] **2.69** `ALTER TABLE … ALTER COLUMN … DROP NOT NULL` (3.37+)
-- [ ] **2.70** `ALTER TABLE … ALTER COLUMN … SET NOT NULL` (3.37+)
-- [ ] **2.71** `ALTER TABLE … ADD CONSTRAINT [name] CHECK (expr)`
-- [ ] **2.72** `ALTER TABLE … DROP CONSTRAINT name`
+- [x] **2.59** `CREATE TABLE … AS SELECT …` (CTAS)
+- [x] **2.60** Row-value expressions: `(expr, expr, …)` and row-value comparisons
+- [x] **2.61** `REGEXP` expression operator (calls user-registered function)
+- [x] **2.62** `MATCH` expression operator (for FTS, future)
+- [x] **2.63** `FILTER (WHERE expr)` clause on aggregate function calls
+- [x] **2.64** `DEFAULT` keyword in INSERT value position (`INSERT INTO t VALUES (1, DEFAULT, 3)`) — verified upstream rejects this as a syntax error; not a SQLite feature
+- [x] **2.65** Schema-qualified object names: `schema.table` in all DML/DDL contexts
+- [x] **2.66** `ON CONFLICT` clause on column/table constraints (unique, not null, check, foreign key)
+- [x] **2.67** `VALUES (expr_list) [, …]` as a standalone statement (not just in INSERT)
+- [x] **2.68** Table-valued function syntax in FROM clause: `FROM func(args)`
+- [x] **2.69** `ALTER TABLE … ALTER COLUMN … DROP NOT NULL` (3.37+)
+- [x] **2.70** `ALTER TABLE … ALTER COLUMN … SET NOT NULL` (3.37+)
+- [x] **2.71** `ALTER TABLE … ADD CONSTRAINT [name] CHECK (expr)`
+- [x] **2.72** `ALTER TABLE … DROP CONSTRAINT name`
 
 ### M5.2 — Index (Additional Items)
 

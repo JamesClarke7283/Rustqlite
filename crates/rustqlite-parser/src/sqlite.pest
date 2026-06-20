@@ -98,6 +98,8 @@ K_NOT           = @{ ^"not"           ~ !ident_cont }
 K_IS            = @{ ^"is"            ~ !ident_cont }
 K_LIKE          = @{ ^"like"          ~ !ident_cont }
 K_GLOB          = @{ ^"glob"          ~ !ident_cont }
+K_REGEXP        = @{ ^"regexp"        ~ !ident_cont }
+K_MATCH         = @{ ^"match"         ~ !ident_cont }
 K_ESCAPE        = @{ ^"escape"        ~ !ident_cont }
 K_IN            = @{ ^"in"            ~ !ident_cont }
 K_BETWEEN       = @{ ^"between"       ~ !ident_cont }
@@ -125,6 +127,69 @@ K_INDEX         = @{ ^"index"         ~ !ident_cont }
 K_WITH          = @{ ^"with"          ~ !ident_cont }
 K_RECURSIVE     = @{ ^"recursive"     ~ !ident_cont }
 K_MATERIALIZED  = @{ ^"materialized"  ~ !ident_cont }
+K_ALTER         = @{ ^"alter"         ~ !ident_cont }
+K_RENAME        = @{ ^"rename"        ~ !ident_cont }
+K_TO            = @{ ^"to"            ~ !ident_cont }
+K_COLUMN        = @{ ^"column"        ~ !ident_cont }
+K_ADD           = @{ ^"add"           ~ !ident_cont }
+K_VIEW          = @{ ^"view"          ~ !ident_cont }
+K_TRIGGER       = @{ ^"trigger"       ~ !ident_cont }
+K_BEFORE        = @{ ^"before"        ~ !ident_cont }
+K_AFTER         = @{ ^"after"         ~ !ident_cont }
+K_INSTEAD       = @{ ^"instead"       ~ !ident_cont }
+K_OF            = @{ ^"of"            ~ !ident_cont }
+K_FOR           = @{ ^"for"           ~ !ident_cont }
+K_EACH          = @{ ^"each"          ~ !ident_cont }
+K_ROW            = @{ ^"row"           ~ !ident_cont }
+K_BEGIN         = @{ ^"begin"         ~ !ident_cont }
+K_PRAGMA        = @{ ^"pragma"        ~ !ident_cont }
+K_TRANSACTION  = @{ ^"transaction"   ~ !ident_cont }
+K_DEFERRED     = @{ ^"deferred"      ~ !ident_cont }
+K_IMMEDIATE    = @{ ^"immediate"     ~ !ident_cont }
+K_EXCLUSIVE    = @{ ^"exclusive"     ~ !ident_cont }
+K_COMMIT       = @{ ^"commit"       ~ !ident_cont }
+K_SAVEPOINT    = @{ ^"savepoint"     ~ !ident_cont }
+K_RELEASE      = @{ ^"release"      ~ !ident_cont }
+K_ATTACH       = @{ ^"attach"       ~ !ident_cont }
+K_DETACH       = @{ ^"detach"       ~ !ident_cont }
+K_DATABASE    = @{ ^"database"     ~ !ident_cont }
+K_VACUUM       = @{ ^"vacuum"       ~ !ident_cont }
+K_ANALYZE      = @{ ^"analyze"      ~ !ident_cont }
+K_REINDEX      = @{ ^"reindex"      ~ !ident_cont }
+K_VIRTUAL      = @{ ^"virtual"      ~ !ident_cont }
+K_CONSTRAINT   = @{ ^"constraint"   ~ !ident_cont }
+K_FOREIGN      = @{ ^"foreign"      ~ !ident_cont }
+K_REFERENCES   = @{ ^"references"   ~ !ident_cont }
+K_CASCADE      = @{ ^"cascade"      ~ !ident_cont }
+K_RESTRICT     = @{ ^"restrict"     ~ !ident_cont }
+K_ACTION       = @{ ^"action"       ~ !ident_cont }
+K_NO           = @{ ^"no"           ~ !ident_cont }
+K_DEFERRABLE   = @{ ^"deferrable"   ~ !ident_cont }
+K_INITIALLY   = @{ ^"initially"    ~ !ident_cont }
+K_CHECK        = @{ ^"check"        ~ !ident_cont }
+K_WITHOUT      = @{ ^"without"      ~ !ident_cont }
+K_STRICT       = @{ ^"strict"       ~ !ident_cont }
+K_GENERATED   = @{ ^"generated"    ~ !ident_cont }
+K_ALWAYS       = @{ ^"always"       ~ !ident_cont }
+K_STORED       = @{ ^"stored"       ~ !ident_cont }
+K_INDEXED      = @{ ^"indexed"       ~ !ident_cont }
+K_WINDOW       = @{ ^"window"        ~ !ident_cont }
+K_OVER         = @{ ^"over"          ~ !ident_cont }
+K_FILTER       = @{ ^"filter"        ~ !ident_cont }
+K_PARTITION   = @{ ^"partition"    ~ !ident_cont }
+K_RANGE        = @{ ^"range"         ~ !ident_cont }
+K_ROWS         = @{ ^"rows"          ~ !ident_cont }
+K_GROUPS       = @{ ^"groups"        ~ !ident_cont }
+K_UNBOUNDED   = @{ ^"unbounded"   ~ !ident_cont }
+K_PRECEDING   = @{ ^"preceding"   ~ !ident_cont }
+K_FOLLOWING   = @{ ^"following"   ~ !ident_cont }
+K_CURRENT      = @{ ^"current"       ~ !ident_cont }
+K_EXCLUDE      = @{ ^"exclude"      ~ !ident_cont }
+K_OTHERS       = @{ ^"others"        ~ !ident_cont }
+K_TIES         = @{ ^"ties"          ~ !ident_cont }
+K_NULLS        = @{ ^"nulls"         ~ !ident_cont }
+K_FIRST        = @{ ^"first"         ~ !ident_cont }
+K_LAST         = @{ ^"last"          ~ !ident_cont }
 
 // JOIN keywords are matched in context.  `JOIN`, `ON`, and `USING` are fully reserved and
 // added to the global `keyword` rule (e.g. `CREATE TABLE join` must be quoted).  The join
@@ -156,17 +221,35 @@ keyword = @{
     | K_TEMP | K_TABLE | K_IF | K_EXISTS | K_PRIMARY | K_KEY | K_AUTOINCREMENT
     | K_UNIQUE | K_DEFAULT | K_INSERT | K_REPLACE | K_INTO | K_VALUES | K_NULL
     | K_TRUE | K_FALSE | K_AND | K_OR | K_NOT | K_IS | K_LIKE | K_GLOB | K_ESCAPE | K_IN
+    | K_REGEXP | K_MATCH
     | K_BETWEEN | K_COLLATE | K_CAST | K_CASE | K_WHEN | K_THEN | K_ELSE | K_END | K_DISTINCT
     | K_ON | K_CONFLICT | K_ABORT | K_FAIL | K_IGNORE | K_ROLLBACK
     | K_EXPLAIN | K_DELETE | K_DROP | K_UPDATE | K_SET | K_INDEX
     | K_UNION | K_INTERSECT | K_EXCEPT
     | K_JOIN | K_USING | K_WITH | K_RECURSIVE
     | K_DO | K_NOTHING | K_RETURNING
+    | K_ALTER | K_RENAME | K_TO
+    | K_COLUMN | K_ADD
+    | K_VIEW
+    | K_TRIGGER | K_BEFORE | K_AFTER | K_INSTEAD | K_OF | K_FOR | K_EACH | K_ROW | K_BEGIN
+    | K_PRAGMA
+    | K_TRANSACTION | K_DEFERRED | K_IMMEDIATE | K_EXCLUSIVE | K_COMMIT
+    | K_SAVEPOINT | K_RELEASE
+    | K_ATTACH | K_DETACH | K_DATABASE | K_VACUUM | K_ANALYZE | K_REINDEX
+    | K_VIRTUAL
+    | K_CONSTRAINT | K_FOREIGN | K_REFERENCES | K_CASCADE | K_RESTRICT | K_ACTION | K_NO
+    | K_DEFERRABLE | K_INITIALLY | K_CHECK
+    | K_WITHOUT | K_STRICT
+    | K_GENERATED | K_ALWAYS | K_STORED
+    | K_INDEXED
+    | K_WINDOW | K_OVER | K_FILTER | K_PARTITION | K_RANGE | K_ROWS | K_GROUPS
+    | K_UNBOUNDED | K_PRECEDING | K_FOLLOWING | K_CURRENT | K_EXCLUDE | K_OTHERS | K_TIES
+    | K_NULLS | K_FIRST | K_LAST
 }
 
 // ---- Top level: a list of statements separated/terminated by ';' ----
 sql = { SOI ~ statement? ~ (";" ~ statement?)* ~ EOI }
-statement = { explain_prefix? ~ (select_stmt | create_table_stmt | insert_stmt | delete_stmt | drop_table_stmt | update_stmt | create_index_stmt | drop_index_stmt) }
+statement = { explain_prefix? ~ (select_stmt | create_table_stmt | insert_stmt | delete_stmt | drop_table_stmt | update_stmt | create_index_stmt | drop_index_stmt | alter_table_stmt | create_view_stmt | drop_view_stmt | create_trigger_stmt | drop_trigger_stmt | pragma_stmt | transaction_stmt | attach_stmt | detach_stmt | vacuum_stmt | analyze_stmt | reindex_stmt | create_vtab_stmt) }
 
 // `EXPLAIN` / `EXPLAIN QUERY PLAN` may prefix a statement. The query-plan form is tried first
 // (it is the more specific, longer match).
@@ -180,7 +263,7 @@ qualified_name = { ident ~ ("." ~ ident)? }
 // A compound SELECT: one or more cores joined by UNION/UNION ALL/INTERSECT/EXCEPT, with a
 // single trailing ORDER BY / LIMIT that binds to the whole compound (not the last arm).
 // A leading WITH / WITH RECURSIVE clause attaches to the whole statement.
-select_stmt = { with_clause? ~ select_core ~ (compound_op ~ select_core)* ~ order_item? ~ limit_item? }
+select_stmt = { with_clause? ~ select_core ~ (compound_op ~ select_core)* ~ order_item? ~ limit_item? ~ window_clause? }
 select_core = {
     K_SELECT ~ (K_DISTINCT | K_ALL)? ~ result_columns
     ~ from_item?
@@ -254,10 +337,20 @@ using_clause  = { K_USING ~ "(" ~ ident ~ ("," ~ ident)* ~ ")" }
 
 // An unqualified table reference, optionally aliased.  The bare-alias form is
 // context-sensitive in SQLite: a join-modifier keyword (`INNER`, `LEFT`, ...) is a
-// table alias only when preceded by `AS`; without `AS` it is interpreted as starting the
-// next join.  We model that with two sub-rules: `table_as_alias` requires `AS`, and
+// table alias only when preceded by `AS`; without `AS` it is interpreted as starting
+// the next join.  We model that with two sub-rules: `table_as_alias` requires `AS`, and
 // `implicit_alias` is a plain identifier that is not a join-modifier keyword.
-table_ref = { qualified_name ~ table_alias? }
+//
+// M2.68: a table reference may be a table-valued function call: `name(args)` (with optional
+// schema.name form). The optional `(exprlist)` after the qualified_name is the function
+// argument list.
+table_ref = { qualified_name ~ ("(" ~ expr_list_opt ~ ")")? ~ indexed_opt? ~ table_alias? }
+expr_list_opt = { expr ~ ("," ~ expr)* }
+// `INDEXED BY name` / `NOT INDEXED` table hint (M2.54). May appear after a qualified_name
+// and before the optional alias.
+indexed_opt = { indexed_by | not_indexed }
+indexed_by = { K_INDEXED ~ K_BY ~ ident }
+not_indexed = { K_NOT ~ K_INDEXED }
 
 where_item = { K_WHERE ~ expr }
 group_item = { K_GROUP ~ K_BY ~ group_by }
@@ -265,18 +358,35 @@ group_by = { expr ~ ("," ~ expr)* }
 having_item = { K_HAVING ~ expr }
 order_item = { K_ORDER ~ K_BY ~ order_by }
 order_by = { ordering_term ~ ("," ~ ordering_term)* }
-ordering_term = { expr ~ (K_ASC | K_DESC)? }
+ordering_term = { expr ~ (K_ASC | K_DESC)? ~ nulls_opt? }
+nulls_opt = { K_NULLS ~ (K_FIRST | K_LAST) }
 limit_item = { K_LIMIT ~ expr ~ (offset_item | limit_comma)? }
 offset_item = { K_OFFSET ~ expr }
 limit_comma = { "," ~ expr }
 
 // ---- CREATE TABLE ----
+// Two forms: `CREATE TABLE name (cols) [options]` or `CREATE TABLE name AS SELECT ...` (CTAS).
 create_table_stmt = {
     K_CREATE ~ (K_TEMPORARY | K_TEMP)? ~ K_TABLE
     ~ if_not_exists?
     ~ qualified_name
-    ~ "(" ~ column_def ~ ("," ~ column_def)* ~ ")"
+    ~ ( "(" ~ table_element ~ ("," ~ table_element)* ~ ")" ~ table_options?
+       | K_AS ~ select_stmt
+       )
 }
+// Optional trailing table options: `WITHOUT ROWID` / `STRICT` (comma-separated, any order).
+// Upstream's `table_option_set` accepts `nm` and validates `rowid`/`strict` semantically; we
+// accept the two known forms directly and reject others at parse time (faithful to upstream's
+// "unknown table option" error for non-keyword names).
+table_options = { table_option ~ ("," ~ table_option)* }
+table_option = { without_rowid_opt | strict_opt }
+without_rowid_opt = { K_WITHOUT ~ ident }
+strict_opt = { K_STRICT }
+// A `table_element` is either a column definition or a table-level constraint.
+// `column_def` is tried first; it fails on `CONSTRAINT`/`PRIMARY KEY`/`UNIQUE`/`CHECK`/
+// `FOREIGN KEY` because those keywords are reserved (so `ident` won't match them), so the
+// `table_constraint` alternative takes over.
+table_element = { column_def | table_constraint }
 if_not_exists = { K_IF ~ K_NOT ~ K_EXISTS }
 if_exists = { K_IF ~ K_EXISTS }
 column_def = { ident ~ type_name? ~ column_constraint* }
@@ -284,12 +394,42 @@ column_def = { ident ~ type_name? ~ column_constraint* }
 // "UNSIGNED BIG INT"), optionally with a size like VARCHAR(255). Using `ident` makes the
 // repetition stop naturally at a reserved constraint keyword (PRIMARY/NOT/UNIQUE/DEFAULT).
 type_name = { ident+ ~ ("(" ~ signed_number ~ ("," ~ signed_number)? ~ ")")? }
-column_constraint = { c_primary_key | c_not_null | c_unique | c_default }
-c_primary_key = { K_PRIMARY ~ K_KEY ~ (K_ASC | K_DESC)? ~ K_AUTOINCREMENT? }
-c_not_null = { K_NOT ~ K_NULL }
-c_unique = { K_UNIQUE }
+column_constraint = { c_primary_key | c_not_null | c_unique | c_default | c_references | c_generated }
+c_primary_key = { K_PRIMARY ~ K_KEY ~ (K_ASC | K_DESC)? ~ K_AUTOINCREMENT? ~ onconf? }
+c_not_null = { K_NOT ~ K_NULL ~ onconf? }
+c_unique = { K_UNIQUE ~ onconf? }
 c_default = { K_DEFAULT ~ (("(" ~ expr ~ ")") | literal | signed_number) }
+// Column-level REFERENCES (foreign key). The full refargs/deferrable clauses are shared with
+// the table-level FOREIGN KEY constraint.
+c_references = { K_REFERENCES ~ ident ~ column_list? ~ refargs? ~ defer_subclause? }
+// `GENERATED ALWAYS AS (expr) [STORED|VIRTUAL]` / `AS (expr) [STORED|VIRTUAL]`. M2.50.
+// The bare `AS (expr)` form (without `GENERATED ALWAYS`) is also accepted by upstream.
+c_generated = { (K_GENERATED ~ K_ALWAYS)? ~ K_AS ~ "(" ~ expr ~ ")" ~ (K_STORED | K_VIRTUAL)? }
 signed_number = @{ ("+" | "-")? ~ (hex_int | float_or_int) }
+
+// ---- Table-level constraints (M2.44) ----
+// `CONSTRAINT name <body>` | `PRIMARY KEY (cols)` | `UNIQUE (cols)` | `CHECK (expr)` |
+// `FOREIGN KEY (cols) REFERENCES parent [(cols)] [refargs] [deferrable]`.
+table_constraint = { constraint_name? ~ constraint_body }
+constraint_name = { K_CONSTRAINT ~ ident }
+constraint_body = { tc_primary_key | tc_unique | tc_check | tc_foreign_key }
+tc_primary_key = { K_PRIMARY ~ K_KEY ~ "(" ~ sortlist ~ ")" ~ K_AUTOINCREMENT? ~ onconf? }
+tc_unique = { K_UNIQUE ~ "(" ~ sortlist ~ ")" ~ onconf? }
+tc_check = { K_CHECK ~ "(" ~ expr ~ ")" ~ onconf? }
+tc_foreign_key = { K_FOREIGN ~ K_KEY ~ "(" ~ idlist ~ ")" ~ K_REFERENCES ~ ident ~ column_list? ~ refargs? ~ defer_subclause? }
+// `sortlist` for PRIMARY KEY / UNIQUE: a comma-separated list of column names with optional
+// ASC/DESC. (COLLATE on PK columns is deferred.)
+sortlist = { sortlist_item ~ ("," ~ sortlist_item)* }
+sortlist_item = { ident ~ (K_ASC | K_DESC)? }
+// `ON CONFLICT <action>` on a constraint. Optional.
+onconf = { K_ON ~ K_CONFLICT ~ (K_ROLLBACK | K_ABORT | K_FAIL | K_IGNORE | K_REPLACE) }
+// Foreign-key reference actions: `ON DELETE/UPDATE SET NULL|DEFAULT|CASCADE|RESTRICT|NO ACTION`.
+refargs = { refarg+ }
+refarg = { K_ON ~ (K_DELETE | K_UPDATE) ~ refact }
+refact = { (K_SET ~ K_NULL) | (K_SET ~ K_DEFAULT) | K_CASCADE | K_RESTRICT | (K_NO ~ K_ACTION) }
+// `DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]` / `NOT DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]`.
+defer_subclause = { (K_NOT ~ K_DEFERRABLE) | (K_DEFERRABLE ~ init_deferred?) }
+init_deferred = { K_INITIALLY ~ (K_DEFERRED | K_IMMEDIATE) }
 
 // ---- INSERT ----
 insert_stmt = {
@@ -311,17 +451,18 @@ default_values_clause = { K_DEFAULT ~ K_VALUES }
 values_clause = { K_VALUES ~ value_row ~ ("," ~ value_row)* }
 value_row = { "(" ~ expr ~ ("," ~ expr)* ~ ")" }
 
-// ---- DELETE (M4.6 / M2.24) ----
-// `DELETE FROM [tbl] [WHERE expr] [RETURNING ...]`.
-delete_stmt = { K_DELETE ~ K_FROM ~ qualified_name ~ where_item? ~ returning_clause? }
+// ---- DELETE (M4.6 / M2.24 / M2.51) ----
+// `DELETE FROM [tbl] [WHERE expr] [ORDER BY ...] [LIMIT n [OFFSET m]] [RETURNING ...]`.
+delete_stmt = { K_DELETE ~ K_FROM ~ qualified_name ~ where_item? ~ order_item? ~ limit_item? ~ returning_clause? }
 
 // ---- DROP TABLE (M4.6b) ----
 // First slice: `DROP TABLE [IF EXISTS] [tbl]`. `DROP INDEX/VIEW/TRIGGER` arrive later.
 drop_table_stmt = { K_DROP ~ K_TABLE ~ if_exists? ~ qualified_name }
 
-// ---- UPDATE (M5.0 / M2.24) ----
-// `UPDATE [or_action] tbl SET assignment [, assignment ...] [WHERE expr] [RETURNING ...]`.
-update_stmt = { K_UPDATE ~ or_action? ~ qualified_name ~ K_SET ~ assignment_list ~ where_item? ~ returning_clause? }
+// ---- UPDATE (M5.0 / M2.24 / M2.52 / M2.53) ----
+// `UPDATE [or_action] tbl SET assignment [, assignment ...] [FROM from_clause]
+//  [WHERE expr] [ORDER BY ...] [LIMIT n [OFFSET m]] [RETURNING ...]`.
+update_stmt = { K_UPDATE ~ or_action? ~ qualified_name ~ K_SET ~ assignment_list ~ from_item? ~ where_item? ~ order_item? ~ limit_item? ~ returning_clause? }
 or_action = { K_OR ~ (K_ROLLBACK | K_ABORT | K_FAIL | K_IGNORE | K_REPLACE) }
 assignment_list = { assignment ~ ("," ~ assignment)* }
 assignment = { ident ~ "=" ~ expr }
@@ -344,6 +485,137 @@ indexed_column = { (expr ~ (K_COLLATE ~ ident)? ~ (K_ASC | K_DESC)?) | (ident ~ 
 // rejected at codegen (we still parse it for fidelity).
 drop_index_stmt = { K_DROP ~ K_INDEX ~ if_exists? ~ qualified_name }
 
+// ---- ALTER TABLE (M2.25) ----
+// First slice: `ALTER TABLE [schema.]tbl RENAME TO new_name`. ADD/DROP/RENAME COLUMN arrive
+// in M2.26–M2.28; the rule is structured so those can be added as additional alternatives.
+alter_table_stmt = { K_ALTER ~ K_TABLE ~ qualified_name ~ alter_action }
+alter_action = { rename_column | rename_to | add_column | drop_column | alter_column | add_constraint | drop_constraint }
+rename_to = { K_RENAME ~ K_TO ~ ident }
+// `ALTER TABLE tbl RENAME [COLUMN] old TO new` — rename an existing column. The
+// `rename_column` alternative must precede `rename_to` so `RENAME COLUMN` is not parsed
+// as `RENAME TO <COLUMN-as-name>` (which would fail since COLUMN is reserved).
+rename_column = { K_RENAME ~ K_COLUMN? ~ ident ~ K_TO ~ ident }
+// `ALTER TABLE tbl ADD [COLUMN] col_def` — the column definition reuses the same shape as
+// CREATE TABLE's `column_def` (name, optional type, zero or more column constraints).
+add_column = { K_ADD ~ K_COLUMN? ~ column_def }
+// `ALTER TABLE tbl DROP [COLUMN] name` — drop an existing column by name.
+drop_column = { K_DROP ~ K_COLUMN? ~ ident }
+// `ALTER TABLE tbl ALTER [COLUMN] name DROP NOT NULL` / `SET NOT NULL` (SQLite 3.37+, M2.69/2.70).
+alter_column = { K_ALTER ~ K_COLUMN? ~ ident ~ (K_DROP ~ K_NOT ~ K_NULL | K_SET ~ K_NOT ~ K_NULL) }
+// `ALTER TABLE tbl ADD [CONSTRAINT name] CHECK (expr)` / `ADD CHECK (expr)` (M2.71).
+add_constraint = { K_ADD ~ (K_CONSTRAINT ~ ident)? ~ K_CHECK ~ "(" ~ expr ~ ")" }
+// `ALTER TABLE tbl DROP CONSTRAINT name` (M2.72).
+drop_constraint = { K_DROP ~ K_CONSTRAINT ~ ident }
+
+// ---- CREATE VIEW (M2.29) ----
+// `CREATE [TEMP] VIEW [IF NOT EXISTS] [schema.]name [(cols)] AS SELECT ...`. The optional
+// column list gives explicit names to the view's columns; when absent the names are
+// inferred from the SELECT's result columns. M2.29 covers the parser only.
+create_view_stmt = {
+    K_CREATE ~ (K_TEMPORARY | K_TEMP)? ~ K_VIEW
+    ~ if_not_exists?
+    ~ qualified_name
+    ~ column_list?
+    ~ K_AS ~ select_stmt
+}
+
+// ---- DROP VIEW (M2.30) ----
+// `DROP VIEW [IF EXISTS] [schema.]name`. Mirrors DROP INDEX/TABLE.
+drop_view_stmt = { K_DROP ~ K_VIEW ~ if_exists? ~ qualified_name }
+
+// ---- CREATE TRIGGER (M2.31) ----
+// `CREATE [TEMP] TRIGGER [IF NOT EXISTS] [schema.]name <timing> <event> ON tbl
+//  [FOR EACH ROW] [WHEN expr] BEGIN <body> END`. The body is a `;`-separated list of
+// INSERT/UPDATE/DELETE/SELECT statements. RAISE(...) inside the body is deferred to M16.
+create_trigger_stmt = {
+    K_CREATE ~ (K_TEMPORARY | K_TEMP)? ~ K_TRIGGER
+    ~ if_not_exists?
+    ~ qualified_name
+    ~ trigger_time
+    ~ trigger_event
+    ~ K_ON ~ qualified_name
+    ~ foreach_clause?
+    ~ when_clause?
+    ~ K_BEGIN ~ trigger_cmd_list ~ K_END
+}
+trigger_time = { K_INSTEAD ~ K_OF | K_BEFORE | K_AFTER }
+// `UPDATE [OF col1, col2, ...]` — the OF clause takes a bare comma-separated idlist (no
+// surrounding parentheses), matching upstream's `idlist`.
+trigger_event = { K_DELETE | K_INSERT | (K_UPDATE ~ (K_OF ~ idlist)? ) }
+idlist = { ident ~ ("," ~ ident)* }
+foreach_clause = { K_FOR ~ K_EACH ~ K_ROW }
+when_clause = { K_WHEN ~ expr }
+trigger_cmd_list = { trigger_cmd ~ (";" ~ trigger_cmd?)* }
+// Each trigger command is one of the four statement forms, parsed without its trailing `;`.
+trigger_cmd = { insert_stmt | update_stmt | delete_stmt | select_stmt }
+
+// ---- DROP TRIGGER (M2.32) ----
+// `DROP TRIGGER [IF EXISTS] [schema.]name`. Mirrors DROP VIEW/INDEX/TABLE.
+drop_trigger_stmt = { K_DROP ~ K_TRIGGER ~ if_exists? ~ qualified_name }
+
+// ---- PRAGMA (M2.33) ----
+// `PRAGMA [schema.]name` (read), `PRAGMA [schema.]name = value`, or
+// `PRAGMA [schema.]name (value)`. The value is a signed number, identifier, or one of the
+// keywords ON/DELETE/DEFAULT (matching upstream's nmnum/minus_num non-terminals).
+pragma_stmt = { K_PRAGMA ~ qualified_name ~ pragma_value? }
+pragma_value = { pragma_eq | pragma_paren }
+pragma_eq = { "=" ~ pragma_value_kind }
+pragma_paren = { "(" ~ pragma_value_kind ~ ")" }
+pragma_value_kind = { signed_number | pragma_kw_value | ident }
+pragma_kw_value = { K_ON | K_DELETE | K_DEFAULT }
+
+// ---- Transactions & Savepoints (M2.34–M2.37) ----
+// `BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE] [TRANSACTION [name]]`
+// `COMMIT|END [TRANSACTION [name]]`
+// `ROLLBACK [TRANSACTION [name]] [TO [SAVEPOINT] name]`
+// `SAVEPOINT name`
+// `RELEASE [SAVEPOINT] name`
+transaction_stmt = {
+    begin_stmt | commit_stmt | rollback_stmt | savepoint_stmt | release_stmt
+}
+begin_stmt = { K_BEGIN ~ transtype? ~ trans_opt? }
+commit_stmt = { (K_COMMIT | K_END) ~ trans_opt? }
+rollback_stmt = { K_ROLLBACK ~ trans_opt? ~ (K_TO ~ savepoint_opt? ~ ident)? }
+savepoint_stmt = { K_SAVEPOINT ~ ident }
+release_stmt = { K_RELEASE ~ savepoint_opt? ~ ident }
+transtype = { K_DEFERRED | K_IMMEDIATE | K_EXCLUSIVE }
+trans_opt = { K_TRANSACTION ~ ident? }
+savepoint_opt = { K_SAVEPOINT }
+
+// ---- ATTACH / DETACH (M2.38–M2.39) ----
+// `ATTACH [DATABASE] expr AS expr [KEY expr]` / `DETACH [DATABASE] expr`.
+attach_stmt = { K_ATTACH ~ database_kw_opt? ~ expr ~ K_AS ~ expr ~ key_opt? }
+detach_stmt = { K_DETACH ~ database_kw_opt? ~ expr }
+database_kw_opt = { K_DATABASE }
+key_opt = { K_KEY ~ expr }
+
+// ---- VACUUM (M2.40) ----
+// `VACUUM [schema] [INTO expr]`.
+vacuum_stmt = { K_VACUUM ~ ident? ~ vacuum_into? }
+vacuum_into = { K_INTO ~ expr }
+
+// ---- ANALYZE (M2.41) ----
+// `ANALYZE [schema.]name`. Bare `ANALYZE` analyzes all tables.
+analyze_stmt = { K_ANALYZE ~ qualified_name? }
+
+// ---- REINDEX (M2.42) ----
+// `REINDEX [schema.]name`. Bare `REINDEX` reindexes everything.
+reindex_stmt = { K_REINDEX ~ qualified_name? }
+
+// ---- CREATE VIRTUAL TABLE (M2.43) ----
+// `CREATE VIRTUAL TABLE [IF NOT EXISTS] [schema.]name USING module [(args)]`. The module
+// arguments are captured as the raw text inside the parentheses (matching upstream's
+// permissive `vtabarglist` which accepts arbitrary token sequences with balanced parens).
+// `vtab_args` matches balanced parens with any content; when no `(...)` follows the module
+// name, `args` is empty.
+create_vtab_stmt = { K_CREATE ~ K_VIRTUAL ~ K_TABLE ~ if_not_exists? ~ qualified_name ~ K_USING ~ ident ~ vtab_args? }
+vtab_args = { "(" ~ vtab_inner ~ ")" }
+// Match any text with balanced parentheses (the `~` consumes nothing, the inner alternation
+// recurses for nested parens or matches a single non-paren character). pest's `ANY` matches
+// any single character; we explicitly exclude `(` and `)` and recurse for balanced groups.
+vtab_inner = @{ (vtab_group | !"(" ~ !")" ~ ANY)* }
+vtab_group = { "(" ~ vtab_inner ~ ")" }
+
 
 // ---- Expressions (folded by PrattParser in expr.rs) ----
 // `ESCAPE Z` is grammatically valid ONLY immediately after a `<operand> LIKE/NOT-LIKE <operand>`
@@ -355,7 +627,7 @@ drop_index_stmt = { K_DROP ~ K_INDEX ~ if_exists? ~ qualified_name }
 expr = { prefix* ~ primary ~ suffix* }
 suffix = _{ like_clause | infix_suffix | between_suffix | in_suffix | collate_suffix | is_distinct_suffix }
 
-like_clause = _{ (op_not_like | op_like) ~ prefix* ~ primary ~ (op_escape ~ prefix* ~ primary)? }
+like_clause = _{ (op_not_regexp | op_not_match | op_not_like | op_not_glob | op_regexp | op_match | op_like | op_glob) ~ prefix* ~ primary ~ (op_escape ~ prefix* ~ primary)? }
 
 infix_suffix = _{ infix ~ prefix* ~ primary }
 
@@ -366,7 +638,16 @@ between_suffix = { K_NOT? ~ K_BETWEEN ~ prefix* ~ primary ~ K_AND ~ prefix* ~ pr
 
 // `X IN (value, ...)` / `X NOT IN (value, ...)`.  Parenthesised single-expression value lists are
 // accepted for the single-value case; this does not overlap with subqueries (which are SELECTs).
-in_suffix = { K_NOT? ~ K_IN ~ "(" ~ (expr ~ ("," ~ expr)*)? ~ ")" }
+// M2.60 extends this to the row-value forms:
+//   * `X IN (SELECT …)`           — subquery on the RHS (any arity; the codegen path checks
+//                                    compatibility against the LHS width).
+//   * `X IN (VALUES (…), …)`       — a VALUES select body, the same as a subquery.
+//   * `X IN ((a,b), (c,d), …)`     — parenthesised row-value literals; each element is a row
+//                                    value (>=2 entries) or a parenthesised scalar.
+// The plain value list `X IN (1, 2, 3)` keeps working via the `expr` alternative; a leading `(`
+// inside the list is picked up by the `Row` primary in `expr`.
+in_suffix = { K_NOT? ~ K_IN ~ "(" ~ in_rhs ~ ")" }
+in_rhs    = _{ select_stmt | (expr ~ ("," ~ expr)*)? }
 
 // `expr COLLATE name` — postfix collation operator, low precedence (tighter than LIKE here, but
 // lowered in the AST as a post-fix wrapper; the grammar makes it a suffix so it binds looser than
@@ -379,7 +660,14 @@ is_distinct_suffix = { K_IS ~ K_NOT? ~ K_DISTINCT ~ K_FROM ~ prefix* ~ primary }
 // The following constructs are grammatically primaries (they cannot be chained as infix operands
 // and must be the sole or wrapped expression in their position).  They are kept in `primary` so
 // `SELECT EXISTS(...)` / `SELECT CAST(...)` / `SELECT CASE ... END` work without a dummy prefix.
-primary = _{ literal | exists_expr | cast_expr | case_expr | func_call | column_ref | subquery | "(" ~ expr ~ ")" }
+// `row_value` is tried before the generic parenthesised expression so `(a, b)` parses as a row
+// value (>=2 entries) rather than backtracking through `"(" ~ expr ~ ")"`.
+primary = _{ literal | exists_expr | cast_expr | case_expr | func_call | column_ref | subquery | row_value | "(" ~ expr ~ ")" }
+
+// Row value `(e0, e1, …)` (>=2 entries), matching upstream's `LP nexprlist COMMA expr RP` rule.
+// A parenthesised single expression `(e)` is *not* a row value and is handled by the trailing
+// `"(" ~ expr ~ ")"` alternative above. Parsed in M2.60; execution is deferred.
+row_value = { "(" ~ expr ~ "," ~ expr ~ ("," ~ expr)* ~ ")" }
 
 // `EXISTS (SELECT ...)` — allowed as a standalone primary (so `SELECT EXISTS(...)` works) and in
 // expression position (so `WHERE EXISTS(...)` works).
@@ -398,10 +686,32 @@ case_expr = { K_CASE ~ expr? ~ (K_WHEN ~ expr ~ K_THEN ~ expr)+ ~ (K_ELSE ~ expr
 
 literal = { number | string | blob | bind_param | K_NULL | K_TRUE | K_FALSE }
 
-func_call = { func_name ~ "(" ~ (func_star | arg_list)? ~ ")" }
+func_call = { func_name ~ "(" ~ (func_star | arg_list)? ~ ")" ~ filter_over? }
 func_name = @{ ident }
 func_star = { "*" }
 arg_list = { K_DISTINCT? ~ expr ~ ("," ~ expr)* }
+
+// ---- Window function FILTER / OVER (M2.55) ----
+// `func(args) [FILTER (WHERE expr)] [OVER (window_spec | name)]`. Either FILTER or OVER or
+// both may appear (in that order). Codegen is M11.
+filter_over = { filter_clause? ~ over_clause? }
+filter_clause = { K_FILTER ~ "(" ~ K_WHERE ~ expr ~ ")" }
+over_clause = { K_OVER ~ ("(" ~ window ~ ")" | ident) }
+window = { (K_PARTITION ~ K_BY ~ group_by)? ~ order_item? ~ frame_opt? }
+// `ROWS|RANGE|GROUPS [BETWEEN] bound [AND bound] [EXCLUDE ...]`.
+frame_opt = { range_or_rows ~ (K_BETWEEN ~ frame_bound_s ~ K_AND ~ frame_bound_e | frame_bound_s) ~ frame_exclude_opt? }
+range_or_rows = { K_RANGE | K_ROWS | K_GROUPS }
+frame_bound_s = { K_UNBOUNDED ~ K_PRECEDING | frame_bound }
+frame_bound_e = { K_UNBOUNDED ~ K_FOLLOWING | frame_bound }
+frame_bound = { K_CURRENT ~ K_ROW | (expr ~ (K_PRECEDING | K_FOLLOWING)) }
+frame_exclude_opt = { K_EXCLUDE ~ frame_exclude }
+frame_exclude = { (K_NO ~ K_OTHERS) | (K_CURRENT ~ K_ROW) | K_GROUP | K_TIES }
+
+// ---- Trailing WINDOW clause on SELECT (M2.55) ----
+// `SELECT ... [WINDOW name AS (window_spec), ...]`.
+window_clause = { K_WINDOW ~ windowdefn_list }
+windowdefn_list = { windowdefn ~ ("," ~ windowdefn)* }
+windowdefn = { ident ~ K_AS ~ "(" ~ window ~ ")" }
 
 column_ref = { ident ~ ("." ~ ident ~ ("." ~ ident)?)? }
 
@@ -455,10 +765,17 @@ op_isnot = { K_IS ~ K_NOT }
 op_is = { K_IS }
 op_like = { K_LIKE }
 op_glob = { K_GLOB }
-// `NOT LIKE` / `NOT GLOB`: matched (in `like_clause`/`infix`) before the bare forms so the leading
-// NOT is not parsed as a prefix operator. They lower (expr.rs) to `NOT (X LIKE Y)` / `NOT (X GLOB Y)`.
+// `REGEXP` and `MATCH` are infix operators in the LIKE family (M2.61/M2.62). They call
+// user-registered functions (`regexp`, `match`) as infix; the AST lowers to a BinaryOp.
+op_regexp = { K_REGEXP }
+op_match = { K_MATCH }
+// `NOT LIKE` / `NOT GLOB` / `NOT REGEXP` / `NOT MATCH`: matched (in `like_clause`/`infix`) before
+// the bare forms so the leading NOT is not parsed as a prefix operator. They lower (expr.rs)
+// to `NOT (X LIKE Y)` / `NOT (X GLOB Y)` / etc.
 op_not_like = { K_NOT ~ K_LIKE }
 op_not_glob = { K_NOT ~ K_GLOB }
+op_not_regexp = { K_NOT ~ K_REGEXP }
+op_not_match = { K_NOT ~ K_MATCH }
 // `op_escape` is the `ESCAPE` keyword of a LIKE clause (`X LIKE Y ESCAPE Z`); the Pratt builder
 // (expr.rs) treats it as an infix operator joining the LIKE comparison to its escape operand and
 // rewrites the result to the 3-arg `like(Y, X, Z)` builtin. Wired only after LIKE (`like_clause`).

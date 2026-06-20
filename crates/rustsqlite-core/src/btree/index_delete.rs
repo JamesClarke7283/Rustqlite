@@ -67,6 +67,15 @@ pub async fn index_leaf_delete(
         return Ok(false);
     };
 
+    // Reap the cell's overflow chain (if any) before we drop the cell bytes themselves,
+    // matching the table-side `leaf_delete_current`. Without this the index overflow pages
+    // would be orphaned (leaked) on every IdxDelete.
+    let cell_off = hdr.cell_pointer(&page, idx_to_remove)?;
+    let cell = parse_index_leaf_cell(&page, cell_off, usable)?;
+    if let Some(first_overflow) = cell.overflow_page {
+        free_index_overflow_chain(pager, first_overflow).await?;
+    }
+
     // Rebuild the page from the surviving cells. The cell sizes are read directly from the
     // on-page bytes (the varint payload-size + the local payload + the optional 4-byte
     // overflow pointer), the cells are sliced, and `write_page_cells` lays them out from
@@ -117,4 +126,17 @@ fn prefixes_equal(a: &[Value], b: &[Value], key_info: &[KeyField]) -> bool {
         }
     }
     true
+}
+
+/// Walk a chain of index overflow pages and free each via [`Pager::free_page`], matching the
+/// table-side [`super::delete::leaf_delete_current`]'s overflow reaping.
+async fn free_index_overflow_chain(pager: &Arc<Pager>, first_pgno: u32) -> Result<()> {
+    let mut pgno = first_pgno;
+    while pgno != 0 {
+        let page = pager.get_page(pgno).await?;
+        let next = u32::from_be_bytes([page[0], page[1], page[2], page[3]]);
+        pager.free_page(pgno).await?;
+        pgno = next;
+    }
+    Ok(())
 }

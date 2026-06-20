@@ -74,6 +74,14 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
     if upd.schema.is_some() {
         return Err(Error::msg("schema-qualified UPDATE is not yet supported"));
     }
+    if table.without_rowid {
+        // UPDATE on a WITHOUT ROWID table is an IdxDelete + IdxInsert on the table b-tree
+        // (keyed by the PK); M5.3.6 ships INSERT + SELECT, with DELETE/UPDATE landing in a
+        // follow-up that reuses the storage-order key-record helpers.
+        return Err(Error::msg(
+            "UPDATE on a WITHOUT ROWID table is not supported yet",
+        ));
+    }
     if let Some(action) = upd.or_action {
         return Err(Error::msg(format!(
             "ON CONFLICT {:?} is not yet supported (only the default ABORT is implemented)",

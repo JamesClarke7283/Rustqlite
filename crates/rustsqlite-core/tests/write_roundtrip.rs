@@ -837,3 +837,268 @@ fn returning_real_affinity() {
 
     assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
 }
+
+#[test]
+fn without_rowid_create_insert_select_roundtrip_and_c_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("wr");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(
+            &mut conn,
+            "CREATE TABLE t(a TEXT, b INTEGER PRIMARY KEY, c TEXT) WITHOUT ROWID;",
+        );
+        exec(&mut conn, "INSERT INTO t VALUES ('hello', 42, 'world');");
+        exec(&mut conn, "INSERT INTO t VALUES ('foo', 1, 'bar');");
+
+        // The rows come back in PK order (b=1 first, then b=42) — the b-tree is keyed by b.
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b, c FROM t;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Text("foo".into()), Value::Int(1), Value::Text("bar".into())],
+                vec![
+                    Value::Text("hello".into()),
+                    Value::Int(42),
+                    Value::Text("world".into())
+                ],
+            ]
+        );
+        let _ = conn;
+    }
+
+    // C oracle: the file is a valid WITHOUT ROWID table and reads back the same rows.
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b, c FROM t;"), "foo|1|bar\nhello|42|world");
+    // The stored CREATE text is byte-verbatim including the WITHOUT ROWID clause.
+    assert_eq!(
+        db.query("SELECT quote(sql) FROM sqlite_schema WHERE name='t';"),
+        "'CREATE TABLE t(a TEXT, b INTEGER PRIMARY KEY, c TEXT) WITHOUT ROWID'"
+    );
+}
+
+#[test]
+fn without_rowid_composite_pk_roundtrip_and_c_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("wrcp");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(
+            &mut conn,
+            "CREATE TABLE t(a INTEGER, b TEXT, c REAL, PRIMARY KEY(a, b)) WITHOUT ROWID;",
+        );
+        exec(&mut conn, "INSERT INTO t VALUES (2, 'x', 1.5), (1, 'y', 2.5), (1, 'x', 3.5);");
+
+        // PK order: (1, 'x'), (1, 'y'), (2, 'x').
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b, c FROM t;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Text("x".into()), Value::Real(3.5)],
+                vec![Value::Int(1), Value::Text("y".into()), Value::Real(2.5)],
+                vec![Value::Int(2), Value::Text("x".into()), Value::Real(1.5)],
+            ]
+        );
+
+        // A PK conflict raises the same error as in C SQLite.
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (1, 'x', 99.0);").unwrap();
+        match stmt.step() {
+            ResultCode::Error => {
+                assert!(
+                    stmt.errmsg()
+                        .contains("UNIQUE constraint failed: t.a, t.b"),
+                    "got: {}",
+                    stmt.errmsg()
+                );
+            }
+            other => panic!("expected UNIQUE error, got {other:?}: {}", stmt.errmsg()),
+        }
+
+        // NULL in a PK column is rejected (PK is implicitly NOT NULL).
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (NULL, 'z', 0.0);").unwrap();
+        match stmt.step() {
+            ResultCode::Error => {
+                assert!(
+                    stmt.errmsg()
+                        .contains("NOT NULL constraint failed: t.a"),
+                    "got: {}",
+                    stmt.errmsg()
+                );
+            }
+            other => panic!("expected NOT NULL error, got {other:?}: {}", stmt.errmsg()),
+        }
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(
+        db.query("SELECT a, b, c FROM t;"),
+        "1|x|3.5\n1|y|2.5\n2|x|1.5"
+    );
+}
+
+#[test]
+fn without_rowid_single_integer_pk_roundtrip_and_c_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("wripk");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        // A single INTEGER PRIMARY KEY on a WITHOUT ROWID table is NOT a rowid alias — the
+        // value is stored as the leading key field of the index b-tree, not as the rowid.
+        exec(
+            &mut conn,
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID;",
+        );
+        exec(&mut conn, "INSERT INTO t VALUES (5, 'a'), (1, 'b'), (3, 'c');");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT id, v FROM t;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Text("b".into())],
+                vec![Value::Int(3), Value::Text("c".into())],
+                vec![Value::Int(5), Value::Text("a".into())],
+            ]
+        );
+
+        // `SELECT rowid FROM t` errors because a WITHOUT ROWID table has no rowid. The
+        // error is raised at prepare time (column resolution is a compile-time step).
+        match sqlite3_prepare_v2(&mut conn, "SELECT rowid FROM t;") {
+            Err(e) => {
+                assert!(
+                    e.message.contains("no such column: rowid"),
+                    "got: {}",
+                    e.message
+                );
+            }
+            Ok((mut stmt, _)) => match stmt.step() {
+                ResultCode::Error => {
+                    assert!(
+                        stmt.errmsg().contains("no such column: rowid"),
+                        "got: {}",
+                        stmt.errmsg()
+                    );
+                }
+                other => panic!("expected 'no such column: rowid', got {other:?}"),
+            },
+        }
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT id, v FROM t;"), "1|b\n3|c\n5|a");
+}
+
+#[test]
+fn auto_vacuum_full_shrinks_file_after_delete_all() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("autovac");
+
+    // Set auto_vacuum = FULL on a fresh database, then create a table and an index.
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "PRAGMA auto_vacuum = 1;");
+        // Read back the mode.
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "PRAGMA auto_vacuum;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(1)]]);
+        exec(&mut conn, "CREATE TABLE av1(a);");
+        exec(&mut conn, "CREATE INDEX av1_idx ON av1(a);");
+        // Insert rows with large payloads to force overflow pages and b-tree splits. Use rows
+        // large enough to overflow the TABLE b-tree (the table-leaf local window is
+        // `usable - 35 = 4061` bytes on a 4096-byte page). To avoid pre-existing limitations
+        // in multi-leaf index delete, keep the total index size within one leaf (~1000 bytes
+        // of index data): use 5 rows of 200 bytes each.
+        for i in 1..=5 {
+            let s = std::iter::repeat((b'a' + ((i - 1) as u8 % 26)) as char)
+                .take(200)
+                .collect::<String>();
+            let sql = format!("INSERT INTO av1 VALUES ('{}');", s);
+            exec(&mut conn, &sql);
+        }
+        let size_before = db.path.metadata().unwrap().len();
+        assert!(size_before > 4096 * 2, "DB should have grown: {size_before}");
+        // Delete all rows. After commit, the auto-vacuum should reclaim the freed pages
+        // and shrink the file.
+        exec(&mut conn, "DELETE FROM av1;");
+        let _ = conn;
+    }
+
+    // The C oracle can read back the file and integrity_check passes.
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT count(*) FROM av1;"), "0");
+    // The file should have shrunk significantly. The exact size depends on our vacuum
+    // implementation; assert it's much smaller than a non-vacuumed file would be.
+    let size_after = db.path.metadata().unwrap().len();
+    assert!(
+        size_after <= 4096 * 16,
+        "auto_vacuum should have shrunk the file: {size_after} bytes"
+    );
+}
+
+#[test]
+fn auto_vacuum_incremental_shrinks_file_step_by_step() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("autovacincr");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "PRAGMA auto_vacuum = 2;"); // INCREMENTAL
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "PRAGMA auto_vacuum;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(2)]]);
+        exec(&mut conn, "CREATE TABLE av1(a);");
+        for i in 1..=5 {
+            let s = std::iter::repeat((b'a' + ((i - 1) as u8 % 26)) as char)
+                .take(200)
+                .collect::<String>();
+            let sql = format!("INSERT INTO av1 VALUES ('{}');", s);
+            exec(&mut conn, &sql);
+        }
+        // Delete all rows — the file does NOT shrink yet (incremental mode defers vacuum).
+        exec(&mut conn, "DELETE FROM av1;");
+        let size_before_vacuum = db.path.metadata().unwrap().len();
+        // Run incremental vacuum: this should shrink the file.
+        exec(&mut conn, "PRAGMA incremental_vacuum;");
+        let _ = conn;
+        let size_after_vacuum = db.path.metadata().unwrap().len();
+        assert!(
+            size_after_vacuum <= size_before_vacuum,
+            "incremental_vacuum should not grow the file: before={size_before_vacuum} after={size_after_vacuum}"
+        );
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT count(*) FROM av1;"), "0");
+}
+
+#[test]
+fn pragma_integrity_check_returns_ok_on_healthy_db() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("intck");
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE INDEX i ON t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z');");
+        // Our own integrity_check should report "ok" on a healthy database.
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "PRAGMA integrity_check;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Text("ok".to_string())]]);
+        // quick_check should also report "ok".
+        let (mut stmt2, _) = sqlite3_prepare_v2(&mut conn, "PRAGMA quick_check;").unwrap();
+        let rows2 = collect(&mut stmt2);
+        assert_eq!(rows2, vec![vec![Value::Text("ok".to_string())]]);
+        let _ = conn;
+    }
+    // The C oracle agrees.
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+}

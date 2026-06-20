@@ -10,7 +10,7 @@ use pest::iterators::{Pair, Pairs};
 use pest::pratt_parser::{Assoc, Op, PrattParser};
 
 use crate::ast::*;
-use crate::{build_select, Rule};
+use crate::{build_select, build_ordering_term, Rule};
 
 /// Operator precedence, lowest binding first, matching SQLite's documented table
 /// (<https://www.sqlite.org/lang_expr.html>): OR < AND < NOT < (= IS LIKE GLOB) <
@@ -33,8 +33,12 @@ fn pratt() -> &'static PrattParser<Rule> {
                 | Op::infix(Rule::op_isnot, Assoc::Left)
                 | Op::infix(Rule::op_like, Assoc::Left)
                 | Op::infix(Rule::op_glob, Assoc::Left)
+                | Op::infix(Rule::op_regexp, Assoc::Left)
+                | Op::infix(Rule::op_match, Assoc::Left)
                 | Op::infix(Rule::op_not_like, Assoc::Left)
-                | Op::infix(Rule::op_not_glob, Assoc::Left))
+                | Op::infix(Rule::op_not_glob, Assoc::Left)
+                | Op::infix(Rule::op_not_regexp, Assoc::Left)
+                | Op::infix(Rule::op_not_match, Assoc::Left))
             .op(Op::infix(Rule::op_lt, Assoc::Left)
                 | Op::infix(Rule::op_le, Assoc::Left)
                 | Op::infix(Rule::op_gt, Assoc::Left)
@@ -107,9 +111,8 @@ fn fold_expr(pairs: Pairs<'_, Rule>) -> Expr {
         let single = pairs.into_iter().next().unwrap();
         let folded = match single.as_rule() {
             Rule::literal | Rule::column_ref | Rule::func_call => map_primary(single),
-            Rule::expr | Rule::exists_expr | Rule::subquery | Rule::cast_expr | Rule::case_expr => {
-                map_primary(single)
-            }
+            Rule::expr | Rule::exists_expr | Rule::subquery | Rule::cast_expr | Rule::case_expr
+            | Rule::row_value => map_primary(single),
             other => unreachable!("unexpected sole expr child {other:?}"),
         };
         return suffixes.into_iter().rev().fold(folded, apply_suffix);
@@ -163,14 +166,18 @@ fn fold<'a, P: Iterator<Item = Pair<'a, Rule>>>(pairs: P) -> Expr {
                 Rule::op_isnot => BinaryOp::IsNot,
                 Rule::op_like => BinaryOp::Like,
                 Rule::op_glob => BinaryOp::Glob,
-                // `X NOT LIKE Y` ≡ `NOT (X LIKE Y)` and `X NOT GLOB Y` ≡ `NOT (X GLOB Y)` — mirror
+                Rule::op_regexp => BinaryOp::Regexp,
+                Rule::op_match => BinaryOp::Match,
+                // `X NOT LIKE Y` ≡ `NOT (X LIKE Y)` and similarly for NOT GLOB/REGEXP/MATCH — mirror
                 // upstream's `likeexpr`, which builds the negation around the plain comparison so
                 // NULL propagates through `OP_Not` (NOT NULL = NULL). No codegen change is needed.
-                Rule::op_not_like | Rule::op_not_glob => {
-                    let inner_op = if op.as_rule() == Rule::op_not_like {
-                        BinaryOp::Like
-                    } else {
-                        BinaryOp::Glob
+                Rule::op_not_like | Rule::op_not_glob | Rule::op_not_regexp | Rule::op_not_match => {
+                    let inner_op = match op.as_rule() {
+                        Rule::op_not_like => BinaryOp::Like,
+                        Rule::op_not_glob => BinaryOp::Glob,
+                        Rule::op_not_regexp => BinaryOp::Regexp,
+                        Rule::op_not_match => BinaryOp::Match,
+                        _ => unreachable!(),
                     };
                     return Expr::Unary {
                         op: UnaryOp::Not,
@@ -213,6 +220,8 @@ fn apply_like_escape(like_cmp: Expr, escape: Expr) -> Expr {
             // left = X (text), right = Y (pattern) per the AST built above; the builtin takes
             // (pattern, text, escape).
             args: FunctionArgs::List(vec![*right, *left, escape]),
+            filter: None,
+            over: None,
         },
         Expr::Unary {
             op: UnaryOp::Not,
@@ -281,10 +290,59 @@ fn build_between(expr: Expr, suffix: Pair<'_, Rule>) -> Expr {
 
 fn build_in(expr: Expr, suffix: Pair<'_, Rule>) -> Expr {
     let mut negated = false;
-    let mut values = Vec::new();
-    for part in suffix.into_inner() {
-        match part.as_rule() {
+    // The inner `in_rhs` resolves to either a `select_stmt` (the subquery form, M2.60) or a
+    // possibly-empty sequence of `expr` pairs (the inline value list). Pest flattens the
+    // `(expr ~ ("," ~ expr)*)?` alternative directly into `in_suffix`'s inner pairs, so we
+    // see `expr` siblings directly; the subquery case is detected by a single `select_stmt`
+    // child.
+    let mut inner = suffix.into_inner().collect::<Vec<_>>().into_iter();
+    // The leading `K_NOT` (if present) is the first child.
+    if let Some(first) = inner.next() {
+        match first.as_rule() {
             Rule::K_NOT => negated = true,
+            Rule::K_IN => {}
+            Rule::select_stmt => {
+                // `X [NOT] IN (SELECT …)` — wrap as InSubquery.  The K_NOT/K_IN tokens are emitted
+                // before the in_rhs alternative, so when the very first inner token is a
+                // select_stmt the negation was absent.
+                return Expr::InSubquery {
+                    expr: Box::new(expr),
+                    subquery: Box::new(
+                        build_select(first.clone()).expect("IN subquery select"),
+                    ),
+                    negated,
+                };
+            }
+            Rule::expr => {
+                let mut values = vec![build_expr(first)];
+                for part in inner {
+                    match part.as_rule() {
+                        Rule::expr => values.push(build_expr(part)),
+                        _ => {}
+                    }
+                }
+                return Expr::In {
+                    expr: Box::new(expr),
+                    values,
+                    negated,
+                };
+            }
+            other => unreachable!("unexpected in_suffix child {other:?}"),
+        }
+    }
+    // `X IN ()` — empty value list.  Upstream simplifies this to a constant; we keep the literal
+    // empty list and let codegen lower it.  Negated stays false because no K_NOT was seen.
+    let mut values = Vec::new();
+    for part in inner {
+        match part.as_rule() {
+            Rule::K_IN => {}
+            Rule::select_stmt => {
+                return Expr::InSubquery {
+                    expr: Box::new(expr),
+                    subquery: Box::new(build_select(part).expect("IN subquery select")),
+                    negated,
+                };
+            }
             Rule::expr => values.push(build_expr(part)),
             _ => {}
         }
@@ -421,6 +479,12 @@ fn map_primary(pair: Pair<'_, Rule>) -> Expr {
         Rule::literal => build_literal_expr(pair),
         Rule::column_ref => build_column_ref(pair),
         Rule::func_call => build_func_call(pair),
+        Rule::row_value => Expr::Row(
+            pair.into_inner()
+                .filter(|p| p.as_rule() == Rule::expr)
+                .map(build_expr)
+                .collect(),
+        ),
         other => unreachable!("unexpected primary {other:?}"),
     }
 }
@@ -509,6 +573,8 @@ fn build_func_call(pair: Pair<'_, Rule>) -> Expr {
     let mut name = String::new();
     let mut distinct = false;
     let mut args = FunctionArgs::List(Vec::new());
+    let mut filter = None;
+    let mut over = None;
     for child in pair.into_inner() {
         match child.as_rule() {
             Rule::func_name => name = unquote_ident(child.as_str()),
@@ -524,6 +590,21 @@ fn build_func_call(pair: Pair<'_, Rule>) -> Expr {
                 }
                 args = FunctionArgs::List(list);
             }
+            Rule::filter_over => {
+                for fo in child.into_inner() {
+                    match fo.as_rule() {
+                        Rule::filter_clause => {
+                            filter = Some(Box::new(build_expr(
+                                fo.into_inner()
+                                    .find(|p| p.as_rule() == Rule::expr)
+                                    .expect("filter_clause has an expr"),
+                            )));
+                        }
+                        Rule::over_clause => over = Some(build_over_clause(fo)),
+                        _ => {}
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -531,6 +612,154 @@ fn build_func_call(pair: Pair<'_, Rule>) -> Expr {
         name,
         distinct,
         args,
+        filter,
+        over,
+    }
+}
+
+/// Build an `over_clause` (`OVER (window_spec)` or `OVER name`) into a `Window`.
+fn build_over_clause(pair: Pair<'_, Rule>) -> Window {
+    let mut name: Option<String> = None;
+    let mut partition_by: Vec<Expr> = Vec::new();
+    let mut order_by: Vec<OrderingTerm> = Vec::new();
+    let mut frame: Option<Frame> = None;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::ident => name = Some(child.as_str().to_string()),
+            Rule::window => {
+                let w = build_window_spec(child);
+                partition_by = w.partition_by;
+                order_by = w.order_by;
+                frame = w.frame;
+                if name.is_none() {
+                    name = w.name;
+                }
+            }
+            _ => {}
+        }
+    }
+    Window {
+        name,
+        partition_by,
+        order_by,
+        frame,
+    }
+}
+
+/// Build a `window` rule pair into a `Window` (without the named-window reference).
+pub(crate) fn build_window_spec(pair: Pair<'_, Rule>) -> Window {
+    let mut partition_by: Vec<Expr> = Vec::new();
+    let mut order_by: Vec<OrderingTerm> = Vec::new();
+    let mut frame: Option<Frame> = None;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::group_by => {
+                partition_by = child.into_inner().map(build_expr).collect();
+            }
+            Rule::order_item => {
+                let order_by_pair = child
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::order_by)
+                    .expect("order_item has order_by");
+                order_by = order_by_pair
+                    .into_inner()
+                    .map(build_ordering_term)
+                    .collect();
+            }
+            Rule::frame_opt => frame = Some(build_frame(child)),
+            _ => {}
+        }
+    }
+    Window {
+        name: None,
+        partition_by,
+        order_by,
+        frame,
+    }
+}
+
+/// Build a `frame_opt` pair into a `Frame`.
+fn build_frame(pair: Pair<'_, Rule>) -> Frame {
+    let mut mode = FrameMode::Rows;
+    let mut start = FrameBound::UnboundedPreceding;
+    let mut end: Option<FrameBound> = None;
+    let mut exclude: Option<FrameExclude> = None;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::range_or_rows => {
+                mode = match child.into_inner().next().expect("range_or_rows has a kind").as_rule() {
+                    Rule::K_RANGE => FrameMode::Range,
+                    Rule::K_ROWS => FrameMode::Rows,
+                    Rule::K_GROUPS => FrameMode::Groups,
+                    other => unreachable!("unexpected range_or_rows child {other:?}"),
+                };
+            }
+            Rule::frame_bound_s => start = build_frame_bound_s(child),
+            Rule::frame_bound_e => end = Some(build_frame_bound_e(child)),
+            Rule::frame_exclude_opt => {
+                let fe = child
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::frame_exclude)
+                    .expect("frame_exclude_opt has frame_exclude");
+                exclude = Some(build_frame_exclude(fe));
+            }
+            _ => {}
+        }
+    }
+    Frame {
+        mode,
+        start,
+        end,
+        exclude,
+    }
+}
+
+fn build_frame_bound_s(pair: Pair<'_, Rule>) -> FrameBound {
+    let mut inner = pair.into_inner();
+    let first = inner.next().expect("frame_bound_s has a child");
+    match first.as_rule() {
+        Rule::K_UNBOUNDED => FrameBound::UnboundedPreceding,
+        Rule::frame_bound => build_frame_bound(first),
+        other => unreachable!("unexpected frame_bound_s child {other:?}"),
+    }
+}
+
+fn build_frame_bound_e(pair: Pair<'_, Rule>) -> FrameBound {
+    let mut inner = pair.into_inner();
+    let first = inner.next().expect("frame_bound_e has a child");
+    match first.as_rule() {
+        Rule::K_UNBOUNDED => FrameBound::UnboundedFollowing,
+        Rule::frame_bound => build_frame_bound(first),
+        other => unreachable!("unexpected frame_bound_e child {other:?}"),
+    }
+}
+
+fn build_frame_bound(pair: Pair<'_, Rule>) -> FrameBound {
+    let mut inner = pair.into_inner();
+    let first = inner.next().expect("frame_bound has a child");
+    match first.as_rule() {
+        Rule::K_CURRENT => FrameBound::CurrentRow,
+        Rule::expr => {
+            let e = build_expr(first);
+            let dir = inner.next().expect("frame_bound has a direction");
+            match dir.as_rule() {
+                Rule::K_PRECEDING => FrameBound::Preceding(Box::new(e)),
+                Rule::K_FOLLOWING => FrameBound::Following(Box::new(e)),
+                other => unreachable!("unexpected frame_bound direction {other:?}"),
+            }
+        }
+        other => unreachable!("unexpected frame_bound child {other:?}"),
+    }
+}
+
+fn build_frame_exclude(pair: Pair<'_, Rule>) -> FrameExclude {
+    let inner = pair.into_inner().next().expect("frame_exclude has a child");
+    match inner.as_rule() {
+        Rule::K_NO => FrameExclude::NoOthers,
+        Rule::K_CURRENT => FrameExclude::CurrentRow,
+        Rule::K_GROUP => FrameExclude::Group,
+        Rule::K_TIES => FrameExclude::Ties,
+        other => unreachable!("unexpected frame_exclude child {other:?}"),
     }
 }
 

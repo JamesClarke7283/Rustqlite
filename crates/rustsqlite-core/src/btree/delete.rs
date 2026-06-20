@@ -60,16 +60,15 @@ pub async fn leaf_delete_current(pager: &Pager, leaf_pgno: u32, cell_idx: usize)
 
 /// Walk a chain of overflow pages and free each. The chain is
 /// `[u32 next][u32 next]…` terminated by a `0`. The page's payload follows the `next`
-/// pointer. We zero each page so the freelist bitmap stays clean; rollback reclaims
-/// the page numbers via the size-truncate path.
+/// pointer. Each page is added to the freelist via [`Pager::free_page`] (so a subsequent
+/// allocation can reuse it, and the auto-vacuum pointer map records the free state). Rollback
+/// reclaims the page numbers via the size-truncate path.
 async fn free_overflow_chain(pager: &Pager, first_pgno: u32) -> Result<()> {
     let mut pgno = first_pgno;
     while pgno != 0 {
         let page = pager.get_page(pgno).await?;
         let next = u32::from_be_bytes([page[0], page[1], page[2], page[3]]);
-        // Overflow pages we free don't need a journal record — a rollback simply
-        // truncates the file back to its pre-transaction size, undoing the allocation.
-        pager.write_page(pgno, vec![0u8; page.len()])?;
+        pager.free_page(pgno).await?;
         pgno = next;
     }
     Ok(())

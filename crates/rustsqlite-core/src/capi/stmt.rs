@@ -9,7 +9,8 @@
 use std::sync::{Arc, Mutex};
 
 use rustqlite_parser::{
-    parse, DropIndexStmt, DropTableStmt, ExplainKind, InsertSource, SelectStmt, Stmt,
+    parse, DropIndexStmt, DropTableStmt, ExplainKind, InsertSource, Literal, PragmaStmt,
+    PragmaValue, PragmaValueKind, SelectStmt, Stmt,
 };
 
 use crate::codegen;
@@ -18,7 +19,7 @@ use crate::error::{Error, Result, ResultCode};
 use crate::pager::Pager;
 use crate::schema::{read_catalog, schema_cookie, IndexObject, Table};
 use crate::types::Value;
-use crate::vdbe::{explain, Program, StepResult, Vdbe};
+use crate::vdbe::{explain, Instruction, Opcode, Program, StepResult, Vdbe};
 
 use super::connection::{ChangeCounts, Sqlite3};
 use super::runtime::block_on;
@@ -276,6 +277,59 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 last_error: None,
             })
         }
+        Stmt::AlterTable(_) => {
+            // ALTER TABLE parsing is implemented (M2.25–M2.28) but codegen is deferred to M14.
+            Err(Error::msg("ALTER TABLE is not supported yet"))
+        }
+        Stmt::CreateView(_) => {
+            // CREATE VIEW parsing is implemented (M2.29) but codegen is deferred to M15.
+            Err(Error::msg("CREATE VIEW is not supported yet"))
+        }
+        Stmt::DropView(_) => {
+            // DROP VIEW parsing is implemented (M2.30) but codegen is deferred to M15.
+            Err(Error::msg("DROP VIEW is not supported yet"))
+        }
+        Stmt::CreateTrigger(_) => {
+            // CREATE TRIGGER parsing is implemented (M2.31) but codegen is deferred to M16.
+            Err(Error::msg("CREATE TRIGGER is not supported yet"))
+        }
+        Stmt::DropTrigger(_) => {
+            // DROP TRIGGER parsing is implemented (M2.32) but codegen is deferred to M16.
+            Err(Error::msg("DROP TRIGGER is not supported yet"))
+        }
+        Stmt::Pragma(pragma) => {
+            // PRAGMA codegen is implemented inline here for the auto_vacuum family
+            // (M5.3.7). Other pragmas remain deferred to M20.
+            compile_pragma(db, sql, &pragma)
+        }
+        Stmt::Transaction(_) => {
+            // Transaction control parsing is implemented (M2.34–M2.37) but codegen is M12.
+            Err(Error::msg("transactions are not supported yet"))
+        }
+        Stmt::Attach(_) => {
+            // ATTACH parsing is implemented (M2.38) but codegen is deferred to M21.
+            Err(Error::msg("ATTACH is not supported yet"))
+        }
+        Stmt::Detach(_) => {
+            // DETACH parsing is implemented (M2.39) but codegen is deferred to M21.
+            Err(Error::msg("DETACH is not supported yet"))
+        }
+        Stmt::Vacuum(_) => {
+            // VACUUM parsing is implemented (M2.40) but codegen is deferred to M22.
+            Err(Error::msg("VACUUM is not supported yet"))
+        }
+        Stmt::Analyze(_) => {
+            // ANALYZE parsing is implemented (M2.41) but codegen is deferred to M22.
+            Err(Error::msg("ANALYZE is not supported yet"))
+        }
+        Stmt::Reindex(_) => {
+            // REINDEX parsing is implemented (M2.42) but codegen is deferred to M22.
+            Err(Error::msg("REINDEX is not supported yet"))
+        }
+        Stmt::CreateVirtualTable(_) => {
+            // CREATE VIRTUAL TABLE parsing is implemented (M2.43) but codegen is deferred to M31.
+            Err(Error::msg("CREATE VIRTUAL TABLE is not supported yet"))
+        }
     }
 }
 
@@ -394,6 +448,8 @@ fn resolve_sqlite_schema(pager: &Arc<Pager>) -> Result<Table> {
             },
         ],
         rowid_alias: None,
+        without_rowid: false,
+        pk_columns: Vec::new(),
     })
 }
 
@@ -670,4 +726,283 @@ impl Sqlite3Stmt {
     pub fn explain_kind(&self) -> u8 {
         self.explain
     }
+}
+
+/// Compile a `PRAGMA` statement. M5.3.7 implements the `auto_vacuum` family
+/// (`auto_vacuum` and `incremental_vacuum`); other pragmas remain deferred to M20 and return
+/// an "unsupported PRAGMA" error.
+///
+/// `PRAGMA auto_vacuum` (read) returns the current mode as a single-row, single-column result
+/// (0 = NONE, 1 = FULL, 2 = INCREMENTAL). `PRAGMA auto_vacuum = N` sets the mode; this is only
+/// allowed before the database has been written (matching upstream's `BTS_PAGESIZE_FIXED`
+/// guard, which is set once page 1 is laid down).
+///
+/// `PRAGMA incremental_vacuum(N)` runs up to N incremental-vacuum steps in a write transaction,
+/// returning one result row per step with the new page count. With no argument (or a large N),
+/// it runs until the freelist is exhausted.
+fn compile_pragma(db: &mut Sqlite3, sql: &str, pragma: &PragmaStmt) -> Result<Sqlite3Stmt> {
+    let name = pragma.name.to_ascii_lowercase();
+    match name.as_str() {
+        "auto_vacuum" => compile_pragma_auto_vacuum(db, sql, pragma),
+        "incremental_vacuum" => compile_pragma_incremental_vacuum(db, sql, pragma),
+        "integrity_check" | "quick_check" => {
+            compile_pragma_integrity_check(db, sql, pragma, name == "quick_check")
+        }
+        _ => Err(Error::msg(format!("PRAGMA {name} is not supported yet"))),
+    }
+}
+
+/// `PRAGMA integrity_check` / `PRAGMA quick_check` — run the integrity check and return the
+/// result rows (one row per error, or a single "ok" row when consistent). `quick` skips the
+/// overflow-chain and page-reference checks (mirrors `PRAGMA quick_check`).
+fn compile_pragma_integrity_check(
+    db: &mut Sqlite3,
+    sql: &str,
+    _pragma: &PragmaStmt,
+    quick: bool,
+) -> Result<Sqlite3Stmt> {
+    let pager = db.ensure_pager()?;
+    let rows = block_on(crate::btree::integrity_check::integrity_check(&pager, quick))?;
+    Ok(Sqlite3Stmt {
+        sql: sql.to_string(),
+        program: Arc::new(Program::empty()),
+        column_names: vec!["integrity_check".to_string()],
+        backing: Backing::Static {
+            rows,
+            cur: None,
+            pos: 0,
+        },
+        explain: 0,
+        counts: None,
+        last_error: None,
+    })
+}
+
+/// `PRAGMA auto_vacuum` — read returns the current mode (0/1/2); set writes the header flag.
+fn compile_pragma_auto_vacuum(
+    db: &mut Sqlite3,
+    sql: &str,
+    pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    let pager = db.ensure_pager()?;
+    match &pragma.value {
+        None => {
+            // Read: return the current mode.
+            let mode = if pager.incr_vacuum() {
+                2
+            } else if pager.auto_vacuum() {
+                1
+            } else {
+                0
+            };
+            let rows = vec![vec![Value::Int(mode as i64)]];
+            Ok(Sqlite3Stmt {
+                sql: sql.to_string(),
+                program: Arc::new(Program::empty()),
+                column_names: vec!["auto_vacuum".to_string()],
+                backing: Backing::Static {
+                    rows,
+                    cur: None,
+                    pos: 0,
+                },
+                explain: 0,
+                counts: None,
+                last_error: None,
+            })
+        }
+        Some(PragmaValue::Equal(kind)) | Some(PragmaValue::Paren(kind)) => {
+            // Set: parse the value as one of NONE/FULL/INCREMENTAL or 0/1/2.
+            let mode = pragma_auto_vacuum_mode(kind)?;
+            // The set path must open a write transaction so the header change is committed
+            // atomically. We use a tiny program: Transaction + Halt. The header mutation runs
+            // before the program (synchronously) via `set_auto_vacuum`, which also refuses to
+            // change the mode after the database has been written. `ensure_pager` creates a
+            // fresh database file (page 1) on the first write, so setting auto_vacuum before
+            // any CREATE TABLE works (mirroring how upstream sets the flag before
+            // `BTS_PAGESIZE_FIXED` is set by the first real write).
+            let pager = db.ensure_pager()?;
+            pager.set_auto_vacuum(mode)?;
+            // Mark page 1 dirty so the commit path serializes the updated header into the
+            // file. Without this the Transaction+Halt program would commit with no dirty
+            // pages and the in-memory header change would be lost.
+            {
+                let pager = pager.clone();
+                block_on(async move {
+                    let mut page1 = pager.read_page_for_write(1).await?;
+                    let bytes = pager.header().serialize();
+                    page1[0..100].copy_from_slice(&bytes);
+                    pager.write_page(1, page1)?;
+                    Ok::<(), Error>(())
+                })?;
+            }
+            // Build a minimal write program: `Transaction 0 1` + `Halt` commits it.
+            let mut p = Program::default();
+            p.instructions
+                .push(Instruction::new(Opcode::Transaction, 0, 1, 0));
+            p.instructions.push(Instruction::new(Opcode::Halt, 0, 0, 0));
+            let program = Arc::new(p);
+            let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
+            Ok(Sqlite3Stmt {
+                sql: sql.to_string(),
+                program,
+                column_names: Vec::new(),
+                backing: Backing::Vdbe(vdbe),
+                explain: 0,
+                counts: Some(db.counts_handle()),
+                last_error: None,
+            })
+        }
+    }
+}
+
+/// Parse the right-hand side of `PRAGMA auto_vacuum = X`: 0/NONE, 1/FULL, 2/INCREMENTAL.
+fn pragma_auto_vacuum_mode(kind: &PragmaValueKind) -> Result<u8> {
+    match kind {
+        PragmaValueKind::Number(lit) => {
+            use crate::types::Value;
+            let v = match lit {
+                Literal::Integer(n) => Value::Int(*n),
+                Literal::Real(f) => Value::Real(*f),
+                _ => return Err(Error::msg("PRAGMA auto_vacuum: invalid numeric value")),
+            };
+            let n = match v {
+                Value::Int(n) => n as i32,
+                Value::Real(f) => f as i32,
+                _ => 0,
+            };
+            if !(0..=2).contains(&n) {
+                return Err(Error::msg(format!(
+                    "PRAGMA auto_vacuum: {n} out of range (0..2)"
+                )));
+            }
+            Ok(n as u8)
+        }
+        PragmaValueKind::Ident(s) => match s.to_ascii_lowercase().as_str() {
+            "none" => Ok(0),
+            "full" => Ok(1),
+            "incremental" => Ok(2),
+            _ => Err(Error::msg(format!("PRAGMA auto_vacuum: unknown mode '{s}'"))),
+        },
+        PragmaValueKind::On => Ok(1),
+        PragmaValueKind::Delete => Err(Error::msg(
+            "PRAGMA auto_vacuum: DELETE is not a valid mode (use NONE/FULL/INCREMENTAL or 0/1/2)",
+        )),
+        PragmaValueKind::Default => Ok(0),
+    }
+}
+
+/// `PRAGMA incremental_vacuum(N)` — run up to N steps of incremental vacuum, returning one row
+/// per step with the new page count. With no argument, runs until the freelist is exhausted.
+fn compile_pragma_incremental_vacuum(
+    db: &mut Sqlite3,
+    sql: &str,
+    pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    let pager = db.pager_arc()?;
+    // Only valid in INCREMENTAL mode.
+    if !pager.auto_vacuum() || !pager.incr_vacuum() {
+        // Upstream silently no-ops (returns no rows) when incremental vacuum is not enabled.
+        return Ok(Sqlite3Stmt {
+            sql: sql.to_string(),
+            program: Arc::new(Program::empty()),
+            column_names: Vec::new(),
+            backing: Backing::Static {
+                rows: Vec::new(),
+                cur: None,
+                pos: 0,
+            },
+            explain: 0,
+            counts: None,
+            last_error: None,
+        });
+    }
+    // Determine the step limit. Default (no value) is "until done" — use u32::MAX.
+    let limit = match &pragma.value {
+        None => u32::MAX,
+        Some(PragmaValue::Equal(kind)) | Some(PragmaValue::Paren(kind)) => match kind {
+            PragmaValueKind::Number(lit) => {
+                use crate::types::Value;
+                let v = match lit {
+                    Literal::Integer(n) => Value::Int(*n),
+                    Literal::Real(f) => Value::Real(*f),
+                    _ => return Err(Error::msg("PRAGMA incremental_vacuum: invalid value")),
+                };
+                match v {
+                    Value::Int(n) if n > 0 => n as u32,
+                    Value::Real(f) if f > 0.0 => f as u32,
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        },
+    };
+    // Run the incremental vacuum synchronously: open a write transaction, call
+    // `incremental_vacuum` for up to `limit` steps, commit, and capture the resulting page
+    // counts as a Static result set.
+    let rows = block_on(incremental_vacuum_run(&pager, limit))?;
+    Ok(Sqlite3Stmt {
+        sql: sql.to_string(),
+        program: Arc::new(Program::empty()),
+        column_names: vec!["incremental_vacuum".to_string()],
+        backing: Backing::Static {
+            rows,
+            cur: None,
+            pos: 0,
+        },
+        explain: 0,
+        counts: None,
+        last_error: None,
+    })
+}
+
+/// Drive an incremental vacuum: open a write transaction, run up to `limit` steps (each
+/// relocating one tail page), commit, and return the page-count-after-each-step result rows.
+async fn incremental_vacuum_run(pager: &Arc<Pager>, limit: u32) -> Result<Vec<Vec<Value>>> {
+    use crate::btree::autovac::incr_vacuum_step_impl;
+    pager.begin_write().await?;
+    let mut rows = Vec::new();
+    let usable = pager.usable_size();
+    let mut steps = 0u32;
+    loop {
+        if steps >= limit {
+            break;
+        }
+        let n_orig = pager.page_count();
+        let n_free = pager.header().freelist_count;
+        if n_free == 0 || n_free >= n_orig {
+            break;
+        }
+        let n_fin = crate::btree::autovac::final_db_size_pub(usable, n_orig, n_free);
+        if n_fin >= n_orig {
+            break;
+        }
+        // Find the last non-reserved page.
+        let mut i_last = n_orig;
+        while i_last > n_fin
+            && (crate::btree::ptrmap::is_ptrmap_page(usable, i_last)
+                || crate::btree::ptrmap::is_pending_byte_page(usable, i_last))
+        {
+            i_last -= 1;
+        }
+        if i_last <= n_fin {
+            break;
+        }
+        match incr_vacuum_step_impl(pager, n_fin, i_last).await {
+            Ok(()) => {}
+            Err(e) if e.message == "autovacuum done" => break,
+            Err(other) => {
+                let _ = pager.rollback().await;
+                return Err(other);
+            }
+        }
+        steps += 1;
+        // After the step, the page count is `n_orig - 1` (one page was relocated away from the
+        // end). Upstream's PRAGMA incremental_vacuum yields the new page count per step.
+        let new_count = n_orig - 1;
+        rows.push(vec![Value::Int(new_count as i64)]);
+    }
+    // If no steps ran, the freelist is unchanged; just commit. Otherwise the header was
+    // updated by the steps; commit persists it.
+    pager.commit().await?;
+    Ok(rows)
 }

@@ -7,7 +7,7 @@
 //! rootpage into the record and re-parses via `OP_ParseSchema`); we keep that structure but
 //! simplify to what the first write slice needs.
 
-use rustqlite_parser::CreateTable;
+use rustqlite_parser::{ColumnConstraint, CreateTable};
 
 use crate::error::{Error, Result};
 use crate::schema::bootstrap::table_schema_row;
@@ -39,6 +39,31 @@ pub fn compile_create_table(
             ct.name
         )));
     }
+    // A WITHOUT ROWID table needs a declared PRIMARY KEY (upstream errors with
+    // "PRIMARY KEY missing on table"). Collect the PK column count for the sanity check.
+    if ct.without_rowid {
+        let mut pk_count = 0usize;
+        for cd in &ct.columns {
+            if cd
+                .constraints
+                .iter()
+                .any(|c| matches!(c, ColumnConstraint::PrimaryKey { .. }))
+            {
+                pk_count += 1;
+            }
+        }
+        for c in &ct.constraints {
+            if let rustqlite_parser::TableConstraintBody::PrimaryKey { columns } = &c.body {
+                pk_count = columns.len();
+            }
+        }
+        if pk_count == 0 {
+            return Err(Error::msg(format!(
+                "table \"{}\" may not be WITHOUT ROWID because it has no PRIMARY KEY",
+                ct.name
+            )));
+        }
+    }
 
     let mut b = ProgramBuilder::new();
 
@@ -50,8 +75,10 @@ pub fn compile_create_table(
     b.emit(Opcode::Transaction, 0, 1, 0);
 
     // (2) create the new table's b-tree; its root page lands in `root_reg`.
+    //     `p3 = 1` → a rowid-keyed (table) b-tree; `p3 = 0` → a blob-keyed (index) b-tree,
+    //     used by WITHOUT ROWID tables whose PK is the b-tree key (M5.3.6).
     let root_reg = b.alloc_reg();
-    b.emit(Opcode::CreateBtree, 0, root_reg, 1); // p3 = 1 → a table b-tree
+    b.emit(Opcode::CreateBtree, 0, root_reg, if ct.without_rowid { 0 } else { 1 });
 
     // (3) build the five-value sqlite_schema record. The static columns are loaded from the
     // schema-row template (built by bootstrap), with the rootpage taken from `root_reg` (the

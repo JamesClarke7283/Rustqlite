@@ -23,6 +23,15 @@ use super::page::{PageHeader, PageType};
 /// `idxType == SQLITE_IDXTYPE_APPDEF` case. The caller must hold a write transaction; the new
 /// page is committed with the rest of the transaction.
 pub async fn create_index_btree(pager: &Pager) -> Result<u32> {
+    if pager.auto_vacuum() {
+        super::create_index_btree_autovac(pager).await
+    } else {
+        create_index_btree_plain(pager).await
+    }
+}
+
+/// Non-auto-vacuum index b-tree creation: allocate a fresh page at the end of the file.
+async fn create_index_btree_plain(pager: &Pager) -> Result<u32> {
     let pgno = pager.allocate_page();
     let mut buf = pager.read_page_for_write(pgno).await?;
     let base = pager.btree_header_offset(pgno);

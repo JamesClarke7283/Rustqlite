@@ -40,6 +40,8 @@ pub fn compile_expr(b: &mut ProgramBuilder, e: &Expr, target: i32, ctx: Ctx) -> 
             name,
             distinct,
             args,
+            filter: _,
+            over: _,
         } => {
             if *distinct {
                 return Err(Error::msg(
@@ -66,6 +68,9 @@ pub fn compile_expr(b: &mut ProgramBuilder, e: &Expr, target: i32, ctx: Ctx) -> 
             return Err(Error::msg("BETWEEN is not supported by the executor yet"))
         }
         Expr::In { .. } => return Err(Error::msg("IN is not supported by the executor yet")),
+        Expr::InSubquery { .. } => {
+            return Err(Error::msg("IN subquery is not supported by the executor yet"))
+        }
         Expr::Exists(_) => return Err(Error::msg("EXISTS is not supported by the executor yet")),
         Expr::Subquery(_) => {
             return Err(Error::msg(
@@ -87,6 +92,9 @@ pub fn compile_expr(b: &mut ProgramBuilder, e: &Expr, target: i32, ctx: Ctx) -> 
                 "IS DISTINCT FROM is not supported by the executor yet",
             ))
         }
+        Expr::Row(_) => return Err(Error::msg(
+            "row-value expressions are not supported by the executor yet",
+        )),
     }
     Ok(())
 }
@@ -167,7 +175,16 @@ fn compile_column(
             if let Some(base) = ctx.register_base {
                 b.emit(Opcode::SCopy, base + i as i32, target, 0);
             } else {
-                b.emit(Opcode::Column, ctx.cursor, i as i32, target);
+                // A WITHOUT ROWID table is stored as an index b-tree keyed by the PK record;
+                // the on-disk column position is the storage index, not the table column index.
+                let col_pos = if ctx.table.without_rowid {
+                    ctx.table
+                        .without_rowid_storage_index(i)
+                        .expect("column exists on WITHOUT ROWID table") as i32
+                } else {
+                    i as i32
+                };
+                b.emit(Opcode::Column, ctx.cursor, col_pos, target);
             }
             // A REAL-affinity column may store integer-valued rows as integers on disk; realify
             // so they read back as REAL (matches upstream's OP_RealAffinity after OP_Column).
@@ -297,6 +314,9 @@ fn compile_binary(
         }
         BinaryOp::JsonExtract | BinaryOp::JsonExtractText => Err(Error::msg(
             "JSON -> / ->> operators are not supported by the executor yet",
+        )),
+        BinaryOp::Regexp | BinaryOp::Match => Err(Error::msg(
+            "REGEXP / MATCH operators are not supported by the executor yet",
         )),
         _ => unreachable!("binary op already handled"),
     }

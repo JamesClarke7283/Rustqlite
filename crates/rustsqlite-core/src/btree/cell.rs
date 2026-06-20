@@ -129,6 +129,20 @@ pub fn build_table_leaf_cell(
     payload: &[u8],
     usable: usize,
 ) -> Vec<u8> {
+    build_table_leaf_cell_with_host(pager, rowid, payload, usable, None)
+}
+
+/// As [`build_table_leaf_cell`] but with an optional `host_pgno`: when auto-vacuum is on and
+/// this is `Some(h)`, the first overflow page is recorded in the pointer map as an
+/// `OVERFLOW1` entry whose parent is `h`, and each subsequent overflow page as `OVERFLOW2`
+/// whose parent is the previous overflow page. Mirrors `ptrmapPutOvflPtr` in `btree.c`.
+pub fn build_table_leaf_cell_with_host(
+    pager: &crate::pager::Pager,
+    rowid: i64,
+    payload: &[u8],
+    usable: usize,
+    host_pgno: Option<u32>,
+) -> Vec<u8> {
     let max_local = usable - 35;
     let (local_len, has_overflow) = local_payload_len(payload.len(), usable, max_local);
     let mut cell = Vec::with_capacity(9 + 9 + local_len + if has_overflow { 4 } else { 0 });
@@ -140,6 +154,17 @@ pub fn build_table_leaf_cell(
         let tail = &payload[local_len..];
         let chunk = usable - 4;
         let first_pgno = pager.allocate_page();
+        let autovac = pager.auto_vacuum();
+        if autovac {
+            if let Some(h) = host_pgno {
+                let _ = super::ptrmap::ptrmap_put_sync(
+                    pager,
+                    first_pgno,
+                    super::ptrmap::PtrMapType::Overflow1,
+                    h,
+                );
+            }
+        }
         // Walk the chain. For each chunk, fill a fresh page with `[u32 next_pgno][chunk]`
         // and install it. The last page's `next_pgno` is 0.
         let mut curr_pgno = first_pgno;
@@ -154,6 +179,14 @@ pub fn build_table_leaf_cell(
             pager
                 .write_page(curr_pgno, buf)
                 .expect("write overflow page");
+            if autovac && !is_last {
+                let _ = super::ptrmap::ptrmap_put_sync(
+                    pager,
+                    next_pgno,
+                    super::ptrmap::PtrMapType::Overflow2,
+                    curr_pgno,
+                );
+            }
             offset += take;
             if is_last {
                 break;
@@ -259,6 +292,17 @@ pub fn build_index_leaf_cell(
     key_record: &[u8],
     usable: usize,
 ) -> Vec<u8> {
+    build_index_leaf_cell_with_host(pager, key_record, usable, None)
+}
+
+/// As [`build_index_leaf_cell`] but with an optional `host_pgno` for auto-vacuum pointer-map
+/// maintenance of the overflow chain (see [`build_table_leaf_cell_with_host`]).
+pub fn build_index_leaf_cell_with_host(
+    pager: &crate::pager::Pager,
+    key_record: &[u8],
+    usable: usize,
+    host_pgno: Option<u32>,
+) -> Vec<u8> {
     let max_local = index_max_local(usable);
     let (local_len, has_overflow) = local_payload_len(key_record.len(), usable, max_local);
     let mut cell = Vec::with_capacity(9 + local_len + if has_overflow { 4 } else { 0 });
@@ -269,6 +313,17 @@ pub fn build_index_leaf_cell(
         let tail = &key_record[local_len..];
         let chunk = usable - 4;
         let first_pgno = pager.allocate_page();
+        let autovac = pager.auto_vacuum();
+        if autovac {
+            if let Some(h) = host_pgno {
+                let _ = super::ptrmap::ptrmap_put_sync(
+                    pager,
+                    first_pgno,
+                    super::ptrmap::PtrMapType::Overflow1,
+                    h,
+                );
+            }
+        }
         let mut curr_pgno = first_pgno;
         let mut offset = 0usize;
         loop {
@@ -281,6 +336,14 @@ pub fn build_index_leaf_cell(
             pager
                 .write_page(curr_pgno, buf)
                 .expect("write overflow page");
+            if autovac && !is_last {
+                let _ = super::ptrmap::ptrmap_put_sync(
+                    pager,
+                    next_pgno,
+                    super::ptrmap::PtrMapType::Overflow2,
+                    curr_pgno,
+                );
+            }
             offset += take;
             if is_last {
                 break;
