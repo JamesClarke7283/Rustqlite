@@ -171,6 +171,10 @@ pub struct Vdbe {
     /// keep it in a side table so the `Value` type stays storage-class-only. An entry is created
     /// lazily by `AggStep` on its first call for a given register, and consumed by `AggFinal`.
     aggregates: HashMap<usize, Accumulator>,
+    /// The result of the most recent `OP_Compare` (`-1/0/+1`), read by the immediately following
+    /// `OP_Jump`. Mirrors the `iCompare` global in `vdbe.c`. `None` means no `Compare` has run
+    /// yet (a defensive default; the codegen always emits `Jump` right after `Compare`).
+    last_compare: Ordering,
 }
 
 impl Vdbe {
@@ -195,6 +199,7 @@ impl Vdbe {
             cursor_root: HashMap::new(),
             write_txn: false,
             aggregates: HashMap::new(),
+            last_compare: Ordering::Equal,
         }
     }
 
@@ -226,6 +231,7 @@ impl Vdbe {
         self.cursor_root.clear();
         self.write_txn = false;
         self.aggregates.clear();
+        self.last_compare = Ordering::Equal;
     }
 
     /// Number of columns in the current result row.
@@ -278,6 +284,65 @@ impl Vdbe {
             match inst.opcode {
                 Opcode::Init => self.pc = p2 as usize,
                 Opcode::Goto => self.pc = p2 as usize,
+                Opcode::Gosub => {
+                    // Store the address of the *next* instruction in `r[p1]` and jump to `p2`.
+                    self.regs[p1 as usize] = Value::Int((pc + 1) as i64);
+                    self.pc = p2 as usize;
+                }
+                Opcode::Return => {
+                    // Jump to the address in `r[p1]`. With `p3 == 1` the jump is conditional on
+                    // `r[p1]` being an integer (fall through otherwise); with `p3 == 0` it is
+                    // strict. Codegen always pairs `Gosub` with the strict form here.
+                    match &self.regs[p1 as usize] {
+                        Value::Int(addr) => {
+                            self.pc = *addr as usize;
+                        }
+                        _ => {
+                            if p3 == 0 {
+                                return Err(Error::msg(
+                                    "OP_Return: return-address register is not an integer",
+                                ));
+                            }
+                            self.pc += 1;
+                        }
+                    }
+                }
+                Opcode::Compare => {
+                    // Compare `n = p3` registers starting at `r[p1]` against `r[p2]` under the
+                    // per-key collation carried by `p4 = KeyInfo`, leaving the ordering in
+                    // `last_compare` for the immediately following `OP_Jump`.
+                    let n = p3 as usize;
+                    let ki = match &inst.p4 {
+                        P4::KeyInfo(k) => k.clone(),
+                        _ => {
+                            return Err(Error::msg("OP_Compare requires a KeyInfo p4"));
+                        }
+                    };
+                    let mut ord = Ordering::Equal;
+                    for i in 0..n {
+                        let a = &self.regs[p1 as usize + i];
+                        let b = &self.regs[p2 as usize + i];
+                        let key = &ki[i];
+                        let mut o = mem_compare(a, b, key.collation);
+                        if key.desc {
+                            o = o.reverse();
+                        }
+                        if o != Ordering::Equal {
+                            ord = o;
+                            break;
+                        }
+                    }
+                    self.last_compare = ord;
+                    self.pc += 1;
+                }
+                Opcode::Jump => {
+                    // Route to p1/p2/p3 based on the last `Compare` result (Less/Equal/Greater).
+                    self.pc = match self.last_compare {
+                        Ordering::Less => p1 as usize,
+                        Ordering::Equal => p2 as usize,
+                        Ordering::Greater => p3 as usize,
+                    };
+                }
                 Opcode::Halt => {
                     // A successful Halt commits an open write transaction (the durable commit
                     // point); read-only programs have no transaction to commit. Mirrors the

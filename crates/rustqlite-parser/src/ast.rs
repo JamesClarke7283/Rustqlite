@@ -894,6 +894,12 @@ pub enum Expr {
         right: Box<Expr>,
         negated: bool,
     },
+    /// A codegen-only synthetic reference to an aggregate accumulator's result register,
+    /// emitted by the aggregate codegen path after it assigns each aggregate call a register.
+    /// Never produced by the parser; used to rewrite projection/HAVING expressions so a
+    /// `count(*)` in `SELECT g, count(*) FROM t GROUP BY g` reads from the accumulator register
+    /// instead of trying to evaluate the function call during the per-group output pass.
+    AggRef(i32),
 }
 
 #[derive(Debug, Clone, PartialEq)]

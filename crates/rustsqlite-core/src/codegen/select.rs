@@ -9,9 +9,10 @@
 //!   projects; the sorter is dropped when `ORDER BY <indexed_col> ASC` is also present (the
 //!   index is already ordered).
 
-use rustqlite_parser::{Expr, Literal, OrderingTerm, ResultColumn, SelectStmt, UnaryOp};
+use rustqlite_parser::{Expr, FunctionArgs, Literal, OrderingTerm, ResultColumn, SelectStmt, UnaryOp};
 
 use crate::error::{Error, Result};
+use crate::func::aggregate::{is_aggregate_call, AggregateKind};
 use crate::schema::{IndexObject, Table};
 use crate::types::Value;
 use crate::util::fp::fp_to_text;
@@ -45,9 +46,9 @@ pub fn compile(
     } else {
         match table {
             Some(t) => {
-                // M5.1: try an indexed-equality plan first; fall back to a scan if no index
-                // covers the WHERE.
-                if let Some(plan) = pick_index(select, t, indexes) {
+                if is_aggregate_query(select, &outputs) {
+                    compile_aggregate(select, t, &outputs, limit, offset)?
+                } else if let Some(plan) = pick_index(select, t, indexes) {
                     compile_indexed_select(select, t, &plan, &outputs, limit, offset)?
                 } else {
                     compile_scan(select, t, &outputs, limit, offset)?
@@ -57,6 +58,509 @@ pub fn compile(
         }
     };
     Ok((program, names))
+}
+
+/// Compile an aggregate `SELECT` — either a bare `SELECT agg(...) FROM t` (no GROUP BY) or a
+/// `SELECT ..., agg(...) FROM t GROUP BY ...` (with GROUP BY). Mirrors the
+/// `tag-select-0810`/`tag-select-0820` branches of `sqlite3Select` in `select.c`.
+///
+/// For the GROUP BY case the strategy is the simplest "always sort" path upstream documents:
+/// 1. Scan the table, applying the WHERE filter.
+/// 2. For each passing row, evaluate the GROUP BY key expressions and the aggregate argument
+///    expressions, build a `[group_keys..., agg_args...]` record, and `SorterInsert` it.
+/// 3. Sort by the group key (ASC, BINARY — matching SQLite's default group ordering).
+/// 4. Walk the sorted rows: load the key registers, `Compare` against the previous group's key,
+///    and on a mismatch call the output subroutine (which finalizes the accumulators and emits
+///    a `ResultRow`). On every row call `AggStep` with the row's args.
+/// 5. After the loop, emit the final group's row.
+///
+/// For the no-GROUP-BY case the whole scan+step loop accumulates one row, which is emitted once
+/// at the end. This is the `tag-select-0822` branch (without the min/max optimization).
+#[allow(clippy::too_many_arguments)]
+fn compile_aggregate(
+    select: &SelectStmt,
+    table: &Table,
+    outputs: &[(Expr, String)],
+    limit: Option<i64>,
+    offset: i64,
+) -> Result<Program> {
+    // (A) Collect every aggregate call from the projection list (and, in future, HAVING).
+    let mut agg_calls: Vec<AggCall> = Vec::new();
+    for (e, _) in outputs {
+        collect_aggregates(e, &mut agg_calls);
+    }
+    // Deduplicate by syntactic identity (name + args) so the same call appearing twice shares
+    // one accumulator. Matches upstream's `AggInfo` deduplication.
+    let mut dedup: Vec<AggCall> = Vec::new();
+    for c in &agg_calls {
+        if !dedup.iter().any(|d| agg_call_eq(d, c)) {
+            dedup.push(c.clone());
+        }
+    }
+    let agg_calls = dedup;
+
+    // (B) Resolve each call to an `AggregateKind`, validating the argument count.
+    let kinds: Vec<AggregateKind> = agg_calls
+        .iter()
+        .map(|c| {
+            let n_arg = match &c.args {
+                FunctionArgs::Star => 0,
+                FunctionArgs::List(v) => v.len(),
+            };
+            AggregateKind::from_name(&c.name, n_arg)
+                .ok_or_else(|| Error::msg(format!("no such aggregate: {}({})", c.name, n_arg)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let cursor = 0i32;
+    let ncol = outputs.len() as i32;
+    let nkey = select.group_by.len() as i32;
+    let n_agg = agg_calls.len() as i32;
+    let ctx = Ctx {
+        table,
+        cursor,
+        register_base: None,
+    };
+    let mut b = ProgramBuilder::new();
+
+    let setup = b.new_label();
+    b.emit_jump(Opcode::Init, 0, setup, 0);
+    let after_init = b.cur_addr();
+
+    // LIMIT 0 → no rows.
+    if limit == Some(0) {
+        b.emit(Opcode::Halt, 0, 0, 0);
+        b.resolve(setup);
+        b.emit(Opcode::Transaction, 0, 0, 0);
+        b.emit(Opcode::Goto, 0, after_init, 0);
+        return Ok(b.finish());
+    }
+    let limit_reg = match limit {
+        Some(n) if n > 0 => Some(emit_int(&mut b, n)),
+        _ => None,
+    };
+    let offset_reg = (offset > 0).then(|| emit_int(&mut b, offset));
+
+    // (C) Allocate the per-aggregate accumulator registers and build the lookup table that
+    // `rewrite_aggregates` uses to replace each call with an `AggRef(reg)`.
+    let agg_reg_base = if n_agg > 0 { b.alloc_regs(n_agg) } else { 0 };
+    // For the GROUP BY path, allocate the "previous group key" registers (iAMem) now so the
+    // projection rewrite can substitute GROUP BY expression matches with `AggRef` references
+    // to them. The output subroutine reads the *previous* group's key from iAMem — when a group
+    // change is detected, the previous group is emitted before iAMem is overwritten with the
+    // new group's key. (For the no-GROUP-BY path these are unused — `nkey == 0`.)
+    let i_amem = if nkey > 0 { b.alloc_regs(nkey) } else { 0 };
+    let reg_of = |call: &AggCall| -> Option<i32> {
+        agg_calls
+            .iter()
+            .position(|d| agg_call_eq(d, call))
+            .map(|i| agg_reg_base + i as i32)
+    };
+    let group_key_of = |expr: &Expr| -> Option<i32> {
+        select
+            .group_by
+            .iter()
+            .position(|g| g == expr)
+            .map(|i| i_amem + i as i32)
+    };
+    // Rewrite each output expression: aggregate calls → `AggRef(agg_reg)`, and any subexpression
+    // that exactly matches a GROUP BY expression → `AggRef(i_amem)` (so the projection in
+    // `SELECT g, count(*) FROM t GROUP BY g` reads `g` from the previous-group-key register
+    // during the output subroutine, instead of the now-exhausted table cursor). The GROUP BY
+    // substitution happens at the top level only: if the whole expression equals a GROUP BY
+    // expr, replace it; otherwise only rewrite aggregate calls inside it.
+    let rewritten_outputs: Vec<(Expr, String)> = outputs
+        .iter()
+        .map(|(e, n)| (rewrite_projection_expr(e, &reg_of, &group_key_of), n.clone()))
+        .collect();
+
+    // (D) Open the table cursor.
+    let open = b.emit(Opcode::OpenRead, cursor, table.rootpage as i32, 0);
+    if table.without_rowid {
+        b.set_p4(open, P4::KeyInfo(table.without_rowid_key_info()));
+    } else {
+        b.set_p4(open, P4::Int(table.columns.len() as i64));
+    }
+
+    if nkey == 0 {
+        // ---- No GROUP BY: accumulate one row over the whole scan, then emit once. ----
+        // This is the `tag-select-0822` path (minus the min/max optimization, which we don't
+        // implement yet). The accumulators are reset implicitly by `Accumulator::new` on the
+        // first `AggStep` call (they start fresh); there is only one group.
+        let end_scan = b.new_label();
+        b.emit_jump(Opcode::Rewind, cursor, end_scan, 0);
+        let scan_top = b.new_label();
+        b.resolve(scan_top);
+        let scan_next = b.new_label();
+        if let Some(w) = &select.where_clause {
+            compile_jump(&mut b, w, scan_next, false, true, ctx)?;
+        }
+        // Evaluate each aggregate's arguments and `AggStep` it.
+        for (i, call) in agg_calls.iter().enumerate() {
+            let kind = kinds[i];
+            let n_arg = match &call.args {
+                FunctionArgs::Star => 0u8,
+                FunctionArgs::List(v) => v.len() as u8,
+            };
+            let arg_base = match &call.args {
+                FunctionArgs::Star => 0,
+                FunctionArgs::List(v) => {
+                    let r = b.alloc_regs(v.len() as i32);
+                    for (k, a) in v.iter().enumerate() {
+                        compile_expr(&mut b, a, r + k as i32, ctx)?;
+                    }
+                    r
+                }
+            };
+            let idx = b.emit(Opcode::AggStep, 0, arg_base, agg_reg_base + i as i32);
+            b.set_p4(idx, P4::FuncDef(kind));
+            b.set_p5(idx, n_arg);
+        }
+        b.resolve(scan_next);
+        b.emit_jump(Opcode::Next, cursor, scan_top, 0);
+        b.resolve(end_scan);
+
+        // Finalize the accumulators into their registers.
+        for (i, kind) in kinds.iter().enumerate() {
+            let idx = b.emit(Opcode::AggFinal, agg_reg_base + i as i32, 0, 0);
+            b.set_p4(idx, P4::FuncDef(*kind));
+        }
+
+        // Emit the single result row. OFFSET/LIMIT apply to the result of an aggregate without
+        // GROUP BY (the LIMIT of a `SELECT count(*) FROM t LIMIT 0` is zero rows).
+        let emit_end = b.new_label();
+        if let Some(oreg) = offset_reg {
+            b.emit_jump(Opcode::IfPos, oreg, emit_end, 1);
+        }
+        let result_reg = b.alloc_regs(ncol);
+        for (j, (expr, _)) in rewritten_outputs.iter().enumerate() {
+            compile_expr(&mut b, expr, result_reg + j as i32, ctx)?;
+        }
+        b.emit(Opcode::ResultRow, result_reg, ncol, 0);
+        if let Some(lreg) = limit_reg {
+            b.emit_jump(Opcode::DecrJumpZero, lreg, emit_end, 0);
+        }
+        b.resolve(emit_end);
+        b.emit(Opcode::Halt, 0, 0, 0);
+        b.resolve(setup);
+        b.emit(Opcode::Transaction, 0, 0, 0);
+        b.emit(Opcode::Goto, 0, after_init, 0);
+        return Ok(b.finish());
+    }
+
+    // ---- GROUP BY case: sort by group key, walk, emit per group. ----
+
+    // Sorter records: [group_key_0, ..., group_key_{nkey-1}, agg_args..., payload...].
+    // The payload is the per-row aggregate argument values; the key is the group key.
+    //
+    // Actually the simpler layout: [group_keys..., agg_args...] where agg_args is the
+    // concatenation of every aggregate's argument registers. The output pass reads group keys
+    // from the sorter directly; the agg-args are read for the `AggStep` call.
+
+    // Determine per-aggregate arg counts.
+    let agg_arg_counts: Vec<i32> = agg_calls
+        .iter()
+        .map(|c| match &c.args {
+            FunctionArgs::Star => 0,
+            FunctionArgs::List(v) => v.len() as i32,
+        })
+        .collect();
+    let total_agg_args: i32 = agg_arg_counts.iter().sum();
+    let n_sorter_fields = nkey + total_agg_args;
+
+    // KeyInfo for the sorter: the GROUP BY keys, ASC BINARY (matches SQLite's default group
+    // ordering; a future task threads through explicit COLLATE / DESC).
+    let keyinfo: Vec<KeyField> = select
+        .group_by
+        .iter()
+        .map(|_| KeyField::asc_binary())
+        .collect();
+    let sorter = 1i32;
+    let so = b.emit(Opcode::SorterOpen, sorter, n_sorter_fields, 0);
+    b.set_p4(so, P4::KeyInfo(keyinfo));
+
+    // ---- Scan loop: filter, evaluate group keys + agg args, build record, sorter insert. ----
+    let end_scan = b.new_label();
+    b.emit_jump(Opcode::Rewind, cursor, end_scan, 0);
+    let scan_top = b.new_label();
+    b.resolve(scan_top);
+    let scan_next = b.new_label();
+    if let Some(w) = &select.where_clause {
+        compile_jump(&mut b, w, scan_next, false, true, ctx)?;
+    }
+    let block = b.alloc_regs(n_sorter_fields);
+    // Group keys first.
+    for (k, gexpr) in select.group_by.iter().enumerate() {
+        compile_expr(&mut b, gexpr, block + k as i32, ctx)?;
+    }
+    // Then each aggregate's arguments, in declaration order.
+    let mut arg_offset = nkey;
+    for (i, call) in agg_calls.iter().enumerate() {
+        match &call.args {
+            FunctionArgs::Star => {}
+            FunctionArgs::List(v) => {
+                for (k, a) in v.iter().enumerate() {
+                    compile_expr(&mut b, a, block + arg_offset + k as i32, ctx)?;
+                }
+            }
+        }
+        arg_offset += agg_arg_counts[i];
+    }
+    let rec = b.alloc_reg();
+    b.emit(Opcode::MakeRecord, block, n_sorter_fields, rec);
+    b.emit(Opcode::SorterInsert, sorter, rec, 0);
+    b.resolve(scan_next);
+    b.emit_jump(Opcode::Next, cursor, scan_top, 0);
+    b.resolve(end_scan);
+
+    // ---- Output pass: walk the sorted sorter, detect group changes, emit per group. ----
+    // Registers:
+    //   iUseFlag    — 1 once the accumulator has seen any row (suppresses emitting an empty
+    //                 first row when the input is empty).
+    //   iAMem       — `nkey` registers holding the *previous* group key (for `Compare`).
+    //   iBMem       — `nkey` registers holding the *current* group key (just read from sorter).
+    let i_use_flag = b.alloc_reg();
+    b.emit(Opcode::Integer, 0, i_use_flag, 0);
+    // iAMem was already allocated during the projection rewrite (so `AggRef(i_amem + i)` in the
+    // rewritten outputs reads the previous group's key during the output subroutine). Initialize
+    // it to NULL here — the first group change's Compare sees NULL < key and routes to the
+    // group-changed handler, which (because iUseFlag is still 0) skips emitting.
+    b.emit(Opcode::Null, i_amem, i_amem + nkey - 1, 0);
+    let i_bmem = b.alloc_regs(nkey);
+
+    // Output subroutine addresses (resolved later).
+    let addr_end = b.new_label();
+    let addr_output_row = b.new_label();
+    let reg_output_row = b.alloc_reg(); // return address register for the output subroutine
+    let addr_reset = b.new_label();
+    let reg_reset = b.alloc_reg(); // return address register for the reset subroutine
+
+    // Kick off by resetting the accumulator (this is a no-op on the first call but matches
+    // upstream's `OP_Gosub regReset, addrReset`).
+    b.emit_jump(Opcode::Gosub, reg_reset, addr_reset, 0);
+
+    // Sort the sorter and position at the first record, or jump to `addr_end` if empty.
+    b.emit_jump(Opcode::SorterSort, sorter, addr_end, 0);
+    let loop_top = b.new_label();
+    b.resolve(loop_top);
+
+    // Load the current group key from the sorter into iBMem.
+    b.emit(Opcode::SorterData, sorter, 0, 0);
+    for j in 0..nkey {
+        b.emit(Opcode::Column, sorter, j, i_bmem + j);
+    }
+
+    // Compare the current key (iBMem) against the previous key (iAMem) under the group's
+    // KeyInfo. The `Jump` that follows routes to:
+    //   p1 = addr_after_step   — current < previous (shouldn't happen with a stable ASC sort,
+    //                            but treat like "different group" → emit then step).
+    //   p2 = addr_step          — equal → step only.
+    //   p3 = addr_emit_then_step — current > previous → emit the previous group, then step.
+    //
+    // To match upstream's `OP_Compare`/`OP_Jump` idiom (P1=Less, P2=Equal, P3=Greater), we set:
+    //   p1 = "group changed"  (treat as different — emit, then step)
+    //   p2 = "same group"     (step only)
+    //   p3 = "group changed"  (emit, then step)
+    // We resolve these labels after emitting the step block.
+    let addr_step_only = b.new_label();
+    let addr_group_changed = b.new_label();
+    {
+        // We need a KeyInfo on the Compare. Reuse the GROUP BY KeyInfo (ASC BINARY).
+        let cmp_ki: Vec<KeyField> = select
+            .group_by
+            .iter()
+            .map(|_| KeyField::asc_binary())
+            .collect();
+        let cmp = b.emit(Opcode::Compare, i_amem, i_bmem, nkey);
+        b.set_p4(cmp, P4::KeyInfo(cmp_ki));
+        // Jump: Less→group_changed, Equal→step_only, Greater→group_changed.
+        b.emit_jump3(Opcode::Jump, addr_group_changed, addr_step_only, addr_group_changed);
+    }
+
+    // ---- group-changed handler: emit a result row for the *previous* group, then step. ----
+    b.resolve(addr_group_changed);
+    b.emit_jump(Opcode::Gosub, reg_output_row, addr_output_row, 0);
+    // Copy iBMem → iAMem so the new group becomes the "previous" for the next comparison.
+    b.emit(Opcode::Copy, i_bmem, i_amem, nkey - 1);
+    // Reset the accumulator for the new group (clears the per-group state).
+    b.emit_jump(Opcode::Gosub, reg_reset, addr_reset, 0);
+    // Fall through to the step block.
+
+    // ---- step-only handler: update the accumulator with the current row's args. ----
+    b.resolve(addr_step_only);
+    for (i, call) in agg_calls.iter().enumerate() {
+        let kind = kinds[i];
+        let n_arg = match &call.args {
+            FunctionArgs::Star => 0u8,
+            FunctionArgs::List(v) => v.len() as u8,
+        };
+        // The args for aggregate `i` live at sorter column `nkey + agg_arg_offset_i`.
+        let agg_arg_base = b.alloc_regs(agg_arg_counts[i].max(1));
+        match &call.args {
+            FunctionArgs::Star => {}
+            FunctionArgs::List(v) => {
+                // The starting sorter column index for this aggregate's args is
+                // `nkey + sum(agg_arg_counts[0..i])`.
+                let start_col = nkey
+                    + agg_arg_counts[..i].iter().sum::<i32>();
+                for (k, _) in v.iter().enumerate() {
+                    b.emit(
+                        Opcode::Column,
+                        sorter,
+                        start_col + k as i32,
+                        agg_arg_base + k as i32,
+                    );
+                }
+            }
+        }
+        let idx = b.emit(Opcode::AggStep, 0, agg_arg_base, agg_reg_base + i as i32);
+        b.set_p4(idx, P4::FuncDef(kind));
+        b.set_p5(idx, n_arg);
+    }
+    // Mark that we've seen at least one row in this group.
+    b.emit(Opcode::Integer, 1, i_use_flag, 0);
+    // Advance the sorter; loop back to the top.
+    b.emit_jump(Opcode::SorterNext, sorter, loop_top, 0);
+
+    // After the loop: emit the final group's row.
+    b.emit_jump(Opcode::Gosub, reg_output_row, addr_output_row, 0);
+
+    // Jump past the subroutines to `addr_end`.
+    b.emit_jump(Opcode::Goto, 0, addr_end, 0);
+
+    // ---- output subroutine: finalize accumulators, evaluate projection, emit a ResultRow. ----
+    b.resolve(addr_output_row);
+    // If we never saw any row (iUseFlag == 0), skip emitting. This is the upstream behavior
+    // (the `OP_IfPos iUseFlag` guard before the finalize/emit body).
+    let output_skip = b.new_label();
+    b.emit_jump(Opcode::IfNot, i_use_flag, output_skip, 1);
+    // Finalize each accumulator into its register.
+    for (i, kind) in kinds.iter().enumerate() {
+        let idx = b.emit(Opcode::AggFinal, agg_reg_base + i as i32, 0, 0);
+        b.set_p4(idx, P4::FuncDef(*kind));
+    }
+    // Evaluate the projection (now containing `AggRef`s to the finalized registers and plain
+    // column refs that read from the sorter's group-key columns).
+    let result_reg = b.alloc_regs(ncol);
+    for (j, (expr, _)) in rewritten_outputs.iter().enumerate() {
+        compile_expr(&mut b, expr, result_reg + j as i32, ctx)?;
+    }
+    // Apply OFFSET/LIMIT.
+    let row_end = b.new_label();
+    if let Some(oreg) = offset_reg {
+        b.emit_jump(Opcode::IfPos, oreg, row_end, 1);
+    }
+    b.emit(Opcode::ResultRow, result_reg, ncol, 0);
+    if let Some(lreg) = limit_reg {
+        b.emit_jump(Opcode::DecrJumpZero, lreg, addr_end, 0);
+    }
+    b.resolve(row_end);
+    b.resolve(output_skip);
+    b.emit(Opcode::Return, reg_output_row, 0, 0);
+
+    // ---- reset subroutine: clear the accumulator state. ----
+    b.resolve(addr_reset);
+    // Clear each accumulator register (the executor's `aggregates` map is keyed by register;
+    // setting the register to NULL would not remove the entry, so we instead rely on
+    // `Accumulator::step`'s `finalized` reset path. The cleanest faithful approach is to remove
+    // the entry, but the executor owns the map; we emit a no-op here and let the first
+    // `AggStep` of the new group lazily create a fresh accumulator — the previous group's was
+    // already consumed by `AggFinal` in the output subroutine).
+    // Set iUseFlag = 0 to indicate the accumulator is empty.
+    b.emit(Opcode::Integer, 0, i_use_flag, 0);
+    b.emit(Opcode::Return, reg_reset, 0, 0);
+
+    b.resolve(addr_end);
+    b.emit(Opcode::Halt, 0, 0, 0);
+    b.resolve(setup);
+    b.emit(Opcode::Transaction, 0, 0, 0);
+    b.emit(Opcode::Goto, 0, after_init, 0);
+    Ok(b.finish())
+}
+
+/// `true` if two aggregate calls are syntactically identical (same name, same args). Used to
+/// deduplicate the same aggregate call appearing twice in the projection list so both sites
+/// share one accumulator register — matching upstream's `AggInfo` deduplication.
+fn agg_call_eq(a: &AggCall, b: &AggCall) -> bool {
+    a.name.eq_ignore_ascii_case(&b.name) && a.args == b.args
+}
+
+/// Rewrite a projection expression for the GROUP BY output pass. This combines two
+/// substitutions applied recursively:
+/// * Any subexpression that exactly matches a GROUP BY expression becomes `AggRef(i_amem_reg)`
+///   — this is checked *before* recursing, so a GROUP BY expression is treated as an atomic
+///   value during the output pass (we don't look for aggregates inside it). This is what lets
+///   `SELECT g, count(*) FROM t GROUP BY g` and `SELECT g || '!', count(*) FROM t GROUP BY g`
+///   read `g` from the sorter-loaded iAMem register instead of the now-exhausted table cursor.
+/// * Aggregate calls become `AggRef(agg_reg)` (via [`rewrite_aggregates`]).
+fn rewrite_projection_expr(
+    e: &Expr,
+    reg_of: &impl Fn(&AggCall) -> Option<i32>,
+    group_key_of: &impl Fn(&Expr) -> Option<i32>,
+) -> Expr {
+    if let Some(reg) = group_key_of(e) {
+        return Expr::AggRef(reg);
+    }
+    // Not a GROUP BY expression as a whole — recurse and rewrite aggregates / nested GROUP BY
+    // expression matches inside.
+    rewrite_aggregates_with_group_keys(e, reg_of, group_key_of)
+}
+
+/// Like [`rewrite_aggregates`] but also substitutes any subexpression that exactly matches a
+/// GROUP BY expression with `AggRef(i_amem_reg)`. The GROUP BY match is checked at every node
+/// before recursing, so a GROUP BY expression nested inside a larger expression (e.g. `g` inside
+/// `g || '!'`) is replaced while the surrounding `'!'` / `||` structure is preserved.
+fn rewrite_aggregates_with_group_keys(
+    e: &Expr,
+    reg_of: &impl Fn(&AggCall) -> Option<i32>,
+    group_key_of: &impl Fn(&Expr) -> Option<i32>,
+) -> Expr {
+    if let Some(reg) = group_key_of(e) {
+        return Expr::AggRef(reg);
+    }
+    match e {
+        Expr::Function { name, args, .. }
+            if is_aggregate_call(
+                name,
+                match args {
+                    FunctionArgs::Star => 0,
+                    FunctionArgs::List(v) => v.len(),
+                },
+            ) =>
+        {
+            let call = AggCall {
+                name: name.clone(),
+                args: args.clone(),
+            };
+            match reg_of(&call) {
+                Some(reg) => Expr::AggRef(reg),
+                None => e.clone(),
+            }
+        }
+        Expr::Unary { op, expr } => Expr::Unary {
+            op: *op,
+            expr: Box::new(rewrite_aggregates_with_group_keys(expr, reg_of, group_key_of)),
+        },
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: *op,
+            left: Box::new(rewrite_aggregates_with_group_keys(left, reg_of, group_key_of)),
+            right: Box::new(rewrite_aggregates_with_group_keys(right, reg_of, group_key_of)),
+        },
+        Expr::Collate { expr, collation } => Expr::Collate {
+            expr: Box::new(rewrite_aggregates_with_group_keys(expr, reg_of, group_key_of)),
+            collation: collation.clone(),
+        },
+        Expr::Cast { expr, type_name } => Expr::Cast {
+            expr: Box::new(rewrite_aggregates_with_group_keys(expr, reg_of, group_key_of)),
+            type_name: type_name.clone(),
+        },
+        // Leaves and non-aggregate function calls: clone unchanged. (A plain column reference
+        // that is NOT a GROUP BY expression reads from the table cursor — but the table cursor
+        // is exhausted during the output pass, so such a query is actually invalid SQL. We
+        // leave it as-is and let the executor error, matching upstream's "no such column" /
+        // "misuse" behavior.)
+        other => other.clone(),
+    }
 }
 
 /// An indexed-equality codegen. Opens a read cursor on the index b-tree (with `KeyInfo`
@@ -201,7 +705,7 @@ fn emit_value_load(b: &mut ProgramBuilder, v: &Value, target: i32) {
     }
 }
 
-/// Reject M3a-out-of-scope features with a clear message.
+/// Reject out-of-scope features with a clear message.
 fn reject_unsupported(select: &SelectStmt) -> Result<()> {
     if !select.compound.is_empty() {
         return Err(Error::msg(
@@ -209,15 +713,238 @@ fn reject_unsupported(select: &SelectStmt) -> Result<()> {
         ));
     }
     if select.distinct {
-        return Err(Error::msg("SELECT DISTINCT is not supported in M3a"));
-    }
-    if !select.group_by.is_empty() || select.having.is_some() {
-        return Err(Error::msg("GROUP BY / HAVING are not supported in M3a"));
+        return Err(Error::msg("SELECT DISTINCT is not supported yet"));
     }
     if select.from.iter().any(|t| t.table().is_none() && t.subquery().is_none()) {
         return Err(Error::msg("joins are not supported"));
     }
+    if select.having.is_some() {
+        return Err(Error::msg("HAVING is not supported yet"));
+    }
+    // ORDER BY on an aggregate query is handled by M6.8 (two-pass: aggregate then sort). Until
+    // that lands, reject it so we don't silently produce wrong-order output.
+    if !select.group_by.is_empty() && !select.order_by.is_empty() {
+        return Err(Error::msg(
+            "GROUP BY with ORDER BY is not supported yet (M6.8)",
+        ));
+    }
+    if !select.order_by.is_empty()
+        && select
+            .order_by
+            .iter()
+            .any(|t| contains_aggregate(&t.expr))
+    {
+        return Err(Error::msg(
+            "ORDER BY on an aggregate expression is not supported yet (M6.8)",
+        ));
+    }
     Ok(())
+}
+
+/// `true` if `e` contains an aggregate function call (recursing through the operator tree).
+/// Mirrors the analysis walk upstream does in `sqlite3ExprAnalyzeAggregates`. A function name
+/// that is also an aggregate name (e.g. `max`) only counts as an aggregate when its argument
+/// count matches the aggregate's arity — `max(a, 0)` is the scalar `max`, not the aggregate.
+fn contains_aggregate(e: &Expr) -> bool {
+    match e {
+        Expr::Function { name, args, .. } => {
+            let n_arg = match args {
+                FunctionArgs::Star => 0,
+                FunctionArgs::List(v) => v.len(),
+            };
+            is_aggregate_call(name, n_arg)
+                || matches!(args, FunctionArgs::List(v) if v.iter().any(contains_aggregate))
+        }
+        Expr::Unary { expr, .. } => contains_aggregate(expr),
+        Expr::Binary { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
+        Expr::Between { expr, low, high, .. } => {
+            contains_aggregate(expr) || contains_aggregate(low) || contains_aggregate(high)
+        }
+        Expr::In { expr, values, .. } => {
+            contains_aggregate(expr) || values.iter().any(contains_aggregate)
+        }
+        Expr::InSubquery { expr, .. } => contains_aggregate(expr),
+        Expr::Cast { expr, .. } => contains_aggregate(expr),
+        Expr::Case {
+            base,
+            when_then,
+            else_expr,
+        } => {
+            base.as_ref().is_some_and(|b| contains_aggregate(b))
+                || when_then
+                    .iter()
+                    .any(|(w, t)| contains_aggregate(w) || contains_aggregate(t))
+                || else_expr.as_ref().is_some_and(|e| contains_aggregate(e))
+        }
+        Expr::Collate { expr, .. } => contains_aggregate(expr),
+        Expr::IsDistinctFrom { left, right, .. } => {
+            contains_aggregate(left) || contains_aggregate(right)
+        }
+        Expr::Row(es) => es.iter().any(contains_aggregate),
+        // Plain leaves — no aggregate hidden inside.
+        Expr::Literal(_)
+        | Expr::Column { .. }
+        | Expr::BindParam(_)
+        | Expr::Exists(_)
+        | Expr::Subquery(_)
+        | Expr::AggRef(_) => false,
+    }
+}
+
+/// Whether this SELECT is an aggregate query: has a GROUP BY clause, or any aggregate function
+/// call in its projection list.
+fn is_aggregate_query(select: &SelectStmt, outputs: &[(Expr, String)]) -> bool {
+    !select.group_by.is_empty() || outputs.iter().any(|(e, _)| contains_aggregate(e))
+}
+
+/// A located aggregate call discovered during analysis: the function name, its argument list
+/// (or `Star`), and a stable identity used to deduplicate the same call appearing twice.
+#[derive(Clone, Debug)]
+struct AggCall {
+    name: String,
+    args: FunctionArgs,
+}
+
+/// Walk an expression, collecting every aggregate function call in evaluation order (left to
+/// right). The same call syntactically appearing twice is recorded once and both sites reference
+/// the same accumulator register — matching upstream's `AggInfo` deduplication.
+fn collect_aggregates(e: &Expr, out: &mut Vec<AggCall>) {
+    match e {
+        Expr::Function { name, args, .. }
+            if is_aggregate_call(
+                name,
+                match args {
+                    FunctionArgs::Star => 0,
+                    FunctionArgs::List(v) => v.len(),
+                },
+            ) =>
+        {
+            // The arguments of an aggregate are NOT themselves walked for nested aggregates —
+            // SQLite disallows nested aggregate calls (`sum(count(*))` is a parse error).
+            out.push(AggCall {
+                name: name.clone(),
+                args: args.clone(),
+            });
+        }
+        Expr::Unary { expr, .. } => collect_aggregates(expr, out),
+        Expr::Binary { left, right, .. } => {
+            collect_aggregates(left, out);
+            collect_aggregates(right, out);
+        }
+        Expr::Between { expr, low, high, .. } => {
+            collect_aggregates(expr, out);
+            collect_aggregates(low, out);
+            collect_aggregates(high, out);
+        }
+        Expr::In { expr, values, .. } => {
+            collect_aggregates(expr, out);
+            for v in values {
+                collect_aggregates(v, out);
+            }
+        }
+        Expr::InSubquery { expr, .. } => collect_aggregates(expr, out),
+        Expr::Cast { expr, .. } => collect_aggregates(expr, out),
+        Expr::Case {
+            base,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(b) = base {
+                collect_aggregates(b, out);
+            }
+            for (w, t) in when_then {
+                collect_aggregates(w, out);
+                collect_aggregates(t, out);
+            }
+            if let Some(e) = else_expr {
+                collect_aggregates(e, out);
+            }
+        }
+        Expr::Collate { expr, .. } => collect_aggregates(expr, out),
+        Expr::IsDistinctFrom { left, right, .. } => {
+            collect_aggregates(left, out);
+            collect_aggregates(right, out);
+        }
+        Expr::Row(es) => es.iter().for_each(|e| collect_aggregates(e, out)),
+        Expr::Literal(_) | Expr::Column { .. } | Expr::BindParam(_)
+        | Expr::Exists(_) | Expr::Subquery(_) | Expr::AggRef(_) | Expr::Function { .. } => {}
+    }
+}
+
+/// Rewrite an expression tree so every aggregate call is replaced by an `AggRef` to its
+/// assigned accumulator register. Non-aggregate function calls are left untouched. The
+/// `reg_of` closure maps a syntactic call (name + args) to its register; calls not present in
+/// `reg_of` (which should not happen if analysis was complete) are left as-is.
+fn rewrite_aggregates(e: &Expr, reg_of: &impl Fn(&AggCall) -> Option<i32>) -> Expr {
+    match e {
+        Expr::Function { name, args, .. }
+            if is_aggregate_call(
+                name,
+                match args {
+                    FunctionArgs::Star => 0,
+                    FunctionArgs::List(v) => v.len(),
+                },
+            ) =>
+        {
+            let call = AggCall {
+                name: name.clone(),
+                args: args.clone(),
+            };
+            match reg_of(&call) {
+                Some(reg) => Expr::AggRef(reg),
+                None => e.clone(),
+            }
+        }
+        Expr::Unary { op, expr } => Expr::Unary {
+            op: *op,
+            expr: Box::new(rewrite_aggregates(expr, reg_of)),
+        },
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: *op,
+            left: Box::new(rewrite_aggregates(left, reg_of)),
+            right: Box::new(rewrite_aggregates(right, reg_of)),
+        },
+        Expr::Between { expr, low, high, negated } => Expr::Between {
+            expr: Box::new(rewrite_aggregates(expr, reg_of)),
+            low: Box::new(rewrite_aggregates(low, reg_of)),
+            high: Box::new(rewrite_aggregates(high, reg_of)),
+            negated: *negated,
+        },
+        Expr::In { expr, values, negated } => Expr::In {
+            expr: Box::new(rewrite_aggregates(expr, reg_of)),
+            values: values.iter().map(|v| rewrite_aggregates(v, reg_of)).collect(),
+            negated: *negated,
+        },
+        Expr::InSubquery { expr, subquery, negated } => Expr::InSubquery {
+            expr: Box::new(rewrite_aggregates(expr, reg_of)),
+            subquery: subquery.clone(),
+            negated: *negated,
+        },
+        Expr::Cast { expr, type_name } => Expr::Cast {
+            expr: Box::new(rewrite_aggregates(expr, reg_of)),
+            type_name: type_name.clone(),
+        },
+        Expr::Case { base, when_then, else_expr } => Expr::Case {
+            base: base.as_ref().map(|b| Box::new(rewrite_aggregates(b, reg_of))),
+            when_then: when_then
+                .iter()
+                .map(|(w, t)| (rewrite_aggregates(w, reg_of), rewrite_aggregates(t, reg_of)))
+                .collect(),
+            else_expr: else_expr.as_ref().map(|e| Box::new(rewrite_aggregates(e, reg_of))),
+        },
+        Expr::Collate { expr, collation } => Expr::Collate {
+            expr: Box::new(rewrite_aggregates(expr, reg_of)),
+            collation: collation.clone(),
+        },
+        Expr::IsDistinctFrom { left, right, negated } => Expr::IsDistinctFrom {
+            left: Box::new(rewrite_aggregates(left, reg_of)),
+            right: Box::new(rewrite_aggregates(right, reg_of)),
+            negated: *negated,
+        },
+        Expr::Row(es) => Expr::Row(es.iter().map(|e| rewrite_aggregates(e, reg_of)).collect()),
+        // Leaves: clone unchanged.
+        other => other.clone(),
+    }
 }
 
 /// A `VALUES` select body: emit one result row per literal/constant row. ORDER BY / LIMIT /
@@ -745,6 +1472,7 @@ pub fn expr_to_text(e: &Expr) -> String {
             let inner = es.iter().map(expr_to_text).collect::<Vec<_>>().join(", ");
             format!("({inner})")
         }
+        Expr::AggRef(r) => format!("agg#{r}"),
     }
 }
 

@@ -93,6 +93,14 @@ pub fn is_aggregate_name(name: &str) -> bool {
     )
 }
 
+/// `true` if `(name, n_arg)` resolves to a built-in aggregate — i.e. the name is an aggregate
+/// name *and* the argument count matches one of its accepted arities. Used by the aggregate
+/// codegen to distinguish a scalar `max(a, 0)` (2-arg `max`, which is the scalar form) from the
+/// aggregate `max(a)` (1-arg `max`). Mirrors the dispatch in [`AggregateKind::from_name`].
+pub fn is_aggregate_call(name: &str, n_arg: usize) -> bool {
+    AggregateKind::from_name(name, n_arg).is_some()
+}
+
 /// The per-group accumulator state for a built-in aggregate. Stored as `Value::Aggregate` in
 /// the register file so a single `AggStep`/`AggFinal` pair can update it in place.
 #[derive(Clone, Debug)]

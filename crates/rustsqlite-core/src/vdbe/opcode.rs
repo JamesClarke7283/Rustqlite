@@ -20,6 +20,21 @@ pub enum Opcode {
     Goto,
     /// `Halt`: stop execution and report the statement is done.
     Halt,
+    /// `Gosub p1 p2`: store the next instruction's address in `r[p1]` and jump to `p2`.
+    /// Mirrors `OP_Gosub` in `vdbe.c` — the subroutine-call opcode paired with `Return`.
+    Gosub,
+    /// `Return p1 p2 p3`: jump to the address stored in `r[p1]`. `p3 == 1` makes the jump
+    /// conditional on `r[p1]` being an integer (a no-op fall-through otherwise); `p3 == 0` is the
+    /// strict form (used after `Gosub`). `p2` is an EXPLAIN indentation hint, unused at runtime.
+    /// Mirrors `OP_Return` in `vdbe.c`.
+    Return,
+    /// `Compare p1 p2 p3 p4=KeyInfo`: compare `n=p3` registers starting at `r[p1]` against
+    /// `r[p2]` under the per-key collation in `p4`, leaving the result (`-1/0/+1`) in a hidden
+    /// `last_compare` cell that the immediately following `Jump` reads. Mirrors `OP_Compare`.
+    Compare,
+    /// `Jump p1 p2 p3`: route to `p1`/`p2`/`p3` depending on whether the most recent `Compare`
+    /// found the P1 vector less than, equal to, or greater than the P2 vector. Mirrors `OP_Jump`.
+    Jump,
 
     // --- transactions / schema ---
     /// `Transaction p1 p2`: begin a transaction on database `p1`. `p2 != 0` opens a WRITE
@@ -264,6 +279,10 @@ impl Opcode {
             Opcode::Init => "Init",
             Opcode::Goto => "Goto",
             Opcode::Halt => "Halt",
+            Opcode::Gosub => "Gosub",
+            Opcode::Return => "Return",
+            Opcode::Compare => "Compare",
+            Opcode::Jump => "Jump",
             Opcode::Transaction => "Transaction",
             Opcode::SetCookie => "SetCookie",
             Opcode::ParseSchema => "ParseSchema",

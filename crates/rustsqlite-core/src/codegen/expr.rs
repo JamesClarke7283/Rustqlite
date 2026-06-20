@@ -95,6 +95,12 @@ pub fn compile_expr(b: &mut ProgramBuilder, e: &Expr, target: i32, ctx: Ctx) -> 
         Expr::Row(_) => return Err(Error::msg(
             "row-value expressions are not supported by the executor yet",
         )),
+        Expr::AggRef(reg) => {
+            // A synthetic reference emitted by the aggregate codegen path: copy the
+            // accumulator's result register into the target. The accumulator register was
+            // filled by `AggFinal` during the per-group output pass.
+            b.emit(Opcode::SCopy, *reg, target, 0);
+        }
     }
     Ok(())
 }

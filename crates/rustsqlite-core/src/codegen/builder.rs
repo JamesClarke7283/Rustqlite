@@ -8,6 +8,8 @@
 use crate::vdbe::program::{Instruction, Program, P4};
 use crate::vdbe::Opcode;
 
+use std::collections::HashMap;
+
 /// A forward-jump target, resolved later with [`ProgramBuilder::resolve`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Label(usize);
@@ -85,17 +87,42 @@ impl ProgramBuilder {
         idx
     }
 
+    /// Emit a three-way jump (`OP_Jump`) whose `p1`, `p2`, and `p3` operands are all labels
+    /// patched at `finish`. Mirrors the `OP_Jump P1 P2 P3` form that follows an `OP_Compare`.
+    /// Registration order matches the apply order (p2 first, p1 second, p3 third), so we push
+    /// `l2` first to land in `p2`, then `l1` for `p1`, then `l3` for `p3`.
+    pub fn emit_jump3(&mut self, opcode: Opcode, l1: Label, l2: Label, l3: Label) -> usize {
+        let idx = self.emit(opcode, 0, 0, 0);
+        self.fixups.push((idx, l2));
+        self.fixups.push((idx, l1));
+        self.fixups.push((idx, l3));
+        idx
+    }
+
     /// Append a pre-built instruction directly, bypassing label fixup machinery.
     pub fn append(&mut self, inst: Instruction) {
         self.insts.push(inst);
     }
 
-    /// Finalize into a [`Program`], backpatching every labeled jump.
+    /// Finalize into a [`Program`], backpatching every labeled jump. A single instruction may
+    /// carry up to three label fixups; the first is applied to `p2` (the common single-jump case),
+    /// the second to `p1`, and the third to `p3` — matching the registration order used by
+    /// [`emit_jump`](Self::emit_jump) (one label → p2) and [`emit_jump3`](Self::emit_jump3)
+    /// (three labels → p1, p2, p3 in that order, so the second registration overwrites the p2
+    /// set by the first and the third sets p3).
     pub fn finish(mut self) -> Program {
+        let mut counts: HashMap<usize, usize> = HashMap::new();
         for (idx, label) in &self.fixups {
             let target =
                 self.label_addr[label.0].expect("every label must be resolved before finish()");
-            self.insts[*idx].p2 = target;
+            let n = counts.entry(*idx).or_insert(0);
+            match *n {
+                0 => self.insts[*idx].p2 = target,
+                1 => self.insts[*idx].p1 = target,
+                2 => self.insts[*idx].p3 = target,
+                _ => panic!("too many label fixups on one instruction"),
+            }
+            *n += 1;
         }
         Program {
             instructions: self.insts,

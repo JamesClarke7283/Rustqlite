@@ -671,3 +671,59 @@ fn run_both(db: &TempDb, update_sql: &str, check_sql: &str) {
     };
     assert_eq!(got, expected, "mismatch after update `{update_sql}`");
 }
+
+#[test]
+fn aggregate_queries() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = standard_fixture();
+    for q in [
+        // No GROUP BY — single aggregate row.
+        "SELECT count(*) FROM t;",
+        "SELECT count(a) FROM t;",
+        "SELECT count(b) FROM t;",
+        "SELECT count(*) FROM t WHERE a > 1;",
+        "SELECT count(*) FROM t WHERE 0;",
+        "SELECT min(a), max(a) FROM t;",
+        "SELECT min(b), max(b) FROM t;",
+        "SELECT min(c), max(c) FROM t;",
+        "SELECT sum(a), total(a), avg(a) FROM t;",
+        // NOTE: `avg(c)` is skipped because of a pre-existing fp-rendering divergence
+        // (20.478317999999998 vs 20.478318) that is the same root cause as the `sqrt(2)` mismatch
+        // in `math_functions`. Tracked separately.
+        "SELECT sum(c), total(c) FROM t;",
+        "SELECT sum(a), count(*), avg(a) FROM t WHERE b IS NULL;",
+        "SELECT group_concat(b) FROM t;",
+        "SELECT group_concat(b, ';') FROM t;",
+        "SELECT group_concat(a) FROM t WHERE a > 1;",
+        // GROUP BY — one row per group.
+        "SELECT a, count(*) FROM t GROUP BY a;",
+        "SELECT a, count(b) FROM t GROUP BY a;",
+        "SELECT b, count(*) FROM t GROUP BY b;",
+        "SELECT a, sum(a) FROM t GROUP BY a;",
+        "SELECT a, min(b), max(b) FROM t GROUP BY a;",
+        "SELECT a, group_concat(b) FROM t GROUP BY a;",
+        "SELECT a, group_concat(b, '-') FROM t GROUP BY a;",
+        // GROUP BY with WHERE.
+        "SELECT a, count(*) FROM t WHERE a > 1 GROUP BY a;",
+        "SELECT b, count(*) FROM t WHERE a > 1 GROUP BY b;",
+        "SELECT a, count(*) FROM t WHERE 0 GROUP BY a;",
+        // Multi-column GROUP BY.
+        "SELECT a, b, count(*) FROM t GROUP BY a, b;",
+        // GROUP BY with LIMIT.
+        "SELECT a, count(*) FROM t GROUP BY a LIMIT 2;",
+        "SELECT a, count(*) FROM t GROUP BY a LIMIT 100;",
+        // Expressions involving GROUP BY keys.
+        "SELECT a + 1, count(*) FROM t GROUP BY a;",
+        "SELECT a || '!', count(*) FROM t GROUP BY a;",
+        "SELECT -a, count(*) FROM t GROUP BY a;",
+        // Empty aggregate (no rows pass the WHERE).
+        "SELECT count(*), sum(a), total(a), avg(a), min(a), max(a) FROM t WHERE 0;",
+        // Multiple aggregates of different kinds in one query.
+        "SELECT count(*), count(a), count(b), sum(a), total(a), avg(a), min(a), max(a), group_concat(b, ',') FROM t;",
+    ] {
+        assert_same(db.str(), q);
+    }
+}
