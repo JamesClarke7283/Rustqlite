@@ -316,22 +316,22 @@ list every granular item needed.
 
 ## M16 — Triggers
 
-- [ ] **16.1** Parser: `CREATE [TEMP] TRIGGER … BEFORE|AFTER|INSTEAD OF INSERT|UPDATE|DELETE ON tbl …`
-- [ ] **16.2** Parser: `DROP TRIGGER [IF EXISTS] name`
-- [ ] **16.3** Parser: trigger body (`BEGIN … END` with INSERT/UPDATE/DELETE/SELECT statements)
-- [ ] **16.4** Parser: `WHEN expr` trigger condition
-- [ ] **16.5** Parser: `FOR EACH ROW` clause
-- [ ] **16.6** Parser: `RAISE (IGNORE|ROLLBACK|ABORT|FAIL)` inside trigger body
-- [ ] **16.7** Codegen: `CREATE TRIGGER` — store trigger definition in `sqlite_schema` (type='trigger')
-- [ ] **16.8** Codegen: `DROP TRIGGER` — remove entry, invalidate schema
-- [ ] **16.9** Trigger firing: before/after INSERT/UPDATE/DELETE, compile trigger body as sub-VDBE (`Program` opcode)
-- [ ] **16.10** VDBE: `Program` opcode — execute sub-VDBE (trigger program)
-- [ ] **16.11** VDBE: `Param` opcode — pass NEW/OLD row references to trigger program
-- [ ] **16.12** `OLD` and `NEW` row references inside trigger body
-- [ ] **16.13** `RAISE(IGNORE)` — skip the current triggering statement row
-- [ ] **16.14** `RAISE(ROLLBACK/ABORT/FAIL)` — raise constraint error
-- [ ] **16.15** Recursive trigger guard (`PRAGMA recursive_triggers`)
-- [ ] **16.16** VDBE: `Trigger` / `DropTrigger` opcodes
+- [x] **16.1** Parser: `CREATE [TEMP] TRIGGER … BEFORE|AFTER|INSTEAD OF INSERT|UPDATE|DELETE ON tbl …`
+- [x] **16.2** Parser: `DROP TRIGGER [IF EXISTS] name`
+- [x] **16.3** Parser: trigger body (`BEGIN … END` with INSERT/UPDATE/DELETE/SELECT statements)
+- [x] **16.4** Parser: `WHEN expr` trigger condition
+- [x] **16.5** Parser: `FOR EACH ROW` clause
+- [x] **16.6** Parser: `RAISE (IGNORE|ROLLBACK|ABORT|FAIL)` inside trigger body
+- [x] **16.7** Codegen: `CREATE TRIGGER` — store trigger definition in `sqlite_schema` (type='trigger')
+- [x] **16.8** Codegen: `DROP TRIGGER` — remove entry, invalidate schema
+- [ ] **16.9** Trigger firing: before/after INSERT/UPDATE/DELETE, compile trigger body as sub-VDBE (`Program` opcode) [BLOCKED: deferred — requires the codegen to detect triggers on the target table, compile each trigger body as a sub-VDBE, and invoke it via `OP_Program` with `OLD`/`NEW` row registers passed via `OP_Param`. The `OP_Program`/`OP_Param` opcodes are already implemented (M8.10/M8.11); the trigger-firing codegen integration is the remaining work.]
+- [x] **16.10** VDBE: `Program` opcode — execute sub-VDBE (trigger program) — already implemented in M8.10
+- [x] **16.11** VDBE: `Param` opcode — pass NEW/OLD row references to trigger program — already implemented in M8.11
+- [ ] **16.12** `OLD` and `NEW` row references inside trigger body [BLOCKED: deferred — part of trigger firing (M16.9)]
+- [ ] **16.13** `RAISE(IGNORE)` — skip the current triggering statement row [BLOCKED: deferred — part of trigger firing (M16.9)]
+- [ ] **16.14** `RAISE(ROLLBACK/ABORT/FAIL)` — raise constraint error [BLOCKED: deferred — part of trigger firing (M16.9)]
+- [ ] **16.15** Recursive trigger guard (`PRAGMA recursive_triggers`) [BLOCKED: deferred — part of trigger firing (M16.9)]
+- [ ] **16.16** VDBE: `Trigger` / `DropTrigger` opcodes [BLOCKED: deferred — the CREATE/DROP TRIGGER DDL is handled via direct sqlite_schema row manipulation (M16.7/M16.8); dedicated opcodes are not needed for the DDL path]
 
 ---
 

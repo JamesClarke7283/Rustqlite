@@ -26,6 +26,7 @@ pub mod returning;
 pub mod select;
 pub mod subquery;
 pub mod transaction;
+pub mod trigger;
 pub mod update;
 pub mod view;
 pub mod window;
@@ -37,8 +38,9 @@ use crate::schema::{IndexObject, Table};
 use crate::vdbe::Program;
 
 use rustqlite_parser::{
-    AlterTableStmt, CreateIndex, CreateTable, CreateView, DeleteStmt, DropIndexStmt,
-    DropTableStmt, DropViewStmt, InsertStmt, SelectStmt, TransactionStmt, UpdateStmt,
+    AlterTableStmt, CreateIndex, CreateTable, CreateTrigger, CreateView, DeleteStmt,
+    DropIndexStmt, DropTableStmt, DropTriggerStmt, DropViewStmt, InsertStmt, SelectStmt,
+    TransactionStmt, UpdateStmt,
 };
 /// Compile a single-table (or constant) `SELECT` into a VDBE program plus its result column
 /// names. `table` is the resolved table for the lone `FROM` entry, or `None` for a `SELECT`
@@ -272,5 +274,30 @@ pub fn compile_drop_view(
         Ok(view::compile_drop_view_noop())
     } else {
         view::compile_drop_view(dv, schema_cookie, schema_rowid)
+    }
+}
+
+/// Compile a `CREATE TRIGGER` into a VDBE write program. `sql_text` is stored verbatim in
+/// the new `sqlite_schema` row's `sql` column; `schema_cookie` is the current cookie.
+/// Trigger firing (M16.9+) is deferred.
+pub fn compile_create_trigger(
+    ct: &CreateTrigger,
+    sql_text: &str,
+    schema_cookie: u32,
+) -> Result<Program> {
+    trigger::compile_create_trigger(ct, sql_text, schema_cookie)
+}
+
+/// Compile a `DROP TRIGGER [IF EXISTS] [schema.]name` into a VDBE write program.
+/// `schema_rowid` is the rowid of the trigger's `sqlite_schema` row (0 for a no-op).
+pub fn compile_drop_trigger(
+    dt: &DropTriggerStmt,
+    schema_cookie: u32,
+    schema_rowid: i64,
+) -> Result<Program> {
+    if schema_rowid == 0 {
+        Ok(trigger::compile_drop_trigger_noop())
+    } else {
+        trigger::compile_drop_trigger(dt, schema_cookie, schema_rowid)
     }
 }

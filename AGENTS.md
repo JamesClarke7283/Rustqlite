@@ -821,3 +821,18 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   EXISTS, collision error, DROP VIEW, IF EXISTS, nonexistent error). Still M15+: 15.5
   view expansion (substituting a view's SELECT body when it appears in FROM), 15.6
   `sqlite_master` alias, 15.7 `INSTEAD OF` triggers (depends on M16).
+- **M16 — Triggers** 🚧: **16.1–16.6** ✅ (parser shipped in M2.31/M2.32). **16.7 `CREATE
+  TRIGGER`** ✅ / **16.8 `DROP TRIGGER`** ✅: `codegen::trigger::compile_create_trigger`
+  (mirrors `sqlite3CreateTrigger` in `build.c`/`trigger.c`) writes a `sqlite_schema` row
+  with `type='trigger'`, `tbl_name=<table>`, `rootpage=0`, and the verbatim CREATE TRIGGER
+  text; `compile_drop_trigger` removes the row. The resolver validates the target table
+  exists, rejects name collisions, and handles `IF NOT EXISTS`/`IF EXISTS`. **16.10
+  `OP_Program`** ✅ / **16.11 `OP_Param`** ✅ (already implemented in M8.10/M8.11 — the
+  runtime infrastructure for trigger sub-VDBE execution). Still M16+: 16.9 trigger firing
+  (detecting triggers on the target table, compiling each trigger body as a sub-VDBE,
+  invoking it via `OP_Program` with `OLD`/`NEW` row registers), 16.12 `OLD`/`NEW`
+  references, 16.13 `RAISE(IGNORE)`, 16.14 `RAISE(ROLLBACK/ABORT/FAIL)`, 16.15
+  `PRAGMA recursive_triggers`, 16.16 dedicated `Trigger`/`DropTrigger` opcodes (the DDL
+  path uses direct `sqlite_schema` row manipulation). Differential-tested vs the C oracle
+  (`create_trigger_*` / `drop_trigger_*` — schema row, IF NOT EXISTS, collision error,
+  nonexistent-table error, DROP TRIGGER, IF EXISTS, nonexistent error).

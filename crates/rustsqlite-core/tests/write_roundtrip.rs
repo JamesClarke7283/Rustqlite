@@ -2234,3 +2234,125 @@ fn drop_view_nonexistent_errors() {
         let _ = conn;
     }
 }
+
+#[test]
+fn create_trigger_writes_schema_row() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("create_trigger");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a);");
+        exec(&mut conn, "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END;");
+
+        // The trigger is present in sqlite_schema with type='trigger' and rootpage=0.
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT type, name, tbl_name, rootpage FROM sqlite_schema WHERE name='tr';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![
+            Value::Text("trigger".to_string()),
+            Value::Text("tr".to_string()),
+            Value::Text("t".to_string()),
+            Value::Int(0),
+        ]]);
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT type, name, tbl_name, rootpage FROM sqlite_schema WHERE name='tr';"), "trigger|tr|t|0");
+}
+
+#[test]
+fn create_trigger_nonexistent_table_errors() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("create_trigger_no_table");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let result = sqlite3_prepare_v2(&mut conn, "CREATE TRIGGER tr AFTER INSERT ON nope BEGIN SELECT 1; END;");
+        assert!(result.is_err(), "expected error for trigger on nonexistent table");
+        let _ = conn;
+    }
+}
+
+#[test]
+fn create_trigger_if_not_exists_is_noop() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("create_trigger_if_not_exists");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a);");
+        exec(&mut conn, "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END;");
+        exec(&mut conn, "CREATE TRIGGER IF NOT EXISTS tr AFTER INSERT ON t BEGIN SELECT 1; END;");
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT count(*) FROM sqlite_schema WHERE name='tr';"), "1");
+}
+
+#[test]
+fn create_trigger_collision_errors() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("create_trigger_collision");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a);");
+        exec(&mut conn, "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END;");
+        let result = sqlite3_prepare_v2(&mut conn, "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END;");
+        assert!(result.is_err(), "expected error for duplicate trigger name");
+        let _ = conn;
+    }
+}
+
+#[test]
+fn drop_trigger_removes_schema_row() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("drop_trigger");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a);");
+        exec(&mut conn, "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END;");
+        exec(&mut conn, "DROP TRIGGER tr;");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT count(*) FROM sqlite_schema WHERE name='tr';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(0)]]);
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT count(*) FROM sqlite_schema WHERE name='tr';"), "0");
+}
+
+#[test]
+fn drop_trigger_if_exists_missing_is_noop() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("drop_trigger_if_exists");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a);");
+        exec(&mut conn, "DROP TRIGGER IF EXISTS nope;");
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+}
+
+#[test]
+fn drop_trigger_nonexistent_errors() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("drop_trigger_nonexistent");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let result = sqlite3_prepare_v2(&mut conn, "DROP TRIGGER nope;");
+        assert!(result.is_err(), "expected error for dropping nonexistent trigger");
+        let _ = conn;
+    }
+}

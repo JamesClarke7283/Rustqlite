@@ -508,13 +508,79 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 last_error: None,
             })
         }
-        Stmt::CreateTrigger(_) => {
-            // CREATE TRIGGER parsing is implemented (M2.31) but codegen is deferred to M16.
-            Err(Error::msg("CREATE TRIGGER is not supported yet"))
+        Stmt::CreateTrigger(ct) => {
+            // CREATE TRIGGER: write a sqlite_schema row with type='trigger', rootpage=0,
+            // and the verbatim CREATE TRIGGER text. Trigger firing (M16.9+) is deferred.
+            let pager = db.ensure_pager()?;
+            let catalog = block_on(read_catalog(&pager))?;
+            // The target table must exist.
+            if catalog.find_table(&ct.table).is_none() {
+                return Err(Error::msg(format!("no such table: {}", ct.table)));
+            }
+            // IF NOT EXISTS against a pre-existing trigger is a no-op.
+            if ct.if_not_exists && catalog.find_object(&ct.name).is_some() {
+                return Ok(Sqlite3Stmt {
+                    sql: sql.to_string(),
+                    program: Arc::new(Program::empty()),
+                    column_names: Vec::new(),
+                    backing: Backing::Vdbe(vdbe_for(Arc::new(Program::empty()), None, db)),
+                    explain: 0,
+                    counts: Some(db.counts_handle()),
+                    last_error: None,
+                });
+            }
+            // Reject if an object with this name already exists.
+            if catalog.find_object(&ct.name).is_some() {
+                return Err(Error::msg(format!(
+                    "there is already another table or index with this name: {}",
+                    ct.name
+                )));
+            }
+            let schema_cookie = schema_cookie(&pager);
+            let sql_text = create_table_text(sql);
+            let program = Arc::new(codegen::compile_create_trigger(&ct, sql_text, schema_cookie)?);
+            let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
+            Ok(Sqlite3Stmt {
+                sql: sql.to_string(),
+                program,
+                column_names: Vec::new(),
+                backing: Backing::Vdbe(vdbe),
+                explain: 0,
+                counts: Some(db.counts_handle()),
+                last_error: None,
+            })
         }
-        Stmt::DropTrigger(_) => {
-            // DROP TRIGGER parsing is implemented (M2.32) but codegen is deferred to M16.
-            Err(Error::msg("DROP TRIGGER is not supported yet"))
+        Stmt::DropTrigger(dt) => {
+            // DROP TRIGGER: resolve the trigger's sqlite_schema rowid, then compile a write
+            // program that deletes it. IF EXISTS against a missing trigger is a no-op.
+            let pager = db.pager_arc()?;
+            let catalog = block_on(read_catalog(&pager))?;
+            let mut schema_rowid = 0i64;
+            let mut found = false;
+            for obj in &catalog.objects {
+                if obj.obj_type == "trigger"
+                    && dequote_ident(&obj.name).eq_ignore_ascii_case(&dequote_ident(&dt.name))
+                {
+                    schema_rowid = obj.rowid;
+                    found = true;
+                    break;
+                }
+            }
+            if !found && !dt.if_exists {
+                return Err(Error::msg(format!("no such trigger: {}", dt.name)));
+            }
+            let schema_cookie = schema_cookie(&pager);
+            let program = Arc::new(codegen::compile_drop_trigger(&dt, schema_cookie, schema_rowid)?);
+            let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
+            Ok(Sqlite3Stmt {
+                sql: sql.to_string(),
+                program,
+                column_names: Vec::new(),
+                backing: Backing::Vdbe(vdbe),
+                explain: 0,
+                counts: Some(db.counts_handle()),
+                last_error: None,
+            })
         }
         Stmt::Pragma(pragma) => {
             // PRAGMA codegen is implemented inline here for the auto_vacuum family

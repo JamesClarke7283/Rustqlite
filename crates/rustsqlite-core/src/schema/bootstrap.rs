@@ -54,3 +54,17 @@ pub fn view_schema_row(name: &str, sql: &str) -> Vec<Value> {
         Value::Text(sql.to_string()),
     ]
 }
+
+/// Build the five-value `sqlite_schema` row for a `CREATE TRIGGER`:
+/// `('trigger', name, tbl_name, 0, sql)`. The `rootpage` is 0 because a trigger has no
+/// b-tree (it is a saved program fired by row events). The `tbl_name` is the table the
+/// trigger is attached to.
+pub fn trigger_schema_row(name: &str, tbl_name: &str, sql: &str) -> Vec<Value> {
+    vec![
+        Value::Text("trigger".to_string()),
+        Value::Text(name.to_string()),
+        Value::Text(tbl_name.to_string()),
+        Value::Int(0),
+        Value::Text(sql.to_string()),
+    ]
+}
