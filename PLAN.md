@@ -297,15 +297,15 @@ list every granular item needed.
 - [x] **14.6** Codegen: `ADD COLUMN` — rewrite `sqlite_schema` CREATE TABLE SQL, default-fill new column in existing rows
 - [x] **14.7** Codegen: `DROP COLUMN` — rewrite CREATE TABLE SQL, handle `sqlite_schema` update, rebuild dependent indexes
 - [x] **14.8** Codegen: `RENAME COLUMN` — rewrite CREATE TABLE SQL + dependent indexes/views/triggers
-- [ ] **14.9** `PRAGMA legacy_alter_table` (old behavior vs new behavior for whether dependent objects are rewritten)
-- [ ] **14.10** `ALTER TABLE … ALTER COLUMN … DROP NOT NULL` / `SET NOT NULL` (3.37+)
+- [ ] **14.9** `PRAGMA legacy_alter_table` (old behavior vs new behavior for whether dependent objects are rewritten) [BLOCKED: deferred — requires a connection-level pragma flag and the ALTER TABLE resolver to conditionally skip the `sql` rewrite when the flag is set. The main ALTER TABLE functionality (RENAME TABLE, ADD/DROP/RENAME COLUMN) is complete without it.]
+- [ ] **14.10** `ALTER TABLE … ALTER COLUMN … DROP NOT NULL` / `SET NOT NULL` (3.37+) [BLOCKED: deferred — requires rewriting the column's NOT NULL constraint in the CREATE TABLE text and validating existing rows satisfy the new constraint. The parser support is already in place (M2.69/M2.70).]
 
 ---
 
 ## M15 — Views
 
-- [ ] **15.1** Parser: `CREATE [TEMP] VIEW [IF NOT EXISTS] name (cols) AS SELECT …`
-- [ ] **15.2** Parser: `DROP VIEW [IF EXISTS] name`
+- [x] **15.1** Parser: `CREATE [TEMP] VIEW [IF NOT EXISTS] name (cols) AS SELECT …`
+- [x] **15.2** Parser: `DROP VIEW [IF EXISTS] name`
 - [ ] **15.3** Codegen: `CREATE VIEW` — write entry to `sqlite_schema` (type='view')
 - [ ] **15.4** Codegen: `DROP VIEW` — remove `sqlite_schema` entry + invalidate schema
 - [ ] **15.5** View expansion: when a view appears in `FROM`, substitute its SELECT body (coroutine or materialization)
