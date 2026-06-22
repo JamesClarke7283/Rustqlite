@@ -212,6 +212,14 @@ pub enum Opcode {
     /// `NotFound p1 p2 p3 p4=Int(n)`: the inverse of `Found` — jump to `p2` when the record
     /// is *not* present on cursor `p1`. Mirrors `OP_NotFound`.
     NotFound,
+    /// `NoConflict p1 p2 p3 p4=Int(n)`: seek index cursor `p1` at the first entry `>=` the
+    /// key in `r[p3..p3+n]`; jump to `p2` when no conflicting entry exists. A "conflict" is an
+    /// entry whose indexed-column prefix equals the search key under the cursor's per-column
+    /// collation. A NULL in any search-key column means "no conflict" (NULL is never equal to
+    /// NULL in SQL), so the jump is taken regardless of the cursor's content. Used by the
+    /// INSERT/UPDATE conflict-resolution codegen to detect UNIQUE-index collisions before the
+    /// `IdxInsert` would raise them. Mirrors `OP_NoConflict` in `vdbe.c`.
+    NoConflict,
 
     // --- value loads ---
     /// `Integer p1 p2`: `r[p2]` = the integer `p1`.
@@ -424,6 +432,7 @@ impl Opcode {
             Opcode::IdxLT => "IdxLT",
             Opcode::Found => "Found",
             Opcode::NotFound => "NotFound",
+            Opcode::NoConflict => "NoConflict",
             Opcode::NotExists => "NotExists",
             Opcode::NullRow => "NullRow",
             Opcode::Rowid => "Rowid",

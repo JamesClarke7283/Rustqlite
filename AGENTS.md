@@ -593,6 +593,29 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   statement fails with `SQLITE_BUSY`). `begin_write` ensures a SHARED lock is held before
   escalating to RESERVED/EXCLUSIVE. Differential-tested vs the C oracle (3 new cross-
   connection cases in `transactions.rs`: BEGIN IMMEDIATE blocks BEGIN IMMEDIATE, BEGIN
-  EXCLUSIVE blocks BEGIN EXCLUSIVE + SELECT, BEGIN IMMEDIATE allows reads). Still M12:
-  12.8–12.9 conflict resolution (`OR ROLLBACK`/`OR FAIL`/`OR IGNORE`/`OR REPLACE`) and
-  `ON CONFLICT` column/table constraints.
+  EXCLUSIVE blocks BEGIN EXCLUSIVE + SELECT, BEGIN IMMEDIATE allows reads). **12.8
+  `OR ROLLBACK`/`OR FAIL`/`OR IGNORE`/`OR REPLACE` conflict resolution** ✅: the codegen
+  threads the parsed `or_action` through a new `OeAction` enum (`vdbe::oe`, mirroring the
+  `OE_*` macros in `sqliteInt.h`) and sets it on `Program::default_oe` so the executor's
+  `step()` knows how to clean up on a constraint violation. `OR IGNORE` and `OR REPLACE` are
+  handled at codegen time via a new `OP_NoConflict` opcode (mirrors `OP_NoConflict` in
+  `vdbe.c`) that pre-checks each unique index BEFORE the table `Insert`: IGNORE jumps past
+  the row on conflict (no table row written); REPLACE fetches the conflicting row's rowid via
+  `IdxRowid`, seeks the table cursor to it via `NotExists`, deletes its entries from every
+  index via `IdxDelete`, deletes the table row, then falls through to the new `Insert` +
+  `IdxInsert`s (which now won't conflict). `OR ABORT` (the default), `OR FAIL`, and
+  `OR ROLLBACK` are handled by `step()`'s error path: ABORT rolls back just the statement's
+  changes (via an implicit statement savepoint opened by `OP_Transaction` when inside an
+  explicit `BEGIN`, or a full rollback under autocommit); FAIL keeps all prior changes
+  (including earlier rows from the same statement); ROLLBACK rolls back the entire
+  transaction. The statement savepoint (`__rustqlite_stmt_abort`) is released on success by
+  `OP_Halt`. `NoConflict`/`Found`/`NotFound` now work on real index b-tree cursors (not
+  just ephemeral) by seeking the main cursor and comparing the entry's prefix. UPDATE
+  supports `OR ROLLBACK`/`ABORT`/`FAIL` (sets `default_oe`); `OR IGNORE`/`OR REPLACE` on
+  UPDATE is rejected at codegen time (needs the same pre-check shape threaded through the
+  two-pass sorter — deferred to a follow-up). Differential-tested vs the C oracle (7 new
+  cases in `write_roundtrip.rs`: OR IGNORE skips conflicting rows, OR REPLACE deletes + 
+  re-inserts, OR REPLACE with secondary index, OR FAIL keeps prior rows, OR ROLLBACK in
+  explicit transaction, OR ABORT in explicit transaction, default ABORT in explicit
+  transaction). Still M12: 12.9 `ON CONFLICT` column/table constraints (unique, not null,
+  check) triggering constraint abort vs ignore.

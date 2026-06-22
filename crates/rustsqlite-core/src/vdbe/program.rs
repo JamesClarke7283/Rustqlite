@@ -94,6 +94,12 @@ pub struct Program {
     /// codegen to advance the outer builder's `next_cursor` after inlining a sub-program so a
     /// subsequent inlined sub-program's cursors land in a free range.
     pub num_cursors: usize,
+    /// The default conflict-resolution action (`OE_Abort` by default; `OE_Ignore`/`OE_Replace`/
+    /// `OE_Fail`/`OE_Rollback` for `INSERT OR …` / `UPDATE OR …`). The executor consults this
+    /// when a constraint violation propagates as an error from `IdxInsert`/`HaltIfNull` so the
+    /// correct statement-vs-transaction cleanup runs in `step()`. Mirrors the `pParse->onError`
+    /// field that upstream's `sqlite3VdbeHalt` reads via `p->errorAction`.
+    pub default_oe: u8,
 }
 
 impl Program {

@@ -771,6 +771,20 @@ impl Pager {
             .position(|s| s.name.eq_ignore_ascii_case(name))
     }
 
+    /// Drop every savepoint named `name` and any nested inside it (engine-internal helper for
+    /// the implicit statement savepoint: clears a stale entry from a prior errored statement
+    /// before opening a fresh one). Returns the number of entries dropped.
+    pub fn drop_savepoint_named(&self, name: &str) -> usize {
+        let mut savepoints = self.savepoints.lock().unwrap();
+        if let Some(idx) = savepoints.iter().position(|s| s.name == name) {
+            let dropped = savepoints.len() - idx;
+            savepoints.truncate(idx);
+            dropped
+        } else {
+            0
+        }
+    }
+
     /// Find the index of the savepoint named `name` (case-insensitive, matching upstream's
     /// `sqlite3StrICmp`). The index is from the OUTERMOST savepoint (0 = first created), so it
     /// matches `iSavepoint` as passed to `sqlite3BtreeSavepoint`/`sqlite3PagerSavepoint` in

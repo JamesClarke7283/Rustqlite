@@ -23,6 +23,7 @@ use crate::codegen::update::compile_pred_jump;
 use crate::error::{Error, Result};
 use crate::schema::{IndexObject, Table};
 use crate::types::Affinity;
+use crate::vdbe::oe::OeAction;
 use crate::vdbe::program::{Program, P4, P5_NCHANGE, P5_UNIQUE};
 use crate::vdbe::Opcode;
 
@@ -98,7 +99,9 @@ fn compile_insert_values(
         index_read: None,
         subquery_resolver: None,
     };
+    let oe = OeAction::from_parser(ins.or_action);
     let mut b = ProgramBuilder::new();
+    b.set_default_oe(oe as u8);
 
     let returning = ins
         .returning
@@ -177,6 +180,28 @@ fn compile_insert_values(
             b.emit(Opcode::NewRowid, cursor, rowid_reg, 0);
         }
 
+        // Conflict-resolution pre-checks (IGNORE / REPLACE only). For IGNORE, on conflict we
+        // jump to `row_skip` — BEFORE the table Insert — so the conflicting row is never
+        // written. For REPLACE, on conflict we delete the existing row (from the table and
+        // every index) and fall through to the new Insert. For the default ABORT/FAIL/
+        // ROLLBACK, no pre-check is emitted here; the `IdxInsert` below raises the constraint
+        // error and `step()` does the right cleanup. Mirrors the order in upstream's
+        // `sqlite3GenerateConstraintChecks` (constraint checks before the table Insert).
+        let row_skip = b.new_label();
+        if matches!(oe, OeAction::Ignore | OeAction::Replace) {
+            emit_conflict_prechecks(
+                &mut b,
+                indexes,
+                table,
+                rec_start,
+                rowid_reg,
+                index_cursor_base,
+                cursor,
+                oe,
+                row_skip,
+            )?;
+        }
+
         let record = b.alloc_reg();
         b.emit(Opcode::MakeRecord, rec_start, ncol as i32, record);
         b.emit(Opcode::Insert, cursor, record, rowid_reg);
@@ -196,6 +221,8 @@ fn compile_insert_values(
             }
             ret.emit_buffer_row(&mut b, table, cursor, rec_start)?;
         }
+
+        b.resolve(row_skip);
     }
 
     if let Some(ref ret) = returning {
@@ -273,7 +300,9 @@ fn compile_insert_without_rowid(
         index_read: None,
         subquery_resolver: None,
     };
+    let oe = OeAction::from_parser(ins.or_action);
     let mut b = ProgramBuilder::new();
+    b.set_default_oe(oe as u8);
 
     let returning = ins
         .returning
@@ -521,7 +550,9 @@ fn compile_insert_default_values(
         index_read: None,
         subquery_resolver: None,
     };
+    let oe = OeAction::from_parser(ins.or_action);
     let mut b = ProgramBuilder::new();
+    b.set_default_oe(oe as u8);
 
     let setup = b.new_label();
     b.emit_jump(Opcode::Init, 0, setup, 0); // addr 0
@@ -656,7 +687,9 @@ fn compile_insert_select(
 
     let cursor = 0i32;
     let sorter = 1i32;
+    let oe = OeAction::from_parser(ins.or_action);
     let mut b = ProgramBuilder::new();
+    b.set_default_oe(oe as u8);
 
     let setup = b.new_label();
     let after_init = b.new_label();
@@ -926,6 +959,154 @@ fn validate_indexes(table: &Table, indexes: &[IndexObject]) -> Result<()> {
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+/// Emit the pre-table-Insert conflict checks for `OE_Ignore` and `OE_Replace` (mirrors the
+/// UNIQUE-index section of `sqlite3GenerateConstraintChecks` in `insert.c`). For each unique
+/// index, build the new key's prefix registers, emit `NoConflict` to jump to `no_conflict`
+/// when no existing entry matches, and on conflict:
+///
+/// * `OE_Ignore`: jump to `row_skip` (the caller resolves it past the table Insert + index
+///   inserts + RETURNING buffering, so the conflicting row is never written).
+/// * `OE_Replace`: fetch the conflicting row's rowid via `IdxRowid`, seek the table cursor
+///   to it, delete its entries from every index, delete the table row, then fall through
+///   (the subsequent table Insert + IdxInserts will now succeed because the conflict is gone).
+///
+/// For the default `OE_Abort`/`OE_Fail`/`OE_Rollback` this helper is not called — the
+/// `IdxInsert` opcode raises the constraint error itself and `step()` does the cleanup.
+fn emit_conflict_prechecks(
+    b: &mut ProgramBuilder,
+    indexes: &[IndexObject],
+    table: &Table,
+    rec_start: i32,
+    rowid_reg: i32,
+    index_cursor_base: i32,
+    table_cursor: i32,
+    oe: OeAction,
+    row_skip: super::builder::Label,
+) -> Result<()> {
+    for (i, idx) in indexes.iter().enumerate() {
+        if !idx.unique {
+            continue;
+        }
+        let ic = index_cursor_base + i as i32;
+        let indexed_cis = idx.table_column_indices(table)?;
+        let nfield = idx.nkey_fields() as i32;
+        let nkey = nfield + 1;
+
+        // Build the new key prefix registers (the indexed columns; the trailing rowid is
+        // included for IdxRowid/IdxDelete but not for the NoConflict probe's field count).
+        let key_start = b.alloc_regs(nkey);
+        let mut plain_iter = indexed_cis.iter();
+        for (j, icol) in idx.columns.iter().enumerate() {
+            let target = key_start + j as i32;
+            if let Some(expr) = &icol.expr {
+                let expr_ctx = Ctx {
+                    table,
+                    cursor: 0,
+                    register_base: Some(rec_start), join_tables: None,
+                    index_read: None,
+                    subquery_resolver: None,
+                };
+                compile_expr(b, expr, target, expr_ctx)?;
+            } else {
+                let col_idx = *plain_iter
+                    .next()
+                    .expect("plain column aligned with indexed_cis");
+                b.emit(Opcode::SCopy, rec_start + col_idx as i32, target, 0);
+            }
+        }
+        b.emit(Opcode::SCopy, rowid_reg, key_start + nfield, 0);
+
+        let no_conflict = b.new_label();
+        let nc = b.emit_jump(Opcode::NoConflict, ic, no_conflict, key_start);
+        b.set_p4(nc, P4::Int(nfield as i64));
+
+        // Fall-through: conflict on this index.
+        match oe {
+            OeAction::Ignore => {
+                b.emit_jump(Opcode::Goto, 0, row_skip, 0);
+            }
+            OeAction::Replace => {
+                // Fetch the conflicting row's rowid from this index.
+                let conflict_rowid = b.alloc_reg();
+                b.emit(Opcode::IdxRowid, ic, conflict_rowid, 0);
+                // Seek the table cursor to the conflicting row; if it's gone, skip the delete
+                // (the conflict was with a stale index entry that's already being replaced).
+                b.emit_jump(Opcode::NotExists, table_cursor, no_conflict, conflict_rowid);
+                // Delete this index's entry for the old row. The old key prefix matches the new
+                // key prefix (that's why we're here); overwrite the trailing rowid with the
+                // conflict rowid so IdxDelete targets the right entry.
+                b.emit(Opcode::SCopy, conflict_rowid, key_start + nfield, 0);
+                b.emit(Opcode::IdxDelete, ic, key_start, nkey);
+                // Delete the other indexes' entries for the old row. Read the old row's columns
+                // from the table (the table cursor is now positioned on it).
+                let old_row_start = b.alloc_regs(table.columns.len() as i32);
+                for ci in 0..table.columns.len() {
+                    b.emit(Opcode::Column, table_cursor, ci as i32, old_row_start + ci as i32);
+                }
+                for (j, other_idx) in indexes.iter().enumerate() {
+                    if j == i {
+                        continue;
+                    }
+                    let oic = index_cursor_base + j as i32;
+                    let other_cis = other_idx.table_column_indices(table)?;
+                    let onkey = other_idx.nkey_fields() as i32 + 1;
+                    let old_key = b.alloc_regs(onkey);
+                    let mut other_plain = other_cis.iter();
+                    for (k, oicol) in other_idx.columns.iter().enumerate() {
+                        let target = old_key + k as i32;
+                        if let Some(expr) = &oicol.expr {
+                            let expr_ctx = Ctx {
+                                table,
+                                cursor: 0,
+                                register_base: Some(old_row_start), join_tables: None,
+                                index_read: None,
+                                subquery_resolver: None,
+                            };
+                            compile_expr(b, expr, target, expr_ctx)?;
+                        } else {
+                            let col_idx = *other_plain
+                                .next()
+                                .expect("plain column aligned with other_cis");
+                            b.emit(Opcode::SCopy, old_row_start + col_idx as i32, target, 0);
+                        }
+                    }
+                    b.emit(Opcode::SCopy, conflict_rowid, old_key + other_idx.nkey_fields() as i32, 0);
+                    // Partial index: skip the delete when the old row doesn't satisfy the
+                    // predicate (no index entry exists for it).
+                    let skip_del = if let Some(pred) = &other_idx.where_clause {
+                        let skip = b.new_label();
+                        let pred_ctx = Ctx {
+                            table,
+                            cursor: 0,
+                            register_base: None, join_tables: None,
+                            index_read: None,
+                            subquery_resolver: None,
+                        };
+                        compile_pred_jump(b, pred, skip, table, old_row_start, other_cis.as_slice(), pred_ctx)?;
+                        Some(skip)
+                    } else {
+                        None
+                    };
+                    b.emit(Opcode::IdxDelete, oic, old_key, onkey);
+                    if let Some(skip) = skip_del {
+                        b.resolve(skip);
+                    }
+                }
+                // Delete the table row.
+                let del = b.emit(Opcode::Delete, table_cursor, 0, 0);
+                b.set_p5(del, P5_NCHANGE);
+                // Restore the new key's trailing rowid (we overwrote it with the conflict
+                // rowid above) so the post-Insert IdxInsert sees the correct new entry.
+                b.emit(Opcode::SCopy, rowid_reg, key_start + nfield, 0);
+            }
+            _ => unreachable!("emit_conflict_prechecks only for Ignore/Replace"),
+        }
+
+        b.resolve(no_conflict);
     }
     Ok(())
 }

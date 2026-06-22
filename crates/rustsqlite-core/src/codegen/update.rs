@@ -61,6 +61,7 @@ use crate::codegen::returning::Returning;
 use crate::error::{Error, Result};
 use crate::schema::{IndexObject, Table};
 use crate::types::Affinity;
+use crate::vdbe::oe::OeAction;
 use crate::vdbe::program::{Program, P4, P5_ISUPDATE, P5_UNIQUE};
 use crate::vdbe::{KeyField, Opcode};
 
@@ -82,11 +83,17 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
             "UPDATE on a WITHOUT ROWID table is not supported yet",
         ));
     }
-    if let Some(action) = upd.or_action {
-        return Err(Error::msg(format!(
-            "ON CONFLICT {:?} is not yet supported (only the default ABORT is implemented)",
-            action
-        )));
+    let oe = OeAction::from_parser(upd.or_action);
+    if matches!(oe, OeAction::Ignore | OeAction::Replace) {
+        // UPDATE with OR IGNORE / OR REPLACE on the rowid-alias column or on a UNIQUE index
+        // requires the same pre-check + delete-conflicting-row shape as INSERT, plus the
+        // OLD-row index maintenance the UPDATE path already does. The first slice supports
+        // the default ABORT/FAIL/ROLLBACK actions (which differ only in error cleanup, handled
+        // by `step()` via `Program::default_oe`); IGNORE/REPLACE land in a follow-up that
+        // threads the per-row conflict pre-checks through the two-pass sorter shape.
+        return Err(Error::msg(
+            "UPDATE OR IGNORE / OR REPLACE is not yet supported (only OR ROLLBACK/ABORT/FAIL)",
+        ));
     }
     if upd.assignments.is_empty() {
         return Err(Error::msg("UPDATE must set at least one column"));
@@ -131,6 +138,7 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
     let sorter = 1i32;
     let ctx = Ctx { table, cursor, register_base: None, join_tables: None, index_read: None, subquery_resolver: None };
     let mut b = ProgramBuilder::new();
+    b.set_default_oe(oe as u8);
 
     let returning = upd
         .returning
@@ -582,11 +590,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_or_action() {
+    fn rejects_or_ignore_or_replace() {
         let t = table_of("CREATE TABLE t(a, b)");
         let u = update_of("UPDATE OR REPLACE t SET a = 1;");
         let err = compile_update(&u, &t, &[]).unwrap_err();
-        assert!(err.to_string().contains("ON CONFLICT"));
+        assert!(err.to_string().contains("OR IGNORE / OR REPLACE"));
+        let u = update_of("UPDATE OR IGNORE t SET a = 1;");
+        let err = compile_update(&u, &t, &[]).unwrap_err();
+        assert!(err.to_string().contains("OR IGNORE / OR REPLACE"));
+    }
+
+    #[test]
+    fn accepts_or_rollback_abort_fail() {
+        let t = table_of("CREATE TABLE t(a, b)");
+        let u = update_of("UPDATE OR ROLLBACK t SET a = 1;");
+        let prog = compile_update(&u, &t, &[]).unwrap();
+        assert_eq!(prog.default_oe, OeAction::Rollback as u8);
+        let u = update_of("UPDATE OR FAIL t SET a = 1;");
+        let prog = compile_update(&u, &t, &[]).unwrap();
+        assert_eq!(prog.default_oe, OeAction::Fail as u8);
+        let u = update_of("UPDATE OR ABORT t SET a = 1;");
+        let prog = compile_update(&u, &t, &[]).unwrap();
+        assert_eq!(prog.default_oe, OeAction::Abort as u8);
     }
 
     #[test]

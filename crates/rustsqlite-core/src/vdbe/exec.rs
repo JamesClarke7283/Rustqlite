@@ -235,6 +235,13 @@ pub struct Vdbe {
     /// recently entered sub-program's parent. Empty for a flat (non-sub-program) statement.
     /// Mirrors `p->pFrame` in `vdbe.c` (kept as a `Vec` so a pop is a simple `pop()`).
     frames: Vec<VdbeFrame>,
+    /// The name of the implicit "statement savepoint" opened at the start of a write statement
+    /// so an `OE_Abort` constraint violation can roll back just the statement's changes (not
+    /// the entire transaction) when the connection is inside an explicit `BEGIN`. `None` when
+    /// no statement savepoint is active (autocommit mode, read-only statements, or a statement
+    /// that already completed its setup). Mirrors the statement sub-journal in upstream's
+    /// `sqlite3VdbeMakeReady`/`sqlite3VdbeHalt`.
+    stmt_savepoint: Option<String>,
 }
 
 impl Vdbe {
@@ -264,6 +271,7 @@ impl Vdbe {
             last_compare: Ordering::Equal,
             once_done: std::collections::HashSet::new(),
             frames: Vec::new(),
+            stmt_savepoint: None,
         }
     }
 
@@ -357,18 +365,60 @@ impl Vdbe {
 
     /// Run until the next result row or completion.
     ///
-    /// On an error inside a write transaction, the transaction is rolled back (discarding the
-    /// uncommitted changes and deleting the journal) before the error propagates — mirroring how
-    /// `sqlite3VdbeHalt` aborts a statement that errored (`OE_Abort`/`OE_Rollback`).
+    /// On an error inside a write transaction, the cleanup depends on the program's default
+    /// conflict-resolution action (`Program::default_oe`, mirroring `p->errorAction`):
+    /// `OE_Abort` (the default) rolls back just this statement's changes (via the implicit
+    /// statement savepoint when inside an explicit `BEGIN`, or the whole transaction under
+    /// autocommit — same effect since the transaction IS the statement); `OE_Rollback` rolls
+    /// back the entire transaction; `OE_Fail` leaves all prior changes in place. `OE_Ignore`
+    /// and `OE_Replace` are handled at codegen level and never reach this path. Mirrors how
+    /// `sqlite3VdbeHalt` picks `SAVEPOINT_ROLLBACK` / `sqlite3RollbackAll` / nothing based on
+    /// `p->errorAction`.
     pub async fn step(&mut self) -> Result<StepResult> {
         match self.step_inner().await {
             Ok(r) => Ok(r),
             Err(e) => {
+                let oe = crate::vdbe::oe::OeAction::from_u8(self.program.default_oe);
                 if self.write_txn {
                     if let Some(pager) = &self.pager {
-                        let _ = pager.rollback().await;
+                        match oe {
+                            crate::vdbe::oe::OeAction::Fail => {
+                                // Keep all prior changes (including earlier rows from this
+                                // statement). Only drop the implicit statement savepoint so a
+                                // later COMMIT/ROLLBACK sees a clean savepoint stack. The
+                                // write transaction stays open under an explicit BEGIN; under
+                                // autocommit there is nothing to keep — the changes stay in
+                                // the dirty overlay until COMMIT, which the caller still
+                                // drives (matches upstream: FAIL under autocommit commits the
+                                // successful rows).
+                                if let Some(name) = self.stmt_savepoint.take() {
+                                    let _ = pager.release_savepoint(&name);
+                                }
+                            }
+                            crate::vdbe::oe::OeAction::Rollback => {
+                                // Roll back the entire transaction.
+                                let _ = pager.rollback().await;
+                                self.write_txn = false;
+                                self.stmt_savepoint = None;
+                            }
+                            // Abort (default) and any other value: roll back this statement's
+                            // changes but keep the transaction.
+                            _ => {
+                                if let Some(name) = self.stmt_savepoint.take() {
+                                    // Inside an explicit BEGIN: roll back to the statement
+                                    // savepoint (discards just this statement's writes), then
+                                    // release it so the enclosing transaction is clean.
+                                    let _ = pager.rollback_to_savepoint(&name).await;
+                                    let _ = pager.release_savepoint(&name);
+                                } else {
+                                    // Autocommit mode: the whole transaction is this one
+                                    // statement, so a full rollback is the right move.
+                                    let _ = pager.rollback().await;
+                                    self.write_txn = false;
+                                }
+                            }
+                        }
                     }
-                    self.write_txn = false;
                 }
                 self.halted = true;
                 Err(e)
@@ -660,6 +710,14 @@ impl Vdbe {
                             pager.commit().await?;
                         }
                         self.write_txn = false;
+                    } else if let (Some(name), Some(pager)) =
+                        (self.stmt_savepoint.take(), self.pager.as_ref())
+                    {
+                        // Inside an explicit transaction: release the implicit statement
+                        // savepoint so its changes merge into the enclosing transaction (a
+                        // no-op when the savepoint was never opened, e.g. a read statement).
+                        // Mirrors the `SAVEPOINT_RELEASE` tail of `sqlite3VdbeHalt`.
+                        let _ = pager.release_savepoint(&name);
                     }
                     self.halted = true;
                     return Ok(StepResult::Done);
@@ -792,8 +850,28 @@ impl Vdbe {
                     } else {
                         // `p2 >= 2` carries the EXCLUSIVE flag (`exFlag = wrflag > 1` in
                         // `sqlite3PagerBegin`); `p2 == 1` is a plain write (RESERVED) lock.
+                        // If we're upgrading from a read transaction (the common
+                        // `BEGIN DEFERRED` + write-statement path), `begin_write` handles the
+                        // lock escalation; otherwise it opens a fresh write transaction.
+                        let already_write = self.write_txn;
                         pager.begin_write(p2 >= 2).await?;
                         self.write_txn = true;
+                        // Open an implicit statement savepoint so an `OE_Abort` constraint
+                        // violation can roll back just this statement's changes when the
+                        // connection is inside an explicit `BEGIN` (autocommit off). Under
+                        // autocommit, the whole transaction is this one statement, so a full
+                        // rollback is correct and we skip the savepoint. Mirrors the statement
+                        // sub-journal that upstream opens in `sqlite3VdbeMakeReady` for
+                        // multi-write-statement transactions.
+                        if !already_write && !self.autocommit() {
+                            const STMT_SP: &str = "__rustqlite_stmt_abort";
+                            // Clear any stale statement savepoint from a prior statement in
+                            // the same transaction (it should have been released on success,
+                            // but a prior error might have left it).
+                            pager.drop_savepoint_named(STMT_SP);
+                            pager.open_savepoint(STMT_SP.to_string());
+                            self.stmt_savepoint = Some(STMT_SP.to_string());
+                        }
                     }
                     self.pc += 1;
                 }
@@ -1298,23 +1376,71 @@ impl Vdbe {
                     self.pc += 1;
                 }
 
-                Opcode::Found | Opcode::NotFound => {
-                    // Search the ephemeral index cursor `p1` for the record formed by
-                    // `r[p3..p3+n]` (n = p4). Jump to `p2` on a found/not-found match.
+                Opcode::Found | Opcode::NotFound | Opcode::NoConflict => {
+                    // `Found`/`NotFound`: exact membership test (NULL never matches).
+                    // `NoConflict`: "no conflicting entry" test (NULL in any search-key
+                    // column means no conflict, regardless of cursor content).
+                    //
+                    // On an ephemeral index cursor these use the in-memory dedup map; on a
+                    // real index b-tree cursor they seek to `>=` the key and compare the
+                    // current entry's prefix.
                     let n = p4_len(&inst.p4) as usize;
                     let values: Vec<Value> =
                         self.regs[p3 as usize..p3 as usize + n].to_vec();
+
+                    // `NoConflict`: a NULL in any search-key column short-circuits to "no
+                    // conflict" (mirrors upstream's `OP_NoConflict` NULL handling and the
+                    // `check_unique_constraint` NULL-suppression in `index_insert.rs`).
+                    if matches!(inst.opcode, Opcode::NoConflict)
+                        && values.iter().any(|v| matches!(v, Value::Null))
+                    {
+                        self.pc = p2 as usize;
+                        continue;
+                    }
+
                     let found = {
-                        let slot = self.cursors.get(p1 as usize)
-                            .and_then(|c| c.as_ref())
+                        let slot = self.cursors.get_mut(p1 as usize)
+                            .and_then(|c| c.as_mut())
                             .ok_or_else(|| Error::msg("cursor is not open"))?;
-                        let eph = slot.as_ephemeral()
-                            .ok_or_else(|| Error::msg("Found/NotFound requires an ephemeral index cursor"))?;
-                        eph.find_values(&values)?
+                        match slot {
+                            VdbeCursor::Ephemeral(eph) => {
+                                // Ephemeral: use the in-memory dedup map (no cursor position
+                                // to update).
+                                eph.find_values(&values)?
+                            }
+                            VdbeCursor::Index(idx) => {
+                                // Seek the MAIN cursor to the first entry `>=` the key and
+                                // check whether the current entry's indexed-column prefix
+                                // equals the search key. Positioning the main cursor (rather
+                                // than a probe clone) lets a following `IdxRowid` read the
+                                // conflicting entry's rowid directly — the INSERT/UPDATE
+                                // conflict-resolution codegen relies on this. Mirrors
+                                // upstream's `OP_NoConflict`/`OP_Found` which leaves `pC`'s
+                                // BtCursor positioned on the match.
+                                let ki = idx.key_info().to_vec();
+                                let positioned = idx
+                                    .seek(btree::index_cursor::SeekOp::Ge, &values)
+                                    .await?;
+                                if !positioned {
+                                    false
+                                } else {
+                                    let payload = idx.payload().to_vec();
+                                    let encoding = self.encoding;
+                                    let entry = decode_record(&payload, encoding)?;
+                                    let prefix_len = entry.len().saturating_sub(1).min(n);
+                                    let prefix = &entry[..prefix_len];
+                                    compare_prefix(prefix, &values, &ki) == Ordering::Equal
+                                }
+                            }
+                            _ => return Err(Error::msg(
+                                "Found/NotFound/NoConflict requires an index cursor",
+                            )),
+                        }
                     };
                     let jump = match inst.opcode {
                         Opcode::Found => found,
                         Opcode::NotFound => !found,
+                        Opcode::NoConflict => !found,
                         _ => unreachable!(),
                     };
                     if jump {
@@ -2552,6 +2678,7 @@ mod tests {
         let mut prog = Program {
             instructions: Vec::new(),
             num_registers: 4, num_cursors: 0,
+            ..Default::default()
         };
         prog.instructions.push(inst(Opcode::Init, 0, 8, 0));
         // Setup: load the literal 1 into r2 (the per-row argument).
@@ -2638,6 +2765,7 @@ mod tests {
                 inst(Opcode::Goto, 0, 1, 0),
             ],
             num_registers: 2, num_cursors: 0,
+            ..Default::default()
         };
         let mut v = Vdbe::new(Arc::new(prog), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -2675,6 +2803,7 @@ mod tests {
                 inst(Opcode::Goto, 0, 1, 0),
             ],
             num_registers: 3, num_cursors: 0,
+            ..Default::default()
         };
         let mut v = Vdbe::new(Arc::new(prog), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -2724,6 +2853,7 @@ mod tests {
                 inst(Opcode::Goto, 0, 1, 0), // 18
             ],
             num_registers: 5, num_cursors: 0,
+            ..Default::default()
         };
         let mut v = Vdbe::new(Arc::new(prog), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -2758,6 +2888,7 @@ mod tests {
                 inst(Opcode::Goto, 0, 1, 0), // 12
             ],
             num_registers: 5, num_cursors: 0,
+            ..Default::default()
         };
         let mut v = Vdbe::new(Arc::new(prog), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -2797,6 +2928,7 @@ mod tests {
                 inst(Opcode::Goto, 0, 1, 0), // 16
             ],
             num_registers: 5, num_cursors: 0,
+            ..Default::default()
         };
         let mut v = Vdbe::new(Arc::new(prog), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -2827,6 +2959,7 @@ mod tests {
                 inst(Opcode::Goto, 0, 1, 0), // 7
             ],
             num_registers: 5, num_cursors: 0,
+            ..Default::default()
         };
         let mut v = Vdbe::new(Arc::new(prog), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -2851,6 +2984,7 @@ mod tests {
                 inst(Opcode::Goto, 0, 1, 0), // 4
             ],
             num_registers: 4, num_cursors: 0,
+            ..Default::default()
         };
         let mut v = Vdbe::new(Arc::new(prog), None);
         let res = v.step().await;
@@ -2941,6 +3075,7 @@ mod tests {
                 inst(Opcode::Goto, 0, 1, 0),          // 15: enter program
             ],
             num_registers: 5, num_cursors: 0,
+            ..Default::default()
         };
         let mut v = Vdbe::new(Arc::new(prog), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -2993,6 +3128,7 @@ mod tests {
                 inst(Opcode::Goto, 0, 1, 0),          // 11: enter program
             ],
             num_registers: 5, num_cursors: 0,
+            ..Default::default()
         };
         let mut v = Vdbe::new(Arc::new(prog), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -3023,6 +3159,7 @@ mod tests {
                 inst(Opcode::Halt, 0, 0, 0),
             ],
             num_registers: 3, num_cursors: 0,
+            ..Default::default()
         };
         // Parent layout (6 instructions, 4 registers):
         //   0 Init    0  6 0          ; -> 6 (setup)
@@ -3050,6 +3187,7 @@ mod tests {
                 inst(Opcode::Goto, 0, 1, 0),
             ],
             num_registers: 4, num_cursors: 0,
+            ..Default::default()
         };
         let mut v = Vdbe::new(Arc::new(parent), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -3076,6 +3214,7 @@ mod tests {
                 inst(Opcode::Halt, 0, 5, 0), // p1=OK, p2=OE_Ignore
             ],
             num_registers: 1, num_cursors: 0,
+            ..Default::default()
         };
         // Parent layout:
         //   0 Init    0  6 0
@@ -3100,6 +3239,7 @@ mod tests {
                 inst(Opcode::Goto, 0, 1, 0),
             ],
             num_registers: 3, num_cursors: 0,
+            ..Default::default()
         };
         let mut v = Vdbe::new(Arc::new(parent), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -3131,6 +3271,7 @@ mod tests {
                 inst(Opcode::Halt, 0, 0, 0),
             ],
             num_registers: 2, num_cursors: 0,
+            ..Default::default()
         };
         let inner_arc = Arc::new(inner);
         let outer = Program {
@@ -3141,6 +3282,7 @@ mod tests {
                 inst(Opcode::Halt, 0, 0, 0),
             ],
             num_registers: 3, num_cursors: 0,
+            ..Default::default()
         };
         let outer_arc = Arc::new(outer);
         let parent = Program {
@@ -3152,6 +3294,7 @@ mod tests {
                 inst(Opcode::Goto, 0, 1, 0),
             ],
             num_registers: 2, num_cursors: 0,
+            ..Default::default()
         };
         let mut v = Vdbe::new(Arc::new(parent), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -3197,6 +3340,7 @@ mod tests {
                 inst(Opcode::Goto, 0, 1, 0), // 12
             ],
             num_registers: 5, num_cursors: 0,
+            ..Default::default()
         };
         let mut v = Vdbe::new(Arc::new(prog), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -3236,6 +3380,7 @@ mod tests {
                 inst(Opcode::Goto, 0, 1, 0), // 12
             ],
             num_registers: 5, num_cursors: 0,
+            ..Default::default()
         };
         let mut v = Vdbe::new(Arc::new(prog), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -3273,6 +3418,7 @@ mod tests {
                 inst(Opcode::Goto, 0, 1, 0), // 13
             ],
             num_registers: 5, num_cursors: 0,
+            ..Default::default()
         };
         let mut v = Vdbe::new(Arc::new(prog), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -3316,6 +3462,7 @@ mod tests {
                 inst(Opcode::Goto, 0, 1, 0), // 19
             ],
             num_registers: 5, num_cursors: 0,
+            ..Default::default()
         };
         let mut v = Vdbe::new(Arc::new(prog), None);
         let mut rows: Vec<Vec<Value>> = Vec::new();

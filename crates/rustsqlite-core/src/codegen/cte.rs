@@ -840,10 +840,10 @@ fn is_cursor_p1_opcode(op: Opcode) -> bool {
     matches!(
         op,
         OpenRead | OpenWrite | OpenWriteReg | OpenEphemeral | OpenPseudo | Close | Rewind
-        | Next | Column | Rowid | NullRow | NotExists | SeekGE | SeekGT | SeekLE | SeekLT
-        | IdxGE | IdxGT | IdxLE | IdxLT | Found | NotFound | IdxInsert | IdxDelete | IdxRowid
-        | RowData | Delete | Insert | NewRowid | SorterOpen | SorterInsert | SorterData
-        | SorterSort | SorterNext
+            | Next | Column | Rowid | NullRow | NotExists | SeekGE | SeekGT | SeekLE | SeekLT
+            | IdxGE | IdxGT | IdxLE | IdxLT | Found | NotFound | NoConflict | IdxInsert
+            | IdxDelete | IdxRowid | RowData | Delete | Insert | NewRowid | SorterOpen
+            | SorterInsert | SorterData | SorterSort | SorterNext
     )
 }
 
@@ -855,7 +855,8 @@ fn is_absolute_jump(inst: &Instruction) -> bool {
         inst.opcode,
         Goto | Init | Gosub | If | IfNot | IsNull | NotNull | IfPos | DecrJumpZero | Eq | Ne | Lt
             | Le | Gt | Ge | Rewind | Next | NotExists | SeekGE | SeekGT | SeekLE | SeekLT
-            | IdxGE | IdxGT | IdxLE | IdxLT | Found | NotFound | SorterSort | SorterNext
+            | IdxGE | IdxGT | IdxLE | IdxLT | Found | NotFound | NoConflict | SorterSort
+            | SorterNext
     )
 }
 
@@ -964,9 +965,9 @@ fn rebase_cursor_operands(inst: &mut Instruction, cursor_offset: i32) {
     match inst.opcode {
         OpenRead | OpenWrite | OpenWriteReg | OpenEphemeral | OpenPseudo | Close => c(&mut inst.p1),
         Rewind | Next | Column | Rowid | NullRow | NotExists | SeekGE | SeekGT | SeekLE
-        | SeekLT | IdxGE | IdxGT | IdxLE | IdxLT | Found | NotFound | IdxInsert | IdxDelete
-        | IdxRowid | RowData | Delete | Insert | NewRowid | SorterOpen | SorterInsert
-        | SorterData | SorterSort | SorterNext => c(&mut inst.p1),
+        | SeekLT | IdxGE | IdxGT | IdxLE | IdxLT | Found | NotFound | NoConflict | IdxInsert
+        | IdxDelete | IdxRowid | RowData | Delete | Insert | NewRowid | SorterOpen
+        | SorterInsert | SorterData | SorterSort | SorterNext => c(&mut inst.p1),
         _ => {}
     }
 }

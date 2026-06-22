@@ -422,7 +422,8 @@ fn is_absolute_jump(inst: &Instruction) -> bool {
         inst.opcode,
         Goto | Init | Gosub | If | IfNot | IsNull | NotNull | IfPos | DecrJumpZero | Eq | Ne | Lt
             | Le | Gt | Ge | Rewind | Next | NotExists | SeekGE | SeekGT | SeekLE | SeekLT
-            | IdxGE | IdxGT | IdxLE | IdxLT | Found | NotFound | SorterSort | SorterNext
+            | IdxGE | IdxGT | IdxLE | IdxLT | Found | NotFound | NoConflict | SorterSort
+            | SorterNext
     )
 }
 
@@ -773,7 +774,7 @@ fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) 
             c(&mut inst.p1); // cursor
             r(&mut inst.p3); // key register
         }
-        Found | NotFound => {
+        Found | NotFound | NoConflict => {
             c(&mut inst.p1); // cursor
             r(&mut inst.p3); // record start register
         }

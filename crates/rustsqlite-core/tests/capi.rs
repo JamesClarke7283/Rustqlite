@@ -88,8 +88,8 @@ fn out_of_subset_sql_errors_cleanly() {
     assert!(sqlite3_prepare_v2(&mut conn, "SELECT * FROM nope;").is_err());
     assert!(sqlite3_prepare_v2(&mut conn, "SELECT zzz FROM t;").is_err());
     assert!(sqlite3_prepare_v2(&mut conn, "SELECT nosuchfn(a) FROM t;").is_err());
-    // INSERT ... OR REPLACE is still out of subset; prepare should error.
-    assert!(sqlite3_prepare_v2(&mut conn, "INSERT OR REPLACE INTO t VALUES (1);").is_err());
+    // INSERT ... OR REPLACE now compiles (M12.8 conflict resolution).
+    assert!(sqlite3_prepare_v2(&mut conn, "INSERT OR REPLACE INTO t VALUES (1, 2);").is_ok());
 
     let _ = std::fs::remove_file(&db);
 }

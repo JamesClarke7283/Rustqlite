@@ -369,7 +369,7 @@ fn unique_index_rejects_duplicate_insert() {
 
         let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (1, 'y');").unwrap();
         let rc = stmt.step();
-        assert_eq!(rc, ResultCode::Abort);
+        assert_eq!(rc, ResultCode::Constraint);
         assert!(stmt.errmsg().contains("UNIQUE constraint failed"));
 
         let _ = conn;
@@ -389,11 +389,203 @@ fn unique_index_rejects_duplicate_update() {
 
         let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "UPDATE t SET a = 1 WHERE a = 2;").unwrap();
         let rc = stmt.step();
-        assert_eq!(rc, ResultCode::Abort);
+        assert_eq!(rc, ResultCode::Constraint);
         assert!(stmt.errmsg().contains("UNIQUE constraint failed"));
 
         let _ = conn;
     }
+}
+
+#[test]
+fn insert_or_ignore_skips_conflicting_rows() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("or_ignore");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_a ON t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        // OR IGNORE skips the conflicting row and inserts the rest.
+        exec(&mut conn, "INSERT OR IGNORE INTO t VALUES (1, 'x'), (2, 'y'), (1, 'z'), (3, 'w');");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("a".into())],
+            vec![Value::Int(2), Value::Text("y".into())],
+            vec![Value::Int(3), Value::Text("w".into())],
+        ]);
+    }
+
+    // The file must be byte-format-valid to C SQLite.
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|a\n2|y\n3|w");
+}
+
+#[test]
+fn insert_or_replace_deletes_conflicting_row() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("or_replace");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_a ON t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        // OR REPLACE replaces the conflicting row (1,'a') with (1,'x'), then inserts (2,'y').
+        exec(&mut conn, "INSERT OR REPLACE INTO t VALUES (1, 'x'), (2, 'y');");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("x".into())],
+            vec![Value::Int(2), Value::Text("y".into())],
+        ]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|x\n2|y");
+}
+
+#[test]
+fn insert_or_replace_with_secondary_index() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("or_replace_sec");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_a ON t(a);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_b ON t(b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        // REPLACE on a: the old row (1,'a') is deleted (from both indexes), then (1,'x') inserted.
+        exec(&mut conn, "INSERT OR REPLACE INTO t VALUES (1, 'x');");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(1), Value::Text("x".into())]]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+}
+
+#[test]
+fn insert_or_fail_keeps_prior_rows() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("or_fail");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_a ON t(a);");
+        // OR FAIL: the rows before the conflict are kept; the conflicting row and later rows
+        // are not inserted (the statement stops at the conflict).
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "INSERT OR FAIL INTO t VALUES (1, 'x'), (2, 'y'), (1, 'z'), (3, 'w');").unwrap();
+        let rc = stmt.step();
+        assert_eq!(rc, ResultCode::Constraint);
+        assert!(stmt.errmsg().contains("UNIQUE constraint failed"));
+        // (1,'x') and (2,'y') were inserted before the conflict; (1,'z') and (3,'w') were not.
+        let (mut stmt2, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt2);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("x".into())],
+            vec![Value::Int(2), Value::Text("y".into())],
+        ]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+}
+
+#[test]
+fn insert_or_rollback_in_explicit_transaction() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("or_rollback");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_a ON t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        exec(&mut conn, "BEGIN;");
+        exec(&mut conn, "INSERT INTO t VALUES (5, 'e');");
+        // OR ROLLBACK rolls back the entire transaction (including the (5,'e') insert).
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "INSERT OR ROLLBACK INTO t VALUES (1, 'x');").unwrap();
+        let rc = stmt.step();
+        assert_eq!(rc, ResultCode::Constraint);
+        assert!(stmt.errmsg().contains("UNIQUE constraint failed"));
+        // After ROLLBACK the transaction is gone; the (5,'e') row is rolled back too.
+        let (mut stmt2, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt2);
+        assert_eq!(rows, vec![vec![Value::Int(1), Value::Text("a".into())]]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|a");
+}
+
+#[test]
+fn insert_or_abort_in_explicit_transaction() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("or_abort");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_a ON t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        exec(&mut conn, "BEGIN;");
+        exec(&mut conn, "INSERT INTO t VALUES (5, 'e');");
+        // OR ABORT rolls back only this statement (the (5,'e') row stays); the transaction
+        // remains open.
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "INSERT OR ABORT INTO t VALUES (1, 'x');").unwrap();
+        let rc = stmt.step();
+        assert_eq!(rc, ResultCode::Constraint);
+        assert!(stmt.errmsg().contains("UNIQUE constraint failed"));
+        // The (5,'e') insert from the same transaction is still there.
+        let (mut stmt2, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt2);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("a".into())],
+            vec![Value::Int(5), Value::Text("e".into())],
+        ]);
+        // COMMIT persists (5,'e').
+        exec(&mut conn, "COMMIT;");
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|a\n5|e");
+}
+
+#[test]
+fn insert_default_abort_in_explicit_transaction() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("default_abort");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_a ON t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        exec(&mut conn, "BEGIN;");
+        exec(&mut conn, "INSERT INTO t VALUES (5, 'e');");
+        // A plain INSERT (default ABORT) on conflict rolls back only this statement.
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (1, 'x');").unwrap();
+        let rc = stmt.step();
+        assert_eq!(rc, ResultCode::Constraint);
+        assert!(stmt.errmsg().contains("UNIQUE constraint failed"));
+        let (mut stmt2, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt2);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("a".into())],
+            vec![Value::Int(5), Value::Text("e".into())],
+        ]);
+        exec(&mut conn, "COMMIT;");
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|a\n5|e");
 }
 
 #[test]
@@ -605,7 +797,7 @@ fn multi_column_unique_index_rejects_duplicate() {
 
         let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (1, 2);").unwrap();
         let rc = stmt.step();
-        assert_eq!(rc, ResultCode::Abort);
+        assert_eq!(rc, ResultCode::Constraint);
         assert!(stmt.errmsg().contains("UNIQUE constraint failed"));
 
         let _ = conn;

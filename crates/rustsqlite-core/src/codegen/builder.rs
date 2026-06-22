@@ -27,6 +27,9 @@ pub struct ProgramBuilder {
     label_addr: Vec<Option<i32>>,
     /// `(instruction index, label)` pairs whose `p2` must be patched to the label's address.
     fixups: Vec<(usize, Label)>,
+    /// The default conflict-resolution action for this program (`OE_Abort` by default).
+    /// Populated by INSERT/UPDATE codegen when the statement carries an explicit `OR action`.
+    default_oe: u8,
 }
 
 impl ProgramBuilder {
@@ -37,6 +40,7 @@ impl ProgramBuilder {
             next_cursor: 0,
             label_addr: Vec::new(),
             fixups: Vec::new(),
+            default_oe: 0,
         }
     }
 
@@ -92,6 +96,15 @@ impl ProgramBuilder {
     /// the outer program's already-allocated cursors.
     pub fn next_cursor(&self) -> i32 {
         self.next_cursor
+    }
+
+    /// Set the default conflict-resolution action for this program. INSERT/UPDATE codegen
+    /// calls this with the parsed `OR action` so the executor's `step()` knows whether to
+    /// roll back the statement (ABORT), the transaction (ROLLBACK), keep prior changes
+    /// (FAIL), or skip the row (IGNORE — handled at codegen level, not here). REPLACE is
+    /// also handled at codegen level. The value is an `OeAction` discriminant.
+    pub fn set_default_oe(&mut self, oe: u8) {
+        self.default_oe = oe;
     }
 
     /// The current number of emitted instructions (alias of [`Self::cur_addr`] as a count).
@@ -193,6 +206,7 @@ impl ProgramBuilder {
             instructions: self.insts,
             num_registers: self.next_reg as usize,
             num_cursors: self.next_cursor as usize,
+            default_oe: self.default_oe,
         }
     }
 }
