@@ -771,14 +771,24 @@ impl Vdbe {
                     }
                 }
                 Opcode::Transaction => {
-                    // p2 != 0 opens a WRITE transaction (the rollback journal). A read
-                    // transaction is implicit in our engine, so p2 == 0 is a no-op marker.
+                    // `OP_Transaction p1 p2`: begin a transaction on database `p1`. `p2 == 0`
+                    // is a read transaction (implicit in our engine — a no-op marker).
+                    // `p2 == 1` opens a WRITE transaction acquiring a RESERVED lock (the
+                    // `BEGIN IMMEDIATE` path, and the lazy-write path taken by every write
+                    // statement under `BEGIN DEFERRED`). `p2 == 2` opens a WRITE transaction
+                    // acquiring an EXCLUSIVE lock (the `BEGIN EXCLUSIVE` path, which blocks
+                    // even readers on other connections). The lock-level distinction is
+                    // faithful to `sqlite3PagerBegin`'s `exFlag` parameter (`exFlag = wrflag >
+                    // 1`). A read transaction is implicit in our engine, so `p2 == 0` is a
+                    // no-op marker. Mirrors `OP_Transaction` in `vdbe.c`.
                     if p2 != 0 {
                         let pager = self
                             .pager
                             .clone()
                             .ok_or_else(|| Error::msg("no database is open"))?;
-                        pager.begin_write().await?;
+                        // `p2 >= 2` carries the EXCLUSIVE flag (`exFlag = wrflag > 1` in
+                        // `sqlite3PagerBegin`); `p2 == 1` is a plain write (RESERVED) lock.
+                        pager.begin_write(p2 >= 2).await?;
                         self.write_txn = true;
                     }
                     self.pc += 1;

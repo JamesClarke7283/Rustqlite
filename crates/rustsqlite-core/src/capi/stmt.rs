@@ -1321,7 +1321,7 @@ fn compile_pragma_incremental_vacuum(
 /// relocating one tail page), commit, and return the page-count-after-each-step result rows.
 async fn incremental_vacuum_run(pager: &Arc<Pager>, limit: u32) -> Result<Vec<Vec<Value>>> {
     use crate::btree::autovac::incr_vacuum_step_impl;
-    pager.begin_write().await?;
+    pager.begin_write(false).await?;
     let mut rows = Vec::new();
     let usable = pager.usable_size();
     let mut steps = 0u32;

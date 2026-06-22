@@ -1,7 +1,9 @@
-//! Transaction-control tests (M12.3): `BEGIN`/`COMMIT`/`END`/`ROLLBACK` via `OP_AutoCommit`.
+//! Transaction-control tests (M12.3 + M12.6): `BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE]` /
+//! `COMMIT`/`END`/`ROLLBACK` via `OP_AutoCommit` (+ `OP_Transaction` for IMMEDIATE/EXCLUSIVE),
+//! plus the `SAVEPOINT` family.
 //!
 //! Plain `#[test]`s (drive the engine via `sqlite3_step`); skipped if the system `sqlite3`
-//! oracle is absent. Differential cases replay the same sequence against the C oracle and
+//! oracle is absent. Differential cases replay the same SQL sequence against the C oracle and
 //! compare the resulting table contents and the error text from invalid transitions.
 
 use std::process::Command;
@@ -464,6 +466,245 @@ fn commit_via_explicit_commit_after_savepoint_auto_start() {
     // An explicit COMMIT commits the implicit transaction started by SAVEPOINT.
     assert_eq!(exec(&mut conn, "COMMIT;"), ResultCode::Done);
     assert!(conn.autocommit(), "COMMIT restores autocommit");
+    let rows = read_a(&mut conn);
+    assert_eq!(values_to_lines(&rows), expected);
+
+    let _ = std::fs::remove_file(&db);
+}
+
+// ---------------------------------------------------------------------------
+// M12.6 — `BEGIN IMMEDIATE` / `BEGIN EXCLUSIVE` locking.
+//
+// In SQLite, `BEGIN IMMEDIATE` acquires a RESERVED lock up-front (so writes from other
+// connections block, reads still work), while `BEGIN EXCLUSIVE` acquires an EXCLUSIVE lock
+// (so even readers block). `BEGIN DEFERRED` (the default) acquires no lock at BEGIN; the
+// RESERVED lock is taken lazily at first write via the `OP_Transaction 0 1` opcode every
+// write statement already emits.
+//
+// Codegen mirrors `sqlite3BeginTransaction` in `build.c`:
+// * `BEGIN DEFERRED` → `OP_AutoCommit 0 0` only.
+// * `BEGIN IMMEDIATE` → `OP_Transaction 0 1` + `OP_AutoCommit 0 0` (RESERVED up-front).
+// * `BEGIN EXCLUSIVE` → `OP_Transaction 0 2` + `OP_AutoCommit 0 0` (EXCLUSIVE up-front).
+//
+// The single-connection tests below verify the behavior matches the C oracle: each BEGIN
+// variant commits/rolls back the same way, and a nested BEGIN IMMEDIATE/EXCLUSIVE inside an
+// active transaction errors with the same "cannot start a transaction within a transaction"
+// message as in SQLite.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn begin_immediate_commits_like_oracle() {
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("begin_imm");
+    let setup = "CREATE TABLE t(a);";
+    let body = "BEGIN IMMEDIATE;\nINSERT INTO t VALUES (1),(2),(3);\nCOMMIT;";
+    let expected = oracle_table_contents_with_setup(setup, body);
+
+    let mut conn = sqlite3_open(&db).unwrap();
+    exec(&mut conn, "CREATE TABLE t(a);");
+    assert!(conn.autocommit(), "starts in autocommit");
+    assert_eq!(exec(&mut conn, "BEGIN IMMEDIATE;"), ResultCode::Done);
+    assert!(!conn.autocommit(), "BEGIN IMMEDIATE turns autocommit off");
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (1),(2),(3);"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "COMMIT;"), ResultCode::Done);
+    assert!(conn.autocommit(), "COMMIT restores autocommit");
+
+    let rows = read_a(&mut conn);
+    assert_eq!(values_to_lines(&rows), expected);
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn begin_exclusive_commits_like_oracle() {
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("begin_excl");
+    let setup = "CREATE TABLE t(a);";
+    let body = "BEGIN EXCLUSIVE;\nINSERT INTO t VALUES (10),(20),(30);\nCOMMIT;";
+    let expected = oracle_table_contents_with_setup(setup, body);
+
+    let mut conn = sqlite3_open(&db).unwrap();
+    exec(&mut conn, "CREATE TABLE t(a);");
+    assert!(conn.autocommit(), "starts in autocommit");
+    assert_eq!(exec(&mut conn, "BEGIN EXCLUSIVE;"), ResultCode::Done);
+    assert!(!conn.autocommit(), "BEGIN EXCLUSIVE turns autocommit off");
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (10),(20),(30);"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "COMMIT;"), ResultCode::Done);
+    assert!(conn.autocommit(), "COMMIT restores autocommit");
+
+    let rows = read_a(&mut conn);
+    assert_eq!(values_to_lines(&rows), expected);
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn begin_immediate_rollback_like_oracle() {
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("begin_imm_rb");
+    let setup = "CREATE TABLE t(a);";
+    let body = "BEGIN IMMEDIATE;\nINSERT INTO t VALUES (1),(2);\nROLLBACK;";
+    let expected = oracle_table_contents_with_setup(setup, body);
+
+    let mut conn = sqlite3_open(&db).unwrap();
+    exec(&mut conn, "CREATE TABLE t(a);");
+    assert_eq!(exec(&mut conn, "BEGIN IMMEDIATE;"), ResultCode::Done);
+    assert!(!conn.autocommit());
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (1),(2);"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "ROLLBACK;"), ResultCode::Done);
+    assert!(conn.autocommit(), "ROLLBACK restores autocommit");
+
+    let rows = read_a(&mut conn);
+    assert_eq!(values_to_lines(&rows), expected);
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn begin_immediate_then_read_works() {
+    // `BEGIN IMMEDIATE` takes a RESERVED lock — readers on the same connection still work
+    // (a SELECT inside the transaction returns the in-progress writes, matching SQLite).
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("begin_imm_read");
+    let mut conn = sqlite3_open(&db).unwrap();
+    exec(&mut conn, "CREATE TABLE t(a);");
+    assert_eq!(exec(&mut conn, "BEGIN IMMEDIATE;"), ResultCode::Done);
+    assert!(!conn.autocommit());
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (7),(8);"), ResultCode::Done);
+    // A SELECT inside the IMMEDIATE transaction sees the in-progress writes.
+    let rows = read_a(&mut conn);
+    assert_eq!(values_to_lines(&rows), "7\n8");
+    assert_eq!(exec(&mut conn, "COMMIT;"), ResultCode::Done);
+    assert!(conn.autocommit());
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn nested_begin_immediate_errors_like_oracle() {
+    // A `BEGIN IMMEDIATE` inside an active transaction errors with the same message as
+    // `BEGIN` (DEFERRED). The `OP_AutoCommit` arm detects the same-state transition; the
+    // preceding `OP_Transaction 0 1` is idempotent (a no-op when a write txn is already open).
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("nested_begin_imm");
+    let mut conn = sqlite3_open(&db).unwrap();
+    exec(&mut conn, "CREATE TABLE t(a);");
+    assert_eq!(exec(&mut conn, "BEGIN;"), ResultCode::Done);
+    assert!(!conn.autocommit());
+
+    let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "BEGIN IMMEDIATE;").unwrap();
+    let res = stmt.step();
+    assert!(
+        matches!(res, ResultCode::Error),
+        "nested BEGIN IMMEDIATE should error, got {res:?}"
+    );
+    // The failed BEGIN IMMEDIATE must not have flipped autocommit.
+    assert!(!conn.autocommit(), "failed BEGIN IMMEDIATE keeps autocommit off");
+    // The error message matches the C oracle.
+    assert_eq!(
+        stmt.errmsg(),
+        "cannot start a transaction within a transaction"
+    );
+
+    // The outer transaction is still usable.
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (1);"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "COMMIT;"), ResultCode::Done);
+    assert!(conn.autocommit());
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn nested_begin_exclusive_errors_like_oracle() {
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("nested_begin_excl");
+    let mut conn = sqlite3_open(&db).unwrap();
+    exec(&mut conn, "CREATE TABLE t(a);");
+    assert_eq!(exec(&mut conn, "BEGIN;"), ResultCode::Done);
+    assert!(!conn.autocommit());
+
+    let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "BEGIN EXCLUSIVE;").unwrap();
+    let res = stmt.step();
+    assert!(
+        matches!(res, ResultCode::Error),
+        "nested BEGIN EXCLUSIVE should error, got {res:?}"
+    );
+    assert!(!conn.autocommit(), "failed BEGIN EXCLUSIVE keeps autocommit off");
+    assert_eq!(
+        stmt.errmsg(),
+        "cannot start a transaction within a transaction"
+    );
+
+    // The outer transaction is still usable.
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (1);"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "ROLLBACK;"), ResultCode::Done);
+    assert!(conn.autocommit());
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn begin_immediate_after_begin_immediate_errors() {
+    // Two `BEGIN IMMEDIATE` in a row: the second one errors, exactly like two `BEGIN`s would.
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("imm_then_imm");
+    let mut conn = sqlite3_open(&db).unwrap();
+    exec(&mut conn, "CREATE TABLE t(a);");
+    assert_eq!(exec(&mut conn, "BEGIN IMMEDIATE;"), ResultCode::Done);
+    assert!(!conn.autocommit());
+
+    let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "BEGIN IMMEDIATE;").unwrap();
+    let res = stmt.step();
+    assert!(
+        matches!(res, ResultCode::Error),
+        "second BEGIN IMMEDIATE should error, got {res:?}"
+    );
+    assert_eq!(
+        stmt.errmsg(),
+        "cannot start a transaction within a transaction"
+    );
+
+    exec(&mut conn, "ROLLBACK;");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn begin_exclusive_then_end_uses_read_works() {
+    // Inside a `BEGIN EXCLUSIVE` transaction, the connection that owns the lock can still read
+    // its own writes. (Cross-connection blocking isn't testable here since our in-process VFS
+    // doesn't enforce cross-connection locks yet — that's M12.7's real-OS-locking follow-up.
+    // This test verifies the same-connection behavior matches the oracle's.)
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("begin_excl_end");
+    let setup = "CREATE TABLE t(a);";
+    let body = "BEGIN EXCLUSIVE;\nINSERT INTO t VALUES (100);\nEND;";
+    let expected = oracle_table_contents_with_setup(setup, body);
+
+    let mut conn = sqlite3_open(&db).unwrap();
+    exec(&mut conn, "CREATE TABLE t(a);");
+    assert_eq!(exec(&mut conn, "BEGIN EXCLUSIVE;"), ResultCode::Done);
+    assert!(!conn.autocommit());
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (100);"), ResultCode::Done);
+    // `END` is an alias for `COMMIT`.
+    assert_eq!(exec(&mut conn, "END;"), ResultCode::Done);
+    assert!(conn.autocommit(), "END commits and restores autocommit");
+
     let rows = read_a(&mut conn);
     assert_eq!(values_to_lines(&rows), expected);
 

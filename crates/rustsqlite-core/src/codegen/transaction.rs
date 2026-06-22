@@ -4,26 +4,40 @@
 //! `sqlite3CommitTransaction` / `sqlite3RollbackStatement` for the autocommit family, and
 //! `sqlite3Savepoint` for the savepoint family.
 
-use rustqlite_parser::TransactionStmt;
+use rustqlite_parser::{TransactionStmt, TransactionType};
 
 use crate::vdbe::program::{Instruction, Program, P4};
 use crate::vdbe::{Opcode, Program as VdbeProgram};
 
-/// Compile a transaction-control statement to a tiny one-instruction program that drives the
-/// connection's autocommit flag via `OP_AutoCommit` (for BEGIN/COMMIT/END/ROLLBACK) or the
-/// pager's savepoint stack via `OP_Savepoint` (for SAVEPOINT/RELEASE/ROLLBACK TO). Both
-/// opcodes are terminal — they halt the VDBE themselves, so the program ends with that single
-/// instruction and never reaches a `Halt`.
+/// Compile a transaction-control statement to a tiny program that drives the connection's
+/// autocommit flag via `OP_AutoCommit` (for BEGIN/COMMIT/END/ROLLBACK) or the pager's savepoint
+/// stack via `OP_Savepoint` (for SAVEPOINT/RELEASE/ROLLBACK TO). For `BEGIN IMMEDIATE`/`BEGIN
+/// EXCLUSIVE` an `OP_Transaction` opcode precedes `OP_AutoCommit` so the pager acquires the
+/// RESERVED (IMMEDIATE) or EXCLUSIVE (EXCLUSIVE) lock up-front — mirroring `sqlite3BeginTransaction`
+/// in `build.c`, which emits `OP_Transaction iDb eTxnType` (eTxnType = 1 for IMMEDIATE, 2 for
+/// EXCLUSIVE) before the `OP_AutoCommit` that turns autocommit off. `BEGIN DEFERRED` emits only
+/// `OP_AutoCommit` (the lock is acquired lazily at first write, exactly as in upstream). Both
+/// `OP_AutoCommit` and `OP_Savepoint` are terminal — they halt the VDBE themselves, so the
+/// program ends with that instruction and never reaches a `Halt`.
 pub fn compile_transaction(stmt: &TransactionStmt) -> crate::error::Result<Program> {
     match stmt {
         // `BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE] [TRANSACTION [name]]`.
-        // Emit `OP_AutoCommit 0 0` (turn autocommit OFF). The runtime errors with
-        // "cannot start a transaction within a transaction" if autocommit is already off.
-        // The `transaction_type` (DEFERRED/IMMEDIATE/EXCLUSIVE) and `name` are accepted by the
-        // parser but the M12 first slice treats every BEGIN as DEFERRED (the writer lock is
-        // acquired lazily at first write, matching the existing `begin_write` behavior).
-        // IMMEDIATE/EXCLUSIVE locking (M12.6/M12.7) is the follow-up.
-        TransactionStmt::Begin { .. } => Ok(program_of(Instruction::new(Opcode::AutoCommit, 0, 0, 0))),
+        // `BEGIN DEFERRED` emits only `OP_AutoCommit 0 0` (turn autocommit OFF); the RESERVED lock
+        // is acquired lazily at first write via the `OP_Transaction 0 1` opcode that every write
+        // statement already emits. `BEGIN IMMEDIATE` emits `OP_Transaction 0 1` + `OP_AutoCommit 0
+        // 0` so the RESERVED lock is taken up-front (errors with `SQLITE_BUSY` if another
+        // connection already holds RESERVED/EXCLUSIVE). `BEGIN EXCLUSIVE` emits `OP_Transaction 0
+        // 2` + `OP_AutoCommit 0 0` so the EXCLUSIVE lock is taken up-front (blocks even readers
+        // on other connections). The runtime errors with "cannot start a transaction within a
+        // transaction" if autocommit is already off (the `OP_AutoCommit` arm detects the
+        // same-state transition; `OP_Transaction` is idempotent so the lock-acquisition is a
+        // no-op when already in a write transaction). Mirrors `sqlite3BeginTransaction` in
+        // `build.c`. The `name` is accepted by the parser but ignored (SQLite's named
+        // transactions are syntactic sugar only — the name has no runtime effect on a top-level
+        // BEGIN/COMMIT/ROLLBACK).
+        TransactionStmt::Begin { transaction_type, .. } => {
+            Ok(begin_program(*transaction_type))
+        }
 
         // `COMMIT [TRANSACTION [name]]` / `END [TRANSACTION [name]]`.
         // Emit `OP_AutoCommit 1 0` (turn autocommit ON, commit any pending write txn). The
@@ -85,6 +99,30 @@ pub fn compile_transaction(stmt: &TransactionStmt) -> crate::error::Result<Progr
             p5: 0,
         })),
     }
+}
+
+/// Build the program for a `BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE]` statement. `DEFERRED` emits
+/// only `OP_AutoCommit 0 0` (the lock is acquired lazily at first write by the `OP_Transaction 0
+/// 1` that every write statement already emits). `IMMEDIATE` emits `OP_Transaction 0 1` first so
+/// the RESERVED lock is taken up-front; `EXCLUSIVE` emits `OP_Transaction 0 2` so the EXCLUSIVE
+/// lock is taken up-front. In all three cases `OP_AutoCommit 0 0` turns autocommit OFF (BEGIN)
+/// and ends the statement. Mirrors `sqlite3BeginTransaction` in `build.c`, which emits
+/// `OP_Transaction iDb eTxnType` for non-deferred BEGINs and then unconditionally emits
+/// `OP_AutoCommit`.
+fn begin_program(transaction_type: TransactionType) -> Program {
+    let mut p = VdbeProgram::default();
+    match transaction_type {
+        TransactionType::Deferred => {}
+        TransactionType::Immediate => p
+            .instructions
+            .push(Instruction::new(Opcode::Transaction, 0, 1, 0)),
+        TransactionType::Exclusive => p
+            .instructions
+            .push(Instruction::new(Opcode::Transaction, 0, 2, 0)),
+    }
+    p.instructions
+        .push(Instruction::new(Opcode::AutoCommit, 0, 0, 0));
+    p
 }
 
 /// Build a one-instruction program (the `OP_AutoCommit`/`OP_Savepoint` opcode is terminal — it

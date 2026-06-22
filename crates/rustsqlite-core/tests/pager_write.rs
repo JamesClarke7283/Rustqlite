@@ -125,7 +125,7 @@ fn committed_header_change_passes_c_integrity_check() {
 
         // A journaled write transaction that sets the user_version in the header and restamps
         // page 1. This exercises begin_write → journal → commit (and page-1 change-counter stamp).
-        pager.begin_write().await.expect("begin");
+        pager.begin_write(false).await.expect("begin");
         pager.with_header_mut(|h| h.user_version = 42);
         // Mark page 1 dirty so the commit re-serializes the header (with the new user_version).
         let p1 = pager.read_page_for_write(1).await.expect("read p1");

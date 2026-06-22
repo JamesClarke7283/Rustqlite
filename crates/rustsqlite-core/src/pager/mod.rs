@@ -539,12 +539,30 @@ impl Pager {
 
     /// Begin a write transaction: take the writer lock, snapshot the database size, and create the
     /// rollback journal with its header. A no-op if a transaction is already open. Mirrors the
-    /// `PAGER_WRITER_LOCKED` → journal-open transition in `pager.c`.
-    pub async fn begin_write(&self) -> Result<()> {
+    /// `PAGER_READER` → `PAGER_WRITER_LOCKED` transition driven by `sqlite3PagerBegin` in
+    /// `pager.c`.
+    ///
+    /// `ex_flag` mirrors `sqlite3PagerBegin`'s `exFlag` parameter: when `false`, acquire a
+    /// RESERVED lock (the `BEGIN IMMEDIATE` and lazy-deferred-write paths — both take
+    /// RESERVED). When `true`, escalate to an EXCLUSIVE lock after acquiring RESERVED (the
+    /// `BEGIN EXCLUSIVE` path, which blocks even readers on other connections). The RESERVED
+    /// lock is held for the entire transaction; commit-time escalation to EXCLUSIVE (so the
+    /// writer can copy dirty pages into the file while readers are blocked) is the M12.7
+    /// follow-up — for now the lock level acquired here is held until `end_txn` releases it.
+    pub async fn begin_write(&self, ex_flag: bool) -> Result<()> {
         if self.in_write_txn() {
             return Ok(());
         }
-        self.file.lock(LockLevel::Exclusive).await?;
+        // `sqlite3PagerBegin` first acquires RESERVED; if `exFlag`, it then escalates to
+        // EXCLUSIVE (via `pager_wait_on_lock`). We elide the intermediate step and acquire
+        // the final target lock in one call — the on-disk effect is the same (a single
+        // byte-range lock at the chosen level).
+        let target = if ex_flag {
+            LockLevel::Exclusive
+        } else {
+            LockLevel::Reserved
+        };
+        self.file.lock(target).await?;
 
         let db_orig_size = self.page_count();
         let cksum_init = next_cksum_init();
@@ -1026,7 +1044,7 @@ mod tests {
             let pager = fresh(&vfs, "commit.db").await;
             let orig_change_counter = pager.header().file_change_counter;
 
-            pager.begin_write().await.unwrap();
+            pager.begin_write(false).await.unwrap();
             // Allocate a page and modify page 1 (touch an existing page so it is journaled).
             let pgno = pager.allocate_page();
             let mut p = pager.read_page_for_write(pgno).await.unwrap();
@@ -1063,7 +1081,7 @@ mod tests {
             let pager = fresh(&vfs, "rb.db").await;
             let orig_change_counter = pager.header().file_change_counter;
 
-            pager.begin_write().await.unwrap();
+            pager.begin_write(false).await.unwrap();
             let pgno = pager.allocate_page();
             let mut p = pager.read_page_for_write(pgno).await.unwrap();
             p[0] = 0x99;

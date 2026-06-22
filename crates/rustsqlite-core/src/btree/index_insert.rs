@@ -479,7 +479,7 @@ mod tests {
                 .unwrap();
 
             let pager = Arc::new(pager);
-            pager.begin_write().await.unwrap();
+            pager.begin_write(false).await.unwrap();
             let idx_root = create_index_btree(&pager).await.unwrap();
 
             for rowid in 1i64..=200 {
@@ -518,7 +518,7 @@ mod tests {
                 .unwrap();
 
             let pager = Arc::new(pager);
-            pager.begin_write().await.unwrap();
+            pager.begin_write(false).await.unwrap();
             let idx_root = create_index_btree(&pager).await.unwrap();
 
             for i in 1i64..=100 {
@@ -555,7 +555,7 @@ mod tests {
                     .unwrap();
 
                 let pager = Arc::new(pager);
-                pager.begin_write().await.unwrap();
+                pager.begin_write(false).await.unwrap();
                 let idx_root = create_index_btree(&pager).await.unwrap();
 
                 for i in (1i64..=n as i64).rev() {
@@ -599,7 +599,7 @@ mod tests {
                 .unwrap();
 
             let pager = Arc::new(pager);
-            pager.begin_write().await.unwrap();
+            pager.begin_write(false).await.unwrap();
             let idx_root = create_index_btree(&pager).await.unwrap();
 
             for i in 1i64..=10 {
@@ -632,7 +632,7 @@ mod tests {
                 .unwrap();
 
             let pager = Arc::new(pager);
-            pager.begin_write().await.unwrap();
+            pager.begin_write(false).await.unwrap();
             let idx_root = create_index_btree(&pager).await.unwrap();
 
             let n = 5000i64;
@@ -677,7 +677,7 @@ mod tests {
                 .unwrap();
             let pager = Arc::new(pager);
 
-            pager.begin_write().await.unwrap();
+            pager.begin_write(false).await.unwrap();
             let idx_root = create_index_btree(&pager).await.unwrap();
 
             let key1 = encode_record(&[Value::Text("x".into()), Value::Int(1)]);
@@ -708,7 +708,7 @@ mod tests {
                 .unwrap();
             let pager = Arc::new(pager);
 
-            pager.begin_write().await.unwrap();
+            pager.begin_write(false).await.unwrap();
             let idx_root = create_index_btree(&pager).await.unwrap();
 
             let key1 = encode_record(&[Value::Null, Value::Int(1)]);
@@ -739,7 +739,7 @@ mod tests {
                 .unwrap();
 
             let pager = Arc::new(pager);
-            pager.begin_write().await.unwrap();
+            pager.begin_write(false).await.unwrap();
             let idx_root = create_index_btree(&pager).await.unwrap();
 
             for i in 1i64..=10 {

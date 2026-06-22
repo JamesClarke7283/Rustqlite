@@ -376,7 +376,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            pager.begin_write().await.unwrap();
+            pager.begin_write(false).await.unwrap();
             let root = create_table_btree(&pager).await.unwrap();
             assert_eq!(max_rowid(&pager, root).await.unwrap(), 0); // empty
 
@@ -430,7 +430,7 @@ mod tests {
             let pager = Pager::create_fresh(vfs.clone(), "split.db".into(), file, 512)
                 .await
                 .unwrap();
-            pager.begin_write().await.unwrap();
+            pager.begin_write(false).await.unwrap();
             let root = create_table_btree(&pager).await.unwrap();
             let big = encode_record(&[Value::Blob(vec![0u8; 60])]);
             // 200 rows forces several leaf splits; on a 512-byte page each leaf holds ~3 rows.
@@ -466,7 +466,7 @@ mod tests {
             let pager = Pager::create_fresh(vfs.clone(), "overflow.db".into(), file, 4096)
                 .await
                 .unwrap();
-            pager.begin_write().await.unwrap();
+            pager.begin_write(false).await.unwrap();
             let root = create_table_btree(&pager).await.unwrap();
             // 8 KiB payload, far larger than the inline 4061-byte local window.
             let big_payload = vec![0xABu8; 8 * 1024];
