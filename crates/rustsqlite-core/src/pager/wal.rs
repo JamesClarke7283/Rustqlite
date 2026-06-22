@@ -1118,4 +1118,134 @@ mod tests {
             assert_eq!(out[0], 0x22);
         });
     }
+
+    /// M13.11: recovery on open sees multiple committed transactions and drops any
+    /// uncommitted tail. Mirrors the C oracle's `walIndexRecover` semantics: walk every
+    /// frame in WAL order, verify the running checksum + salts, and make visible only the
+    /// frames up to and including the last commit frame. A page written in an earlier
+    /// transaction and rewritten in a later one resolves to the latest frame.
+    #[test]
+    fn recover_multi_transaction_with_uncommitted_tail() {
+        rt().block_on(async {
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
+            let page_size: u32 = 4096;
+            let salt1 = 0x11223344;
+            let salt2 = 0x55667788;
+            let hdr = build_wal_header(page_size, salt1, salt2);
+            let (c0, c1) = wal_checksum(&hdr[0..24], true, 0, 0);
+            let mut running = [c0, c1];
+
+            // Transaction 1: page 1 (0x11), page 2 (0x22), commit_size=2.
+            let f1 = build_frame(page_size, 1, 0, salt1, salt2, &mut running, &vec![0x11u8; page_size as usize]);
+            let f2 = build_frame(page_size, 2, 2, salt1, salt2, &mut running, &vec![0x22u8; page_size as usize]);
+            // Transaction 2: page 1 rewritten (0x33), commit_size=2.
+            let f3 = build_frame(page_size, 1, 2, salt1, salt2, &mut running, &vec![0x33u8; page_size as usize]);
+            // Uncommitted tail: page 3 (0x44), commit_size=0. Must be dropped by recovery.
+            let f4 = build_frame(page_size, 3, 0, salt1, salt2, &mut running, &vec![0x44u8; page_size as usize]);
+
+            let file = vfs.open("db-wal", OpenFlags::READWRITE_CREATE).await.unwrap();
+            file.write_at(0, &hdr).await.unwrap();
+            let mut off = WAL_HEADER_SIZE as u64;
+            file.write_at(off, &f1).await.unwrap();
+            off += f1.len() as u64;
+            file.write_at(off, &f2).await.unwrap();
+            off += f2.len() as u64;
+            file.write_at(off, &f3).await.unwrap();
+            off += f3.len() as u64;
+            file.write_at(off, &f4).await.unwrap();
+
+            let wal = Wal::open(vfs.clone(), "db", page_size).await.unwrap();
+            // mx_frame is the last commit frame (frame 3), not the uncommitted tail (frame 4).
+            assert_eq!(wal.mx_frame(), 3);
+            assert_eq!(wal.n_page(), 2);
+            // Page 1's latest visible frame is frame 3 (the rewrite in txn 2).
+            assert_eq!(wal.find_frame(1), 3);
+            // Page 2's only frame is frame 2.
+            assert_eq!(wal.find_frame(2), 2);
+            // Page 3 was in the uncommitted tail — not visible.
+            assert_eq!(wal.find_frame(3), 0);
+
+            // The recovered data is correct.
+            let mut out = vec![0u8; page_size as usize];
+            wal.read_frame(3, &mut out).await.unwrap();
+            assert_eq!(out[0], 0x33);
+            wal.read_frame(2, &mut out).await.unwrap();
+            assert_eq!(out[0], 0x22);
+        });
+    }
+
+    /// M13.11: a WAL whose entire content is uncommitted (no commit frame) recovers to an
+    /// empty wal-index (mx_frame == 0). All frames are dropped.
+    #[test]
+    fn recover_all_uncommitted_drops_everything() {
+        rt().block_on(async {
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
+            let page_size: u32 = 4096;
+            let salt1 = 0xaabbccdd;
+            let salt2 = 0xeeff0011;
+            let hdr = build_wal_header(page_size, salt1, salt2);
+            let (c0, c1) = wal_checksum(&hdr[0..24], true, 0, 0);
+            let mut running = [c0, c1];
+
+            // Three frames, all commit_size=0 — no commit.
+            let f1 = build_frame(page_size, 1, 0, salt1, salt2, &mut running, &vec![0x11u8; page_size as usize]);
+            let f2 = build_frame(page_size, 2, 0, salt1, salt2, &mut running, &vec![0x22u8; page_size as usize]);
+            let f3 = build_frame(page_size, 3, 0, salt1, salt2, &mut running, &vec![0x33u8; page_size as usize]);
+
+            let file = vfs.open("db-wal", OpenFlags::READWRITE_CREATE).await.unwrap();
+            file.write_at(0, &hdr).await.unwrap();
+            let mut off = WAL_HEADER_SIZE as u64;
+            for f in [&f1, &f2, &f3] {
+                file.write_at(off, f).await.unwrap();
+                off += f.len() as u64;
+            }
+
+            let wal = Wal::open(vfs.clone(), "db", page_size).await.unwrap();
+            assert_eq!(wal.mx_frame(), 0);
+            assert_eq!(wal.n_page(), 0);
+            // No page is visible.
+            assert_eq!(wal.find_frame(1), 0);
+            assert_eq!(wal.find_frame(2), 0);
+            assert_eq!(wal.find_frame(3), 0);
+        });
+    }
+
+    /// M13.11: a WAL with a valid commit followed by a salt-reset (RESTART checkpoint)
+    /// has the old frames invisible after the new salts take effect. Recovery sees only
+    /// the frames up to the last commit *with the header's salts* (mirrors the
+    /// checkpoint-then-write flow).
+    #[test]
+    fn recover_stops_at_salt_reset() {
+        rt().block_on(async {
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
+            let page_size: u32 = 4096;
+            let salt1_old = 0x01020304;
+            let salt2_old = 0x05060708;
+            let hdr_old = build_wal_header(page_size, salt1_old, salt2_old);
+            let (c0, c1) = wal_checksum(&hdr_old[0..24], true, 0, 0);
+            let mut running = [c0, c1];
+
+            // Old transaction: page 1, commit_size=1 (with old salts).
+            let f1 = build_frame(page_size, 1, 1, salt1_old, salt2_old, &mut running, &vec![0x11u8; page_size as usize]);
+
+            let file = vfs.open("db-wal", OpenFlags::READWRITE_CREATE).await.unwrap();
+            file.write_at(0, &hdr_old).await.unwrap();
+            file.write_at(WAL_HEADER_SIZE as u64, &f1).await.unwrap();
+
+            let wal = Wal::open(vfs.clone(), "db", page_size).await.unwrap();
+            assert_eq!(wal.mx_frame(), 1);
+            assert_eq!(wal.find_frame(1), 1);
+
+            // Now simulate a RESTART checkpoint: rewrite the header with new salts.
+            let salt1_new = 0x11112222;
+            let salt2_new = 0x33334444;
+            let hdr_new = build_wal_header(page_size, salt1_new, salt2_new);
+            file.write_at(0, &hdr_new).await.unwrap();
+            // The old frame is still in the file but its salts don't match the new header.
+            // Recovery should see no committed frames (mx_frame == 0).
+            let wal2 = Wal::open(vfs.clone(), "db", page_size).await.unwrap();
+            assert_eq!(wal2.mx_frame(), 0);
+            assert_eq!(wal2.find_frame(1), 0);
+        });
+    }
 }

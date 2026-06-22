@@ -282,7 +282,7 @@ list every granular item needed.
 - [x] **13.8** VDBE: `JournalMode` opcode (switch between delete/wal/memory/off) [implemented via synchronous `Pager::set_journal_mode` from the `PRAGMA journal_mode` codegen, mirroring the existing `wal_checkpoint` pattern — a dedicated `OP_JournalMode` opcode is not emitted; the switch is performed inline at compile time]
 - [x] **13.9** VFS: shared-memory `xShmMap`/`xShmLock`/`xShmBarrier`/`xShmUnmap` methods for WAL index
 - [x] **13.10** `PRAGMA journal_mode` = wal / delete / memory / off / truncate / persist
-- [ ] **13.11** Recovery on open: read WAL frames, rebuild WAL index, apply uncommitted frames
+- [x] **13.11** Recovery on open: read WAL frames, rebuild WAL index, apply uncommitted frames
 - [ ] **13.12** Concurrent readers during WAL writes (MVCC via snapshot in WAL index)
 
 ---
