@@ -1155,6 +1155,7 @@ fn compile_pragma(db: &mut Sqlite3, sql: &str, pragma: &PragmaStmt) -> Result<Sq
             compile_pragma_integrity_check(db, sql, pragma, name == "quick_check")
         }
         "wal_checkpoint" => compile_pragma_wal_checkpoint(db, sql, pragma),
+        "journal_mode" => compile_pragma_journal_mode(db, sql, pragma),
         _ => Err(Error::msg(format!("PRAGMA {name} is not supported yet"))),
     }
 }
@@ -1229,6 +1230,85 @@ fn compile_pragma_wal_checkpoint(
         sql: sql.to_string(),
         program: Arc::new(Program::empty()),
         column_names: vec!["busy".to_string(), "log".to_string(), "checkpointed".to_string()],
+        backing: Backing::Static {
+            rows,
+            cur: None,
+            pos: 0,
+        },
+        explain: 0,
+        counts: None,
+        last_error: None,
+    })
+}
+
+/// `PRAGMA journal_mode` — read returns the current mode name; set switches the mode.
+///
+/// Mirrors `PragTyp_JOURNAL_MODE` in `pragma.c`. The read form (no `= value`) returns the
+/// current journal mode as a single-row, single-column result (the lowercase mode name:
+/// `delete`/`persist`/`off`/`truncate`/`memory`/`wal`). The set form (`= wal`, `= delete`, …)
+/// parses the value as one of the mode names (case-insensitive, unambiguous prefix match —
+/// `= w` resolves to `wal`, matching upstream's `sqlite3StrNICmp` ladder) and switches the
+/// pager's mode via `Pager::set_journal_mode`. An unknown name falls back to a query (the
+/// current mode is returned, no change is made), matching upstream.
+///
+/// The switch is performed synchronously through `block_on` (like `wal_checkpoint`) rather
+/// than by emitting an `OP_JournalMode` opcode, because the pragma is a one-shot statement
+/// and the engine's existing wal_checkpoint pragma already establishes this synchronous
+/// pattern. The result row is captured as a Static row set.
+fn compile_pragma_journal_mode(
+    db: &mut Sqlite3,
+    sql: &str,
+    pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    use crate::pager::JournalMode;
+    let pager = db.ensure_pager()?;
+    // Parse the value (if any). The set form accepts an identifier or a number (upstream's
+    // `nmnum`); numbers are not documented for journal_mode but accepted as a 0-based index
+    // — only the identifier path is meaningful here. An unknown name falls back to a query.
+    //
+    // The parser tokenizes `ON`/`DELETE`/`DEFAULT` as keywords (matching upstream's `nmnum`
+    // grammar), so `PRAGMA journal_mode = delete` arrives as `PragmaValueKind::Delete` rather
+    // than `Ident("delete")`. Map each keyword to its corresponding mode.
+    let requested = match &pragma.value {
+        None => JournalMode::Query,
+        Some(PragmaValue::Equal(kind)) | Some(PragmaValue::Paren(kind)) => match kind {
+            PragmaValueKind::Ident(s) => JournalMode::from_name(s).unwrap_or(JournalMode::Query),
+            PragmaValueKind::Delete => JournalMode::Delete,
+            PragmaValueKind::On => JournalMode::Query, // `= ON` is not a journal_mode
+            PragmaValueKind::Default => JournalMode::Query, // `= DEFAULT` likewise
+            PragmaValueKind::Number(lit) => {
+                // Upstream treats a numeric value as the index into `azModeName`
+                // (0=delete, 1=persist, 2=off, 3=truncate, 4=memory, 5=wal).
+                let n = match lit {
+                    Literal::Integer(n) => *n as i32,
+                    Literal::Real(f) => *f as i32,
+                    _ => return Err(Error::msg("PRAGMA journal_mode: invalid numeric value")),
+                };
+                match n {
+                    0 => JournalMode::Delete,
+                    1 => JournalMode::Persist,
+                    2 => JournalMode::Off,
+                    3 => JournalMode::Truncate,
+                    4 => JournalMode::Memory,
+                    5 => JournalMode::Wal,
+                    _ => JournalMode::Query,
+                }
+            }
+        },
+    };
+
+    // Upstream refuses a journal_mode change inside a transaction (the `OP_JournalMode`
+    // opcode raises "cannot change into/out of wal mode from within a transaction" unless
+    // `db->autoCommit && db->nVdbeRead<=1`). We approximate this with the pager's
+    // `in_write_txn` check inside `set_journal_mode`; a `BEGIN` outside an autocommit
+    // statement would have set that flag. The autocommit-only guard is also enforced there.
+    let pager_for_switch = pager.clone();
+    let final_mode = block_on(pager_for_switch.set_journal_mode(requested))?;
+    let rows = vec![vec![Value::Text(final_mode.name().to_string())]];
+    Ok(Sqlite3Stmt {
+        sql: sql.to_string(),
+        program: Arc::new(Program::empty()),
+        column_names: vec!["journal_mode".to_string()],
         backing: Backing::Static {
             rows,
             cur: None,

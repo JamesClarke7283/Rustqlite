@@ -91,7 +91,7 @@ async fn hand_built_select_star_scans_table() {
             inst(Opcode::Transaction, 0, 0, 0),
             inst(Opcode::Goto, 0, 1, 0),
         ],
-        num_registers: 4, num_cursors: 0,
+        num_registers: 4, num_cursors: 0, default_oe: 2,
     };
 
     let mut vdbe = Vdbe::new(Arc::new(program), Some(pager));

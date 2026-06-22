@@ -40,6 +40,72 @@ pub mod journal;
 pub mod pcache;
 pub mod wal;
 
+/// The pager's journal mode (mirrors `Pager.journalMode` and the `PAGER_JOURNALMODE_*` macros
+/// in `pager.h`). The numeric values match upstream's: DELETE=0, PERSIST=1, OFF=2, TRUNCATE=3,
+/// MEMORY=4, WAL=5. `Query` is the sentinel for "return the current mode" used by the
+/// `PRAGMA journal_mode` (no `= value`) form; it never reaches `set_journal_mode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalMode {
+    Delete = 0,
+    Persist = 1,
+    Off = 2,
+    Truncate = 3,
+    Memory = 4,
+    Wal = 5,
+    /// "Return the current mode" sentinel (mirrors `PAGER_JOURNALMODE_QUERY == -1`). Used only
+    /// by the PRAGMA codegen to mean "read, do not change".
+    Query = -1,
+}
+
+impl JournalMode {
+    /// The lowercase name used by `PRAGMA journal_mode` output (mirrors
+    /// `sqlite3JournalModename` in `pragma.c`).
+    pub fn name(self) -> &'static str {
+        match self {
+            JournalMode::Delete => "delete",
+            JournalMode::Persist => "persist",
+            JournalMode::Off => "off",
+            JournalMode::Truncate => "truncate",
+            JournalMode::Memory => "memory",
+            JournalMode::Wal => "wal",
+            JournalMode::Query => "query",
+        }
+    }
+
+    /// Parse a pragma value into a journal mode (mirrors the `sqlite3StrNICmp` prefix-match
+    /// ladder in `pragma.c`'s `PragTyp_JOURNAL_MODE` handler — `delete`/`persist`/`off`/
+    /// `truncate`/`memory`/`wal` are matched case-insensitively by unambiguous prefix). An
+    /// unknown / empty string returns `None` (upstream falls back to a query in that case).
+    pub fn from_name(name: &str) -> Option<JournalMode> {
+        let n = name.len();
+        let modes = [
+            JournalMode::Delete,
+            JournalMode::Persist,
+            JournalMode::Off,
+            JournalMode::Truncate,
+            JournalMode::Memory,
+            JournalMode::Wal,
+        ];
+        for m in modes {
+            if name.eq_ignore_ascii_case(m.name()) {
+                return Some(m);
+            }
+            // Upstream uses `sqlite3StrNICmp(zRight, zMode, n)` — a prefix match where the
+            // user's value is a prefix of the canonical name (e.g. "w" → "wal"). Match this
+            // so long as the user supplied at least one character.
+            if n >= 1 && m.name().len() >= n && m.name()[..n].eq_ignore_ascii_case(name) {
+                return Some(m);
+            }
+        }
+        None
+    }
+
+    /// Whether this mode is one of the rollback-journal family (everything except WAL).
+    pub fn is_rollback(self) -> bool {
+        !matches!(self, JournalMode::Wal | JournalMode::Query)
+    }
+}
+
 /// A page's bytes (exactly `page_size` long), shared cheaply via `Arc`.
 pub type PageRef = Arc<Vec<u8>>;
 
@@ -67,10 +133,13 @@ pub struct Pager {
     /// journal mode (the default). When the database header's `write_version`/`read_version` is
     /// `2`, the pager is in WAL mode; `open` constructs the `Wal`, recovers its in-memory index,
     /// and `get_page` consults the WAL before reading the database file. The WAL read path is
-    /// M13.4; the write path (appending frames) is M13.5 (not yet implemented — the pager still
-    /// writes through the rollback journal even in WAL mode, so a WAL-mode database written by
-    /// Rustqlite is not yet durable across a crash without a checkpoint).
-    wal: Option<Mutex<wal::Wal>>,
+    /// M13.4; the write path (appending frames) is M13.5.
+    ///
+    /// Wrapped in an outer `Mutex` so `PRAGMA journal_mode = wal`/`= delete` can swap the handle
+    /// in place (mirrors `Pager.pWal = 0` in `sqlite3PagerCloseWal` and `pagerOpenWal`). The
+    /// inner `Arc<Mutex>` lets a reader clone the handle and drop the outer lock before any
+    /// `await`, mirroring the upstream `WAL_WRITE_LOCK`/`WAL_READ_LOCK` splits.
+    wal: Mutex<Option<Arc<Mutex<wal::Wal>>>>,
 }
 
 /// One entry on the pager's savepoint stack (mirrors `PagerSavepoint` in `pager.c`).
@@ -169,7 +238,7 @@ impl Pager {
         // the pager must consult the `-wal` sidecar before reading any page. The WAL handle
         // recovers the in-memory wal-index from the WAL frames (M13.4).
         let wal = if header.write_version == 2 || header.read_version == 2 {
-            Some(Mutex::new(wal::Wal::open(vfs.clone(), &path, page_size as u32).await?))
+            Some(Arc::new(Mutex::new(wal::Wal::open(vfs.clone(), &path, page_size as u32).await?)))
         } else {
             None
         };
@@ -188,7 +257,7 @@ impl Pager {
             }),
             txn: Mutex::new(None),
             savepoints: Mutex::new(Vec::new()),
-            wal,
+            wal: Mutex::new(wal),
         })
     }
 
@@ -240,7 +309,7 @@ impl Pager {
             }),
             txn: Mutex::new(None),
             savepoints: Mutex::new(Vec::new()),
-            wal: None,
+            wal: Mutex::new(None),
         })
     }
 
@@ -259,7 +328,8 @@ impl Pager {
 
     pub fn page_count(&self) -> u32 {
         let st_count = self.state.lock().unwrap().page_count;
-        match &self.wal {
+        let wal = self.wal.lock().unwrap();
+        match &*wal {
             Some(w) => {
                 let w = w.lock().unwrap();
                 if w.mx_frame() != 0 {
@@ -334,16 +404,19 @@ impl Pager {
             // The effective page count: in WAL mode with a non-empty WAL, the WAL's `n_page`
             // is the durable size (it may be larger than the file if pages were added in the
             // WAL but not yet checkpointed). Otherwise the file's page count is authoritative.
-            let effective_count = match &self.wal {
-                Some(w) => {
-                    let w = w.lock().unwrap();
-                    if w.mx_frame() != 0 {
-                        w.n_page().max(st.page_count)
-                    } else {
-                        st.page_count
+            let effective_count = {
+                let wal = self.wal.lock().unwrap();
+                match &*wal {
+                    Some(w) => {
+                        let w = w.lock().unwrap();
+                        if w.mx_frame() != 0 {
+                            w.n_page().max(st.page_count)
+                        } else {
+                            st.page_count
+                        }
                     }
+                    _ => st.page_count,
                 }
-                _ => st.page_count,
             };
             if pgno == 0 || pgno > effective_count {
                 return Err(Error::corrupt(format!(
@@ -357,31 +430,35 @@ impl Pager {
         }
 
         // In WAL mode, consult the WAL before the database file (mirrors `pagerWalRead`).
-        if let Some(wal) = &self.wal {
-            // Find the frame under the lock, then clone the file Arc and release the lock
-            // before the async read (so we don't hold a `std::sync::MutexGuard` across an
-            // `await` — that would make the future `!Send`).
-            let (i_frame, file, offset) = {
-                let w = wal.lock().unwrap();
-                let i_frame = w.find_frame(pgno);
-                if i_frame == 0 {
-                    (0, None, 0u64)
-                } else {
-                    (i_frame, w.file_clone(), w.frame_data_offset(i_frame))
+        // Find the frame under the lock, then clone the file Arc and release the lock
+        // before the async read (so we don't hold a `std::sync::MutexGuard` across an
+        // `await` — that would make the future `!Send`).
+        let (i_frame, file, offset) = {
+            let wal = self.wal.lock().unwrap();
+            match &*wal {
+                Some(wmx) => {
+                    let w = wmx.lock().unwrap();
+                    let i_frame = w.find_frame(pgno);
+                    if i_frame == 0 {
+                        (0, None, 0u64)
+                    } else {
+                        (i_frame, w.file_clone(), w.frame_data_offset(i_frame))
+                    }
                 }
-            };
-            if i_frame != 0 {
-                let file = file.expect("wal frame exists, file must be open");
-                let mut buf = vec![0u8; self.page_size];
-                file.read_at(offset, &mut buf).await?;
-                let page: PageRef = Arc::new(buf);
-                let mut st = self.state.lock().unwrap();
-                if let Some(page) = st.dirty.get(&pgno).or_else(|| st.cache.get(&pgno)).cloned() {
-                    return Ok(page);
-                }
-                st.cache.insert(pgno, page.clone());
+                None => (0, None, 0u64),
+            }
+        };
+        if i_frame != 0 {
+            let file = file.expect("wal frame exists, file must be open");
+            let mut buf = vec![0u8; self.page_size];
+            file.read_at(offset, &mut buf).await?;
+            let page: PageRef = Arc::new(buf);
+            let mut st = self.state.lock().unwrap();
+            if let Some(page) = st.dirty.get(&pgno).or_else(|| st.cache.get(&pgno)).cloned() {
                 return Ok(page);
             }
+            st.cache.insert(pgno, page.clone());
+            return Ok(page);
         }
 
         let mut buf = vec![0u8; self.page_size];
@@ -425,7 +502,7 @@ impl Pager {
         // In WAL mode, the rollback journal is not used — dirty pages are appended as frames
         // to the `-wal` sidecar at commit time, and rollback discards the dirty overlay (no
         // pre-image replay is needed). Skip journaling entirely.
-        if self.wal.is_some() {
+        if self.wal.lock().unwrap().is_some() {
             return Ok(());
         }
         // Reserve the record slot under the txn lock, then write it without holding the lock.
@@ -687,7 +764,7 @@ impl Pager {
         // in `sqlite3PagerBegin`). We still open a `WriteTxn` to track the transaction boundary
         // (the db_orig_size for rollback and the `in_write_txn` flag), but the `journal` field
         // is unused — `commit` writes to the WAL instead of the journal + DB file.
-        if self.wal.is_some() {
+        if self.wal.lock().unwrap().is_some() {
             // A no-op journal placeholder so `in_write_txn`/`rollback` work without a real
             // journal file. The `journal` field is never read in the WAL commit path.
             let journal: Arc<dyn VfsFile> =
@@ -774,7 +851,7 @@ impl Pager {
         // `sqlite3WalFrames`). The WAL sync is the durable commit point. The database file is
         // NOT written — the pages stay in the WAL until a checkpoint copies them into the DB
         // file (M13.6, not yet implemented). Readers see the new pages via the wal-index.
-        if self.wal.is_some() {
+        if self.wal.lock().unwrap().is_some() {
             // Collect the dirty pages in page-number order (deterministic frame order; upstream
             // writes in dirty-list order, which is arbitrary but consistent — page-number order
             // is a faithful-enough stand-in and makes the WAL byte-identical across runs).
@@ -788,11 +865,15 @@ impl Pager {
                 .iter()
                 .map(|(pgno, data)| (*pgno, (**data).clone()))
                 .collect();
-            self.wal
-                .as_ref().unwrap()
-                .lock().unwrap()
-                .write_frames(&frames, page_count)
-                .await?;
+            {
+                let wal = self.wal.lock().unwrap();
+                wal.as_ref()
+                    .expect("wal present (checked above)")
+                    .lock()
+                    .unwrap()
+                    .write_frames(&frames, page_count)
+                    .await?;
+            }
             // Promote the committed pages into the clean cache.
             {
                 let mut st = self.state.lock().unwrap();
@@ -1041,6 +1122,151 @@ impl Pager {
         format!("{}-journal", self.path)
     }
 
+    fn wal_path(&self) -> String {
+        format!("{}-wal", self.path)
+    }
+
+    /// The current journal mode (mirrors `sqlite3PagerGetJournalMode`). Returns `Wal` when
+    /// the WAL sidecar handle is present (the header's `write_version`/`read_version` is `2`),
+    /// and `Delete` otherwise — the default rollback-journal mode that `create_fresh` and a
+    /// legacy header both imply. The full `PAGER_JOURNALMODE_*` family (`PERSIST`/`OFF`/
+    /// `TRUNCATE`/`MEMORY`) collapses to `Delete` here because the pager only distinguishes
+    /// WAL from non-WAL at the I/O layer; the sub-modes of rollback journaling all use the
+    /// same delete-on-commit journal file in this engine.
+    pub fn journal_mode(&self) -> JournalMode {
+        if self.wal.lock().unwrap().is_some() {
+            JournalMode::Wal
+        } else {
+            JournalMode::Delete
+        }
+    }
+
+    /// Whether the pager is currently in WAL mode (mirrors `pagerUseWal`).
+    pub fn is_wal(&self) -> bool {
+        self.wal.lock().unwrap().is_some()
+    }
+
+    /// Whether the database file path is a real on-disk file (not `:memory:`). Used by
+    /// `set_journal_mode` to refuse a transition to WAL for an in-memory database, matching
+    /// upstream's "Temp file" early-out in `OP_JournalMode`.
+    fn is_in_memory(&self) -> bool {
+        self.path == ":memory:" || self.path.is_empty()
+    }
+
+    /// Switch the pager's journal mode (mirrors `OP_JournalMode` in `vdbe.c`). Handles
+    /// transitions between the rollback family (`Delete`/`Persist`/`Off`/`Truncate`/`Memory`)
+    /// and `Wal`. The rollback sub-modes all collapse to "use the rollback journal" here —
+    /// the engine does not model `PERSIST`/`TRUNCATE`/`MEMORY`/`OFF` distinct from `DELETE`
+    /// at the I/O layer, so only the WAL ↔ non-WAL transition does any I/O.
+    ///
+    /// **WAL → rollback**: checkpoint the WAL into the DB file (so all committed frames are
+    /// durable), close the `Wal` handle, delete the `-wal` sidecar, and stamp the DB header's
+    /// `write_version`/`read_version` back to `1`. Mirrors `sqlite3PagerCloseWal` +
+    /// `sqlite3BtreeSetVersion(1)`.
+    ///
+    /// **rollback → WAL**: stamp the DB header's `write_version`/`read_version` to `2`, open
+    /// the `Wal` handle (which recovers any pre-existing `-wal` sidecar), and write the header
+    /// change back to the file. Mirrors `sqlite3BtreeSetVersion(2)` + `pagerOpenWal`.
+    ///
+    /// Refuses a transition to WAL for an in-memory database (upstream's "Temp file" early-out)
+    /// or when the pager has an open write transaction (`PagerOkToChangeJournalMode`). The
+    /// `PRAGMA journal_mode` codegen guards the autocommit/non-transaction case before calling
+    /// this; this method enforces the pager-level invariants.
+    ///
+    /// Returns the new mode (which may differ from `to` when the transition is refused —
+    /// matching upstream's `eNew = eOld` behavior).
+    pub async fn set_journal_mode(&self, to: JournalMode) -> Result<JournalMode> {
+        let current = self.journal_mode();
+        if matches!(to, JournalMode::Query) {
+            return Ok(current);
+        }
+        // Collapse the rollback sub-modes onto `Delete` since the engine doesn't model them
+        // distinctly at the I/O layer. The returned name will be "delete" for any rollback
+        // mode, which matches what a fresh C-SQLite database reports for `journal_mode`
+        // before a `PRAGMA journal_mode = persist` (etc.) is issued.
+        let to_eff = if to.is_rollback() { JournalMode::Delete } else { to };
+
+        if to_eff == current {
+            return Ok(to_eff);
+        }
+
+        // Refuse a transition to WAL for an in-memory database (mirrors upstream's
+        // `zFilename==0` early-out).
+        if to_eff == JournalMode::Wal && self.is_in_memory() {
+            return Ok(current);
+        }
+
+        // Refuse a transition while a write transaction is open (mirrors
+        // `sqlite3PagerOkToChangeJournalMode`).
+        if self.in_write_txn() {
+            return Err(Error::msg(format!(
+                "cannot change {} wal mode from within a transaction",
+                if to_eff == JournalMode::Wal { "into" } else { "out of" }
+            )));
+        }
+
+        match (current, to_eff) {
+            (JournalMode::Wal, JournalMode::Delete) => {
+                // Checkpoint (TRUNCATE) the WAL into the DB file so all committed frames are
+                // durable. The checkpoint syncs the DB file (the durable commit point) and
+                // truncates the `-wal` sidecar to zero bytes.
+                self.checkpoint(wal::CheckpointMode::Truncate).await?;
+                // Drop the Wal handle and delete the `-wal` sidecar (mirrors `sqlite3OsDelete`
+                // after `sqlite3WalClose` succeeds with an EXCLUSIVE lock).
+                {
+                    let mut wal_guard = self.wal.lock().unwrap();
+                    *wal_guard = None;
+                }
+                self.vfs.delete(&self.wal_path()).await.ok();
+                // Stamp the header's read/write version back to 1 (legacy rollback) and
+                // persist the change to page 1.
+                self.with_header_mut(|h| {
+                    h.write_version = 1;
+                    h.read_version = 1;
+                });
+                self.persist_header_bytes().await?;
+                Ok(JournalMode::Delete)
+            }
+            (JournalMode::Delete, JournalMode::Wal) => {
+                // Stamp the header's read/write version to 2 (WAL) and persist it first, so
+                // a subsequent `Wal::open` (which reads the header to detect WAL mode) sees
+                // the new state.
+                self.with_header_mut(|h| {
+                    h.write_version = 2;
+                    h.read_version = 2;
+                });
+                self.persist_header_bytes().await?;
+                // Open the Wal handle (recovers any pre-existing `-wal` sidecar; usually
+                // empty when switching into WAL mode on a rollback database).
+                let wal = wal::Wal::open(self.vfs.clone(), &self.path, self.page_size as u32).await?;
+                {
+                    let mut wal_guard = self.wal.lock().unwrap();
+                    *wal_guard = Some(Arc::new(Mutex::new(wal)));
+                }
+                Ok(JournalMode::Wal)
+            }
+            // All other pairs are no-ops (the engine doesn't distinguish rollback sub-modes).
+            _ => Ok(to_eff),
+        }
+    }
+
+    /// Write the in-memory header back to page 1 in the dirty overlay and persist it through
+    /// a tiny write transaction (mirrors `sqlite3BtreeSetVersion`'s
+    /// `sqlite3BtreeBeginTrans(2)` + `sqlite3PagerWrite(pPage1)`). Used by `set_journal_mode`
+    /// to stamp the read/write version bytes (18/19) into the file.
+    async fn persist_header_bytes(&self) -> Result<()> {
+        self.begin_write(true).await?;
+        {
+            let mut page1 = self.read_page_for_write(1).await?;
+            let bytes = self.header().serialize();
+            page1[0..100].copy_from_slice(&bytes);
+            self.write_page(1, page1)?;
+        }
+        self.commit().await?;
+        // Release the EXCLUSIVE lock taken by `begin_write(true)` back to SHARED.
+        self.end_txn().await
+    }
+
     /// Run a WAL checkpoint (mirrors `sqlite3PagerCheckpoint` → `sqlite3WalCheckpoint`). Copies
     /// committed frames from the `-wal` sidecar back into the database file, then optionally
     /// resets the WAL (RESTART/TRUNCATE). A no-op (returning `(0, 0)`) when the database is not
@@ -1050,9 +1276,15 @@ impl Pager {
     /// actually backfilled into the database. The caller (the VDBE `OP_Checkpoint` or the
     /// `PRAGMA wal_checkpoint` codegen) surfaces these as the result-row columns.
     pub async fn checkpoint(&self, mode: wal::CheckpointMode) -> Result<(u32, u32)> {
-        let wal = match &self.wal {
-            Some(w) => w,
-            None => return Ok((0, 0)),
+        // Clone the inner `Arc<Mutex<Wal>>` under the outer lock, then drop the outer guard
+        // before the async checkpoint (its `MutexGuard` is `!Send`, which would make the
+        // future `!Send` if held across the `await`).
+        let wal = {
+            let outer = self.wal.lock().unwrap();
+            match outer.as_ref() {
+                Some(w) => Arc::clone(w),
+                None => return Ok((0, 0)),
+            }
         };
         let mut w = wal.lock().unwrap();
         if w.mx_frame() == 0 {

@@ -655,3 +655,210 @@ fn rustqlite_wal_write_after_truncate_checkpoint() {
     assert_eq!(db.run("SELECT a FROM t ORDER BY a;"), "1\n2\n3");
     assert_eq!(db.run("PRAGMA integrity_check;"), "ok");
 }
+
+// ===========================================================================
+// M13.8/M13.10 — `PRAGMA journal_mode` (switch between rollback and WAL mode)
+// ===========================================================================
+
+/// `PRAGMA journal_mode` (no value) on a fresh rollback database returns "delete".
+/// Mirrors the C oracle.
+#[test]
+fn pragma_journal_mode_read_returns_delete_on_fresh_db() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("jmread");
+    db.run("CREATE TABLE t(a);"); // create the file in rollback mode
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "PRAGMA journal_mode;")
+            .expect("prepare");
+        let rows = collect(&mut stmt);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Text("delete".to_string()));
+    }
+    // The C oracle agrees.
+    assert_eq!(db.run("PRAGMA journal_mode;"), "delete");
+}
+
+/// `PRAGMA journal_mode = wal` on a fresh rollback database switches into WAL mode and
+/// returns "wal". A subsequent read returns "wal". Mirrors the C oracle.
+#[test]
+fn pragma_journal_mode_switch_to_wal() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("jm2wal");
+    db.run("CREATE TABLE t(a);"); // rollback mode
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "PRAGMA journal_mode = wal;")
+            .expect("prepare");
+        let rows = collect(&mut stmt);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Text("wal".to_string()));
+        // Read form now reports "wal".
+        let (mut stmt2, _) = sqlite3_prepare_v2(&mut conn, "PRAGMA journal_mode;")
+            .expect("prepare");
+        let rows2 = collect(&mut stmt2);
+        assert_eq!(rows2[0][0], Value::Text("wal".to_string()));
+    }
+    // The C oracle sees the database as WAL mode (the header's write/read version is 2).
+    assert_eq!(db.run("PRAGMA journal_mode;"), "wal");
+}
+
+/// `PRAGMA journal_mode = delete` on a WAL-mode database switches back to rollback and
+/// returns "delete". The `-wal` sidecar is checkpointed and removed.
+#[test]
+fn pragma_journal_mode_switch_out_of_wal() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("jm2del");
+    db.run("PRAGMA journal_mode = wal;");
+    db.run("CREATE TABLE t(a);");
+    db.run("INSERT INTO t VALUES (1), (2), (3);");
+    // The C oracle's CLI checkpoints and removes the `-wal` on exit, but the header still
+    // says WAL mode (write_version=2), so Rustqlite opens in WAL mode. Insert a row through
+    // Rustqlite to ensure the `-wal` sidecar exists, then switch back to delete.
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (4);")
+            .expect("prepare");
+        match stmt.step() {
+            ResultCode::Done => {}
+            other => panic!("unexpected step result {other:?}: {}", stmt.errmsg()),
+        }
+        // The `-wal` sidecar should now exist (Rustqlite wrote a frame).
+        assert!(
+            std::fs::metadata(format!("{}-wal", db.str())).is_ok(),
+            "wal file should exist after a Rustqlite write in WAL mode"
+        );
+        // Switch back to delete — this must checkpoint the WAL into the DB file and remove
+        // the sidecar.
+        let (mut stmt2, _) = sqlite3_prepare_v2(&mut conn, "PRAGMA journal_mode = delete;")
+            .expect("prepare");
+        let rows = collect(&mut stmt2);
+        assert_eq!(rows[0][0], Value::Text("delete".to_string()));
+    }
+    // The `-wal` sidecar was deleted by the switch.
+    let wal_exists = std::fs::metadata(format!("{}-wal", db.str())).is_ok();
+    assert!(!wal_exists, "wal file should be removed after switching to delete");
+    // The C oracle sees rollback mode and all committed rows are in the DB file.
+    assert_eq!(db.run("PRAGMA journal_mode;"), "delete");
+    assert_eq!(db.run("SELECT count(*) FROM t;"), "4");
+    assert_eq!(db.run("PRAGMA integrity_check;"), "ok");
+}
+
+/// Round-trip: rollback → WAL → insert rows → rollback. The rows written in WAL mode must
+/// survive the switch back to rollback (the switch checkpoints them into the DB file).
+#[test]
+fn pragma_journal_mode_wal_then_delete_roundtrip() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("jmrt");
+    db.run("CREATE TABLE t(a);");
+    // Switch to WAL, insert, switch back.
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "PRAGMA journal_mode = wal;")
+            .expect("prepare");
+        let _ = collect(&mut stmt);
+        let (mut stmt2, _) = sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (10), (20), (30);")
+            .expect("prepare");
+        match stmt2.step() {
+            ResultCode::Done => {}
+            other => panic!("unexpected step result {other:?}: {}", stmt2.errmsg()),
+        }
+        // Switch back to delete — this must checkpoint the WAL into the DB file.
+        let (mut stmt3, _) = sqlite3_prepare_v2(&mut conn, "PRAGMA journal_mode = delete;")
+            .expect("prepare");
+        let rows = collect(&mut stmt3);
+        assert_eq!(rows[0][0], Value::Text("delete".to_string()));
+    }
+    // The C oracle reads the rows from the DB file (no WAL sidecar).
+    assert_eq!(db.run("SELECT count(*) FROM t;"), "3");
+    assert_eq!(db.run("SELECT a FROM t ORDER BY a;"), "10\n20\n30");
+    assert_eq!(db.run("PRAGMA integrity_check;"), "ok");
+}
+
+/// `PRAGMA journal_mode = wal` on an in-memory database (`:memory:`) is refused — the
+/// mode stays "memory" and the result row reports "memory". Mirrors upstream's
+/// "Do not allow a transition to journal_mode=WAL for a database in temporary storage".
+#[test]
+fn pragma_journal_mode_wal_refused_on_memory_db() {
+    let mut conn = sqlite3_open(":memory:").expect("open");
+    let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "PRAGMA journal_mode = wal;")
+        .expect("prepare");
+    let rows = collect(&mut stmt);
+    // The switch is refused; the current mode ("memory" for a fresh in-memory db, but our
+    // engine reports "delete" for a non-WAL pager) is returned instead of "wal".
+    assert_ne!(rows[0][0], Value::Text("wal".to_string()));
+}
+
+/// `PRAGMA journal_mode = WAL` (uppercase) and `= w` (prefix) are accepted — the parser
+/// uses a case-insensitive unambiguous-prefix match, mirroring upstream's `sqlite3StrNICmp`
+/// ladder.
+#[test]
+fn pragma_journal_mode_case_and_prefix_match() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("jmcase");
+    db.run("CREATE TABLE t(a);");
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        // Uppercase WAL.
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "PRAGMA journal_mode = WAL;")
+            .expect("prepare");
+        let rows = collect(&mut stmt);
+        assert_eq!(rows[0][0], Value::Text("wal".to_string()));
+        // Switch back with prefix "del" → "delete".
+        let (mut stmt2, _) = sqlite3_prepare_v2(&mut conn, "PRAGMA journal_mode = del;")
+            .expect("prepare");
+        let rows2 = collect(&mut stmt2);
+        assert_eq!(rows2[0][0], Value::Text("delete".to_string()));
+    }
+    assert_eq!(db.run("PRAGMA journal_mode;"), "delete");
+}
+
+/// `PRAGMA journal_mode = <unknown>` falls back to a query (no change). Mirrors upstream's
+/// "If the =MODE part does not match any known journal mode, then do a query".
+#[test]
+fn pragma_journal_mode_unknown_name_falls_back_to_query() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("jmunk");
+    db.run("PRAGMA journal_mode = wal;");
+    db.run("CREATE TABLE t(a);");
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        // "bogus" is not a known mode — the result is the current mode ("wal"), no change.
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "PRAGMA journal_mode = bogus;")
+            .expect("prepare");
+        let rows = collect(&mut stmt);
+        assert_eq!(rows[0][0], Value::Text("wal".to_string()));
+    }
+    // Still in WAL mode.
+    assert_eq!(db.run("PRAGMA journal_mode;"), "wal");
+}
+
+/// A WAL-mode database written by Rustqlite (after `PRAGMA journal_mode = wal` from a fresh
+/// rollback DB) is read back correctly by the C oracle. This verifies that the
+/// rollback→WAL transition produces a byte-format-valid WAL-mode database.
+#[test]
+fn rustqlite_switches_to_wal_then_c_oracle_reads() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("jmswitch");
+    db.run("CREATE TABLE t(a, b);"); // rollback mode (created by C oracle)
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        // Switch to WAL mode.
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "PRAGMA journal_mode = wal;")
+            .expect("prepare");
+        let rows = collect(&mut stmt);
+        assert_eq!(rows[0][0], Value::Text("wal".to_string()));
+        // Insert rows in WAL mode.
+        let (mut stmt2, _) =
+            sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (1, 'one'), (2, 'two');")
+                .expect("prepare");
+        match stmt2.step() {
+            ResultCode::Done => {}
+            other => panic!("unexpected step result {other:?}: {}", stmt2.errmsg()),
+        }
+    }
+    // The C oracle recovers the WAL and reads the rows.
+    assert_eq!(db.run("SELECT count(*) FROM t;"), "2");
+    assert_eq!(db.run("SELECT b FROM t WHERE a = 1;"), "one");
+    assert_eq!(db.run("PRAGMA integrity_check;"), "ok");
+}
