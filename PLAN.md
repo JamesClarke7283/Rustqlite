@@ -283,7 +283,7 @@ list every granular item needed.
 - [x] **13.9** VFS: shared-memory `xShmMap`/`xShmLock`/`xShmBarrier`/`xShmUnmap` methods for WAL index
 - [x] **13.10** `PRAGMA journal_mode` = wal / delete / memory / off / truncate / persist
 - [x] **13.11** Recovery on open: read WAL frames, rebuild WAL index, apply uncommitted frames
-- [ ] **13.12** Concurrent readers during WAL writes (MVCC via snapshot in WAL index)
+- [ ] **13.12** Concurrent readers during WAL writes (MVCC via snapshot in WAL index) [BLOCKED: scope — requires per-reader snapshot state (aReadMark[]/WAL_READ_LOCK protocol), the writer backfill constraint (don't overwrite frames a reader still needs), and integration with the shm methods landed in M13.9. Multi-day feature touching the pager's get_page/begin_read/end_txn paths; deferred to a dedicated session to avoid destabilizing the working WAL read/write paths.]
 
 ---
 
