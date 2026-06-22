@@ -17,9 +17,15 @@ pub mod record;
 pub mod serial_type;
 pub mod varint;
 pub mod wal;
+pub mod wal_index;
 
 pub use header::{DbHeader, TextEncoding};
 pub use record::{decode_record, encode_record};
 pub use serial_type::SerialType;
 pub use varint::{read_varint, read_varint_i64, varint_len, write_varint};
 pub use wal::{WalFrameHeader, WalHeader, WAL_HEADER_SIZE, WAL_FRAME_HEADER_SIZE};
+pub use wal_index::{
+    WalCkptInfo, WalIndexHdr, HASHTABLE_NPAGE, HASHTABLE_NPAGE_ONE, HASHTABLE_NSLOT,
+    READMARK_NOT_USED, SQLITE_SHM_NLOCK, WALINDEX_LOCK_OFFSET, WAL_INDEX_HEADER_SIZE,
+    WAL_NREADER,
+};
