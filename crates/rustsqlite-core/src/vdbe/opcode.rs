@@ -85,6 +85,15 @@ pub enum Opcode {
     /// is active" / "cannot rollback - no transaction is active". Mirrors `OP_AutoCommit` in
     /// `vdbe.c`.
     AutoCommit,
+    /// `Savepoint p1 * * P4=Text(name)`: open (`p1 == 0`), release (`p1 == 1`), or
+    /// rollback (`p1 == 2`) the savepoint named by `P4`. Opening a savepoint when the connection
+    /// is in autocommit mode starts an implicit transaction (the savepoint becomes the
+    /// "transaction savepoint"); releasing that outermost transaction savepoint commits the
+    /// transaction. Releasing any other savepoint discards it and any nested savepoints
+    /// (their changes become part of the enclosing transaction). Rolling back to a savepoint
+    /// discards the changes made since the savepoint was created, keeping the savepoint on the
+    /// stack. Mirrors `OP_Savepoint` in `vdbe.c`.
+    Savepoint,
     /// `SetCookie p1 p2 p3`: write the value `p3` into header cookie `p2` of database `p1`. Used
     /// after DDL to bump the schema cookie (header bytes 40-43). Mirrors `OP_SetCookie`.
     SetCookie,
@@ -393,6 +402,7 @@ impl Opcode {
             Opcode::Jump => "Jump",
             Opcode::Transaction => "Transaction",
             Opcode::AutoCommit => "AutoCommit",
+            Opcode::Savepoint => "Savepoint",
             Opcode::SetCookie => "SetCookie",
             Opcode::ParseSchema => "ParseSchema",
             Opcode::CreateBtree => "CreateBtree",

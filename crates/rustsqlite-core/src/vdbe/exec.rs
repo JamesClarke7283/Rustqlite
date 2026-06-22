@@ -211,6 +211,12 @@ pub struct Vdbe {
     /// for unit tests that don't care about transactions — they get the legacy behavior where
     /// every `Halt` commits). Mirrors `db->autoCommit` in `main.c`.
     autocommit: Option<Arc<std::sync::Mutex<bool>>>,
+    /// The connection's shared `isTransactionSavepoint` flag, set by `sqlite3_prepare_v2` so
+    /// `OP_Savepoint` and `OP_AutoCommit` can consult and mutate it. `None` means "no transaction
+    /// savepoint tracking" (the unit-test default — SAVEPOINT auto-starting a transaction still
+    /// works but RELEASE-of-outermost can't tell whether to commit; the test code paths never
+    /// hit that combination). Mirrors `db->isTransactionSavepoint` in `main.c`.
+    is_transaction_savepoint: Option<Arc<std::sync::Mutex<bool>>>,
     /// Per-accumulator state keyed by the register that holds the aggregate's result (the `p3`
     /// of `AggStep` / `p1` of `AggFinal`). SQLite stores this inside the `Mem` cell itself; we
     /// keep it in a side table so the `Value` type stays storage-class-only. An entry is created
@@ -253,6 +259,7 @@ impl Vdbe {
             cursor_root: HashMap::new(),
             write_txn: false,
             autocommit: None,
+            is_transaction_savepoint: None,
             aggregates: HashMap::new(),
             last_compare: Ordering::Equal,
             once_done: std::collections::HashSet::new(),
@@ -279,12 +286,35 @@ impl Vdbe {
         self.autocommit = Some(handle);
     }
 
+    /// Install the connection's shared `isTransactionSavepoint` flag so `OP_Savepoint` and
+    /// `OP_AutoCommit` can consult and mutate it. Called by `sqlite3_prepare_v2` after
+    /// constructing the Vdbe. When never called, the Vdbe treats SAVEPOINT as if it never
+    /// auto-starts a transaction savepoint (the unit-test mode).
+    pub fn set_is_transaction_savepoint_handle(&mut self, handle: Arc<std::sync::Mutex<bool>>) {
+        self.is_transaction_savepoint = Some(handle);
+    }
+
     /// Read the current autocommit flag. Returns `true` when no shared handle is installed
     /// (the legacy unit-test mode) or when the shared flag's value is `true`.
     fn autocommit(&self) -> bool {
         self.autocommit
             .as_ref()
             .map_or(true, |h| *h.lock().unwrap())
+    }
+
+    /// Read the current `isTransactionSavepoint` flag. Returns `false` when no shared handle is
+    /// installed (the legacy unit-test mode) or when the shared flag's value is `false`.
+    fn is_transaction_savepoint(&self) -> bool {
+        self.is_transaction_savepoint
+            .as_ref()
+            .map_or(false, |h| *h.lock().unwrap())
+    }
+
+    /// Set the shared `isTransactionSavepoint` flag, if a handle is installed.
+    fn set_is_transaction_savepoint(&self, value: bool) {
+        if let Some(h) = self.is_transaction_savepoint.as_ref() {
+            *h.lock().unwrap() = value;
+        }
     }
 
     /// Reset to the start so the program can be re-run (`sqlite3_reset`).
@@ -757,7 +787,9 @@ impl Vdbe {
                     // `OP_AutoCommit p1 p2`: toggle the connection's autocommit flag.
                     //   p1 = desired autocommit (1 = on, 0 = off)
                     //   p2 = rollback flag (only valid when p1 == 1; p2 == 1 means ROLLBACK)
-                    // Mirrors `OP_AutoCommit` in `vdbe.c`.
+                    // Mirrors `OP_AutoCommit` in `vdbe.c` (which calls `sqlite3VdbeHalt` to
+                    // commit/rollback the transaction and `sqlite3CloseSavepoints` to wipe the
+                    // savepoint stack and `isTransactionSavepoint` flag).
                     let desired = p1 != 0;
                     let rollback = p2 != 0;
                     let current = self.autocommit();
@@ -786,11 +818,119 @@ impl Vdbe {
                                     pager.commit().await?;
                                 }
                             }
+                            // Mirrors `sqlite3CloseSavepoints` — a COMMIT or ROLLBACK wipes the
+                            // savepoint stack (already done by `end_txn` inside commit/rollback)
+                            // and resets the transaction-savepoint flag. Belt-and-suspenders:
+                            // clear again in case `commit`/`rollback` early-returned without
+                            // calling `end_txn` (the no-write-txn path).
+                            pager.clear_savepoints();
                         }
+                        self.set_is_transaction_savepoint(false);
                         self.write_txn = false;
                     }
                     // OP_AutoCommit ends the statement (mirrors upstream's `goto vdbe_return`
                     // after `sqlite3VdbeHalt`). The `Halt` opcode isn't reached.
+                    self.halted = true;
+                    return Ok(StepResult::Done);
+                }
+
+                Opcode::Savepoint => {
+                    // `OP_Savepoint p1 * * P4=Text(name)`: open (p1 == 0), release (p1 == 1),
+                    // or rollback (p1 == 2) the savepoint named by `P4`. Mirrors `OP_Savepoint`
+                    // in `vdbe.c`.
+                    //
+                    // p1 == 0 (SAVEPOINT_BEGIN): create a new savepoint. If the connection is in
+                    //   autocommit mode, this implicitly starts a transaction (the savepoint
+                    //   becomes the "transaction savepoint"); otherwise the savepoint is nested
+                    //   inside the current transaction. The pager snapshots the current dirty
+                    //   overlay and page count so a later ROLLBACK TO can restore them.
+                    // p1 == 1 (SAVEPOINT_RELEASE): find the named savepoint. If it is the outermost
+                    //   AND is the transaction savepoint, this is a COMMIT — turn autocommit on,
+                    //   commit the pager transaction, and clear the savepoint stack. Otherwise
+                    //   drop the named savepoint and any nested ones; their changes become part of
+                    //   the enclosing transaction.
+                    // p1 == 2 (SAVEPOINT_ROLLBACK): find the named savepoint and restore the dirty
+                    //   overlay/page count to its snapshot, dropping nested savepoints but
+                    //   keeping the named one (so it can be rolled back to again).
+                    let name = match &inst.p4 {
+                        P4::Text(s) => s.clone(),
+                        _ => return Err(Error::msg("OP_Savepoint requires a Text name in p4")),
+                    };
+                    let op = p1;
+                    if op == 0 {
+                        // SAVEPOINT_BEGIN.
+                        // Upstream's `db->nVdbeWrite>0` guard (cannot open a savepoint if there are
+                        // active write statements) is implicitly satisfied because each statement
+                        // is fully stepped through `Done` before the next is prepared.
+                        let was_autocommit = self.autocommit();
+                        if was_autocommit {
+                            // Auto-start a transaction: turn autocommit off and mark this
+                            // savepoint as the transaction savepoint. Mirrors
+                            // `db->autoCommit = 0; db->isTransactionSavepoint = 1;`.
+                            if let Some(handle) = self.autocommit.as_ref() {
+                                *handle.lock().unwrap() = false;
+                            }
+                            self.set_is_transaction_savepoint(true);
+                        }
+                        if let Some(pager) = &self.pager {
+                            pager.open_savepoint(name);
+                        } else {
+                            // No pager yet (the database has no pages). The savepoint still
+                            // needs to be tracked so a later ROLLBACK TO / RELEASE works against
+                            // a connection that later opens a database; but since the pager is
+                            // created lazily on the first write, and a SAVEPOINT outside a
+                            // transaction that auto-starts one is followed by a write that opens
+                            // the pager, we cannot push the savepoint without a pager. SQLite
+                            // refuses SAVEPOINT on an unopenable database with the same shape;
+                            // surface a clearer error.
+                            return Err(Error::msg(
+                                "cannot open savepoint - no database is open",
+                            ));
+                        }
+                    } else if op == 1 {
+                        // SAVEPOINT_RELEASE.
+                        let pager = self
+                            .pager
+                            .clone()
+                            .ok_or_else(|| Error::msg("no database is open"))?;
+                        // Determine whether this release targets the outermost savepoint that
+                        // is also the transaction savepoint. The named savepoint is the
+                        // outermost iff its index in the pager's stack is 0 (mirrors upstream's
+                        // `pSavepoint->pNext==0` check — `pNext` walks from innermost outward,
+                        // so the LAST node is the outermost, which is index 0 in our array).
+                        let is_outermost = pager.savepoint_index(&name) == Some(0);
+                        let is_txn_savepoint = self.is_transaction_savepoint();
+                        if is_outermost && is_txn_savepoint {
+                            // Commit the implicit transaction (mirrors `sqlite3VdbeHalt` +
+                            // `sqlite3CloseSavepoints`).
+                            if pager.in_write_txn() {
+                                pager.commit().await?;
+                            }
+                            pager.clear_savepoints();
+                            self.set_is_transaction_savepoint(false);
+                            if let Some(handle) = self.autocommit.as_ref() {
+                                *handle.lock().unwrap() = true;
+                            }
+                            self.write_txn = false;
+                        } else {
+                            // Plain release: drop the named savepoint and any nested ones. The
+                            // changes since the savepoint become part of the enclosing txn.
+                            pager.release_savepoint(&name)?;
+                        }
+                    } else if op == 2 {
+                        // SAVEPOINT_ROLLBACK.
+                        let pager = self
+                            .pager
+                            .clone()
+                            .ok_or_else(|| Error::msg("no database is open"))?;
+                        pager.rollback_to_savepoint(&name).await?;
+                    } else {
+                        return Err(Error::msg(format!(
+                            "OP_Savepoint: invalid p1 operand {op}"
+                        )));
+                    }
+                    // OP_Savepoint ends the statement (mirrors upstream's `goto vdbe_return`
+                    // after the savepoint op completes). No trailing `Halt` is emitted.
                     self.halted = true;
                     return Ok(StepResult::Done);
                 }

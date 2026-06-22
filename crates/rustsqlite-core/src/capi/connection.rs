@@ -54,6 +54,12 @@ pub struct Sqlite3 {
     /// `COMMIT`/`ROLLBACK` set it back to `true` and commit/roll back the pending transaction.
     /// Mirrors `db->autoCommit` in `main.c`. See [`Self::autocommit`] / [`Self::set_autocommit`].
     autocommit: Arc<Mutex<bool>>,
+    /// `db->isTransactionSavepoint` from `main.c`: `true` when the outermost savepoint on the
+    /// stack was created by `SAVEPOINT …` while the connection was in autocommit mode (so it
+    /// auto-started an implicit transaction). `RELEASE` of that outermost savepoint commits the
+    /// transaction; any other release/rollback just pops the stack. Shared by `Arc` with the
+    /// in-flight VDBE so `OP_Savepoint` and `OP_AutoCommit` can consult/mutate it.
+    is_transaction_savepoint: Arc<Mutex<bool>>,
     last_error: Option<Error>,
 }
 
@@ -94,6 +100,7 @@ pub fn sqlite3_open_v2(filename: &str, flags: OpenFlags) -> Result<Sqlite3> {
             read_only: flags.is_readonly(),
             counts: Arc::new(Mutex::new(ChangeCounts::default())),
             autocommit: Arc::new(Mutex::new(true)),
+            is_transaction_savepoint: Arc::new(Mutex::new(false)),
             last_error: None,
         })
     })
@@ -229,6 +236,13 @@ impl Sqlite3 {
     /// and `OP_Halt` can consult and mutate it. Engine-internal (used by [`super::stmt`]).
     pub(crate) fn autocommit_handle(&self) -> Arc<Mutex<bool>> {
         self.autocommit.clone()
+    }
+
+    /// A clone of the shared `is_transaction_savepoint` handle, for the in-flight VDBE so
+    /// `OP_Savepoint` and `OP_AutoCommit` can consult and mutate it. Engine-internal (used by
+    /// [`super::stmt`]). Mirrors `db->isTransactionSavepoint` in `main.c`.
+    pub(crate) fn is_transaction_savepoint_handle(&self) -> Arc<Mutex<bool>> {
+        self.is_transaction_savepoint.clone()
     }
 
     // ---- Interim engine read helpers (until the VDBE prepare/step path lands in M3) ----

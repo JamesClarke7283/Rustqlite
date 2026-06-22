@@ -58,6 +58,31 @@ pub struct Pager {
     usable_size: usize,
     state: Mutex<PagerState>,
     txn: Mutex<Option<WriteTxn>>,
+    /// The savepoint stack (mirrors `Pager.aSavepoint` in `pager.c`). The outermost savepoint is
+    /// at index 0; the innermost (most recently created) is at the end. Each entry snapshots the
+    /// dirty overlay and the page count at savepoint creation so a `ROLLBACK TO` can restore them.
+    /// The stack is cleared when the transaction commits or rolls back.
+    savepoints: Mutex<Vec<PagerSavepoint>>,
+}
+
+/// One entry on the pager's savepoint stack (mirrors `PagerSavepoint` in `pager.c`).
+///
+/// Our copy-on-write dirty overlay lets us snapshot the savepoint-time state of every page that
+/// was dirty at savepoint creation: since [`Pager::write_page`] replaces the [`PageRef`] in the
+/// dirty map (never mutating it in place), a clone of the `Arc`-valued map captures the immutable
+/// savepoint-time page bytes. A `ROLLBACK TO` restores the snapshot in one step — pages modified
+/// after the savepoint go back to their savepoint-time state, and pages first dirtied after the
+/// savepoint disappear from the overlay (returning to their on-disk contents).
+struct PagerSavepoint {
+    /// The savepoint name (case-insensitive on lookup, matching SQLite's `sqlite3StrICmp`).
+    name: String,
+    /// The page count at savepoint creation. A `ROLLBACK TO` truncates back to this count,
+    /// discarding any pages allocated after the savepoint (mirrors `PagerSavepoint.nOrig`).
+    n_orig: u32,
+    /// A snapshot of the dirty overlay at savepoint creation. Cheap to clone (the [`PageRef`]s
+    /// are `Arc`-shared with the live overlay; the snapshot holds the savepoint-time versions
+    /// while subsequent [`Pager::write_page`] calls swap in new `Arc`s).
+    dirty_snapshot: HashMap<u32, PageRef>,
 }
 
 /// The mutable page-cache interior of a [`Pager`].
@@ -133,6 +158,7 @@ impl Pager {
                 dirty: HashMap::new(),
             }),
             txn: Mutex::new(None),
+            savepoints: Mutex::new(Vec::new()),
         })
     }
 
@@ -172,6 +198,7 @@ impl Pager {
                 dirty: HashMap::new(),
             }),
             txn: Mutex::new(None),
+            savepoints: Mutex::new(Vec::new()),
         })
     }
 
@@ -646,12 +673,136 @@ impl Pager {
     }
 
     /// Delete the journal and release the writer lock, ending the transaction. Shared by the commit
-    /// and rollback tails.
+    /// and rollback tails. Also clears the savepoint stack — none of the in-flight savepoints
+    /// outlive their transaction (mirrors `releaseAllSavepoints` in `pager.c`).
     async fn end_txn(&self) -> Result<()> {
         let _ = self.vfs.delete(&self.journal_path()).await;
         self.file.unlock(LockLevel::Unlocked).await?;
         *self.txn.lock().unwrap() = None;
+        self.savepoints.lock().unwrap().clear();
         Ok(())
+    }
+
+    /// Open a new savepoint named `name`, snapshotting the current dirty overlay and page count
+    /// (mirrors `sqlite3PagerOpenSavepoint` in `pager.c`). The savepoint becomes the new innermost
+    /// entry on the stack; a subsequent `ROLLBACK TO name` restores the snapshot, and a
+    /// `RELEASE name` drops it (and any nested savepoints) from the stack.
+    ///
+    /// A savepoint created before a write transaction is open snapshots an empty dirty overlay —
+    /// rolling back to it discards any changes that happen later, even across the write-txn
+    /// boundary, which matches SQLite's "transaction savepoint" behavior. The snapshot is cheap:
+    /// every `Arc`-shared page buffer is reference-counted, so the clone is a shallow copy.
+    pub fn open_savepoint(&self, name: String) {
+        let (n_orig, dirty_snapshot) = {
+            let st = self.state.lock().unwrap();
+            (
+                st.page_count,
+                st.dirty.clone(),
+            )
+        };
+        self.savepoints.lock().unwrap().push(PagerSavepoint {
+            name,
+            n_orig,
+            dirty_snapshot,
+        });
+    }
+
+    /// Find the index of the savepoint named `name` (case-insensitive, matching upstream's
+    /// `sqlite3StrICmp`). The index is from the OUTERMOST savepoint (0 = first created), so it
+    /// matches `iSavepoint` as passed to `sqlite3BtreeSavepoint`/`sqlite3PagerSavepoint` in
+    /// upstream. Returns `None` when no such savepoint exists. Engine-internal — used by
+    /// `OP_Savepoint` to decide whether a RELEASE targets the outermost savepoint (and thus
+    /// commits the transaction if it is the transaction savepoint).
+    pub fn savepoint_index(&self, name: &str) -> Option<usize> {
+        let savepoints = self.savepoints.lock().unwrap();
+        savepoints
+            .iter()
+            .position(|s| s.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Find the index of the savepoint named `name` (case-insensitive, matching upstream's
+    /// `sqlite3StrICmp`). The index is from the OUTERMOST savepoint (0 = first created), so it
+    /// matches `iSavepoint` as passed to `sqlite3BtreeSavepoint`/`sqlite3PagerSavepoint` in
+    /// upstream. Returns `None` when no such savepoint exists.
+    fn find_savepoint(&self, name: &str) -> Option<usize> {
+        self.savepoint_index(name)
+    }
+
+    /// Release (commit) the savepoint named `name` and every savepoint created inside it
+    /// (mirrors `sqlite3PagerSavepoint(pPager, SAVEPOINT_RELEASE, iSavepoint)` in `pager.c`).
+    /// The changes made since the savepoint was created become part of the enclosing transaction
+    /// (or the implicit transaction if this is the outermost "transaction savepoint" — the
+    /// caller decides that and drives the actual commit via the connection's autocommit flag).
+    ///
+    /// Returns `Ok(true)` when the named savepoint was found and released, `Ok(false)` is
+    /// unreachable (the caller rejects unknown names), and an error if the pager is in a state
+    /// where release is unsafe.
+    pub fn release_savepoint(&self, name: &str) -> Result<bool> {
+        let idx = self
+            .find_savepoint(name)
+            .ok_or_else(|| Error::msg(format!("no such savepoint: {name}")))?;
+        // Drop savepoints[idx..] (the named one and everything nested inside it). Their changes
+        // are now part of the enclosing transaction.
+        self.savepoints.lock().unwrap().truncate(idx);
+        Ok(true)
+    }
+
+    /// Roll back to the savepoint named `name`, discarding every change made since the savepoint
+    /// was created but keeping the savepoint on the stack (mirrors
+    /// `sqlite3PagerSavepoint(pPager, SAVEPOINT_ROLLBACK, iSavepoint)` in `pager.c`).
+    ///
+    /// The dirty overlay is restored to the snapshot taken at savepoint creation: pages dirtied
+    /// after the savepoint revert to their savepoint-time state, and pages first modified after
+    /// the savepoint are dropped from the overlay (so subsequent reads see the on-disk contents).
+    /// The page count is truncated back to the savepoint's `n_orig`, discarding any pages
+    /// allocated after the savepoint. Savepoints nested inside the named one are dropped; the
+    /// named savepoint stays on the stack so it can be rolled back to again.
+    ///
+    /// The rollback journal's pre-images are NOT touched: a later full transaction rollback
+    /// still restores every journaled page to its transaction-start state, which is the correct
+    /// behavior for the rollback journal's role (per `pagerPlaybackSavepoint`, the journal records
+    /// the pre-image at FIRST modification, and any savepoint-time state we restore here was
+    /// itself derived from those pre-images on a prior rollback).
+    pub async fn rollback_to_savepoint(&self, name: &str) -> Result<()> {
+        let idx = self
+            .find_savepoint(name)
+            .ok_or_else(|| Error::msg(format!("no such savepoint: {name}")))?;
+        // Snapshot the savepoint's dirty overlay (a clone of the snapshot) and n_orig.
+        let (n_orig, dirty_snapshot) = {
+            let savepoints = self.savepoints.lock().unwrap();
+            let sp = &savepoints[idx];
+            (sp.n_orig, sp.dirty_snapshot.clone())
+        };
+        // Drop savepoints strictly nested inside the named one; keep the named one.
+        // `truncate(idx + 1)` keeps indices 0..=idx.
+        self.savepoints.lock().unwrap().truncate(idx + 1);
+
+        // Restore the dirty overlay and page count. Pages beyond n_orig (allocated after the
+        // savepoint) are dropped from both the dirty and clean caches so subsequent reads see
+        // them as gone. The transaction's `db_orig_size` is left untouched — it is the file size
+        // at write-txn start, which a later full ROLLBACK still restores to.
+        {
+            let mut st = self.state.lock().unwrap();
+            st.dirty = dirty_snapshot;
+            st.cache.retain(|&pgno, _| pgno <= n_orig);
+            st.page_count = n_orig;
+        }
+        Ok(())
+    }
+
+    /// Drop every savepoint without committing or rolling back the dirty overlay (mirrors
+    /// `releaseAllSavepoints` in `pager.c`, called by the commit/rollback tails). Used by
+    /// [`end_txn`](Self::end_txn) so a COMMIT or ROLLBACK wipes the savepoint stack along with
+    /// the transaction.
+    pub fn clear_savepoints(&self) {
+        self.savepoints.lock().unwrap().clear();
+    }
+
+    /// The number of open savepoints (the depth of the savepoint stack). Engine-internal —
+    /// used by `OP_Savepoint` to decide whether a SAVEPOINT created outside any transaction
+    /// should auto-start one (when the stack was empty before).
+    pub fn savepoint_depth(&self) -> usize {
+        self.savepoints.lock().unwrap().len()
     }
 
     /// Write all dirty pages back to the file and move them into the clean cache, then `sync`. This

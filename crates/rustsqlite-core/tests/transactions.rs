@@ -228,17 +228,244 @@ fn rollback_without_transaction_errors() {
     let _ = std::fs::remove_file(&db);
 }
 
+/// Run the same SQL script against the C oracle and return the resulting `t` table as a sorted
+/// string of `a` values (used by the savepoint differential cases, mirroring
+/// [`oracle_table_contents`]). Uses a per-test oracle DB path so parallel test threads don't
+/// collide on the shared file.
+fn oracle_table_contents_with_setup(setup: &str, body: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let oracle_path = format!(
+        "/tmp/rustsqlite_savepoint_oracle_{}_{}.db",
+        std::process::id(),
+        unique
+    );
+    let _ = std::fs::remove_file(&oracle_path);
+    let script = format!("{setup}\n{body}\nSELECT a FROM t ORDER BY a;");
+    Command::new("sqlite3")
+        .arg(&oracle_path)
+        .arg(&script)
+        .output()
+        .expect("sqlite3 oracle");
+    let out = Command::new("sqlite3")
+        .arg(&oracle_path)
+        .arg("SELECT a FROM t ORDER BY a;")
+        .output()
+        .expect("sqlite3 read");
+    let _ = std::fs::remove_file(&oracle_path);
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 #[test]
-fn savepoint_family_rejected() {
+fn savepoint_auto_starts_transaction_and_release_commits() {
     if !sqlite3_available() {
         return;
     }
-    let db = temp_db("savepoint_rejected");
+    let db = temp_db("savepoint_auto");
+    let setup = "CREATE TABLE t(a);";
+    let body = "SAVEPOINT s;\nINSERT INTO t VALUES (1),(2);\nRELEASE s;";
+    let expected = oracle_table_contents_with_setup(setup, body);
+
     let mut conn = sqlite3_open(&db).unwrap();
     exec(&mut conn, "CREATE TABLE t(a);");
-    // SAVEPOINT / RELEASE / ROLLBACK TO are M12.4/M12.5 — must fail at prepare time.
-    assert!(sqlite3_prepare_v2(&mut conn, "SAVEPOINT sp1;").is_err());
-    assert!(sqlite3_prepare_v2(&mut conn, "RELEASE sp1;").is_err());
-    assert!(sqlite3_prepare_v2(&mut conn, "ROLLBACK TO sp1;").is_err());
+    assert!(conn.autocommit(), "starts in autocommit");
+    // SAVEPOINT outside any BEGIN auto-starts a transaction.
+    assert_eq!(exec(&mut conn, "SAVEPOINT s;"), ResultCode::Done);
+    assert!(!conn.autocommit(), "SAVEPOINT turns autocommit off");
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (1),(2);"), ResultCode::Done);
+    // Rows are visible inside the implicit transaction.
+    let in_txn = read_a(&mut conn);
+    assert_eq!(values_to_lines(&in_txn), "1\n2");
+    // RELEASE of the outermost transaction savepoint commits.
+    assert_eq!(exec(&mut conn, "RELEASE s;"), ResultCode::Done);
+    assert!(conn.autocommit(), "RELEASE commits and restores autocommit");
+    let rows = read_a(&mut conn);
+    assert_eq!(values_to_lines(&rows), expected);
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn rollback_to_savepoint_inside_begin_discards_changes() {
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("savepoint_rollback_to");
+    let setup = "CREATE TABLE t(a);";
+    let body = "BEGIN;\nSAVEPOINT s;\nINSERT INTO t VALUES (1),(2);\nROLLBACK TO s;\nINSERT INTO t VALUES (3),(4);\nCOMMIT;";
+    let expected = oracle_table_contents_with_setup(setup, body);
+
+    let mut conn = sqlite3_open(&db).unwrap();
+    exec(&mut conn, "CREATE TABLE t(a);");
+    assert_eq!(exec(&mut conn, "BEGIN;"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "SAVEPOINT s;"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (1),(2);"), ResultCode::Done);
+    let in_savepoint = read_a(&mut conn);
+    assert_eq!(values_to_lines(&in_savepoint), "1\n2");
+    // ROLLBACK TO discards the inserts but keeps the savepoint on the stack.
+    assert_eq!(exec(&mut conn, "ROLLBACK TO s;"), ResultCode::Done);
+    let after_rollback = read_a(&mut conn);
+    assert_eq!(values_to_lines(&after_rollback), "");
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (3),(4);"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "COMMIT;"), ResultCode::Done);
+    assert!(conn.autocommit(), "COMMIT restores autocommit");
+    let rows = read_a(&mut conn);
+    assert_eq!(values_to_lines(&rows), expected);
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn savepoint_auto_start_rollback_to_then_release() {
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("savepoint_auto_rollback");
+    let setup = "CREATE TABLE t(a);";
+    let body = "SAVEPOINT s;\nINSERT INTO t VALUES (1);\nROLLBACK TO s;\nINSERT INTO t VALUES (2);\nRELEASE s;";
+    let expected = oracle_table_contents_with_setup(setup, body);
+
+    let mut conn = sqlite3_open(&db).unwrap();
+    exec(&mut conn, "CREATE TABLE t(a);");
+    assert_eq!(exec(&mut conn, "SAVEPOINT s;"), ResultCode::Done);
+    assert!(!conn.autocommit());
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (1);"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "ROLLBACK TO s;"), ResultCode::Done);
+    // Savepoint is still on the stack — autocommit still off.
+    assert!(!conn.autocommit());
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (2);"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "RELEASE s;"), ResultCode::Done);
+    assert!(conn.autocommit());
+    let rows = read_a(&mut conn);
+    assert_eq!(values_to_lines(&rows), expected);
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn nested_savepoints_inner_rollback_then_outer() {
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("savepoint_nested");
+    let setup = "CREATE TABLE t(a);";
+    let body = "BEGIN;\nSAVEPOINT a;\nINSERT INTO t VALUES (1);\nSAVEPOINT b;\nINSERT INTO t VALUES (2);\nROLLBACK TO b;\nINSERT INTO t VALUES (3);\nCOMMIT;";
+    let expected = oracle_table_contents_with_setup(setup, body);
+
+    let mut conn = sqlite3_open(&db).unwrap();
+    exec(&mut conn, "CREATE TABLE t(a);");
+    assert_eq!(exec(&mut conn, "BEGIN;"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "SAVEPOINT a;"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (1);"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "SAVEPOINT b;"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (2);"), ResultCode::Done);
+    assert_eq!(values_to_lines(&read_a(&mut conn)), "1\n2");
+    assert_eq!(exec(&mut conn, "ROLLBACK TO b;"), ResultCode::Done);
+    assert_eq!(values_to_lines(&read_a(&mut conn)), "1");
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (3);"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "COMMIT;"), ResultCode::Done);
+    let rows = read_a(&mut conn);
+    assert_eq!(values_to_lines(&rows), expected);
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn release_inner_savepoint_keeps_changes() {
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("savepoint_release_inner");
+    let setup = "CREATE TABLE t(a);";
+    let body = "BEGIN;\nSAVEPOINT a;\nINSERT INTO t VALUES (1);\nSAVEPOINT b;\nINSERT INTO t VALUES (2);\nRELEASE b;\nINSERT INTO t VALUES (3);\nROLLBACK TO a;\nCOMMIT;";
+    let expected = oracle_table_contents_with_setup(setup, body);
+
+    let mut conn = sqlite3_open(&db).unwrap();
+    exec(&mut conn, "CREATE TABLE t(a);");
+    assert_eq!(exec(&mut conn, "BEGIN;"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "SAVEPOINT a;"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (1);"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "SAVEPOINT b;"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (2);"), ResultCode::Done);
+    // RELEASE b — the changes since b become part of the enclosing transaction.
+    assert_eq!(exec(&mut conn, "RELEASE b;"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (3);"), ResultCode::Done);
+    // ROLLBACK TO a discards everything since a (1, 2, 3 all gone).
+    assert_eq!(exec(&mut conn, "ROLLBACK TO a;"), ResultCode::Done);
+    assert_eq!(values_to_lines(&read_a(&mut conn)), "");
+    assert_eq!(exec(&mut conn, "COMMIT;"), ResultCode::Done);
+    let rows = read_a(&mut conn);
+    assert_eq!(values_to_lines(&rows), expected);
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn rollback_to_savepoint_keepable_re_rollback() {
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("savepoint_re_rollback");
+    let setup = "CREATE TABLE t(a);";
+    let body = "BEGIN;\nSAVEPOINT s;\nINSERT INTO t VALUES (1);\nROLLBACK TO s;\nROLLBACK TO s;\nCOMMIT;";
+    let expected = oracle_table_contents_with_setup(setup, body);
+
+    let mut conn = sqlite3_open(&db).unwrap();
+    exec(&mut conn, "CREATE TABLE t(a);");
+    assert_eq!(exec(&mut conn, "BEGIN;"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "SAVEPOINT s;"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (1);"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "ROLLBACK TO s;"), ResultCode::Done);
+    // The savepoint is still on the stack — ROLLBACK TO again is a no-op (empty dirty overlay).
+    assert_eq!(exec(&mut conn, "ROLLBACK TO s;"), ResultCode::Done);
+    assert_eq!(exec(&mut conn, "COMMIT;"), ResultCode::Done);
+    let rows = read_a(&mut conn);
+    assert_eq!(values_to_lines(&rows), expected);
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn unknown_savepoint_errors() {
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("savepoint_unknown");
+    let mut conn = sqlite3_open(&db).unwrap();
+    exec(&mut conn, "CREATE TABLE t(a);");
+    assert_eq!(exec(&mut conn, "BEGIN;"), ResultCode::Done);
+    // RELEASE / ROLLBACK TO with an unknown savepoint name must error.
+    let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "RELEASE no_such;").unwrap();
+    assert!(matches!(stmt.step(), ResultCode::Error), "RELEASE unknown errors");
+    let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "ROLLBACK TO no_such;").unwrap();
+    assert!(matches!(stmt.step(), ResultCode::Error), "ROLLBACK TO unknown errors");
+    // The connection stays in the outer transaction.
+    assert!(!conn.autocommit());
+    exec(&mut conn, "ROLLBACK;");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn commit_via_explicit_commit_after_savepoint_auto_start() {
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("savepoint_then_commit");
+    let setup = "CREATE TABLE t(a);";
+    let body = "SAVEPOINT s;\nINSERT INTO t VALUES (1);\nCOMMIT;";
+    let expected = oracle_table_contents_with_setup(setup, body);
+
+    let mut conn = sqlite3_open(&db).unwrap();
+    exec(&mut conn, "CREATE TABLE t(a);");
+    assert_eq!(exec(&mut conn, "SAVEPOINT s;"), ResultCode::Done);
+    assert!(!conn.autocommit());
+    assert_eq!(exec(&mut conn, "INSERT INTO t VALUES (1);"), ResultCode::Done);
+    // An explicit COMMIT commits the implicit transaction started by SAVEPOINT.
+    assert_eq!(exec(&mut conn, "COMMIT;"), ResultCode::Done);
+    assert!(conn.autocommit(), "COMMIT restores autocommit");
+    let rows = read_a(&mut conn);
+    assert_eq!(values_to_lines(&rows), expected);
+
     let _ = std::fs::remove_file(&db);
 }

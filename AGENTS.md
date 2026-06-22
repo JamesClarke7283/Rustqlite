@@ -527,3 +527,32 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   *different* `OVER` specs in one query are still rejected; `ORDER BY` on the outer query
   that references non-projection columns in the PerPeerGroup flush pass may read NULL (the
   peer-buf only carries projection columns — the follow-up carries the full row).
+
+- **M12 — Transactions & Savepoints** 🚧: **12.1–12.3** ✅ (parser + `OP_AutoCommit`-driven
+  `BEGIN`/`COMMIT`/`END`/`ROLLBACK`; the `autocommit` flag is shared between the connection
+  and the VDBE so `OP_Halt` defers the commit when inside a `BEGIN`). **12.4–12.5 savepoint
+  stack** ✅: `SAVEPOINT name` / `RELEASE [SAVEPOINT] name` / `ROLLBACK [TRANSACTION] TO
+  [SAVEPOINT] name` are compiled to the new `OP_Savepoint` opcode (mirrors `OP_Savepoint` in
+  `vdbe.c` + `sqlite3Savepoint` in `build.c`). The opcode dispatches on `p1` (0=BEGIN,
+  1=RELEASE, 2=ROLLBACK) with `P4::Text(name)`. The pager carries a savepoint stack
+  (`Pager::savepoints: Mutex<Vec<PagerSavepoint>>`, mirroring `Pager.aSavepoint` in
+  `pager.c`); each entry snapshots the dirty overlay (`HashMap<u32, PageRef>`) and the page
+  count at savepoint creation. Because `write_page` replaces the `Arc<Vec<u8>>` in the dirty
+  map (never mutating it in place), the snapshot is a cheap shallow clone that preserves the
+  savepoint-time page bytes while subsequent writes swap in new `Arc`s. `SAVEPOINT` outside
+  a transaction auto-starts one (the "transaction savepoint" — `db->isTransactionSavepoint`
+  in `main.c`, shared by `Arc<Mutex<bool>>` between the connection and the VDBE); `RELEASE`
+  of that outermost savepoint commits the implicit transaction (turns autocommit on, calls
+  `pager.commit()`); `RELEASE` of any other savepoint drops it and nested ones (their changes
+  become part of the enclosing transaction); `ROLLBACK TO` restores the dirty overlay to the
+  snapshot, truncates the page count back to the savepoint's `n_orig`, and drops nested
+  savepoints while keeping the named one (so it can be rolled back to again). A `COMMIT` or
+  `ROLLBACK` via `OP_AutoCommit` clears the savepoint stack and resets the transaction-
+  savepoint flag (mirrors `sqlite3CloseSavepoints` in `main.c`). Differential-tested vs the
+  C oracle (8 new cases in `transactions.rs`: auto-start + release commits, rollback-to
+  inside BEGIN discards, auto-start + rollback-to + release, nested savepoints with inner
+  rollback, release inner keeps changes for outer rollback, re-rollback to same savepoint,
+  unknown-savepoint errors, explicit COMMIT after SAVEPOINT auto-start). Still M12: 12.6
+  `Transaction` opcode deferred/immediate/exclusive locking, 12.7 VFS lock escalation,
+  12.8–12.9 conflict resolution (`OR ROLLBACK`/`OR FAIL`/`OR IGNORE`/`OR REPLACE`) and
+  `ON CONFLICT` column/table constraints.

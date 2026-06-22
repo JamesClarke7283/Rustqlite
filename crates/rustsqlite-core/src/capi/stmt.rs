@@ -83,13 +83,15 @@ enum Backing {
     },
 }
 
-/// Construct a Vdbe for `program` and install the connection's shared autocommit flag so
-/// `OP_AutoCommit` and `OP_Halt` can consult/mutate it. Mirrors how `sqlite3VdbeMakeReady` in
-/// `vdbeaux.c` copies `db->autoCommit` into the VDBE before running it. Every Vdbe constructed
-/// by the prepare path should go through this helper so transaction semantics are honored.
+/// Construct a Vdbe for `program` and install the connection's shared autocommit flag and
+/// `is_transaction_savepoint` flag so `OP_AutoCommit`, `OP_Halt`, and `OP_Savepoint` can
+/// consult/mutate them. Mirrors how `sqlite3VdbeMakeReady` in `vdbeaux.c` copies `db->autoCommit`
+/// (and related state) into the VDBE before running it. Every Vdbe constructed by the prepare
+/// path should go through this helper so transaction semantics are honored.
 fn vdbe_for(program: Arc<Program>, pager: Option<Arc<Pager>>, db: &Sqlite3) -> Vdbe {
     let mut v = Vdbe::new(program, pager);
     v.set_autocommit_handle(db.autocommit_handle());
+    v.set_is_transaction_savepoint_handle(db.is_transaction_savepoint_handle());
     v
 }
 

@@ -1334,7 +1334,8 @@ fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) 
             c(&mut inst.p1);
             r(&mut inst.p3);
         }
-        Compare | Jump | Transaction | AutoCommit | SetCookie | ParseSchema | CreateBtree | Halt => {}
+        Compare | Jump | Transaction | AutoCommit | Savepoint | SetCookie | ParseSchema
+        | CreateBtree | Halt => {}
         ResultRow => {
             // p1 is the result start register; rebase it. p2 is the column count (not a
             // register). The merge coroutine rewriter handles ResultRow separately (rewriting
