@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.77"
+version = "0.0.78"
 edition = "2021"
 rust-version = "1.96"
 license = "Apache-2.0"
@@ -22,13 +22,18 @@ description = "A faithful, file-format-compatible reimplementation of SQLite3 in
 
 [workspace.dependencies]
 # Internal crates.
-rustsqlite-core = { path = "crates/rustsqlite-core", version = "0.0.77" }
-rustqlite-parser = { path = "crates/rustqlite-parser", version = "0.0.77" }
+rustsqlite-core = { path = "crates/rustsqlite-core", version = "0.0.78" }
+rustqlite-parser = { path = "crates/rustqlite-parser", version = "0.0.78" }
 
 # Async runtime for the VFS/pager I/O layer (the engine is async on tokio).
 tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "sync", "macros"] }
 # Object-safe async trait methods for the Vfs / VfsFile traits.
 async-trait = "0.1"
+
+# POSIX `fcntl(F_SETLK)` byte-range locking for the OsTokioVfs (mirrors `os_unix.c`'s
+# `unixLock`/`posixUnlock`); std does not expose advisory file locking. Tiny, zero-dep
+# FFI bindings — used only for `libc::fcntl`, `libc::flock`, `libc::{F_RDLCK,F_WRLCK,F_UNLCK,F_SETLK}`.
+libc = "0.2"
 
 # Parser: PEG grammar ported from SQLite's parse.y, precedence via PrattParser.
 pest = "2.7"

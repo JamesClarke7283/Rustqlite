@@ -128,9 +128,20 @@ impl Pager {
     /// Open a pager over an already-opened database file, reading and validating the header. If a
     /// **hot journal** (`<path>-journal`) is present, it is played back (and deleted) first, so the
     /// header is parsed from a consistent database.
+    ///
+    /// No lock is taken here — the SHARED lock is taken lazily by [`begin_read`] when a statement
+    /// first accesses the database (mirrors `sqlite3PagerSharedLock` being called from
+    /// `sqlite3BtreeBeginTrans` at the start of `sqlite3_step`, not from `sqlite3_open`). This
+    /// means `sqlite3_open` on a file that is EXCLUSIVE-locked by another connection succeeds;
+    /// the first `sqlite3_step` fails with `SQLITE_BUSY` instead, matching upstream SQLite.
+    ///
+    /// [`begin_read`]: Pager::begin_read
     pub async fn open(vfs: Arc<dyn Vfs>, path: String, file: Box<dyn VfsFile>) -> Result<Pager> {
         // Crash recovery: a leftover, valid journal means the last writer did not finish. Restore
         // the pre-images before reading anything else (mirrors the hot-journal check in `pager.c`).
+        // The recovery itself escalates to EXCLUSIVE internally (if no other connection holds a
+        // RESERVED lock — `check_reserved_lock` guards against recovering an active transaction's
+        // journal).
         recover_hot_journal(vfs.as_ref(), &path, file.as_ref()).await?;
 
         let mut head = [0u8; 100];
@@ -160,6 +171,17 @@ impl Pager {
             txn: Mutex::new(None),
             savepoints: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Begin a read transaction: acquire the SHARED lock (mirrors `sqlite3PagerSharedLock` in
+    /// `pager.c`). A no-op if a SHARED (or stronger) lock is already held (the VFS `lock`
+    /// implementation short-circuits when `current >= level`). The lock is retained until
+    /// [`end_txn`] downgrades it (or the pager is dropped). Returns `SQLITE_BUSY` if an
+    /// EXCLUSIVE lock is held by another connection.
+    ///
+    /// [`end_txn`]: Pager::end_txn
+    pub async fn begin_read(&self) -> Result<()> {
+        self.file.lock(LockLevel::Shared).await
     }
 
     /// Create a brand-new, empty database on `file`: a single page 1 holding the 100-byte header
@@ -553,6 +575,13 @@ impl Pager {
         if self.in_write_txn() {
             return Ok(());
         }
+        // `sqlite3PagerBegin` asserts `eState >= PAGER_READER` — a SHARED lock must be held
+        // before acquiring RESERVED. The codegen emits `OP_Transaction 0 0` (read txn) before
+        // `OP_Transaction 0 1` (write txn) in the write path, but the autocommit path
+        // (a bare INSERT/UPDATE/DELETE outside BEGIN) may reach `begin_write` without a prior
+        // `begin_read`. Ensure the SHARED lock is held first (the VFS `lock` is idempotent —
+        // a no-op if already at SHARED or above).
+        self.file.lock(LockLevel::Shared).await?;
         // `sqlite3PagerBegin` first acquires RESERVED; if `exFlag`, it then escalates to
         // EXCLUSIVE (via `pager_wait_on_lock`). We elide the intermediate step and acquire
         // the final target lock in one call — the on-disk effect is the same (a single
@@ -693,9 +722,13 @@ impl Pager {
     /// Delete the journal and release the writer lock, ending the transaction. Shared by the commit
     /// and rollback tails. Also clears the savepoint stack — none of the in-flight savepoints
     /// outlive their transaction (mirrors `releaseAllSavepoints` in `pager.c`).
+    ///
+    /// The lock is downgraded to SHARED (not UNLOCKED) so a connection keeps its SHARED lock
+    /// across transactions, matching upstream SQLite (`posixUnlock` drops the writer but
+    /// retains SHARED; the SHARED lock is only released when the pager is closed/dropped).
     async fn end_txn(&self) -> Result<()> {
         let _ = self.vfs.delete(&self.journal_path()).await;
-        self.file.unlock(LockLevel::Unlocked).await?;
+        self.file.unlock(LockLevel::Shared).await?;
         *self.txn.lock().unwrap() = None;
         self.savepoints.lock().unwrap().clear();
         Ok(())
@@ -861,6 +894,12 @@ async fn recover_hot_journal(vfs: &dyn Vfs, path: &str, db: &dyn VfsFile) -> Res
     if !vfs.exists(&jpath).await? {
         return Ok(());
     }
+    // If another connection holds a RESERVED (or stronger) lock, the journal belongs to an
+    // active transaction — it is NOT hot. Skip recovery (mirrors `hasHotJournal`'s
+    // `sqlite3OsCheckReservedLock` check in `pager.c`: `if (rc==SQLITE_OK && !locked)`).
+    if db.check_reserved_lock().await? {
+        return Ok(());
+    }
     let jfile = vfs.open(&jpath, OpenFlags::READWRITE_CREATE).await?;
 
     let mut hdr = vec![0u8; journal::JOURNAL_HDR_SZ];
@@ -879,6 +918,11 @@ async fn recover_hot_journal(vfs: &dyn Vfs, path: &str, db: &dyn VfsFile) -> Res
         let _ = vfs.delete(&jpath).await;
         return Ok(());
     }
+    // Escalate to EXCLUSIVE for the recovery write-back (mirrors `pagerLockDb(pPager,
+    // EXCLUSIVE_LOCK)` in `sqlite3PagerSharedLock`'s hot-journal path — so no other
+    // connection can read the half-recovered database). Downgrade back to SHARED before
+    // returning so the open completes with a SHARED lock held.
+    db.lock(LockLevel::Exclusive).await?;
     let rec_len = journal::record_len(page_size);
     let mut off = journal::JOURNAL_HDR_SZ as u64;
     for _ in 0..header.nrec {
@@ -910,7 +954,10 @@ async fn recover_hot_journal(vfs: &dyn Vfs, path: &str, db: &dyn VfsFile) -> Res
     db.truncate(header.db_orig_size as u64 * page_size as u64)
         .await?;
     db.sync().await?;
-    let _ = vfs.delete(&jpath).await;
+    let _ = vfs.delete(&jpath).await?;
+    // Downgrade back to SHARED so the open completes with the same lock level as a non-recovery
+    // open (mirrors the `pagerUnlockDb(pPager, SHARED_LOCK)` at the end of the recovery branch).
+    db.unlock(LockLevel::Shared).await?;
     Ok(())
 }
 

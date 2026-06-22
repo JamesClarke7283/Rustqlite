@@ -1005,8 +1005,12 @@ impl Sqlite3Stmt {
                     ResultCode::Done
                 }
                 Err(e) => {
+                    // Surface the error's own result code (e.g. `SQLITE_BUSY` from a lock
+                    // contention) rather than collapsing every error to `SQLITE_ERROR`.
+                    // Mirrors `sqlite3_step`'s contract of returning the primary code.
+                    let code = e.code;
                     self.last_error = Some(e);
-                    ResultCode::Error
+                    code
                 }
             },
             Backing::Static { rows, cur, pos } => {

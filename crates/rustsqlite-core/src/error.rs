@@ -120,6 +120,12 @@ impl Error {
         Error::new(ResultCode::IoErr, message)
     }
 
+    /// `SQLITE_BUSY` — the database file is locked by another connection (VFS-level lock
+    /// contention). Mirrors `SQLITE_BUSY` from `sqlite3.h` ("database is locked").
+    pub fn busy(message: impl Into<String>) -> Self {
+        Error::new(ResultCode::Busy, message)
+    }
+
     /// `SQLITE_ERROR` — generic error (often a SQL/logic error).
     pub fn msg(message: impl Into<String>) -> Self {
         Error::new(ResultCode::Error, message)

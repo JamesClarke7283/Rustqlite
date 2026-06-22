@@ -3,6 +3,13 @@
 //! Files are byte vectors behind a shared mutex. A registry keyed by path lets repeated opens
 //! of the same name share storage (handy for tests that write then reopen); `:memory:` and
 //! empty paths get a private, unregistered file.
+//!
+//! In-process multi-connection locking mirrors `os_unix.c`'s POSIX byte-range locking: each
+//! named file carries a shared [`super::LockState`] tracking how many SHARED locks are held and
+//! whether a RESERVED/PENDING/EXCLUSIVE lock is held. A second `MemVfs` connection to the
+//! same path sees the contention (RESERVED/EXCLUSIVE blocks the same level on another
+//! connection), matching what real POSIX `fcntl(F_SETLK)` locks do across processes. This
+//! lets transaction locking be exercised by tests without spawning real processes.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -12,17 +19,32 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 
-use super::{LockLevel, OpenFlags, Vfs, VfsFile};
+use super::{LockLevel, LockState, OpenFlags, Vfs, VfsFile};
 
 /// An in-memory virtual filesystem.
 #[derive(Default)]
 pub struct MemVfs {
     files: Mutex<HashMap<String, Arc<Mutex<Vec<u8>>>>>,
+    locks: Mutex<HashMap<String, Arc<Mutex<LockState>>>>,
 }
 
 impl MemVfs {
     pub fn new() -> MemVfs {
         MemVfs::default()
+    }
+
+    /// Look up (or create) the shared lock state for `path`.
+    fn lock_state_for(&self, path: &str) -> Option<Arc<Mutex<LockState>>> {
+        if path.is_empty() || path == ":memory:" {
+            return None;
+        }
+        let mut locks = self.locks.lock().unwrap();
+        Some(
+            locks
+                .entry(path.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(LockState::default())))
+                .clone(),
+        )
     }
 }
 
@@ -38,14 +60,17 @@ impl Vfs for MemVfs {
                 .or_insert_with(|| Arc::new(Mutex::new(Vec::new())))
                 .clone()
         };
+        let lock_state = self.lock_state_for(path);
         Ok(Box::new(MemFile {
             data,
             lock_level: AtomicU8::new(LockLevel::Unlocked as u8),
+            lock_state,
         }))
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
         self.files.lock().unwrap().remove(path);
+        self.locks.lock().unwrap().remove(path);
         Ok(())
     }
 
@@ -57,6 +82,9 @@ impl Vfs for MemVfs {
 struct MemFile {
     data: Arc<Mutex<Vec<u8>>>,
     lock_level: AtomicU8,
+    /// Shared per-path lock state for named files; `None` for `:memory:` (no contention
+    /// possible — a private file).
+    lock_state: Option<Arc<Mutex<LockState>>>,
 }
 
 #[async_trait]
@@ -96,19 +124,44 @@ impl VfsFile for MemFile {
     }
 
     async fn lock(&self, level: LockLevel) -> Result<()> {
+        let current = LockLevel::from_u8(self.lock_level.load(Ordering::SeqCst));
+        if current >= level {
+            return Ok(());
+        }
+        if let Some(state) = &self.lock_state {
+            let mut st = state.lock().unwrap();
+            st.apply_lock(current, level)?;
+        }
         self.lock_level.store(level as u8, Ordering::SeqCst);
         Ok(())
     }
 
     async fn unlock(&self, level: LockLevel) -> Result<()> {
+        let current = LockLevel::from_u8(self.lock_level.load(Ordering::SeqCst));
+        if current <= level {
+            return Ok(());
+        }
+        if let Some(state) = &self.lock_state {
+            let mut st = state.lock().unwrap();
+            st.apply_unlock(current, level);
+        }
         self.lock_level.store(level as u8, Ordering::SeqCst);
         Ok(())
+    }
+
+    async fn check_reserved_lock(&self) -> Result<bool> {
+        if let Some(state) = &self.lock_state {
+            let st = state.lock().unwrap();
+            return Ok(st.writer.is_some());
+        }
+        Ok(false)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ResultCode;
 
     #[test]
     fn write_then_read_back() {
@@ -153,6 +206,78 @@ mod tests {
             let mut buf = [0u8; 3];
             b.read_at(0, &mut buf).await.unwrap();
             assert_eq!(&buf, b"abc");
+        });
+    }
+
+    #[test]
+    fn shared_locks_coexist() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = MemVfs::new();
+            let a = vfs
+                .open("lock.db", OpenFlags::READWRITE_CREATE)
+                .await
+                .unwrap();
+            let b = vfs.open("lock.db", OpenFlags::READWRITE).await.unwrap();
+
+            a.lock(LockLevel::Shared).await.unwrap();
+            b.lock(LockLevel::Shared).await.unwrap();
+            a.unlock(LockLevel::Unlocked).await.unwrap();
+            b.unlock(LockLevel::Unlocked).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn reserved_blocks_reserved() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = MemVfs::new();
+            let a = vfs
+                .open("lock.db", OpenFlags::READWRITE_CREATE)
+                .await
+                .unwrap();
+            let b = vfs.open("lock.db", OpenFlags::READWRITE).await.unwrap();
+
+            a.lock(LockLevel::Shared).await.unwrap();
+            a.lock(LockLevel::Reserved).await.unwrap();
+
+            // `b` SHARED is still allowed (RESERVED doesn't block new SHARED).
+            b.lock(LockLevel::Shared).await.unwrap();
+            // `b` RESERVED should fail.
+            let err = b.lock(LockLevel::Reserved).await.unwrap_err();
+            assert_eq!(err.code, ResultCode::Busy);
+
+            a.unlock(LockLevel::Unlocked).await.unwrap();
+            b.unlock(LockLevel::Unlocked).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn exclusive_blocks_shared() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = MemVfs::new();
+            let a = vfs
+                .open("lock.db", OpenFlags::READWRITE_CREATE)
+                .await
+                .unwrap();
+            let b = vfs.open("lock.db", OpenFlags::READWRITE).await.unwrap();
+
+            a.lock(LockLevel::Shared).await.unwrap();
+            a.lock(LockLevel::Exclusive).await.unwrap();
+
+            let err = b.lock(LockLevel::Shared).await.unwrap_err();
+            assert_eq!(err.code, ResultCode::Busy);
+
+            a.unlock(LockLevel::Unlocked).await.unwrap();
+            b.lock(LockLevel::Shared).await.unwrap();
+            b.unlock(LockLevel::Unlocked).await.unwrap();
         });
     }
 }

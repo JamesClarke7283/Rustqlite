@@ -710,3 +710,118 @@ fn begin_exclusive_then_end_uses_read_works() {
 
     let _ = std::fs::remove_file(&db);
 }
+
+// ---------------------------------------------------------------------------
+// M12.7 — Cross-connection VFS lock escalation.
+//
+// `BEGIN IMMEDIATE`/`BEGIN EXCLUSIVE` acquire RESERVED/EXCLUSIVE locks via
+// `fcntl(F_SETLK)` byte-range locks on `OsTokioVfs` (mirrors `os_unix.c`'s `unixLock`).
+// The in-process `LockState` registry (mirrors `unixInodeInfo`) catches same-process
+// contention that the per-process OS locks would miss. These tests exercise the
+// cross-connection contention paths on a real file (the second `sqlite3_open` on the
+// same path sees the first connection's RESERVED/EXCLUSIVE lock and `BEGIN IMMEDIATE`/
+// `BEGIN EXCLUSIVE` returns `SQLITE_BUSY`).
+//
+// They don't compare against the C oracle (the C oracle would block forever on a BUSY
+// without a busy-handler; we verify the `SQLITE_BUSY` result code instead, which is
+// what a real SQLite connection sees with a zero busy-timeout).
+// ---------------------------------------------------------------------------
+
+/// Helper: prepare and step a SQL statement, returning the `ResultCode`. On a prepare
+/// failure, return the connection's last-error code (which may be `SQLITE_BUSY` from a
+/// `Pager::open`/`begin_read` failure).
+fn step_sql(conn: &mut rustsqlite_core::Sqlite3, sql: &str) -> ResultCode {
+    match sqlite3_prepare_v2(conn, sql) {
+        Ok((mut stmt, _)) => stmt.step(),
+        Err(_e) => conn.errcode(),
+    }
+}
+
+#[test]
+fn begin_immediate_blocks_begin_immediate_cross_connection() {
+    let db = temp_db("imm_xconn");
+    let mut conn1 = sqlite3_open(&db).unwrap();
+    exec(&mut conn1, "CREATE TABLE t(a);");
+
+    // conn1 takes RESERVED via BEGIN IMMEDIATE.
+    assert_eq!(exec(&mut conn1, "BEGIN IMMEDIATE;"), ResultCode::Done);
+    assert!(!conn1.autocommit());
+
+    // conn2 opening the same file and trying BEGIN IMMEDIATE should see SQLITE_BUSY
+    // (the RESERVED byte is already locked by conn1).
+    let mut conn2 = sqlite3_open(&db).unwrap();
+    let res = step_sql(&mut conn2, "BEGIN IMMEDIATE;");
+    assert!(
+        matches!(res, ResultCode::Busy),
+        "expected SQLITE_BUSY, got {res:?}"
+    );
+
+    // After conn1 commits, conn2 can BEGIN IMMEDIATE.
+    assert_eq!(exec(&mut conn1, "COMMIT;"), ResultCode::Done);
+    assert!(conn1.autocommit());
+    assert_eq!(exec(&mut conn2, "BEGIN IMMEDIATE;"), ResultCode::Done);
+    assert_eq!(exec(&mut conn2, "ROLLBACK;"), ResultCode::Done);
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn begin_exclusive_blocks_begin_exclusive_cross_connection() {
+    let db = temp_db("excl_xconn");
+    let mut conn1 = sqlite3_open(&db).unwrap();
+    exec(&mut conn1, "CREATE TABLE t(a);");
+
+    // conn1 takes EXCLUSIVE via BEGIN EXCLUSIVE.
+    assert_eq!(exec(&mut conn1, "BEGIN EXCLUSIVE;"), ResultCode::Done);
+    assert!(!conn1.autocommit());
+
+    // conn2's BEGIN EXCLUSIVE should fail with SQLITE_BUSY (EXCLUSIVE blocks all).
+    let mut conn2 = sqlite3_open(&db).unwrap();
+    let res = step_sql(&mut conn2, "BEGIN EXCLUSIVE;");
+    assert!(
+        matches!(res, ResultCode::Busy),
+        "expected SQLITE_BUSY, got {res:?}"
+    );
+
+    // Even a table read on conn2 should fail (EXCLUSIVE blocks SHARED).
+    // (A `SELECT 1` with no FROM doesn't touch the database, so it succeeds — matching
+    // real SQLite. A `SELECT * FROM t` acquires a SHARED lock and fails with BUSY.)
+    let res = step_sql(&mut conn2, "SELECT * FROM t;");
+    assert!(
+        matches!(res, ResultCode::Busy),
+        "expected SQLITE_BUSY for SELECT * FROM t under EXCLUSIVE, got {res:?}"
+    );
+
+    // After conn1 commits, conn2 can read.
+    assert_eq!(exec(&mut conn1, "COMMIT;"), ResultCode::Done);
+    assert_eq!(exec(&mut conn2, "SELECT 1;"), ResultCode::Row);
+    // Step to drain the row.
+    let _ = step_sql(&mut conn2, "SELECT 1;");
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn begin_immediate_allows_reads_on_other_connection() {
+    // A RESERVED lock (BEGIN IMMEDIATE) does not block SHARED locks on another connection
+    // (RESERVED allows new readers; only EXCLUSIVE blocks them). This matches SQLite's
+    // locking protocol: a writer and readers can coexist until commit-time escalation.
+    let db = temp_db("imm_read_xconn");
+    let mut conn1 = sqlite3_open(&db).unwrap();
+    exec(&mut conn1, "CREATE TABLE t(a);");
+    exec(&mut conn1, "INSERT INTO t VALUES (1);");
+
+    assert_eq!(exec(&mut conn1, "BEGIN IMMEDIATE;"), ResultCode::Done);
+
+    // conn2 can still read (SHARED lock succeeds alongside conn1's RESERVED).
+    let mut conn2 = sqlite3_open(&db).unwrap();
+    let res = step_sql(&mut conn2, "SELECT a FROM t;");
+    assert!(
+        matches!(res, ResultCode::Row),
+        "expected ROW under RESERVED, got {res:?}"
+    );
+
+    assert_eq!(exec(&mut conn1, "ROLLBACK;"), ResultCode::Done);
+
+    let _ = std::fs::remove_file(&db);
+}

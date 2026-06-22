@@ -62,6 +62,7 @@ runtime (e.g. a `#[tokio::test]`); engine-internal async fns are tested directly
 |---|---|---|
 | `rustsqlite-core` | `tokio` | async runtime + async file I/O for the VFS/pager layer |
 | `rustsqlite-core` | `async-trait` | object-safe (`dyn`) async methods on the `Vfs`/`VfsFile` traits |
+| `rustsqlite-core` | `libc` | POSIX `fcntl(F_SETLK)` byte-range locking for `OsTokioVfs` (mirrors `os_unix.c`'s `unixLock`/`posixUnlock`); std does not expose advisory file locking |
 | `rustqlite-parser` | `pest`, `pest_derive` | PEG grammar engine; the locked decision for the parser |
 | `rustqlite` (CLI) | `clap` (derive) | sqlite3-shell-compatible argument parsing |
 | `rustqlite` (CLI) | `rustyline` | line editing + history for interactive mode |
@@ -560,7 +561,25 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   C oracle (8 new cases in `transactions.rs`: auto-start + release commits, rollback-to
   inside BEGIN discards, auto-start + rollback-to + release, nested savepoints with inner
   rollback, release inner keeps changes for outer rollback, re-rollback to same savepoint,
-  unknown-savepoint errors, explicit COMMIT after SAVEPOINT auto-start). Still M12: 12.6
-  `Transaction` opcode deferred/immediate/exclusive locking, 12.7 VFS lock escalation,
+  unknown-savepoint errors, explicit COMMIT after SAVEPOINT auto-start). **12.6
+  `Transaction` opcode** ✅: `BEGIN IMMEDIATE` emits `OP_Transaction 0 1` + `OP_AutoCommit
+  0 0` (RESERVED up-front); `BEGIN EXCLUSIVE` emits `OP_Transaction 0 2` + `OP_AutoCommit
+  0 0` (EXCLUSIVE up-front); `BEGIN DEFERRED` emits only `OP_AutoCommit 0 0` (lazy
+  RESERVED at first write). `Pager::begin_write` takes an `ex_flag: bool` mirroring
+  `sqlite3PagerBegin`'s `exFlag`. **12.7 VFS lock escalation** ✅: `OsTokioVfs` performs
+  real POSIX `fcntl(F_SETLK)` byte-range locking on the `PENDING_BYTE`/`RESERVED_BYTE`/
+  `SHARED_FIRST` ranges (a faithful port of `unixLock`/`posixUnlock` in `os_unix.c`), so
+  cross-process contention with the real `sqlite3` binary is correct. A process-global
+  `LockState` registry (mirrors `unixInodeInfo`'s `inodeList`) catches same-process
+  contention that the per-process OS locks miss. `MemVfs` shares the same `LockState`
+  abstraction for in-process multi-connection locking. `VfsFile::check_reserved_lock`
+  (mirrors `unixCheckReservedLock`) lets `recover_hot_journal` skip recovery when the
+  journal belongs to an active transaction on another connection. `Pager::begin_read` takes
+  the SHARED lock lazily (called from `OP_Transaction 0 0` at statement start, not from
+  `sqlite3_open` — so `sqlite3_open` on an EXCLUSIVE-locked file succeeds; the first
+  statement fails with `SQLITE_BUSY`). `begin_write` ensures a SHARED lock is held before
+  escalating to RESERVED/EXCLUSIVE. Differential-tested vs the C oracle (3 new cross-
+  connection cases in `transactions.rs`: BEGIN IMMEDIATE blocks BEGIN IMMEDIATE, BEGIN
+  EXCLUSIVE blocks BEGIN EXCLUSIVE + SELECT, BEGIN IMMEDIATE allows reads). Still M12:
   12.8–12.9 conflict resolution (`OR ROLLBACK`/`OR FAIL`/`OR IGNORE`/`OR REPLACE`) and
   `ON CONFLICT` column/table constraints.
