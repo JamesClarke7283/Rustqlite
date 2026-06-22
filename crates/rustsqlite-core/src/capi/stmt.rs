@@ -340,25 +340,61 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
         }
         Stmt::AlterTable(alter) => {
             // ALTER TABLE: resolve the target table from the catalog and dispatch on the
-            // action. M14.5 implements `RENAME TO`; the other actions (ADD/DROP/RENAME
-            // COLUMN, ALTER COLUMN, ADD/DROP CONSTRAINT) are deferred.
+            // action. M14.5 implements `RENAME TO`; M14.6 implements `ADD COLUMN`. The
+            // other actions (DROP/RENAME COLUMN, ALTER COLUMN, ADD/DROP CONSTRAINT) are
+            // deferred.
             let pager = db.pager_arc()?;
-            let (edits, schema_cookie) = resolve_alter_target(&pager, &alter)?;
-            let program = Arc::new(codegen::compile_alter_rename_table(
-                &alter,
-                schema_cookie,
-                &edits,
-            )?);
-            let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
-            Ok(Sqlite3Stmt {
-                sql: sql.to_string(),
-                program,
-                column_names: Vec::new(),
-                backing: Backing::Vdbe(vdbe),
-                explain: 0,
-                counts: Some(db.counts_handle()),
-                last_error: None,
-            })
+            match &alter.action {
+                AlterTableAction::RenameTo(_) => {
+                    let (edits, schema_cookie) = resolve_alter_rename_target(&pager, &alter)?;
+                    let program = Arc::new(codegen::compile_alter_rename_table(
+                        &alter,
+                        schema_cookie,
+                        &edits,
+                    )?);
+                    let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
+                    Ok(Sqlite3Stmt {
+                        sql: sql.to_string(),
+                        program,
+                        column_names: Vec::new(),
+                        backing: Backing::Vdbe(vdbe),
+                        explain: 0,
+                        counts: Some(db.counts_handle()),
+                        last_error: None,
+                    })
+                }
+                AlterTableAction::AddColumn(col_def) => {
+                    let (table_rowid, old_sql, schema_cookie) =
+                        resolve_alter_add_column_target(&pager, &alter, col_def)?;
+                    let col_def_text = codegen::alter::extract_add_column_text(sql)
+                        .ok_or_else(|| {
+                            Error::msg(
+                                "cannot extract column definition text from ALTER TABLE statement",
+                            )
+                        })?;
+                    let program = Arc::new(codegen::compile_alter_add_column(
+                        &alter,
+                        schema_cookie,
+                        table_rowid,
+                        &old_sql,
+                        &col_def_text,
+                    )?);
+                    let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
+                    Ok(Sqlite3Stmt {
+                        sql: sql.to_string(),
+                        program,
+                        column_names: Vec::new(),
+                        backing: Backing::Vdbe(vdbe),
+                        explain: 0,
+                        counts: Some(db.counts_handle()),
+                        last_error: None,
+                    })
+                }
+                _ => Err(Error::msg(format!(
+                    "ALTER TABLE action {:?} is not supported yet",
+                    alter.action
+                ))),
+            }
         }
         Stmt::CreateView(_) => {
             // CREATE VIEW parsing is implemented (M2.29) but codegen is deferred to M15.
@@ -571,17 +607,15 @@ fn resolve_drop_target(pager: &Arc<Pager>, drop: &DropTableStmt) -> Result<(Opti
     Ok((table, cookie))
 }
 
-/// Resolve an `ALTER TABLE` target: validates the table exists, dispatches on the action,
-/// and produces the list of `sqlite_schema` row edits the codegen should perform. Returns
-/// `(edits, schema_cookie)`.
+/// Resolve an `ALTER TABLE … RENAME TO` target: validates the table exists, checks the new
+/// name doesn't collide, and produces the list of `sqlite_schema` row edits the codegen
+/// should perform. Returns `(edits, schema_cookie)`.
 ///
 /// `RENAME TO new_name` collects:
 ///   * the table row itself — `name` and `tbl_name` set to `new_name`, `sql` rewritten,
 ///   * every associated index/trigger row whose `tbl_name` matches the old name — `tbl_name`
 ///     set to `new_name`, `sql` rewritten (when the rewrite succeeds).
-///
-/// Other actions return an error at codegen time (M14.6+ will handle them).
-fn resolve_alter_target(
+fn resolve_alter_rename_target(
     pager: &Arc<Pager>,
     alter: &AlterTableStmt,
 ) -> Result<(Vec<codegen::alter::SchemaRowEdit>, u32)> {
@@ -678,6 +712,37 @@ fn resolve_alter_target(
     }
 
     Ok((edits, cookie))
+}
+
+/// Resolve an `ALTER TABLE … ADD [COLUMN] <def>` target: validates the table exists,
+/// validates the new column is legal for ADD COLUMN, and returns
+/// `(table_rowid, old_sql, schema_cookie)` for the codegen.
+fn resolve_alter_add_column_target(
+    pager: &Arc<Pager>,
+    alter: &AlterTableStmt,
+    col_def: &rustqlite_parser::ColumnDef,
+) -> Result<(i64, String, u32)> {
+    if alter.schema.is_some() {
+        return Err(Error::msg(
+            "schema-qualified ALTER TABLE is not yet supported",
+        ));
+    }
+    if alter.table.starts_with("sqlite_") {
+        return Err(Error::msg(format!("table {} may not be altered", alter.table)));
+    }
+    // Validate the column def is legal for ADD COLUMN.
+    codegen::alter::validate_add_column(col_def)?;
+    let catalog = block_on(read_catalog(pager))?;
+    let cookie = schema_cookie(pager);
+    let table_obj = catalog
+        .find_table(&alter.table)
+        .ok_or_else(|| Error::msg(format!("no such table: {}", alter.table)))?;
+    let old_sql = table_obj
+        .sql
+        .as_ref()
+        .ok_or_else(|| Error::msg(format!("table \"{}\" has no CREATE statement", alter.table)))?
+        .clone();
+    Ok((table_obj.rowid, old_sql, cookie))
 }
 
 /// Resolve the index a `DROP INDEX` targets from the current catalog. Returns

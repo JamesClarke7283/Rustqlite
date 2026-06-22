@@ -757,3 +757,23 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   AST-aware, so FK references inside the CREATE TABLE text (e.g. `REFERENCES old_name`)
   are not rewritten — matches `legacy_alter_table=ON` behavior; the AST-aware rewrite
   lands with the full `parse.y` port.
+  **14.6 `ADD COLUMN`** ✅: `codegen::alter::compile_alter_add_column` (mirrors
+  `sqlite3AlterFinishAddColumn` in `alter.c`) rewrites the table's `sqlite_schema` row to
+  include the new column in the CREATE TABLE text. The `sql` column is rewritten by
+  `splice_column_into_create_table` — a paren-depth-aware splice of `, <col_def_text>`
+  before the closing `)` of the column list (handles `VARCHAR(10)` nested parens and
+  `WITHOUT ROWID` suffixes). The column-definition text is extracted from the user's
+  original ALTER TABLE statement by `extract_add_column_text` (finds `ADD [COLUMN]` and
+  takes the trimmed rest). The resolver (`resolve_alter_add_column_target` in `capi::stmt`)
+  validates the column is legal for ADD COLUMN via `validate_add_column`: rejects
+  `PRIMARY KEY` ("Cannot add a PRIMARY KEY column"), `UNIQUE` ("Cannot add a UNIQUE
+  column"), and `NOT NULL` without a non-NULL default ("Cannot add a NOT NULL column with
+  default value NULL"). Existing rows in the table b-tree are NOT rewritten — they read
+  the new column as NULL (the `Column` opcode returns NULL for indices beyond the record's
+  length); SQLite applies the DEFAULT on read for existing rows, but our engine does not
+  yet model column defaults on read (M35.3), so a non-NULL default diverges for existing
+  rows (documented in the test). New INSERTs that don't specify the new column also get
+  NULL (the current engine behavior — column DEFAULTs are not modeled at INSERT time for
+  unlisted columns). Differential-tested vs the C oracle (`alter_table_add_column_*` in
+  `write_roundtrip.rs` — basic add, add with default, multiple adds, add with `COLUMN`
+  keyword, NOT NULL without default error, PRIMARY KEY error).

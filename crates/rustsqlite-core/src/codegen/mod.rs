@@ -199,3 +199,19 @@ pub fn compile_alter_rename_table(
 ) -> Result<Program> {
     alter::compile_alter_rename_table(stmt, current_schema_cookie, edits)
 }
+
+/// Compile `ALTER TABLE <name> ADD [COLUMN] <def>` into a VDBE write program that rewrites
+/// the table's `sqlite_schema` row to include the new column in the CREATE TABLE text.
+/// `current_schema_cookie` is the value before this DDL runs (the program bumps it by one).
+/// `table_rowid` is the rowid of the table's `sqlite_schema` row. `old_sql` is the current
+/// CREATE TABLE text. `col_def_text` is the verbatim column-definition text from the user's
+/// ALTER TABLE statement.
+pub fn compile_alter_add_column(
+    stmt: &AlterTableStmt,
+    current_schema_cookie: u32,
+    table_rowid: i64,
+    old_sql: &str,
+    col_def_text: &str,
+) -> Result<Program> {
+    alter::compile_alter_add_column(stmt, current_schema_cookie, table_rowid, old_sql, col_def_text)
+}

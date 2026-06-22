@@ -14,7 +14,7 @@
 //! upstream's observable result for the common cases (no FK references, no triggers
 //! referencing the table in their bodies).
 
-use rustqlite_parser::AlterTableStmt;
+use rustqlite_parser::{AlterTableStmt, ColumnDef};
 
 use crate::error::{Error, Result};
 use crate::vdbe::program::{Program, P4, P5_ISUPDATE};
@@ -40,6 +40,207 @@ pub struct SchemaRowEdit {
     pub new_tbl_name: Option<String>,
     /// New value for column 4 (`sql`), or `None` to keep the existing value.
     pub new_sql: Option<String>,
+}
+
+/// Compile `ALTER TABLE <tbl> ADD [COLUMN] <col_def>`.
+///
+/// * `stmt` — the parsed ALTER TABLE statement (action must be `AddColumn`).
+/// * `current_schema_cookie` — the value before this DDL runs (the program bumps it by one).
+/// * `table_rowid` — the rowid of the table's `sqlite_schema` row.
+/// * `old_sql` — the current `sql` text of the CREATE TABLE statement.
+/// * `col_def_text` — the verbatim column-definition text from the user's ALTER TABLE
+///   statement (e.g. `"b TEXT DEFAULT 'x'"`), which is spliced into the CREATE TABLE text.
+///
+/// The existing rows in the table b-tree are NOT rewritten — SQLite reads existing rows with
+/// the old column count and treats missing columns as NULL (or the default on read, which is
+/// M35.3). New INSERTs that don't specify the new column also get NULL (the current engine
+/// behavior — column DEFAULTs are not modeled yet).
+pub fn compile_alter_add_column(
+    stmt: &AlterTableStmt,
+    current_schema_cookie: u32,
+    table_rowid: i64,
+    old_sql: &str,
+    col_def_text: &str,
+) -> Result<Program> {
+    if stmt.schema.is_some() {
+        return Err(Error::msg(
+            "schema-qualified ALTER TABLE is not yet supported",
+        ));
+    }
+    let new_sql = splice_column_into_create_table(old_sql, col_def_text)
+        .ok_or_else(|| Error::msg("cannot splice column into CREATE TABLE text"))?;
+
+    let mut b = ProgramBuilder::new();
+
+    let setup = b.new_label();
+    b.emit_jump(Opcode::Init, 0, setup, 0);
+    let after_init = b.cur_addr();
+
+    // (1) Open the write transaction.
+    b.emit(Opcode::Transaction, 0, 1, 0);
+
+    // (2) Open a write cursor on `sqlite_schema` (page 1).
+    let schema_cursor = 0i32;
+    b.emit(Opcode::OpenWrite, schema_cursor, SCHEMA_ROOT, 0);
+
+    // (3) Seek to the table row, read the 5 columns, overwrite the `sql` column with the
+    //     rewritten CREATE TABLE text, Delete + Insert at the same rowid.
+    let rowid_reg = b.alloc_reg();
+    let i = b.emit(Opcode::Int64, 0, rowid_reg, 0);
+    b.set_p4(i, P4::Int(table_rowid));
+
+    let skip = b.new_label();
+    b.emit_jump(Opcode::NotExists, schema_cursor, skip, rowid_reg);
+
+    let col0 = b.alloc_regs(5);
+    for (ci, _) in [(0usize, ()), (1, ()), (2, ()), (3, ()), (4, ())].iter() {
+        b.emit(Opcode::Column, schema_cursor, *ci as i32, col0 + *ci as i32);
+    }
+    let sql_idx = b.emit(Opcode::String8, 0, col0 + 4, 0);
+    b.set_p4(sql_idx, P4::Text(new_sql));
+
+    let record = b.alloc_reg();
+    b.emit(Opcode::MakeRecord, col0, 5, record);
+    let del_idx = b.emit(Opcode::Delete, schema_cursor, 0, 0);
+    b.set_p5(del_idx, P5_ISUPDATE);
+    let ins = b.emit(Opcode::Insert, schema_cursor, record, rowid_reg);
+    b.set_p5(ins, P5_ISUPDATE);
+
+    b.resolve(skip);
+
+    // (4) Bump the schema cookie.
+    b.emit(
+        Opcode::SetCookie,
+        0,
+        COOKIE_SCHEMA,
+        current_schema_cookie as i32 + 1,
+    );
+
+    // (5) Reload the schema so later statements see the new column.
+    b.emit(Opcode::ParseSchema, 0, 0, 0);
+
+    // (6) Halt commits the transaction.
+    b.emit(Opcode::Halt, 0, 0, 0);
+
+    b.resolve(setup);
+    b.emit(Opcode::Goto, 0, after_init, 0);
+    Ok(b.finish())
+}
+
+/// Splice a new column-definition text into a CREATE TABLE statement, just before the
+/// closing `)` of the column list. Returns the rewritten SQL, or `None` when the splice
+/// position cannot be found.
+fn splice_column_into_create_table(create_sql: &str, col_def_text: &str) -> Option<String> {
+    // Find `CREATE [TEMP] TABLE [IF NOT EXISTS] <name> (`
+    let lower = create_sql.to_ascii_lowercase();
+    let prefix = strip_create_prefix(&lower, "table")?;
+    // Skip the table-name identifier (possibly quoted).
+    let after_name = skip_identifier(create_sql, prefix.0);
+    let pos = skip_whitespace(create_sql, after_name);
+    let bytes = create_sql.as_bytes();
+    if pos >= bytes.len() || bytes[pos] != b'(' {
+        return None;
+    }
+    // Scan for the matching `)` tracking paren depth, skipping string literals.
+    let mut depth: i32 = 0;
+    let mut i = pos;
+    let mut in_string: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match in_string {
+            Some(quote) => {
+                if b == quote {
+                    // Check for doubled quote (escape)
+                    if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                        i += 2;
+                        continue;
+                    }
+                    in_string = None;
+                }
+            }
+            None => match b {
+                b'\'' | b'"' => in_string = Some(b),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        // Found the closing `)` of the column list.
+                        let before = &create_sql[..i];
+                        let after = &create_sql[i..];
+                        // Splice in `, <col_def_text>` before the `)`.
+                        // Trim trailing whitespace from `before` so the comma lands cleanly.
+                        let before_trimmed = before.trim_end();
+                        return Some(format!("{}, {}{}", before_trimmed, col_def_text, after));
+                    }
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Extract the verbatim column-definition text from an `ALTER TABLE … ADD [COLUMN] <def>`
+/// statement. Returns the text of `<def>` (trimmed), or `None` when it cannot be located.
+pub fn extract_add_column_text(alter_sql: &str) -> Option<String> {
+    let lower = alter_sql.to_ascii_lowercase();
+    // Find `add` keyword (whole word).
+    let add_pos = find_keyword(&lower, "add")?;
+    let mut pos = add_pos + 3; // 3 = "add"
+    pos = skip_whitespace(alter_sql, pos);
+    // Optional `COLUMN` keyword.
+    let rest = &lower[pos..];
+    if rest.starts_with("column") {
+        pos += "column".len();
+        pos = skip_whitespace(alter_sql, pos);
+    }
+    // The rest is the column definition, trimmed, with a trailing semicolon stripped.
+    let mut text = alter_sql[pos..].trim();
+    text = text.strip_suffix(';').unwrap_or(text).trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+/// Validate that a `ColumnDef` is legal for `ADD COLUMN`: not PRIMARY KEY, not UNIQUE
+/// (column-level), and if NOT NULL then must have a non-NULL default (when the table is
+/// non-empty — we approximate by always rejecting NOT NULL without default, matching
+/// upstream's `sqlite3ErrorIfNotEmpty` conservative check). Returns `Ok(())` when legal.
+pub fn validate_add_column(col: &ColumnDef) -> Result<()> {
+    let mut has_pk = false;
+    let mut has_unique = false;
+    let mut has_not_null = false;
+    let mut has_default = false;
+    let mut default_is_null = false;
+    for c in &col.constraints {
+        match c {
+            rustqlite_parser::ColumnConstraint::PrimaryKey { .. } => has_pk = true,
+            rustqlite_parser::ColumnConstraint::Unique { .. } => has_unique = true,
+            rustqlite_parser::ColumnConstraint::NotNull { .. } => has_not_null = true,
+            rustqlite_parser::ColumnConstraint::Default(e) => {
+                has_default = true;
+                if let rustqlite_parser::Expr::Literal(rustqlite_parser::Literal::Null) = e {
+                    default_is_null = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if has_pk {
+        return Err(Error::msg("Cannot add a PRIMARY KEY column"));
+    }
+    if has_unique {
+        return Err(Error::msg("Cannot add a UNIQUE column"));
+    }
+    if has_not_null && (!has_default || default_is_null) {
+        return Err(Error::msg(
+            "Cannot add a NOT NULL column with default value NULL",
+        ));
+    }
+    Ok(())
 }
 
 /// Compile `ALTER TABLE <old> RENAME TO <new>`.
@@ -484,5 +685,63 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "CREATE TABLE \"Other Name\"(a)");
+    }
+
+    #[test]
+    fn splice_column_basic() {
+        let out = splice_column_into_create_table("CREATE TABLE t(a)", "b TEXT").unwrap();
+        assert_eq!(out, "CREATE TABLE t(a, b TEXT)");
+    }
+
+    #[test]
+    fn splice_column_with_existing_columns() {
+        let out = splice_column_into_create_table("CREATE TABLE t(a, b INTEGER)", "c TEXT").unwrap();
+        assert_eq!(out, "CREATE TABLE t(a, b INTEGER, c TEXT)");
+    }
+
+    #[test]
+    fn splice_column_with_varchar_n() {
+        // The `)` inside `VARCHAR(10)` must not confuse the paren matcher.
+        let out = splice_column_into_create_table(
+            "CREATE TABLE t(a VARCHAR(10))",
+            "b TEXT",
+        )
+        .unwrap();
+        assert_eq!(out, "CREATE TABLE t(a VARCHAR(10), b TEXT)");
+    }
+
+    #[test]
+    fn splice_column_without_rowid() {
+        let out = splice_column_into_create_table(
+            "CREATE TABLE t(a PRIMARY KEY) WITHOUT ROWID",
+            "b TEXT",
+        )
+        .unwrap();
+        assert_eq!(out, "CREATE TABLE t(a PRIMARY KEY, b TEXT) WITHOUT ROWID");
+    }
+
+    #[test]
+    fn extract_add_column_text_basic() {
+        let out = extract_add_column_text("ALTER TABLE t ADD COLUMN b TEXT").unwrap();
+        assert_eq!(out, "b TEXT");
+    }
+
+    #[test]
+    fn extract_add_column_text_without_keyword() {
+        let out = extract_add_column_text("ALTER TABLE t ADD b TEXT").unwrap();
+        assert_eq!(out, "b TEXT");
+    }
+
+    #[test]
+    fn extract_add_column_text_with_default() {
+        let out =
+            extract_add_column_text("ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 42").unwrap();
+        assert_eq!(out, "b INTEGER DEFAULT 42");
+    }
+
+    #[test]
+    fn extract_add_column_text_strips_semicolon() {
+        let out = extract_add_column_text("ALTER TABLE t ADD COLUMN b TEXT;").unwrap();
+        assert_eq!(out, "b TEXT");
     }
 }
