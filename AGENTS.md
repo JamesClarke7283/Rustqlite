@@ -730,3 +730,30 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   file and the C oracle reads them back + `PRAGMA integrity_check` passes; `wal_checkpoint`
   on a rollback-mode database is a no-op `(0, 0, 0)`; and writes after a TRUNCATE checkpoint
   append fresh frames to the truncated WAL with the new salts — the WAL restart works).
+- **M14 — ALTER TABLE** 🚧: **14.1–14.4** ✅ (parser shipped in M2.25–M2.28). **14.5
+  `RENAME TO`** ✅: `codegen::alter::compile_alter_rename_table` (mirrors
+  `sqlite3AlterRenameTable` in `alter.c`) opens a write cursor on `sqlite_schema` (page 1)
+  and, for the table row + every associated index/trigger row whose `tbl_name` matches the
+  old name, reads the 5 columns, overwrites the `name`/`tbl_name`/`sql` fields, deletes the
+  old row, and inserts the new record at the same rowid (`Insert` does not overwrite in our
+  b-tree, so `Delete`+`Insert` is the in-place update shape). The `sql` column is rewritten
+  by `rewrite_table_name_in_sql` — a textual splice of the table-name token in the stored
+  CREATE TABLE / CREATE INDEX / CREATE TRIGGER text, preserving the original quoting style
+  (SQLite uses an AST-aware rewrite via the `sqlite_rename_table` SQL function; this slice
+  approximates it with a targeted text substitution at the table-name position). A
+  `dequote_ident` helper (mirrors `sqlite3Dequote`) is added to the schema catalog and used
+  in `find_table`/`find_index`/`find_index_for_column` so lookups against a stored name like
+  `"My Table"` (the parser keeps quote characters in identifier strings) match both
+  `"My Table"` and `My Table`. The ALTER TABLE resolver (`resolve_alter_target` in
+  `capi::stmt`) dequotes the new name before storing it in the `name`/`tbl_name` columns
+  (SQLite stores the dequoted form there), rejects renaming system tables (`sqlite_*`),
+  rejects the new name colliding with an existing table or index, and rejects reserved-name
+  targets. Differential-tested vs the C oracle (`alter_table_rename_to_*` in
+  `write_roundtrip.rs` — basic rename, rename with index, quoted names, data preservation,
+  nonexistent-table error, name-collision error). C-SQLite `PRAGMA integrity_check` passes
+  on Rustqlite-written renamed databases. Still M14+: 14.6 `ADD COLUMN`, 14.7
+  `DROP COLUMN`, 14.8 `RENAME COLUMN`, 14.9 `PRAGMA legacy_alter_table`, 14.10
+  `ALTER COLUMN … DROP/SET NOT NULL`. Known gap: the `sql` rewrite is text-based, not
+  AST-aware, so FK references inside the CREATE TABLE text (e.g. `REFERENCES old_name`)
+  are not rewritten — matches `legacy_alter_table=ON` behavior; the AST-aware rewrite
+  lands with the full `parse.y` port.
