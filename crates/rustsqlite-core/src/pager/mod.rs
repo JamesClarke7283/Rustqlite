@@ -63,6 +63,14 @@ pub struct Pager {
     /// dirty overlay and the page count at savepoint creation so a `ROLLBACK TO` can restore them.
     /// The stack is cleared when the transaction commits or rolls back.
     savepoints: Mutex<Vec<PagerSavepoint>>,
+    /// The WAL sidecar handle (mirrors `Pager.pWal`). `None` when the database is in rollback
+    /// journal mode (the default). When the database header's `write_version`/`read_version` is
+    /// `2`, the pager is in WAL mode; `open` constructs the `Wal`, recovers its in-memory index,
+    /// and `get_page` consults the WAL before reading the database file. The WAL read path is
+    /// M13.4; the write path (appending frames) is M13.5 (not yet implemented — the pager still
+    /// writes through the rollback journal even in WAL mode, so a WAL-mode database written by
+    /// Rustqlite is not yet durable across a crash without a checkpoint).
+    wal: Option<wal::Wal>,
 }
 
 /// One entry on the pager's savepoint stack (mirrors `PagerSavepoint` in `pager.c`).
@@ -156,6 +164,16 @@ impl Pager {
         let file_size = file.file_size().await?;
         let page_count = (file_size / page_size as u64) as u32;
 
+        // WAL mode detection (mirrors `sqlite3PagerOpenWal`'s check on the header's
+        // `write_version`/`read_version`). When both are `2`, the database is in WAL mode and
+        // the pager must consult the `-wal` sidecar before reading any page. The WAL handle
+        // recovers the in-memory wal-index from the WAL frames (M13.4).
+        let wal = if header.write_version == 2 || header.read_version == 2 {
+            Some(wal::Wal::open(vfs.as_ref(), &path, page_size as u32).await?)
+        } else {
+            None
+        };
+
         Ok(Pager {
             vfs,
             path,
@@ -170,6 +188,7 @@ impl Pager {
             }),
             txn: Mutex::new(None),
             savepoints: Mutex::new(Vec::new()),
+            wal,
         })
     }
 
@@ -221,6 +240,7 @@ impl Pager {
             }),
             txn: Mutex::new(None),
             savepoints: Mutex::new(Vec::new()),
+            wal: None,
         })
     }
 
@@ -238,7 +258,15 @@ impl Pager {
     }
 
     pub fn page_count(&self) -> u32 {
-        self.state.lock().unwrap().page_count
+        // In WAL mode with a non-empty WAL, the WAL's `n_page` (carried by the last commit
+        // frame) is the durable database size a reader must observe — it may be larger than
+        // the file's page count if pages were added in the WAL but not yet checkpointed. When
+        // the WAL is empty/missing, the file's page count is authoritative.
+        let st_count = self.state.lock().unwrap().page_count;
+        match &self.wal {
+            Some(w) if w.mx_frame() != 0 => w.n_page().max(st_count),
+            _ => st_count,
+        }
     }
 
     pub fn text_encoding(&self) -> TextEncoding {
@@ -287,18 +315,49 @@ impl Pager {
         }
     }
 
-    /// Fetch a page (1-based) as a shared byte buffer, reading through the dirty overlay, then the
-    /// clean cache, then the file. The lock is never held across the file I/O.
+    /// Fetch a page (1-based) as a shared byte buffer, reading through the dirty overlay, then
+    /// the clean cache, then the WAL (if in WAL mode), then the database file. The lock is never
+    /// held across the file I/O.
+    ///
+    /// In WAL mode, the page is served from the WAL when a valid frame exists for it (mirrors
+    /// `sqlite3WalFindFrame` + `sqlite3WalReadFrame`); otherwise it falls back to the database
+    /// file. The page count used for the range check is the WAL's committed `nPage` (carried by
+    /// the last commit frame) when the WAL is non-empty, since that is the durable database
+    /// size a reader must observe; when the WAL is empty/missing, the file's page count is
+    /// authoritative (mirrors `sqlite3PagerPagecount`'s WAL-aware branch).
     pub async fn get_page(&self, pgno: u32) -> Result<PageRef> {
         {
             let st = self.state.lock().unwrap();
-            if pgno == 0 || pgno > st.page_count {
+            // The effective page count: in WAL mode with a non-empty WAL, the WAL's `n_page`
+            // is the durable size (it may be larger than the file if pages were added in the
+            // WAL but not yet checkpointed). Otherwise the file's page count is authoritative.
+            let effective_count = match &self.wal {
+                Some(w) if w.mx_frame() != 0 => w.n_page().max(st.page_count),
+                _ => st.page_count,
+            };
+            if pgno == 0 || pgno > effective_count {
                 return Err(Error::corrupt(format!(
                     "page {pgno} out of range (page count {})",
-                    st.page_count
+                    effective_count
                 )));
             }
             if let Some(page) = st.dirty.get(&pgno).or_else(|| st.cache.get(&pgno)).cloned() {
+                return Ok(page);
+            }
+        }
+
+        // In WAL mode, consult the WAL before the database file (mirrors `pagerWalRead`).
+        if let Some(wal) = &self.wal {
+            let i_frame = wal.find_frame(pgno);
+            if i_frame != 0 {
+                let mut buf = vec![0u8; self.page_size];
+                wal.read_frame(i_frame, &mut buf).await?;
+                let page: PageRef = Arc::new(buf);
+                let mut st = self.state.lock().unwrap();
+                if let Some(page) = st.dirty.get(&pgno).or_else(|| st.cache.get(&pgno)).cloned() {
+                    return Ok(page);
+                }
+                st.cache.insert(pgno, page.clone());
                 return Ok(page);
             }
         }

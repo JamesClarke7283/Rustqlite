@@ -647,3 +647,34 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   pre-existing `insert_or_fail_keeps_prior_rows` test was updated to verify this. CHECK
   constraint enforcement (the `ON CONFLICT` clause is captured but the CHECK itself is not
   evaluated yet — that's M19.8/M35.1).
+- **M13 — WAL (Write-Ahead Logging)** 🚧: **13.1–13.3** ✅ (format codecs for the `-wal`
+  header/frame and the `-shm` shared-memory index — see `format/wal.rs` and
+  `format/wal_index.rs`). **13.4 WAL mode read path** ✅: `pager::wal::Wal` (mirroring
+  `wal.c`) opens the `-wal` sidecar, recovers an in-memory wal-index by scanning every
+  frame and verifying the running checksum + salt match (mirrors `walIndexRecover`), and
+  answers page lookups via `find_frame` (mirrors `walFindFrame` — walks the hash tables
+  newest-block-first, scanning the full hash chain within each block to find the highest
+  frame for the page) + `read_frame` (mirrors `sqlite3WalReadFrameFrame` — reads page data
+  at the computed WAL offset). The in-memory index is a `Vec<IndexBlock>` of
+  `page_mapping: Vec<u32>` + `hash_table: Vec<u16>`, with the asymmetric first-block capacity
+  (`HASHTABLE_NPAGE_ONE = 4062`) matching upstream. Recovery stops at the first frame that
+  fails checksum or salt validation, and only frames up to and including the last *commit
+  frame* (non-zero `commit_size`) are made visible to readers (`mxFrame` = last commit,
+  `nPage` = its `commit_size`); the uncommitted tail is dropped, matching upstream's durable
+  prefix rule. `Pager::open` detects WAL mode (`header.write_version == 2 ||
+  header.read_version == 2`), constructs the `Wal`, recovers its index, and stores it in a
+  new `Pager::wal: Option<Wal>` field; `Pager::get_page` consults `Wal::find_frame` before
+  reading the database file, falling back to the file when the page is not in the WAL; and
+  `Pager::page_count` reports the WAL's `n_page` (the durable size carried by the last
+  commit frame) when the WAL is non-empty, since pages added in the WAL but not yet
+  checkpointed extend the visible database. `Pager::create_fresh` sets `wal: None` (a fresh
+  database starts in rollback-journal mode). The write path (appending frames to the WAL
+  instead of journaling DB pages) is M13.5 — not yet implemented, so a WAL-mode database
+  written by Rustqlite still goes through the rollback journal and is not crash-safe until
+  a checkpoint copies the WAL into the DB file. Differential-tested vs the C oracle (7 new
+  cases in `wal_read.rs`: uncheckpointed WAL reads committed rows from the `-wal` sidecar,
+  post-checkpoint reads fall back to the DB file, multi-commit WAL exposes all committed
+  rows, empty `-wal` (header only) falls back to the DB file, no `-wal` file falls back to
+  the DB file, 200-row database reads across multiple b-tree leaf pages from the WAL, and
+  `sqlite_schema` reads through the WAL). Known limitation: this is a read-only WAL reader;
+  Rustqlite-written WAL-mode databases are not yet crash-safe (M13.5 write path pending).
