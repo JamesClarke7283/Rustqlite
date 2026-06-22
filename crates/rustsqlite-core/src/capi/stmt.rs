@@ -390,6 +390,31 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                         last_error: None,
                     })
                 }
+                AlterTableAction::DropColumn(col_name) => {
+                    let (table, table_rowid, old_sql, schema_cookie) =
+                        resolve_alter_drop_column_target(&pager, &alter, &col_name)?;
+                    let drop_col_idx = codegen::alter::validate_drop_column(&table, &col_name)?;
+                    let drop_col_name_dequoted = codegen::alter::dequote_ident(&col_name);
+                    let program = Arc::new(codegen::compile_alter_drop_column(
+                        &alter,
+                        schema_cookie,
+                        &table,
+                        table_rowid,
+                        &old_sql,
+                        drop_col_idx,
+                        &drop_col_name_dequoted,
+                    )?);
+                    let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
+                    Ok(Sqlite3Stmt {
+                        sql: sql.to_string(),
+                        program,
+                        column_names: Vec::new(),
+                        backing: Backing::Vdbe(vdbe),
+                        explain: 0,
+                        counts: Some(db.counts_handle()),
+                        last_error: None,
+                    })
+                }
                 _ => Err(Error::msg(format!(
                     "ALTER TABLE action {:?} is not supported yet",
                     alter.action
@@ -743,6 +768,36 @@ fn resolve_alter_add_column_target(
         .ok_or_else(|| Error::msg(format!("table \"{}\" has no CREATE statement", alter.table)))?
         .clone();
     Ok((table_obj.rowid, old_sql, cookie))
+}
+
+/// Resolve an `ALTER TABLE … DROP [COLUMN] <name>` target: validates the table exists,
+/// validates the column can be dropped, and returns `(table, table_rowid, old_sql,
+/// schema_cookie)` for the codegen.
+fn resolve_alter_drop_column_target(
+    pager: &Arc<Pager>,
+    alter: &AlterTableStmt,
+    _col_name: &str,
+) -> Result<(Table, i64, String, u32)> {
+    if alter.schema.is_some() {
+        return Err(Error::msg(
+            "schema-qualified ALTER TABLE is not yet supported",
+        ));
+    }
+    if alter.table.starts_with("sqlite_") {
+        return Err(Error::msg(format!("table {} may not be altered", alter.table)));
+    }
+    let catalog = block_on(read_catalog(pager))?;
+    let cookie = schema_cookie(pager);
+    let table_obj = catalog
+        .find_table(&alter.table)
+        .ok_or_else(|| Error::msg(format!("no such table: {}", alter.table)))?;
+    let table = Table::from_schema_object(table_obj)?;
+    let old_sql = table_obj
+        .sql
+        .as_ref()
+        .ok_or_else(|| Error::msg(format!("table \"{}\" has no CREATE statement", alter.table)))?
+        .clone();
+    Ok((table, table_obj.rowid, old_sql, cookie))
 }
 
 /// Resolve the index a `DROP INDEX` targets from the current catalog. Returns

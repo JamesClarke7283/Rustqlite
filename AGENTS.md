@@ -777,3 +777,22 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   unlisted columns). Differential-tested vs the C oracle (`alter_table_add_column_*` in
   `write_roundtrip.rs` — basic add, add with default, multiple adds, add with `COLUMN`
   keyword, NOT NULL without default error, PRIMARY KEY error).
+  **14.7 `DROP COLUMN`** ✅: `codegen::alter::compile_alter_drop_column` (mirrors
+  `sqlite3AlterDropColumn` in `alter.c`) rewrites the table's `sqlite_schema` row to remove
+  the column from the CREATE TABLE text (via `drop_column_from_create_table` — a paren-
+  depth-aware segment splitter that finds the column-def segment by name and removes it
+  with its leading/trailing comma), AND rewrites every existing row in the table b-tree to
+  remove the dropped column's value, using the same two-pass sorter-as-rowset approach as
+  UPDATE (first pass captures rowids into a sorter, second pass re-seeks each rowid, reads
+  all columns except the dropped one, builds a reduced record, deletes the old row, and
+  inserts the new one at the same rowid). The resolver (`resolve_alter_drop_column_target`
+  in `capi::stmt`) validates the column can be dropped via `validate_drop_column`: rejects
+  dropping a PRIMARY KEY column ("cannot drop PRIMARY KEY column"), rejects dropping the
+  only column ("cannot drop column: no other columns exist"), and rejects dropping a
+  nonexistent column ("no such column"). Dependent indexes (those referencing the dropped
+  column) are NOT automatically dropped in this slice — the user must drop them first or
+  the index will reference a missing column (a known gap; upstream drops and rebuilds
+  dependent indexes). Differential-tested vs the C oracle
+  (`alter_table_drop_column_*` in `write_roundtrip.rs` — drop middle/first/last column,
+  multiple rows, nonexistent/PK/only-column errors). C-SQLite `PRAGMA integrity_check`
+  passes on Rustqlite-written databases.

@@ -1824,3 +1824,170 @@ fn alter_table_add_column_with_keyword() {
 
     assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
 }
+
+#[test]
+fn alter_table_drop_column_roundtrip_and_c_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("alter_drop_column");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b, c);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x', 1.5);");
+        exec(&mut conn, "INSERT INTO t VALUES (2, 'y', 2.5);");
+        exec(&mut conn, "ALTER TABLE t DROP COLUMN b;");
+
+        // The dropped column is gone; the remaining columns are intact.
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, c FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Real(1.5)],
+            vec![Value::Int(2), Value::Real(2.5)],
+        ]);
+
+        // Referencing the dropped column is an error.
+        let result = sqlite3_prepare_v2(&mut conn, "SELECT b FROM t;");
+        assert!(result.is_err());
+
+        // The schema sql reflects the dropped column.
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "SELECT sql FROM sqlite_schema WHERE name='t';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(
+            rows,
+            vec![vec![Value::Text("CREATE TABLE t(a, c)".to_string())]]
+        );
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, c FROM t ORDER BY a;"), "1|1.5\n2|2.5");
+    assert_eq!(db.query("SELECT sql FROM sqlite_schema WHERE name='t';"), "CREATE TABLE t(a, c)");
+}
+
+#[test]
+fn alter_table_drop_column_first() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("alter_drop_first");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b, c);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 2, 3);");
+        exec(&mut conn, "ALTER TABLE t DROP COLUMN a;");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT b, c FROM t;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(2), Value::Int(3)]]);
+
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "SELECT sql FROM sqlite_schema WHERE name='t';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(
+            rows,
+            vec![vec![Value::Text("CREATE TABLE t(b, c)".to_string())]]
+        );
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT b, c FROM t;"), "2|3");
+}
+
+#[test]
+fn alter_table_drop_column_last() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("alter_drop_last");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b, c);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 2, 3);");
+        exec(&mut conn, "ALTER TABLE t DROP COLUMN c;");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(1), Value::Int(2)]]);
+
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "SELECT sql FROM sqlite_schema WHERE name='t';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(
+            rows,
+            vec![vec![Value::Text("CREATE TABLE t(a, b)".to_string())]]
+        );
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM t;"), "1|2");
+}
+
+#[test]
+fn alter_table_drop_column_nonexistent_errors() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("alter_drop_nonexistent");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        let result = sqlite3_prepare_v2(&mut conn, "ALTER TABLE t DROP COLUMN nope;");
+        assert!(result.is_err(), "expected error for dropping nonexistent column");
+        let _ = conn;
+    }
+}
+
+#[test]
+fn alter_table_drop_column_pk_errors() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("alter_drop_pk");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a INTEGER PRIMARY KEY, b);");
+        let result = sqlite3_prepare_v2(&mut conn, "ALTER TABLE t DROP COLUMN a;");
+        assert!(result.is_err(), "expected error for dropping PRIMARY KEY column");
+        let _ = conn;
+    }
+}
+
+#[test]
+fn alter_table_drop_column_only_column_errors() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("alter_drop_only");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a);");
+        let result = sqlite3_prepare_v2(&mut conn, "ALTER TABLE t DROP COLUMN a;");
+        assert!(result.is_err(), "expected error for dropping the only column");
+        let _ = conn;
+    }
+}
+
+#[test]
+fn alter_table_drop_column_multiple_rows() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("alter_drop_many");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        for i in 0..100i64 {
+            exec(&mut conn, &format!("INSERT INTO t VALUES ({i}, {i}*2);"));
+        }
+        exec(&mut conn, "ALTER TABLE t DROP COLUMN b;");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT count(*), min(a), max(a) FROM t;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(100), Value::Int(0), Value::Int(99)]]);
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT count(*), min(a), max(a) FROM t;"), "100|0|99");
+}

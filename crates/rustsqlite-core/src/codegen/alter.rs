@@ -17,7 +17,9 @@
 use rustqlite_parser::{AlterTableStmt, ColumnDef};
 
 use crate::error::{Error, Result};
+use crate::schema::Table;
 use crate::vdbe::program::{Program, P4, P5_ISUPDATE};
+use crate::vdbe::KeyField;
 use crate::vdbe::Opcode;
 
 use super::builder::ProgramBuilder;
@@ -205,6 +207,155 @@ pub fn extract_add_column_text(alter_sql: &str) -> Option<String> {
     }
 }
 
+/// Compile `ALTER TABLE <tbl> DROP [COLUMN] <name>`.
+///
+/// * `stmt` — the parsed ALTER TABLE statement (action must be `DropColumn`).
+/// * `current_schema_cookie` — the value before this DDL runs (the program bumps it by one).
+/// * `table` — the catalog-resolved table being altered.
+/// * `table_rowid` — the rowid of the table's `sqlite_schema` row.
+/// * `old_sql` — the current `sql` text of the CREATE TABLE statement.
+/// * `drop_col_idx` — the table-column index of the column being dropped.
+/// * `drop_col_name` — the dequoted name of the column being dropped (for the SQL rewrite).
+///
+/// The program:
+///   1. Rewrites the table's `sqlite_schema` row (removing the column from the CREATE TABLE
+///      text).
+///   2. Rewrites every existing row in the table b-tree (removing the dropped column's
+///      value) using a two-pass sorter-as-rowset approach (same as UPDATE).
+pub fn compile_alter_drop_column(
+    stmt: &AlterTableStmt,
+    current_schema_cookie: u32,
+    table: &Table,
+    table_rowid: i64,
+    old_sql: &str,
+    drop_col_idx: usize,
+    drop_col_name: &str,
+) -> Result<Program> {
+    if stmt.schema.is_some() {
+        return Err(Error::msg(
+            "schema-qualified ALTER TABLE is not yet supported",
+        ));
+    }
+    let new_sql = drop_column_from_create_table(old_sql, drop_col_name)
+        .ok_or_else(|| Error::msg("cannot drop column from CREATE TABLE text"))?;
+
+    let mut b = ProgramBuilder::new();
+
+    let setup = b.new_label();
+    b.emit_jump(Opcode::Init, 0, setup, 0);
+    let after_init = b.cur_addr();
+
+    // (1) Open the write transaction.
+    b.emit(Opcode::Transaction, 0, 1, 0);
+
+    // (2) Open a write cursor on `sqlite_schema` (page 1) and rewrite the table row's sql.
+    let schema_cursor = 0i32;
+    b.emit(Opcode::OpenWrite, schema_cursor, SCHEMA_ROOT, 0);
+
+    let rowid_reg = b.alloc_reg();
+    let i = b.emit(Opcode::Int64, 0, rowid_reg, 0);
+    b.set_p4(i, P4::Int(table_rowid));
+
+    let skip_schema = b.new_label();
+    b.emit_jump(Opcode::NotExists, schema_cursor, skip_schema, rowid_reg);
+
+    let col0 = b.alloc_regs(5);
+    for (ci, _) in [(0usize, ()), (1, ()), (2, ()), (3, ()), (4, ())].iter() {
+        b.emit(Opcode::Column, schema_cursor, *ci as i32, col0 + *ci as i32);
+    }
+    let sql_idx = b.emit(Opcode::String8, 0, col0 + 4, 0);
+    b.set_p4(sql_idx, P4::Text(new_sql));
+    let record = b.alloc_reg();
+    b.emit(Opcode::MakeRecord, col0, 5, record);
+    let del_idx = b.emit(Opcode::Delete, schema_cursor, 0, 0);
+    b.set_p5(del_idx, P5_ISUPDATE);
+    let ins = b.emit(Opcode::Insert, schema_cursor, record, rowid_reg);
+    b.set_p5(ins, P5_ISUPDATE);
+    b.resolve(skip_schema);
+    b.emit(Opcode::Close, schema_cursor, 0, 0);
+
+    // (3) Rewrite every row in the table b-tree: remove the dropped column's value.
+    //     Two-pass sorter-as-rowset approach (same as UPDATE): first pass captures rowids,
+    //     second pass re-seeks each rowid, reads all columns except the dropped one, builds
+    //     a new record, deletes the old row, and inserts the new one.
+    let table_cursor = 0i32;
+    let sorter = 1i32;
+    b.emit(Opcode::OpenWrite, table_cursor, table.rootpage as i32, 0);
+
+    // Open the rowid-set sorter.
+    let so = b.emit(Opcode::SorterOpen, sorter, 1, 0);
+    b.set_p4(so, P4::KeyInfo(vec![KeyField::asc_binary()]));
+
+    // First pass: scan the table, capture each rowid.
+    let end_scan = b.new_label();
+    let scan_top = b.new_label();
+    b.emit_jump(Opcode::Rewind, table_cursor, end_scan, 0);
+    b.resolve(scan_top);
+    let reg_old_rowid = b.alloc_reg();
+    b.emit(Opcode::Rowid, table_cursor, reg_old_rowid, 0);
+    let reg_rowid_rec = b.alloc_reg();
+    b.emit(Opcode::MakeRecord, reg_old_rowid, 1, reg_rowid_rec);
+    b.emit(Opcode::SorterInsert, sorter, reg_rowid_rec, 0);
+    b.emit_jump(Opcode::Next, table_cursor, scan_top, 0);
+    b.resolve(end_scan);
+
+    // Second pass: iterate the sorter, re-seek each rowid, build the reduced record,
+    // delete + insert.
+    let end_update = b.new_label();
+    b.emit_jump(Opcode::SorterSort, sorter, end_update, 0);
+    let update_top = b.new_label();
+    let sort_next = b.new_label();
+    b.resolve(update_top);
+
+    b.emit(Opcode::SorterData, sorter, 0, 0);
+    let reg_old_rowid2 = b.alloc_reg();
+    b.emit(Opcode::Column, sorter, 0, reg_old_rowid2);
+    b.emit_jump(Opcode::NotExists, table_cursor, sort_next, reg_old_rowid2);
+
+    // Build the new record: read all columns except the dropped one.
+    let ncol = table.columns.len();
+    let n_new = ncol - 1; // one fewer column
+    let reg_new = b.alloc_regs(n_new as i32);
+    let mut out_idx = 0i32;
+    for ci in 0..ncol {
+        if ci == drop_col_idx {
+            continue;
+        }
+        // Read the column from the table cursor into the next output register.
+        b.emit(Opcode::Column, table_cursor, ci as i32, reg_new + out_idx);
+        out_idx += 1;
+    }
+
+    let reg_new_rec = b.alloc_reg();
+    b.emit(Opcode::MakeRecord, reg_new, n_new as i32, reg_new_rec);
+    let del_idx = b.emit(Opcode::Delete, table_cursor, 0, 0);
+    b.set_p5(del_idx, P5_ISUPDATE);
+    let ins = b.emit(Opcode::Insert, table_cursor, reg_new_rec, reg_old_rowid2);
+    b.set_p5(ins, P5_ISUPDATE);
+
+    b.resolve(sort_next);
+    b.emit_jump(Opcode::SorterNext, sorter, update_top, 0);
+    b.resolve(end_update);
+
+    // (4) Bump the schema cookie.
+    b.emit(
+        Opcode::SetCookie,
+        0,
+        COOKIE_SCHEMA,
+        current_schema_cookie as i32 + 1,
+    );
+
+    // (5) Reload the schema so later statements see the reduced column set.
+    b.emit(Opcode::ParseSchema, 0, 0, 0);
+
+    // (6) Halt commits the transaction.
+    b.emit(Opcode::Halt, 0, 0, 0);
+
+    b.resolve(setup);
+    b.emit(Opcode::Goto, 0, after_init, 0);
+    Ok(b.finish())
+}
+
 /// Validate that a `ColumnDef` is legal for `ADD COLUMN`: not PRIMARY KEY, not UNIQUE
 /// (column-level), and if NOT NULL then must have a non-NULL default (when the table is
 /// non-empty — we approximate by always rejecting NOT NULL without default, matching
@@ -241,6 +392,141 @@ pub fn validate_add_column(col: &ColumnDef) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Validate that dropping `col_name` from `table` is legal: the column must exist, must not
+/// be a PRIMARY KEY or UNIQUE column, and the table must have at least one other column.
+/// Returns the table-column index of the column to drop.
+pub fn validate_drop_column(table: &Table, col_name: &str) -> Result<usize> {
+    let key = dequote_ident(col_name);
+    let idx = table
+        .column_index(&key)
+        .ok_or_else(|| Error::msg(format!("no such column: {}", col_name)))?;
+    if table.columns[idx].pk {
+        return Err(Error::msg(format!(
+            "cannot drop PRIMARY KEY column: \"{}\"",
+            col_name
+        )));
+    }
+    if table.columns.len() <= 1 {
+        return Err(Error::msg(format!(
+            "cannot drop column \"{}\": no other columns exist",
+            col_name
+        )));
+    }
+    Ok(idx)
+}
+
+/// Remove a column definition from a CREATE TABLE statement's column list. The `col_name`
+/// is the dequoted column name. Returns the rewritten SQL, or `None` when the column
+/// cannot be found or the splice fails.
+fn drop_column_from_create_table(create_sql: &str, col_name: &str) -> Option<String> {
+    let lower = create_sql.to_ascii_lowercase();
+    let prefix = strip_create_prefix(&lower, "table")?;
+    let after_name = skip_identifier(create_sql, prefix.0);
+    let pos = skip_whitespace(create_sql, after_name);
+    let bytes = create_sql.as_bytes();
+    if pos >= bytes.len() || bytes[pos] != b'(' {
+        return None;
+    }
+    // Find the matching `)` and the comma boundaries of each column def.
+    // We scan the column list, tracking paren depth and string literals, and split on
+    // top-level commas (depth == 1, i.e. directly inside the column-list parens). Each
+    // segment is a column-def or table-constraint.
+    let mut depth: i32 = 0;
+    let mut i = pos;
+    let mut in_string: Option<u8> = None;
+    let mut segments: Vec<(usize, usize)> = Vec::new(); // (start, end) of each segment
+    let mut seg_start = pos + 1; // first char after `(`
+    while i < bytes.len() {
+        let b = bytes[i];
+        match in_string {
+            Some(quote) => {
+                if b == quote {
+                    if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                        i += 2;
+                        continue;
+                    }
+                    in_string = None;
+                }
+            }
+            None => match b {
+                b'\'' | b'"' => in_string = Some(b),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        // Closing `)` of the column list. Push the last segment.
+                        let seg_end = i;
+                        if seg_end > seg_start {
+                            segments.push((seg_start, seg_end));
+                        }
+                        break;
+                    }
+                }
+                b',' if depth == 1 => {
+                    // Top-level comma inside the column list.
+                    let seg_end = i;
+                    segments.push((seg_start, seg_end));
+                    seg_start = i + 1;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    // Find the segment whose first identifier matches `col_name` (dequoted).
+    let target_key = dequote_ident(col_name);
+    let mut found_idx: Option<usize> = None;
+    for (sidx, &(s, e)) in segments.iter().enumerate() {
+        let seg = &create_sql[s..e];
+        let seg_trimmed = seg.trim_start();
+        let seg_lower = seg_trimmed.to_ascii_lowercase();
+        // Skip segments that start with a table-constraint keyword.
+        let is_constraint = seg_lower.starts_with("primary")
+            || seg_lower.starts_with("unique")
+            || seg_lower.starts_with("check")
+            || seg_lower.starts_with("foreign")
+            || seg_lower.starts_with("constraint");
+        if is_constraint {
+            continue;
+        }
+        // The first identifier in the segment is the column name.
+        let seg_pos = skip_whitespace(seg_trimmed, 0);
+        let id_end = skip_identifier(seg_trimmed, seg_pos);
+        let id_text = &seg_trimmed[seg_pos..id_end];
+        let id_dequoted = dequote_ident(id_text);
+        if id_dequoted.eq_ignore_ascii_case(&target_key) {
+            found_idx = Some(sidx);
+            break;
+        }
+    }
+    let drop_sidx = found_idx?;
+    // Rebuild the column list without the dropped segment.
+    let (drop_start, drop_end) = segments[drop_sidx];
+    // Determine the comma to remove: if this is not the first segment, remove the comma
+    // before it; if it is the first, remove the comma after it (if any).
+    let (remove_start, remove_end) = if drop_sidx == 0 {
+        // First segment: remove from segment start to the start of the next segment (or to
+        // the closing `)` if this is the only segment — but DROP COLUMN rejects a
+        // single-column table, so there's always a next segment).
+        if segments.len() > 1 {
+            // Trim leading whitespace from the next segment by advancing past it.
+            let next_start = segments[1].0;
+            let next_trimmed = skip_whitespace(create_sql, next_start);
+            (drop_start, next_trimmed)
+        } else {
+            (drop_start, drop_end)
+        }
+    } else {
+        // Not the first: remove from the end of the previous segment (which includes the
+        // comma) to the end of this segment.
+        (segments[drop_sidx - 1].1, drop_end)
+    };
+    // Reconstruct: before + after, skipping the removed range.
+    let before = &create_sql[..remove_start];
+    let after = &create_sql[remove_end..];
+    Some(format!("{}{}", before, after))
 }
 
 /// Compile `ALTER TABLE <old> RENAME TO <new>`.
@@ -743,5 +1029,41 @@ mod tests {
     fn extract_add_column_text_strips_semicolon() {
         let out = extract_add_column_text("ALTER TABLE t ADD COLUMN b TEXT;").unwrap();
         assert_eq!(out, "b TEXT");
+    }
+
+    #[test]
+    fn drop_column_middle() {
+        let out = drop_column_from_create_table("CREATE TABLE t(a, b, c)", "b").unwrap();
+        assert_eq!(out, "CREATE TABLE t(a, c)");
+    }
+
+    #[test]
+    fn drop_column_first() {
+        let out = drop_column_from_create_table("CREATE TABLE t(a, b, c)", "a").unwrap();
+        assert_eq!(out, "CREATE TABLE t(b, c)");
+    }
+
+    #[test]
+    fn drop_column_last() {
+        let out = drop_column_from_create_table("CREATE TABLE t(a, b, c)", "c").unwrap();
+        assert_eq!(out, "CREATE TABLE t(a, b)");
+    }
+
+    #[test]
+    fn drop_column_with_types() {
+        let out =
+            drop_column_from_create_table("CREATE TABLE t(a INTEGER, b TEXT, c REAL)", "b").unwrap();
+        assert_eq!(out, "CREATE TABLE t(a INTEGER, c REAL)");
+    }
+
+    #[test]
+    fn drop_column_with_table_constraint() {
+        // The table-level PRIMARY KEY constraint must not be mistaken for a column def.
+        let out = drop_column_from_create_table(
+            "CREATE TABLE t(a, b, PRIMARY KEY(a))",
+            "b",
+        )
+        .unwrap();
+        assert_eq!(out, "CREATE TABLE t(a, PRIMARY KEY(a))");
     }
 }

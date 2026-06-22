@@ -215,3 +215,28 @@ pub fn compile_alter_add_column(
 ) -> Result<Program> {
     alter::compile_alter_add_column(stmt, current_schema_cookie, table_rowid, old_sql, col_def_text)
 }
+
+/// Compile `ALTER TABLE <name> DROP [COLUMN] <col>` into a VDBE write program that
+/// rewrites the table's `sqlite_schema` row (removing the column from the CREATE TABLE
+/// text) and rewrites every existing row in the table b-tree (removing the dropped
+/// column's value). `table` is the catalog-resolved table. `drop_col_idx` is the
+/// table-column index of the column being dropped.
+pub fn compile_alter_drop_column(
+    stmt: &AlterTableStmt,
+    current_schema_cookie: u32,
+    table: &Table,
+    table_rowid: i64,
+    old_sql: &str,
+    drop_col_idx: usize,
+    drop_col_name: &str,
+) -> Result<Program> {
+    alter::compile_alter_drop_column(
+        stmt,
+        current_schema_cookie,
+        table,
+        table_rowid,
+        old_sql,
+        drop_col_idx,
+        drop_col_name,
+    )
+}
