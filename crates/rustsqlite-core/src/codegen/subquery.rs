@@ -929,7 +929,7 @@ fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) 
             r(&mut inst.p3);
         }
         // Opcodes that don't appear in a scalar subquery scan body — leave as-is.
-        Compare | Jump | Transaction | SetCookie | ParseSchema | CreateBtree | Halt
+        Compare | Jump | Transaction | AutoCommit | SetCookie | ParseSchema | CreateBtree | Halt
         | ResultRow => {}
         // Coroutine opcodes — p1 is a coroutine register.
         InitCoroutine => {

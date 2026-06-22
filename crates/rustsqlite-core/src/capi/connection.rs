@@ -48,6 +48,12 @@ pub struct Sqlite3 {
     /// The change counters, shared by `Arc` with the in-flight statement so it can publish its
     /// `changes`/`last_insert_rowid` back when it steps to completion.
     counts: Arc<Mutex<ChangeCounts>>,
+    /// The autocommit flag, shared by `Arc` with the in-flight VDBE so `OP_AutoCommit` and
+    /// `OP_Halt` can consult and mutate it. `true` (the default) means the connection is in
+    /// autocommit mode — each statement commits independently. `BEGIN` sets this to `false`;
+    /// `COMMIT`/`ROLLBACK` set it back to `true` and commit/roll back the pending transaction.
+    /// Mirrors `db->autoCommit` in `main.c`. See [`Self::autocommit`] / [`Self::set_autocommit`].
+    autocommit: Arc<Mutex<bool>>,
     last_error: Option<Error>,
 }
 
@@ -87,6 +93,7 @@ pub fn sqlite3_open_v2(filename: &str, flags: OpenFlags) -> Result<Sqlite3> {
             filename: filename.to_string(),
             read_only: flags.is_readonly(),
             counts: Arc::new(Mutex::new(ChangeCounts::default())),
+            autocommit: Arc::new(Mutex::new(true)),
             last_error: None,
         })
     })
@@ -210,6 +217,18 @@ impl Sqlite3 {
     /// into when it steps to completion. Engine-internal (used by [`super::stmt`]).
     pub(crate) fn counts_handle(&self) -> Arc<Mutex<ChangeCounts>> {
         self.counts.clone()
+    }
+
+    /// `sqlite3_get_autocommit()` — return `true` if the connection is in autocommit mode (no
+    /// explicit `BEGIN` is active). Mirrors `db->autoCommit` in `main.c`.
+    pub fn autocommit(&self) -> bool {
+        *self.autocommit.lock().unwrap()
+    }
+
+    /// A clone of the shared autocommit-flag handle, for the in-flight VDBE so `OP_AutoCommit`
+    /// and `OP_Halt` can consult and mutate it. Engine-internal (used by [`super::stmt`]).
+    pub(crate) fn autocommit_handle(&self) -> Arc<Mutex<bool>> {
+        self.autocommit.clone()
     }
 
     // ---- Interim engine read helpers (until the VDBE prepare/step path lands in M3) ----

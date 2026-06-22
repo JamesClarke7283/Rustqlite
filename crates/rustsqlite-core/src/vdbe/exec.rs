@@ -206,6 +206,11 @@ pub struct Vdbe {
     /// Set to `true` once a write `Transaction` opcode has opened a write transaction, so `Halt`
     /// knows to commit and a step error knows to roll back. Read-only programs leave this `false`.
     write_txn: bool,
+    /// The connection's shared autocommit flag, set by `sqlite3_prepare_v2` so `OP_Halt` and
+    /// `OP_AutoCommit` can consult and mutate it. `None` means "always autocommit" (the default
+    /// for unit tests that don't care about transactions — they get the legacy behavior where
+    /// every `Halt` commits). Mirrors `db->autoCommit` in `main.c`.
+    autocommit: Option<Arc<std::sync::Mutex<bool>>>,
     /// Per-accumulator state keyed by the register that holds the aggregate's result (the `p3`
     /// of `AggStep` / `p1` of `AggFinal`). SQLite stores this inside the `Mem` cell itself; we
     /// keep it in a side table so the `Value` type stays storage-class-only. An entry is created
@@ -247,6 +252,7 @@ impl Vdbe {
             ctx: RuntimeCtx::new(),
             cursor_root: HashMap::new(),
             write_txn: false,
+            autocommit: None,
             aggregates: HashMap::new(),
             last_compare: Ordering::Equal,
             once_done: std::collections::HashSet::new(),
@@ -263,6 +269,22 @@ impl Vdbe {
             self.ctx.last_insert_rowid,
             self.ctx.did_insert,
         )
+    }
+
+    /// Install the connection's shared autocommit flag so `OP_AutoCommit` and `OP_Halt` can
+    /// consult and mutate it. Called by `sqlite3_prepare_v2` after constructing the Vdbe.
+    /// When never called, the Vdbe runs in legacy "always autocommit" mode (every `Halt` commits
+    /// an open write transaction) — this is the mode unit tests use.
+    pub fn set_autocommit_handle(&mut self, handle: Arc<std::sync::Mutex<bool>>) {
+        self.autocommit = Some(handle);
+    }
+
+    /// Read the current autocommit flag. Returns `true` when no shared handle is installed
+    /// (the legacy unit-test mode) or when the shared flag's value is `true`.
+    fn autocommit(&self) -> bool {
+        self.autocommit
+            .as_ref()
+            .map_or(true, |h| *h.lock().unwrap())
     }
 
     /// Reset to the start so the program can be re-run (`sqlite3_reset`).
@@ -597,10 +619,13 @@ impl Vdbe {
                         continue;
                     }
                     // A successful top-level Halt commits an open write transaction (the
-                    // durable commit point); read-only programs have no transaction to commit.
-                    // Mirrors the CommitPhase in `sqlite3VdbeHalt` for a non-erroring
-                    // statement.
-                    if self.write_txn {
+                    // durable commit point) — but only in autocommit mode. When the connection
+                    // is inside an explicit `BEGIN` (autocommit is false), the write transaction
+                    // is left open so subsequent statements in the same transaction can continue
+                    // against the same rollback journal. The COMMIT/ROLLBACK statement itself
+                    // drives the commit via `OP_AutoCommit`. Mirrors the autocommit-aware
+                    // CommitPhase in `sqlite3VdbeHalt`.
+                    if self.write_txn && self.autocommit() {
                         if let Some(pager) = &self.pager {
                             pager.commit().await?;
                         }
@@ -727,6 +752,47 @@ impl Vdbe {
                         self.write_txn = true;
                     }
                     self.pc += 1;
+                }
+                Opcode::AutoCommit => {
+                    // `OP_AutoCommit p1 p2`: toggle the connection's autocommit flag.
+                    //   p1 = desired autocommit (1 = on, 0 = off)
+                    //   p2 = rollback flag (only valid when p1 == 1; p2 == 1 means ROLLBACK)
+                    // Mirrors `OP_AutoCommit` in `vdbe.c`.
+                    let desired = p1 != 0;
+                    let rollback = p2 != 0;
+                    let current = self.autocommit();
+                    if desired == current {
+                        // Same-state transition is an error in upstream SQLite.
+                        return Err(Error::msg(
+                            if !desired {
+                                "cannot start a transaction within a transaction"
+                            } else if rollback {
+                                "cannot rollback - no transaction is active"
+                            } else {
+                                "cannot commit - no transaction is active"
+                            },
+                        ));
+                    }
+                    if let Some(handle) = self.autocommit.as_ref() {
+                        *handle.lock().unwrap() = desired;
+                    }
+                    if desired {
+                        // Transitioning off → on: this is COMMIT (p2 == 0) or ROLLBACK (p2 == 1).
+                        if let Some(pager) = &self.pager {
+                            if pager.in_write_txn() {
+                                if rollback {
+                                    pager.rollback().await?;
+                                } else {
+                                    pager.commit().await?;
+                                }
+                            }
+                        }
+                        self.write_txn = false;
+                    }
+                    // OP_AutoCommit ends the statement (mirrors upstream's `goto vdbe_return`
+                    // after `sqlite3VdbeHalt`). The `Halt` opcode isn't reached.
+                    self.halted = true;
+                    return Ok(StepResult::Done);
                 }
 
                 Opcode::OpenRead => {

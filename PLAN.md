@@ -258,9 +258,9 @@ list every granular item needed.
 
 ## M12 — Transactions & Savepoints
 
-- [ ] **12.1** Parser: `BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE]`, `COMMIT`/`END`, `ROLLBACK [TO SAVEPOINT]`
-- [ ] **12.2** Parser: `SAVEPOINT name`, `RELEASE [SAVEPOINT] name`
-- [ ] **12.3** VDBE: `AutoCommit` opcode — toggle autocommit mode
+- [x] **12.1** Parser: `BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE]`, `COMMIT`/`END`, `ROLLBACK [TO SAVEPOINT]` (shipped in M2.34–M2.37)
+- [x] **12.2** Parser: `SAVEPOINT name`, `RELEASE [SAVEPOINT] name` (shipped in M2.36–M2.37)
+- [x] **12.3** VDBE: `AutoCommit` opcode — toggle autocommit mode (BEGIN/COMMIT/END/ROLLBACK via `OP_AutoCommit`; the `autocommit` flag is shared between the connection and the VDBE so `OP_Halt` defers the commit when inside a `BEGIN`; `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` are rejected at codegen time — the pager savepoint stack is M12.4/M12.5)
 - [ ] **12.4** VDBE: `Savepoint` opcode — create/release/rollback-to named savepoints
 - [ ] **12.5** Pager: nested savepoint support (save/restore page overlays per savepoint level)
 - [ ] **12.6** `Transaction` opcode: deferred vs immediate vs exclusive locking

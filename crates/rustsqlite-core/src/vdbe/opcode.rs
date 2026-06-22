@@ -78,6 +78,13 @@ pub enum Opcode {
     /// transaction (the rollback journal); `p2 == 0` is a read transaction (implicit in our
     /// engine). Mirrors `OP_Transaction` in `vdbe.c`.
     Transaction,
+    /// `AutoCommit p1 p2`: toggle the connection's autocommit flag. `p1 = 1` turns autocommit
+    /// ON (commit when transitioning from off→on if `p2 == 0`; rollback if `p2 == 1`).
+    /// `p1 = 0` turns autocommit OFF (BEGIN). When the desired state equals the current state,
+    /// raises "cannot start a transaction within a transaction" / "cannot commit - no transaction
+    /// is active" / "cannot rollback - no transaction is active". Mirrors `OP_AutoCommit` in
+    /// `vdbe.c`.
+    AutoCommit,
     /// `SetCookie p1 p2 p3`: write the value `p3` into header cookie `p2` of database `p1`. Used
     /// after DDL to bump the schema cookie (header bytes 40-43). Mirrors `OP_SetCookie`.
     SetCookie,
@@ -385,6 +392,7 @@ impl Opcode {
             Opcode::Compare => "Compare",
             Opcode::Jump => "Jump",
             Opcode::Transaction => "Transaction",
+            Opcode::AutoCommit => "AutoCommit",
             Opcode::SetCookie => "SetCookie",
             Opcode::ParseSchema => "ParseSchema",
             Opcode::CreateBtree => "CreateBtree",

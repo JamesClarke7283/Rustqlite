@@ -83,6 +83,16 @@ enum Backing {
     },
 }
 
+/// Construct a Vdbe for `program` and install the connection's shared autocommit flag so
+/// `OP_AutoCommit` and `OP_Halt` can consult/mutate it. Mirrors how `sqlite3VdbeMakeReady` in
+/// `vdbeaux.c` copies `db->autoCommit` into the VDBE before running it. Every Vdbe constructed
+/// by the prepare path should go through this helper so transaction semantics are honored.
+fn vdbe_for(program: Arc<Program>, pager: Option<Arc<Pager>>, db: &Sqlite3) -> Vdbe {
+    let mut v = Vdbe::new(program, pager);
+    v.set_autocommit_handle(db.autocommit_handle());
+    v
+}
+
 /// A compiled statement. The Rust analogue of `sqlite3_stmt *`.
 pub struct Sqlite3Stmt {
     sql: String,
@@ -125,7 +135,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             // A normal SELECT: compile and back it with a live VDBE.
             let compiled = compile_select(db, &select)?;
             let program = Arc::new(compiled.program);
-            let vdbe = Vdbe::new(Arc::clone(&program), compiled.pager);
+            let pager = compiled.pager;
+            let vdbe = vdbe_for(Arc::clone(&program), pager, db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
                 program,
@@ -144,7 +155,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             let schema_cookie = pager.header().schema_cookie;
             let sql_text = create_table_text(sql);
             let program = Arc::new(codegen::compile_create_table(&ct, sql_text, schema_cookie)?);
-            let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
+            let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
                 program,
@@ -177,7 +188,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 source_table_ref,
                 &source_indexes,
             )?);
-            let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
+            let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
                 program,
@@ -200,7 +211,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 .map(|ret| ret.column_names())
                 .unwrap_or_default();
             let program = Arc::new(codegen::compile_delete(&del, &table, &indexes)?);
-            let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
+            let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
                 program,
@@ -221,7 +232,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 schema_cookie,
                 table_opt.as_ref(),
             )?);
-            let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
+            let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
                 program,
@@ -247,7 +258,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 .map(|ret| ret.column_names())
                 .unwrap_or_default();
             let program = Arc::new(codegen::compile_update(&upd, &table, &indexes)?);
-            let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
+            let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
                 program,
@@ -270,7 +281,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                     sql: sql.to_string(),
                     program: Arc::new(Program::empty()),
                     column_names: Vec::new(),
-                    backing: Backing::Vdbe(Vdbe::new(Arc::new(Program::empty()), None)),
+                    backing: Backing::Vdbe(vdbe_for(Arc::new(Program::empty()), None, db)),
                     explain: 0,
                     counts: Some(db.counts_handle()),
                     last_error: None,
@@ -288,7 +299,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 sql_text,
                 schema_cookie,
             )?);
-            let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
+            let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
                 program,
@@ -312,7 +323,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 schema_cookie,
                 schema_rowid,
             )?);
-            let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
+            let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
                 program,
@@ -348,9 +359,30 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             // (M5.3.7). Other pragmas remain deferred to M20.
             compile_pragma(db, sql, &pragma)
         }
-        Stmt::Transaction(_) => {
-            // Transaction control parsing is implemented (M2.34–M2.37) but codegen is M12.
-            Err(Error::msg("transactions are not supported yet"))
+        Stmt::Transaction(tx) => {
+            // BEGIN / COMMIT / END / ROLLBACK / SAVEPOINT / RELEASE / ROLLBACK TO SAVEPOINT.
+            // The M12 first slice handles BEGIN/COMMIT/END/ROLLBACK via OP_AutoCommit; the
+            // SAVEPOINT family is rejected at codegen time (the pager savepoint stack is
+            // M12.4/M12.5). The program is one OP_AutoCommit instruction (terminal — it halts
+            // the VDBE itself, no trailing Halt needed).
+            let program = Arc::new(codegen::compile_transaction(&tx)?);
+            // The pager is only needed for COMMIT/ROLLBACK (which commit/rollback a pending
+            // write transaction in the pager). For BEGIN/SAVEPOINT/RELEASE the program never
+            // touches the pager, but passing it is harmless. If the database has no pages
+            // yet (no DDL has ever run), COMMIT/ROLLBACK against an empty DB is a no-op
+            // (there's no write transaction to commit). For BEGIN against an empty DB we
+            // pass `None` so OP_AutoCommit doesn't try to consult a missing pager.
+            let pager = db.pager_arc().ok();
+            let vdbe = vdbe_for(Arc::clone(&program), pager, db);
+            Ok(Sqlite3Stmt {
+                sql: sql.to_string(),
+                program,
+                column_names: Vec::new(),
+                backing: Backing::Vdbe(vdbe),
+                explain: 0,
+                counts: None,
+                last_error: None,
+            })
         }
         Stmt::Attach(_) => {
             // ATTACH parsing is implemented (M2.38) but codegen is deferred to M21.
@@ -1169,7 +1201,7 @@ fn compile_pragma_auto_vacuum(
                 .push(Instruction::new(Opcode::Transaction, 0, 1, 0));
             p.instructions.push(Instruction::new(Opcode::Halt, 0, 0, 0));
             let program = Arc::new(p);
-            let vdbe = Vdbe::new(Arc::clone(&program), Some(pager));
+            let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
                 program,

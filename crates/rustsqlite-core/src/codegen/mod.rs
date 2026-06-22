@@ -23,6 +23,7 @@ pub mod join_using;
 pub mod returning;
 pub mod select;
 pub mod subquery;
+pub mod transaction;
 pub mod update;
 pub mod window;
 
@@ -34,7 +35,7 @@ use crate::vdbe::Program;
 
 use rustqlite_parser::{
     CreateIndex, CreateTable, DeleteStmt, DropIndexStmt, DropTableStmt, InsertStmt, SelectStmt,
-    UpdateStmt,
+    TransactionStmt, UpdateStmt,
 };
 /// Compile a single-table (or constant) `SELECT` into a VDBE program plus its result column
 /// names. `table` is the resolved table for the lone `FROM` entry, or `None` for a `SELECT`
@@ -175,4 +176,12 @@ pub fn compile_from_subquery(
     subquery_indexes: &[IndexObject],
 ) -> Result<(Program, Vec<String>)> {
     subquery::compile_from_subquery(outer, subquery, alias, subquery_table, subquery_indexes)
+}
+
+/// Compile a transaction-control statement (`BEGIN`/`COMMIT`/`END`/`ROLLBACK`/`SAVEPOINT`/
+/// `RELEASE`/`ROLLBACK TO SAVEPOINT`) into a tiny VDBE program. The M12 first slice handles
+/// `BEGIN`/`COMMIT`/`END`/`ROLLBACK` via `OP_AutoCommit`; `SAVEPOINT`/`RELEASE`/`ROLLBACK TO`
+/// are rejected (the pager savepoint stack is M12.4/M12.5).
+pub fn compile_transaction(stmt: &TransactionStmt) -> Result<Program> {
+    transaction::compile_transaction(stmt)
 }
