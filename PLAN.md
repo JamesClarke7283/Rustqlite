@@ -273,7 +273,7 @@ list every granular item needed.
 ## M13 — WAL (Write-Ahead Logging)
 
 - [x] **13.1** WAL file format: `-wal` header (magic, version, page size, checkpoint sequence, salt, checksum)
-- [ ] **13.2** WAL frame format: frame header (page number, commit size, salt) + page data + checksums
+- [x] **13.2** WAL frame format: frame header (page number, commit size, salt) + page data + checksums
 - [ ] **13.3** `-shm` shared memory file (lock-page, WAL index header, hash tables)
 - [ ] **13.4** Pager: WAL mode read path (check WAL for page before reading DB file)
 - [ ] **13.5** Pager: WAL mode write path (append frames to WAL instead of journaling DB pages)
