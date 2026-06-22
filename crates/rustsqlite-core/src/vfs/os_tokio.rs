@@ -19,7 +19,7 @@ use async_trait::async_trait;
 
 use crate::error::{Error, Result};
 
-use super::{LockLevel, LockState, OpenFlags, Vfs, VfsFile};
+use super::{LockLevel, LockState, OpenFlags, Vfs, VfsFile, shm_flags, SQLITE_SHM_NLOCK};
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -33,6 +33,47 @@ use std::os::unix::fs::FileExt;
 fn inode_list() -> &'static Mutex<HashMap<String, Arc<Mutex<LockState>>>> {
     static INODES: OnceLock<Mutex<HashMap<String, Arc<Mutex<LockState>>>>> = OnceLock::new();
     INODES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The process-global per-path shared wal-index registry, mirroring `unixShmNode` in
+/// `os_unix.c`. POSIX `fcntl` shm locks are per-process; the per-path `ShmNode` tracks the
+/// in-process lock array (so two opens in this process contend correctly) and the open
+/// `-shm` file handle (shared via `Arc`). The OS-level `fcntl` byte-range locks at
+/// `WALINDEX_LOCK_OFFSET` provide cross-process contention.
+fn shm_list() -> &'static Mutex<HashMap<String, Arc<Mutex<ShmNode>>>> {
+    static SHMS: OnceLock<Mutex<HashMap<String, Arc<Mutex<ShmNode>>>>> = OnceLock::new();
+    SHMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The per-path shared wal-index state for `OsTokioVfs` (mirrors `unixShmNode` in
+/// `os_unix.c`). Holds the open `-shm` file handle, the in-process lock array, and the
+/// in-memory region cache (we read/write the `-shm` file via positioned I/O rather than
+/// `mmap`, so the region cache is the "mapping" — a per-region `Arc<Mutex<Vec<u8>>>` that
+/// `shm_map` hands out).
+struct ShmNode {
+    /// The open `-shm` file (lazily created on the first `shm_map` with `b_extend=true`).
+    /// `None` when no `-shm` file exists yet and `shm_map` has not been asked to extend.
+    shm_file: Option<Arc<std::fs::File>>,
+    /// The `-shm` file path (`<db>-shm`).
+    shm_path: String,
+    /// The mapped regions: one `Arc<Mutex<Vec<u8>>>` per `i_region`. Region `i` has size
+    /// `sz_region` (uniform — `WALINDEX_PGSZ = 32768`). The region is the in-memory cache;
+    /// `shm_sync_region` writes it back to the `-shm` file. `shm_map` returns the Arc.
+    regions: Vec<Arc<Mutex<Vec<u8>>>>,
+    /// Per-slot lock state (mirrors `unixShmNode.aLock`): `0` = unlocked, `>0` = N shared
+    /// holders, `<0` = -1 for one exclusive holder. Indexed by lock slot 0..SQLITE_SHM_NLOCK.
+    a_lock: [i32; SQLITE_SHM_NLOCK],
+}
+
+impl ShmNode {
+    fn new(shm_path: String) -> ShmNode {
+        ShmNode {
+            shm_file: None,
+            shm_path,
+            regions: Vec::new(),
+            a_lock: [0; SQLITE_SHM_NLOCK],
+        }
+    }
 }
 
 /// The default filesystem-backed VFS.
@@ -53,6 +94,21 @@ impl OsTokioVfs {
             locks
                 .entry(path.to_string())
                 .or_insert_with(|| Arc::new(Mutex::new(LockState::default())))
+                .clone(),
+        )
+    }
+
+    /// Look up (or create) the shared wal-index node for `path`. Returns `None` for
+    /// `:memory:` (no shared wal-index).
+    fn shm_node_for(&self, path: &str) -> Option<Arc<Mutex<ShmNode>>> {
+        if path.is_empty() || path == ":memory:" {
+            return None;
+        }
+        let shm_path = format!("{path}-shm");
+        let mut shms = shm_list().lock().unwrap();
+        Some(
+            shms.entry(path.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(ShmNode::new(shm_path))))
                 .clone(),
         )
     }
@@ -79,10 +135,14 @@ impl Vfs for OsTokioVfs {
         .map_err(|e| Error::cant_open(e.to_string()))?;
 
         let lock_state = self.lock_state_for(path);
+        let shm_node = self.shm_node_for(path);
         Ok(Box::new(OsTokioFile {
             file: Arc::new(file),
             lock_level: AtomicU8::new(LockLevel::Unlocked as u8),
             lock_state,
+            shm_node,
+            shm_shared_mask: AtomicU8::new(0),
+            shm_excl_mask: AtomicU8::new(0),
         }))
     }
 
@@ -111,6 +171,14 @@ struct OsTokioFile {
     /// Shared per-path lock state for in-process contention tracking (mirrors
     /// `unixInodeInfo`). `None` for `:memory:` (no contention possible).
     lock_state: Option<Arc<Mutex<LockState>>>,
+    /// Shared wal-index state for the database path; `None` for `:memory:` (no WAL).
+    shm_node: Option<Arc<Mutex<ShmNode>>>,
+    /// This connection's currently-held SHARED shm locks (a bitmask over `aLock` slots).
+    /// Mirrors `unixShm.sharedMask`.
+    shm_shared_mask: AtomicU8,
+    /// This connection's currently-held EXCLUSIVE shm locks (a bitmask over `aLock` slots).
+    /// Mirrors `unixShm.exclMask`.
+    shm_excl_mask: AtomicU8,
 }
 
 #[async_trait]
@@ -230,6 +298,290 @@ impl VfsFile for OsTokioFile {
             .await?
             .map_err(|e| Error::io_err(e.to_string()))?;
         Ok(reserved)
+    }
+
+    async fn shm_map(&self, i_region: usize, sz_region: usize, b_extend: bool) -> Result<Option<Arc<Mutex<Vec<u8>>>>> {
+        let node = match &self.shm_node {
+            Some(n) => n.clone(),
+            None => return Ok(None),
+        };
+        // Fast path: the region is already mapped.
+        {
+            let n = node.lock().unwrap();
+            if i_region < n.regions.len() {
+                return Ok(Some(n.regions[i_region].clone()));
+            }
+            if !b_extend {
+                return Ok(None);
+            }
+        }
+        // Slow path: open the `-shm` file (if not yet open) and read each new region.
+        // We hold the node lock only briefly to set up the shm_file; the per-region reads
+        // run without the lock (they don't need it — the regions vec is mutated only here
+        // and we serialize on the node lock between iterations).
+        let shm_file = {
+            let need_open: Option<String> = {
+                let n = node.lock().unwrap();
+                if n.shm_file.is_some() {
+                    None
+                } else {
+                    Some(n.shm_path.clone())
+                }
+            };
+            match need_open {
+                None => {
+                    let n = node.lock().unwrap();
+                    n.shm_file.as_ref().unwrap().clone()
+                }
+                Some(shm_path) => {
+                    let file = spawn_io(move || {
+                        std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .open(&shm_path)
+                    })
+                    .await?
+                    .map_err(|e| Error::cant_open(format!("cannot open -shm: {e}")))?;
+                    let mut n = node.lock().unwrap();
+                    // Another concurrent opener may have set shm_file first; keep the
+                    // existing one if so (avoids two opens racing — both point at the
+                    // same path anyway).
+                    n.shm_file.get_or_insert_with(|| Arc::new(file)).clone()
+                }
+            }
+        };
+        // Read each new region up through `i_region`. We take the node lock per iteration
+        // to push the new region (and re-check the length, in case a concurrent shm_map
+        // raced ahead).
+        loop {
+            let (need_read, offset) = {
+                let n = node.lock().unwrap();
+                if n.regions.len() > i_region {
+                    return Ok(Some(n.regions[i_region].clone()));
+                }
+                (true, n.regions.len() as u64 * sz_region as u64)
+            };
+            if !need_read {
+                break;
+            }
+            // Read the region from the `-shm` file (or zero-fill if past EOF). A short read
+            // yields a zero-filled region (mirrors mmap of an unallocated region).
+            let sf = shm_file.clone();
+            let region = spawn_io(move || -> std::io::Result<Vec<u8>> {
+                let mut buf = vec![0u8; sz_region];
+                let n = sf.read_at(&mut buf, offset).unwrap_or(0);
+                if n < sz_region {
+                    for b in &mut buf[n..] {
+                        *b = 0;
+                    }
+                }
+                Ok(buf)
+            })
+            .await?
+            .map_err(|e| Error::io_err(format!("shm region read failed: {e}")))?;
+            let mut n = node.lock().unwrap();
+            // A racing shm_map may have pushed this region first; drop ours if so.
+            if n.regions.len() <= i_region {
+                n.regions.push(Arc::new(Mutex::new(region)));
+            }
+        }
+        let n = node.lock().unwrap();
+        Ok(Some(n.regions[i_region].clone()))
+    }
+
+    async fn shm_lock(&self, ofst: usize, n_slots: usize, flags: u32) -> Result<()> {
+        use shm_flags as F;
+        if ofst + n_slots > SQLITE_SHM_NLOCK || n_slots == 0 {
+            return Err(Error::io_err("invalid xShmLock range"));
+        }
+        let mask: u8 = (((1u16 << (ofst + n_slots)) - (1u16 << ofst)) & 0xff) as u8;
+        let node = match &self.shm_node {
+            Some(n) => n.clone(),
+            None => return Err(Error::io_err("xShmLock: no shm node")),
+        };
+        let shared_mask = self.shm_shared_mask.load(Ordering::SeqCst);
+        let excl_mask = self.shm_excl_mask.load(Ordering::SeqCst);
+
+        let unlocking = flags & F::SHM_UNLOCK != 0;
+        let exclusive = flags & F::SHM_EXCLUSIVE != 0;
+        let shared = flags & F::SHM_SHARED != 0;
+
+        // The lock bytes are at `WALINDEX_LOCK_OFFSET + ofst` in the `-shm` file (a separate
+        // file from the DB, so the byte ranges don't collide with the DB's PENDING_BYTE/
+        // RESERVED_BYTE/SHARED_FIRST scheme). Upstream uses `UNIX_SHM_BASE = 120`, which
+        // matches `WALINDEX_LOCK_OFFSET`.
+        // Open the `-shm` file lazily if a lock is requested before any `shm_map`
+        // (upstream's `unixShmMap` opens the shm file on first call, before any lock;
+        // here we open on demand to support the lock-first ordering).
+        let shm_file = {
+            let need_open: Option<String> = {
+                let n = node.lock().unwrap();
+                if n.shm_file.is_some() {
+                    None
+                } else {
+                    Some(n.shm_path.clone())
+                }
+            };
+            match need_open {
+                None => {
+                    let n = node.lock().unwrap();
+                    n.shm_file.as_ref().unwrap().clone()
+                }
+                Some(shm_path) => {
+                    let file = spawn_io(move || {
+                        std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .open(&shm_path)
+                    })
+                    .await?
+                    .map_err(|e| Error::cant_open(format!("cannot open -shm: {e}")))?;
+                    let mut n = node.lock().unwrap();
+                    n.shm_file.get_or_insert_with(|| Arc::new(file)).clone()
+                }
+            }
+        };
+
+        // Decide the action under the in-process lock, capturing any OS-level lock op
+        // to perform after dropping the guard.
+        enum Action {
+            None,
+            SysLock(i32),  // l_type
+            SysUnlock,
+        }
+        let action: Action = {
+            let mut n = node.lock().unwrap();
+            if unlocking {
+                if shared {
+                    if n_slots != 1 {
+                        return Err(Error::io_err("xShmLock: SHARED unlock must have n==1"));
+                    }
+                    if shared_mask & mask == 0 {
+                        return Ok(());
+                    }
+                    if n.a_lock[ofst] > 1 {
+                        n.a_lock[ofst] -= 1;
+                        Action::None
+                    } else {
+                        n.a_lock[ofst] = 0;
+                        Action::SysUnlock
+                    }
+                } else {
+                    if excl_mask & mask == 0 {
+                        return Ok(());
+                    }
+                    for slot in ofst..ofst + n_slots {
+                        n.a_lock[slot] = 0;
+                    }
+                    Action::SysUnlock
+                }
+            } else if shared {
+                if shared_mask & mask != 0 {
+                    return Ok(());
+                }
+                if n.a_lock[ofst] < 0 {
+                    return Err(Error::busy("wal-index lock busy"));
+                }
+                let need_sys = n.a_lock[ofst] == 0;
+                n.a_lock[ofst] += 1;
+                if need_sys { Action::SysLock(libc::F_RDLCK) } else { Action::None }
+            } else if exclusive {
+                if excl_mask & mask != 0 {
+                    return Ok(());
+                }
+                if shared_mask & mask != 0 {
+                    return Err(Error::io_err("xShmLock: cannot upgrade SHARED to EXCLUSIVE"));
+                }
+                for slot in ofst..ofst + n_slots {
+                    if n.a_lock[slot] != 0 {
+                        return Err(Error::busy("wal-index lock busy"));
+                    }
+                }
+                for slot in ofst..ofst + n_slots {
+                    n.a_lock[slot] = -1;
+                }
+                Action::SysLock(libc::F_WRLCK)
+            } else {
+                return Err(Error::io_err("xShmLock: invalid flags"));
+            }
+        };
+        // Update this connection's masks based on the action.
+        match (unlocking, shared, exclusive, &action) {
+            (true, true, false, _) => self.shm_shared_mask.store(shared_mask & !mask, Ordering::SeqCst),
+            (true, false, true, _) => self.shm_excl_mask.store(excl_mask & !mask, Ordering::SeqCst),
+            (false, true, false, _) => self.shm_shared_mask.store(shared_mask | mask, Ordering::SeqCst),
+            (false, false, true, _) => self.shm_excl_mask.store(excl_mask | mask, Ordering::SeqCst),
+            _ => {}
+        }
+        // Perform the OS-level fcntl outside the in-process lock.
+        match action {
+            Action::None => Ok(()),
+            Action::SysLock(l_type) => {
+                let f = shm_file.clone();
+                spawn_io(move || posix_shm_lock(&f, ofst, n_slots, l_type))
+                    .await?
+                    .map_err(|e| Error::io_err(format!("shm lock: {e}")))
+            }
+            Action::SysUnlock => {
+                let f = shm_file.clone();
+                spawn_io(move || posix_shm_lock(&f, ofst, n_slots, libc::F_UNLCK))
+                    .await?
+                    .map_err(|e| Error::io_err(format!("shm unlock: {e}")))
+            }
+        }
+    }
+
+    async fn shm_barrier(&self) {
+        // A SeqCst fence + a no-op OS call (mirrors `unixShmBarrier`'s mutex enter/leave for
+        // redundancy). On a single-process engine this is sufficient.
+        std::sync::atomic::fence(Ordering::SeqCst);
+    }
+
+    async fn shm_unmap(&self, delete_flag: bool) -> Result<()> {
+        let node = match &self.shm_node {
+            Some(n) => n.clone(),
+            None => return Ok(()),
+        };
+        let shared_mask = self.shm_shared_mask.load(Ordering::SeqCst);
+        let excl_mask = self.shm_excl_mask.load(Ordering::SeqCst);
+        // Capture the OS-level unlock slots and the shm file under the in-process lock.
+        let (unlock_slots, shm_file_opt): (Vec<usize>, Option<Arc<std::fs::File>>) = {
+            let mut n = node.lock().unwrap();
+            for slot in 0..SQLITE_SHM_NLOCK {
+                if shared_mask & (1 << slot) != 0 && n.a_lock[slot] > 0 {
+                    n.a_lock[slot] -= 1;
+                }
+                if excl_mask & (1 << slot) != 0 {
+                    n.a_lock[slot] = 0;
+                }
+            }
+            let slots: Vec<usize> = (0..SQLITE_SHM_NLOCK)
+                .filter(|&s| (shared_mask & (1 << s) != 0) || (excl_mask & (1 << s) != 0))
+                .collect();
+            self.shm_shared_mask.store(0, Ordering::SeqCst);
+            self.shm_excl_mask.store(0, Ordering::SeqCst);
+            (slots, n.shm_file.clone())
+        };
+        // Drop this connection's OS-level locks.
+        if let Some(shm_file) = shm_file_opt {
+            for slot in unlock_slots {
+                let f = shm_file.clone();
+                let _ = spawn_io(move || posix_shm_lock(&f, slot, 1, libc::F_UNLCK)).await;
+            }
+        }
+        if delete_flag {
+            let shm_path = {
+                let mut n = node.lock().unwrap();
+                n.regions.clear();
+                let p = n.shm_path.clone();
+                n.shm_file = None;
+                p
+            };
+            let _ = spawn_io(move || std::fs::remove_file(&shm_path)).await;
+        }
+        Ok(())
     }
 }
 
@@ -431,6 +783,37 @@ fn posix_unlock(
     Ok(())
 }
 
+/// The byte offset of the wal-index lock region within the `-shm` file (mirrors
+/// `WALINDEX_LOCK_OFFSET` in `wal.c` = 120). The lock slots are bytes
+/// `WALINDEX_LOCK_OFFSET..WALINDEX_LOCK_OFFSET+SQLITE_SHM_NLOCK` (120..128).
+pub const WALINDEX_LOCK_OFFSET: u64 = 120;
+
+/// Acquire or release a wal-index byte-range lock on the `-shm` file (mirrors
+/// `unixShmSystemLock` in `os_unix.c`). `l_type` is one of `F_RDLCK`/`F_WRLCK`/`F_UNLCK`;
+/// the lock is on bytes `WALINDEX_LOCK_OFFSET+ofst .. +ofst+n` of the `-shm` file. Returns
+/// `Err(WouldBlock)` on a conflicting lock (the upstream `SQLITE_BUSY` case).
+#[cfg(unix)]
+fn posix_shm_lock(file: &std::fs::File, ofst: usize, n: usize, l_type: i32) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = l_type as i16;
+    lock.l_whence = libc::SEEK_SET as i16;
+    lock.l_start = (WALINDEX_LOCK_OFFSET + ofst as u64) as i64;
+    lock.l_len = n as i64;
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETLK, &lock) };
+    if rc == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+fn posix_shm_lock(_file: &std::fs::File, _ofst: usize, _n: usize, _l_type: i32) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Check whether any process holds a write-lock on the RESERVED_BYTE, mirroring
 /// `unixCheckReservedLock` in `os_unix.c`. Returns `true` if a RESERVED (or stronger) lock
 /// is held by any process. Uses `fcntl(F_GETLK)` to probe the lock state.
@@ -572,6 +955,283 @@ mod tests {
             a.unlock(LockLevel::Unlocked).await.unwrap();
             b.unlock(LockLevel::Unlocked).await.unwrap();
 
+            vfs.delete(path_str).await.unwrap();
+        });
+    }
+
+    // ---- xShmMap / xShmLock / xShmBarrier / xShmUnmap tests (M13.9) ----
+    //
+    // The shm tests use real `-shm` files in the temp dir and real POSIX `fcntl` byte-range
+    // locks at `WALINDEX_LOCK_OFFSET + slot`, so they exercise the cross-process lock path
+    // (a second connection in the same process would normally share the in-process
+    // `a_lock` array, but the fcntl path is also exercised and must agree).
+
+    fn unique_shm_path(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir();
+        dir.join(format!(
+            "rustqlite_shm_{label}_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shm_map_extend_creates_shm_file_and_zero_fills_region() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let path = unique_shm_path("extend");
+            let path_str = path.to_str().unwrap();
+            let vfs = OsTokioVfs::new();
+            // Create the database file first (so the -shm sibling exists conceptually).
+            let f = vfs
+                .open(path_str, OpenFlags::READWRITE_CREATE)
+                .await
+                .unwrap();
+            f.write_at(0, b"SQLite format 3\0").await.unwrap();
+            f.sync().await.unwrap();
+
+            // Non-extending request: Ok(None).
+            let r = f.shm_map(0, 32768, false).await.unwrap();
+            assert!(r.is_none());
+
+            // Extending request: Ok(Some(zero-filled region)).
+            let r = f.shm_map(0, 32768, true).await.unwrap().unwrap();
+            let buf = r.lock().unwrap();
+            assert_eq!(buf.len(), 32768);
+            assert!(buf.iter().all(|&b| b == 0));
+
+            f.shm_unmap(true).await.unwrap();
+            vfs.delete(path_str).await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shm_map_returns_shared_region_across_connections() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let path = unique_shm_path("share");
+            let path_str = path.to_str().unwrap();
+            let vfs = OsTokioVfs::new();
+            let a = vfs
+                .open(path_str, OpenFlags::READWRITE_CREATE)
+                .await
+                .unwrap();
+            a.write_at(0, b"SQLite format 3\0").await.unwrap();
+            a.sync().await.unwrap();
+            let b = vfs.open(path_str, OpenFlags::READWRITE).await.unwrap();
+
+            let ra = a.shm_map(0, 32768, true).await.unwrap().unwrap();
+            {
+                let mut buf = ra.lock().unwrap();
+                buf[0] = 0x57;
+            }
+            let rb = b.shm_map(0, 32768, false).await.unwrap().unwrap();
+            // Same shared region across the two connections.
+            assert!(Arc::ptr_eq(&ra, &rb));
+            let buf = rb.lock().unwrap();
+            assert_eq!(buf[0], 0x57);
+
+            a.shm_unmap(true).await.unwrap();
+            vfs.delete(path_str).await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shm_lock_shared_coexist_in_process() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let path = unique_shm_path("lock_shared");
+            let path_str = path.to_str().unwrap();
+            let vfs = OsTokioVfs::new();
+            let a = vfs
+                .open(path_str, OpenFlags::READWRITE_CREATE)
+                .await
+                .unwrap();
+            a.write_at(0, b"SQLite format 3\0").await.unwrap();
+            a.sync().await.unwrap();
+            let b = vfs.open(path_str, OpenFlags::READWRITE).await.unwrap();
+
+            use crate::vfs::shm_flags as F;
+            a.shm_lock(3, 1, F::SHM_LOCK | F::SHM_SHARED)
+                .await
+                .unwrap();
+            // Same process, different connection: the in-process a_lock count goes to 2,
+            // and the OS-level fcntl shared lock is held once (per-process).
+            b.shm_lock(3, 1, F::SHM_LOCK | F::SHM_SHARED)
+                .await
+                .unwrap();
+            a.shm_lock(3, 1, F::SHM_UNLOCK | F::SHM_SHARED)
+                .await
+                .unwrap();
+            b.shm_lock(3, 1, F::SHM_UNLOCK | F::SHM_SHARED)
+                .await
+                .unwrap();
+
+            a.shm_unmap(true).await.unwrap();
+            vfs.delete(path_str).await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shm_lock_exclusive_blocks_shared_in_process() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let path = unique_shm_path("lock_excl");
+            let path_str = path.to_str().unwrap();
+            let vfs = OsTokioVfs::new();
+            let a = vfs
+                .open(path_str, OpenFlags::READWRITE_CREATE)
+                .await
+                .unwrap();
+            a.write_at(0, b"SQLite format 3\0").await.unwrap();
+            a.sync().await.unwrap();
+            let b = vfs.open(path_str, OpenFlags::READWRITE).await.unwrap();
+
+            use crate::vfs::shm_flags as F;
+            a.shm_lock(0, 1, F::SHM_LOCK | F::SHM_EXCLUSIVE)
+                .await
+                .unwrap();
+            let err = b
+                .shm_lock(0, 1, F::SHM_LOCK | F::SHM_SHARED)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, crate::error::ResultCode::Busy);
+            a.shm_lock(0, 1, F::SHM_UNLOCK | F::SHM_EXCLUSIVE)
+                .await
+                .unwrap();
+            // After unlock, B's SHARED succeeds.
+            b.shm_lock(0, 1, F::SHM_LOCK | F::SHM_SHARED)
+                .await
+                .unwrap();
+            b.shm_lock(0, 1, F::SHM_UNLOCK | F::SHM_SHARED)
+                .await
+                .unwrap();
+
+            a.shm_unmap(true).await.unwrap();
+            vfs.delete(path_str).await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shm_lock_cannot_upgrade_shared_to_exclusive() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let path = unique_shm_path("lock_upgrade");
+            let path_str = path.to_str().unwrap();
+            let vfs = OsTokioVfs::new();
+            let a = vfs
+                .open(path_str, OpenFlags::READWRITE_CREATE)
+                .await
+                .unwrap();
+            a.write_at(0, b"SQLite format 3\0").await.unwrap();
+            a.sync().await.unwrap();
+
+            use crate::vfs::shm_flags as F;
+            a.shm_lock(3, 1, F::SHM_LOCK | F::SHM_SHARED)
+                .await
+                .unwrap();
+            let err = a
+                .shm_lock(3, 1, F::SHM_LOCK | F::SHM_EXCLUSIVE)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, crate::error::ResultCode::IoErr);
+            a.shm_lock(3, 1, F::SHM_UNLOCK | F::SHM_SHARED)
+                .await
+                .unwrap();
+
+            a.shm_unmap(true).await.unwrap();
+            vfs.delete(path_str).await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shm_unmap_drops_locks_and_delete_removes_shm_file() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let path = unique_shm_path("unmap_delete");
+            let path_str = path.to_str().unwrap();
+            let shm_path = format!("{path_str}-shm");
+            let vfs = OsTokioVfs::new();
+            let a = vfs
+                .open(path_str, OpenFlags::READWRITE_CREATE)
+                .await
+                .unwrap();
+            a.write_at(0, b"SQLite format 3\0").await.unwrap();
+            a.sync().await.unwrap();
+            let b = vfs.open(path_str, OpenFlags::READWRITE).await.unwrap();
+
+            use crate::vfs::shm_flags as F;
+            a.shm_lock(0, 1, F::SHM_LOCK | F::SHM_EXCLUSIVE)
+                .await
+                .unwrap();
+            // The -shm file should exist now (lazily created by the lock path).
+            assert!(vfs.exists(&shm_path).await.unwrap());
+            a.shm_unmap(false).await.unwrap();
+            // After unmap, B can take the EXCLUSIVE lock.
+            b.shm_lock(0, 1, F::SHM_LOCK | F::SHM_EXCLUSIVE)
+                .await
+                .unwrap();
+            b.shm_lock(0, 1, F::SHM_UNLOCK | F::SHM_EXCLUSIVE)
+                .await
+                .unwrap();
+            // delete_flag=true removes the -shm file.
+            b.shm_unmap(true).await.unwrap();
+            assert!(!vfs.exists(&shm_path).await.unwrap());
+
+            vfs.delete(path_str).await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shm_barrier_is_a_noop() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let path = unique_shm_path("barrier");
+            let path_str = path.to_str().unwrap();
+            let vfs = OsTokioVfs::new();
+            let f = vfs
+                .open(path_str, OpenFlags::READWRITE_CREATE)
+                .await
+                .unwrap();
+            f.shm_barrier().await;
             vfs.delete(path_str).await.unwrap();
         });
     }

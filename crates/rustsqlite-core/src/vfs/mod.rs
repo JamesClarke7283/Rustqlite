@@ -11,6 +11,7 @@
 //! * [`memvfs::MemVfs`] — in-memory files for `:memory:` databases and fast tests.
 
 use async_trait::async_trait;
+use std::sync::{Arc, Mutex};
 
 use crate::error::Result;
 
@@ -177,6 +178,29 @@ pub trait Vfs: Send + Sync {
     async fn exists(&self, path: &str) -> Result<bool>;
 }
 
+/// The number of wal-index lock bytes (mirrors `SQLITE_SHM_NLOCK` in `sqlite3.h`). The WAL
+/// uses slots 0..=2 for the writer/checkpointer/recovery locks and slots 3..=7 for the five
+/// reader read-marks (`WAL_READ_LOCK(0..=4)`). See `format::wal_index` for the indices.
+pub const SQLITE_SHM_NLOCK: usize = 8;
+
+/// `xShmLock` flag bit values (mirrors `SQLITE_SHM_*` in `sqlite3.h`).
+///
+/// `flags` is the bitwise OR of one of `{LOCK, UNLOCK}` and one of `{SHARED, EXCLUSIVE}`:
+/// * `LOCK | SHARED`     — acquire a shared lock on `ofst..ofst+n`.
+/// * `LOCK | EXCLUSIVE`  — acquire an exclusive lock on `ofst..ofst+n`.
+/// * `UNLOCK | SHARED`   — release a shared lock on `ofst..ofst+n`.
+/// * `UNLOCK | EXCLUSIVE`— release an exclusive lock on `ofst..ofst+n`.
+///
+/// Upstream forbids transitions between SHARED and EXCLUSIVE directly (you must unlock to
+/// NONE first); this matches `unixShmLock`'s "one may not go from shared to exclusive or
+/// from exclusive to shared" rule.
+pub mod shm_flags {
+    pub const SHM_UNLOCK: u32 = 1;
+    pub const SHM_LOCK: u32 = 2;
+    pub const SHM_SHARED: u32 = 4;
+    pub const SHM_EXCLUSIVE: u32 = 8;
+}
+
 /// An open file. All methods take `&self` and use interior mutability so a file can be shared
 /// (the pager hands the same file to many readers). Positioned reads/writes mirror SQLite's
 /// `pread`/`pwrite` usage — no shared seek cursor.
@@ -211,4 +235,42 @@ pub trait VfsFile: Send + Sync {
     /// belongs to an active transaction (a RESERVED lock means another connection is the
     /// writer — the journal is not hot).
     async fn check_reserved_lock(&self) -> Result<bool>;
+
+    /// Map (and optionally extend) the wal-index shared-memory region `i_region` of
+    /// `sz_region` bytes. Returns the mapped slice (a view of the underlying `-shm` file or
+    /// in-memory buffer shared between all opens of the same database path). Mirrors
+    /// `xShmMap` / `sqlite3OsShmMap` in `os.h`.
+    ///
+    /// When `b_extend` is `false` and the region has not yet been allocated, returns
+    /// `Ok(None)` (a non-extending request for a region that doesn't exist). When
+    /// `b_extend` is `true`, the region is allocated (zero-filled) if absent.
+    ///
+    /// The default implementation refuses with `SQLITE_IOERR_SHMMAP`, matching a VFS that
+    /// does not support WAL (upstream's "if not WAL-capable" early-out).
+    async fn shm_map(&self, _i_region: usize, _sz_region: usize, _b_extend: bool) -> Result<Option<Arc<Mutex<Vec<u8>>>>> {
+        Err(crate::error::Error::io_err("xShmMap not supported by this VFS"))
+    }
+
+    /// Acquire or release wal-index locks (mirrors `xShmLock` / `sqlite3OsShmLock`). See
+    /// [`shm_flags`] for the `flags` bit values. `ofst` is the first lock slot (0..SQLITE_SHM_NLOCK)
+    /// and `n` is the count of consecutive slots to acquire/release as a unit (n==1 for
+    /// SHARED locks; n>=1 for EXCLUSIVE locks).
+    ///
+    /// The default implementation refuses with `SQLITE_IOERR_SHMLOCK`.
+    async fn shm_lock(&self, _ofst: usize, _n: usize, _flags: u32) -> Result<()> {
+        Err(crate::error::Error::io_err("xShmLock not supported by this VFS"))
+    }
+
+    /// Memory barrier over the wal-index (mirrors `xShmBarrier` / `sqlite3OsShmBarrier`).
+    /// All loads/stores before the barrier complete before any load/store after it. The
+    /// default is a no-op (sufficient for single-threaded tests); VFS implementations that
+    /// share the `-shm` across threads/processes issue a real fence.
+    async fn shm_barrier(&self) {}
+
+    /// Close the wal-index shared-memory mapping for this connection (mirrors `xShmUnmap` /
+    /// `sqlite3OsShmUnmap`). When `delete_flag` is true, the underlying `-shm` file is
+    /// removed (mirrors `sqlite3OsDelete` after `sqlite3WalClose`). The default is a no-op.
+    async fn shm_unmap(&self, _delete_flag: bool) -> Result<()> {
+        Ok(())
+    }
 }

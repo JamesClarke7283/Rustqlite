@@ -76,6 +76,7 @@ Check these before web searching (load with Read tool as needed):
 - @docs/without-rowid-storage.md - WITHOUT ROWID table on-disk layout and `convertToWithoutRowidTable` shape
 - @docs/row-value-expressions.md - SQLite `TK_VECTOR` grammar, row-value comparisons, and `IN (subquery)` forms
 - @docs/autovacuum-ptrmap.md - auto-vacuum/ptrmap page math, header meta[] layout, and Rustqlite implementation notes
+- @docs/wal-shm-vfs-methods.md - WAL shared-memory VFS methods (`xShmMap`/`xShmLock`/`xShmBarrier`/`xShmUnmap`), lock slot indices, and the in-process `a_lock` array
 
 ## Build / run / test
 - Build: `cargo build`
