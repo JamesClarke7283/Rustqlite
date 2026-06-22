@@ -314,11 +314,11 @@ fn compile_column(
                 (sub, t.name)
             })
         } else {
-            // Bare column: search tables in FROM order. An ambiguous column (present in
-            // multiple tables) resolves to the first one — matching SQLite's behavior for
-            // comma joins without USING. (SQLite actually raises an "ambiguous column name"
-            // error, but that's a name-resolution check we defer to M2.74; for now we pick
-            // the first table so the cross-join codegen works.)
+            // Bare column: search tables in FROM order. An ambiguous column (present
+            // in multiple tables) resolves to the first one — the ambiguous-column
+            // check is enforced up front by the `codegen::resolve` pass (M2.74),
+            // which raises "ambiguous column name" before codegen runs, so by the
+            // time we reach here the first match is the uniquely-correct one.
             jt.iter().find(|t| t.table.resolve_column(name).is_some()).map(|t| {
                 let sub = Ctx {
                     table: t.table,

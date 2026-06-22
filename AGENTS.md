@@ -94,10 +94,10 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   async VFS (mem + tokio), read-only pager, table-b-tree read cursor with overflow, `sqlite_schema`
   reader. CLI `.tables`/`.schema` read real C-SQLite databases. Remaining: index b-tree read cursor,
   `WITHOUT ROWID`, ptrmap/auto-vacuum awareness.
-- **M2 — Parser**: 🚧 a working subset grammar (`SELECT`/`CREATE TABLE`/`INSERT` + the full expression
+- **M2 — Parser**: ✅ a working subset grammar (`SELECT`/`CREATE TABLE`/`INSERT` + the full expression
   atom/operator set, including `IS NOT` and **JOIN syntax**); full `parse.y` port pending. Known gap: a bare integer literal
   larger than `i64` (e.g. the exact `-9223372036854775808`) is parsed as REAL rather than special-cased.
-  Most M2 tasks (2.1–2.73) are now done; remaining: 2.74 name resolution. The **2.73 AST walker**
+  All M2 tasks (2.1–2.74) are now done. The **2.73 AST walker**
   (`crates/rustqlite-parser/src/walker.rs`, mirroring `walker.c`) exposes a read-only pre-order
   [`Visitor`] trait with [`WalkControl::Continue`/`Prune`/`Abort`] semantics and free functions
   `walk_expr`/`walk_expr_list`/`walk_select`/`walk_select_expr`/`walk_select_from`/`walk_stmt`
@@ -105,8 +105,21 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   trigger bodies, and the `WINDOW` clause; `Prune` lets a visitor skip a node's children without
   stopping the walk (e.g. `contains_aggregate` would prune on `Exists`/`Subquery`). Existing manual
   walks (`contains_aggregate`, `collect_aggregates`, `rewrite_aggregates`, `rewrite_expr`) are
-  not yet migrated — the walker is the infrastructure for 2.74 name resolution and future passes.
-  Note: `build_qualified_name`
+  not yet migrated — the walker is the infrastructure for future passes. The **2.74 name-resolution
+  pass** (`crates/rustsqlite-core/src/codegen/resolve.rs`, mirroring `resolve.c`) is a read-only
+  validation pre-pass that walks the SELECT's expressions (via `walk_select_expr`) and verifies
+  every `Expr::Column` resolves uniquely against a `NameContext` built from the FROM tables. It
+  raises `"ambiguous column name: X"` and `"no such column: X[.Y]"` matching the oracle, before
+  codegen emits opcodes. The `NameContext` carries a `parent` link for correlated subqueries
+  (upstream's `pNext` chain); subqueries with their own FROM are pruned in `visit_select` (their
+  column refs are resolved by the subquery codegen paths, which raise "no such column" via
+  `compile_column`). The actual cursor/column-index binding still happens at codegen time in
+  `compile_column` — the Rust AST is immutable and has no slot for upstream's `pExpr->iTable`/
+  `iColumn`, so this pass is validate-only. What's **not** yet done (and upstream does): result-
+  column alias resolution for `ORDER BY` (still at codegen time via `resolve_order_term`),
+  `NC_*` flag enforcement (`NC_AllowAgg`/`NC_IsCheck`/`NC_PartIdx`/…), compound-arm FROM
+  resolution (needs catalog access), and FROM-subquery body resolution (handled by subquery
+  codegen). Note: `build_qualified_name`
   preserves quoted-identifier quotes (e.g. `"col"` stays `"col"`, not unquoted to `col`); unquoting
   is deferred to the full parse.y port. `INDEXED`/`MATCH`/`REGEXP` etc. are reserved in our grammar
   (upstream uses `%fallback ID` so they're contextually reserved); this is a minor divergence.

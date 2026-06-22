@@ -829,6 +829,20 @@ fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelec
                 let (select_for_codegen, on_for_codegen) =
                     rewrite_using_or_natural(select, &flat, &from_order, &join_order_arr)?;
 
+                // Name resolution (M2.74): validate every column reference in the
+                // (possibly rewritten) SELECT resolves uniquely against the FROM
+                // tables. Raises "ambiguous column name" and "no such column" matching
+                // the oracle, before codegen emits opcodes. The resolver uses the
+                // FROM-order tables (alias if present, else table name) as the scope.
+                let resolve_tables: Vec<codegen::resolve::ResolveTable<'_>> = table_refs
+                    .iter()
+                    .map(|(t, n)| codegen::resolve::ResolveTable {
+                        table: *t,
+                        name: *n,
+                    })
+                    .collect();
+                codegen::resolve::resolve_select(&select_for_codegen, &resolve_tables, None)?;
+
                 let (program, column_names) = codegen::join::compile_cross_join(
                     &select_for_codegen,
                     &join_order_arr,
@@ -886,6 +900,27 @@ fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelec
     } else {
         (None, None, Vec::new())
     };
+
+    // Name resolution (M2.74): validate every column reference in the SELECT resolves
+    // uniquely against the FROM table. Raises "no such column" matching the oracle,
+    // before codegen emits opcodes. For a single-table SELECT there can be no
+    // ambiguous-column error (only one FROM table), so this only catches
+    // `no-such-column` and qualified-`tbl.col` mistakes here — the ambiguous-column
+    // path is exercised by the join path above. Skip when the FROM is a subquery
+    // (the subquery codegen paths resolve their own column refs).
+    if let Some(t) = table.as_ref() {
+        if let Some(tref) = select.from.first().and_then(|tj| tj.table()) {
+            let alias = tref.alias.as_deref().unwrap_or(t.name.as_str());
+            let resolve_tables = vec![codegen::resolve::ResolveTable {
+                table: t,
+                name: alias,
+            }];
+            // Skip when the FROM is a subquery (no `table()`); the subquery paths
+            // resolve their own refs. The `tref` here is guaranteed to be the FROM
+            // table because we're in the single-table branch.
+            codegen::resolve::resolve_select(select, &resolve_tables, None)?;
+        }
+    }
 
     // Build a subquery resolver over the connection's pager so expression codegen can compile
     // scalar subqueries / EXISTS / IN (SELECT ...) against the catalog. Even a FROM-less outer

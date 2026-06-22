@@ -20,6 +20,7 @@ pub mod index_planner;
 pub mod insert;
 pub mod join;
 pub mod join_using;
+pub mod resolve;
 pub mod returning;
 pub mod select;
 pub mod subquery;

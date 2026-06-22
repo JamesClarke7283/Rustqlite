@@ -1872,4 +1872,179 @@ fn window_function_frame_spec_unsupported() {
     }
 }
 
+/// Name resolution error parity (M2.74). The oracle raises "ambiguous column name: X"
+/// when a bare column reference matches more than one FROM table, and "no such column:
+/// X" when a column reference matches no FROM table. Our resolve pass (M2.74) raises
+/// the same errors before codegen, matching the oracle. This also confirms legitimate
+/// queries with qualified or unique-column references still work.
+#[test]
+fn name_resolution_error_parity() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup(
+        "CREATE TABLE t1(a INT, b TEXT);\
+         CREATE TABLE t2(a INT, c TEXT);\
+         INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');\
+         INSERT INTO t2 VALUES (1, 'p'), (2, 'q'), (4, 'r');",
+    );
+    // Error-parity cases: each query should error in BOTH the oracle and our engine,
+    // with matching error substrings.
+    let error_cases: &[(&str, &str, &str)] = &[
+        // Ambiguous bare column in a comma join.
+        (
+            "SELECT a FROM t1, t2;",
+            "ambiguous column name: a",
+            "ambiguous column name: a",
+        ),
+        // Ambiguous bare column in a JOIN.
+        (
+            "SELECT a FROM t1 JOIN t2 ON t1.a = t2.a;",
+            "ambiguous column name: a",
+            "ambiguous column name: a",
+        ),
+        // Ambiguous column in WHERE.
+        (
+            "SELECT t1.a FROM t1, t2 WHERE a > 0;",
+            "ambiguous column name: a",
+            "ambiguous column name: a",
+        ),
+        // Ambiguous column in ORDER BY.
+        (
+            "SELECT t1.a FROM t1, t2 ORDER BY a;",
+            "ambiguous column name: a",
+            "ambiguous column name: a",
+        ),
+        // No-such-column bare reference (single-table).
+        (
+            "SELECT x FROM t1;",
+            "no such column: x",
+            "no such column: x",
+        ),
+        // No-such-column qualified reference (single-table).
+        (
+            "SELECT t1.x FROM t1;",
+            "no such column: t1.x",
+            "no such column: t1.x",
+        ),
+        // No-such-column with an unknown table qualifier.
+        (
+            "SELECT foo.a FROM t1;",
+            "no such column: foo.a",
+            "no such column: foo.a",
+        ),
+        // No-such-column in WHERE.
+        (
+            "SELECT a FROM t1 WHERE x > 0;",
+            "no such column: x",
+            "no such column: x",
+        ),
+    ];
+    for (q, oracle_sub, our_sub) in error_cases {
+        // Oracle should error with the expected substring.
+        let oracle_out = std::process::Command::new("sqlite3")
+            .arg("-batch")
+            .arg(db.str())
+            .arg(q)
+            .output()
+            .expect("run sqlite3");
+        let oracle_err = String::from_utf8_lossy(&oracle_out.stderr);
+        assert!(
+            oracle_err.contains(oracle_sub),
+            "oracle did not error as expected for {q}: {oracle_err}"
+        );
+        // Our engine should also error, with a matching substring.
+        match rustsqlite_rows(db.str(), q) {
+            Ok(rows) => panic!(
+                "expected error for `{q}`, got rows: {rows:?}\n(oracle errored: {oracle_err})"
+            ),
+            Err(e) => {
+                assert!(
+                    e.contains(our_sub),
+                    "error mismatch for {q}: got {e:?}, expected substring {:?}",
+                    our_sub
+                );
+            }
+        }
+    }
+    // Legitimate queries — must still work (no false positives from the resolve pass).
+    for q in [
+        "SELECT a FROM t1;",
+        "SELECT t1.a FROM t1;",
+        "SELECT t1.a, t2.a FROM t1, t2 WHERE t1.a = t2.a ORDER BY t1.a;",
+        "SELECT t1.a, t2.c FROM t1 JOIN t2 ON t1.a = t2.a ORDER BY t1.a;",
+        "SELECT b FROM t1, t2 WHERE t1.a = t2.a ORDER BY b;",
+        "SELECT c FROM t1, t2 WHERE t1.a = t2.a ORDER BY c;",
+        "SELECT t1.a FROM t1, t2 WHERE t1.a = t2.a ORDER BY t1.a;",
+        "SELECT a, b FROM t1 ORDER BY a;",
+    ] {
+        assert_same(db.str(), q);
+    }
+}
+
+/// Name resolution with aliases (M2.74). A table alias replaces the table name for
+/// qualification purposes — `FROM t1 AS x` means `x.a` works but `t1.a` does not.
+/// The oracle enforces this; our resolve pass matches.
+#[test]
+fn name_resolution_aliases() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup(
+        "CREATE TABLE t1(a INT, b TEXT);\
+         INSERT INTO t1 VALUES (1, 'x'), (2, 'y');",
+    );
+    // Legitimate alias use.
+    for q in [
+        "SELECT x.a FROM t1 AS x ORDER BY x.a;",
+        "SELECT x.a FROM t1 x ORDER BY x.a;",
+        "SELECT a FROM t1 AS x ORDER BY a;",
+        "SELECT x.a, y.a FROM t1 AS x, t1 AS y WHERE x.a = y.a ORDER BY x.a;",
+    ] {
+        assert_same(db.str(), q);
+    }
+    // Error parity: an alias shadows the original table name.
+    let error_cases: &[(&str, &str, &str)] = &[
+        // `t1.a` doesn't resolve when `t1` is aliased to `x`.
+        (
+            "SELECT t1.a FROM t1 AS x;",
+            "no such column: t1.a",
+            "no such column: t1.a",
+        ),
+        // Self-join with aliases: bare `a` is ambiguous.
+        (
+            "SELECT a FROM t1 AS x, t1 AS y;",
+            "ambiguous column name: a",
+            "ambiguous column name: a",
+        ),
+    ];
+    for (q, oracle_sub, our_sub) in error_cases {
+        let oracle_out = std::process::Command::new("sqlite3")
+            .arg("-batch")
+            .arg(db.str())
+            .arg(q)
+            .output()
+            .expect("run sqlite3");
+        let oracle_err = String::from_utf8_lossy(&oracle_out.stderr);
+        assert!(
+            oracle_err.contains(oracle_sub),
+            "oracle did not error as expected for {q}: {oracle_err}"
+        );
+        match rustsqlite_rows(db.str(), q) {
+            Ok(rows) => panic!("expected error for `{q}`, got rows: {rows:?}"),
+            Err(e) => {
+                assert!(
+                    e.contains(our_sub),
+                    "error mismatch for {q}: got {e:?}, expected substring {:?}",
+                    our_sub
+                );
+            }
+        }
+    }
+}
+
 
