@@ -1991,3 +1991,127 @@ fn alter_table_drop_column_multiple_rows() {
     assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
     assert_eq!(db.query("SELECT count(*), min(a), max(a) FROM t;"), "100|0|99");
 }
+
+#[test]
+fn alter_table_rename_column_roundtrip_and_c_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("alter_rename_column");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x');");
+
+        // Rename column b to c.
+        exec(&mut conn, "ALTER TABLE t RENAME COLUMN b TO c;");
+
+        // The new column name works.
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, c FROM t;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(1), Value::Text("x".into())]]);
+
+        // The old column name is gone.
+        let result = sqlite3_prepare_v2(&mut conn, "SELECT b FROM t;");
+        assert!(result.is_err());
+
+        // The schema sql reflects the new column name.
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "SELECT sql FROM sqlite_schema WHERE name='t';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(
+            rows,
+            vec![vec![Value::Text("CREATE TABLE t(a, c)".to_string())]]
+        );
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, c FROM t;"), "1|x");
+    assert_eq!(db.query("SELECT sql FROM sqlite_schema WHERE name='t';"), "CREATE TABLE t(a, c)");
+}
+
+#[test]
+fn alter_table_rename_column_without_keyword() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("alter_rename_col_no_kw");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 2);");
+        // The `COLUMN` keyword is optional.
+        exec(&mut conn, "ALTER TABLE t RENAME b TO c;");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, c FROM t;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(1), Value::Int(2)]]);
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, c FROM t;"), "1|2");
+}
+
+#[test]
+fn alter_table_rename_column_nonexistent_errors() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("alter_rename_col_nonexistent");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        let result = sqlite3_prepare_v2(&mut conn, "ALTER TABLE t RENAME COLUMN nope TO c;");
+        assert!(result.is_err(), "expected error for renaming nonexistent column");
+        let _ = conn;
+    }
+}
+
+#[test]
+fn alter_table_rename_column_collision_errors() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("alter_rename_col_collision");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        let result = sqlite3_prepare_v2(&mut conn, "ALTER TABLE t RENAME COLUMN b TO a;");
+        assert!(result.is_err(), "expected error for renaming to existing column");
+        let _ = conn;
+    }
+}
+
+#[test]
+fn alter_table_rename_column_with_index() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("alter_rename_col_index");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE INDEX idx_b ON t(b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x'), (2, 'y');");
+        exec(&mut conn, "ALTER TABLE t RENAME COLUMN b TO c;");
+
+        // The index sql should reference the new column name.
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "SELECT sql FROM sqlite_schema WHERE name='idx_b';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(
+            rows,
+            vec![vec![Value::Text("CREATE INDEX idx_b ON t(c)".to_string())]]
+        );
+
+        // Queries on the new column using the index still work.
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a FROM t WHERE c='y';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(2)]]);
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT sql FROM sqlite_schema WHERE name='idx_b';"), "CREATE INDEX idx_b ON t(c)");
+    assert_eq!(db.query("SELECT a FROM t WHERE c='y';"), "2");
+}

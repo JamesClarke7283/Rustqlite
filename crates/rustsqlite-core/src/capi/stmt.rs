@@ -415,6 +415,25 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                         last_error: None,
                     })
                 }
+                AlterTableAction::RenameColumn { old, new } => {
+                    let (edits, schema_cookie) =
+                        resolve_alter_rename_column_target(&pager, &alter, &old, &new)?;
+                    let program = Arc::new(codegen::compile_alter_rename_column(
+                        &alter,
+                        schema_cookie,
+                        &edits,
+                    )?);
+                    let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
+                    Ok(Sqlite3Stmt {
+                        sql: sql.to_string(),
+                        program,
+                        column_names: Vec::new(),
+                        backing: Backing::Vdbe(vdbe),
+                        explain: 0,
+                        counts: Some(db.counts_handle()),
+                        last_error: None,
+                    })
+                }
                 _ => Err(Error::msg(format!(
                     "ALTER TABLE action {:?} is not supported yet",
                     alter.action
@@ -798,6 +817,91 @@ fn resolve_alter_drop_column_target(
         .ok_or_else(|| Error::msg(format!("table \"{}\" has no CREATE statement", alter.table)))?
         .clone();
     Ok((table, table_obj.rowid, old_sql, cookie))
+}
+
+/// Resolve an `ALTER TABLE … RENAME [COLUMN] <old> TO <new>` target: validates the table
+/// and column exist, and produces the list of `sqlite_schema` row edits (the table row +
+/// every associated index/trigger row whose `sql` references the column). Returns
+/// `(edits, schema_cookie)`.
+fn resolve_alter_rename_column_target(
+    pager: &Arc<Pager>,
+    alter: &AlterTableStmt,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(Vec<codegen::alter::SchemaRowEdit>, u32)> {
+    if alter.schema.is_some() {
+        return Err(Error::msg(
+            "schema-qualified ALTER TABLE is not yet supported",
+        ));
+    }
+    if alter.table.starts_with("sqlite_") {
+        return Err(Error::msg(format!("table {} may not be altered", alter.table)));
+    }
+    let catalog = block_on(read_catalog(pager))?;
+    let cookie = schema_cookie(pager);
+    let table_obj = catalog
+        .find_table(&alter.table)
+        .ok_or_else(|| Error::msg(format!("no such table: {}", alter.table)))?;
+    let table = Table::from_schema_object(table_obj)?;
+    let old_name_dequoted = codegen::alter::dequote_ident(old_name);
+    let new_name_dequoted = codegen::alter::dequote_ident(new_name);
+    // The column must exist.
+    if table.column_index(&old_name_dequoted).is_none() {
+        return Err(Error::msg(format!("no such column: {}", old_name)));
+    }
+    // The new name must not collide with an existing column.
+    if table.column_index(&new_name_dequoted).is_some() {
+        return Err(Error::msg(format!(
+            "duplicate column name: {}",
+            new_name
+        )));
+    }
+
+    let mut edits: Vec<codegen::alter::SchemaRowEdit> = Vec::new();
+
+    // The table row: rewrite the `sql` column.
+    let table_sql_rewrite = table_obj
+        .sql
+        .as_deref()
+        .and_then(|s| {
+            codegen::alter::rewrite_column_name_in_sql(s, &old_name_dequoted, &new_name_dequoted)
+        });
+    edits.push(codegen::alter::SchemaRowEdit {
+        rowid: table_obj.rowid,
+        new_name: None,
+        new_tbl_name: None,
+        new_sql: table_sql_rewrite,
+    });
+
+    // Associated index/trigger rows whose `tbl_name` matches: rewrite their `sql` to
+    // replace the column name.
+    for obj in &catalog.objects {
+        if obj.rowid == table_obj.rowid {
+            continue;
+        }
+        if !dequote_ident(&obj.tbl_name).eq_ignore_ascii_case(&dequote_ident(&alter.table)) {
+            continue;
+        }
+        if !(obj.is_index() || obj.obj_type == "trigger") {
+            continue;
+        }
+        let sql_rewrite = obj
+            .sql
+            .as_deref()
+            .and_then(|s| {
+                codegen::alter::rewrite_column_name_in_sql(s, &old_name_dequoted, &new_name_dequoted)
+            });
+        if sql_rewrite.is_some() {
+            edits.push(codegen::alter::SchemaRowEdit {
+                rowid: obj.rowid,
+                new_name: None,
+                new_tbl_name: None,
+                new_sql: sql_rewrite,
+            });
+        }
+    }
+
+    Ok((edits, cookie))
 }
 
 /// Resolve the index a `DROP INDEX` targets from the current catalog. Returns

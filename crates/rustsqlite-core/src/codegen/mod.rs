@@ -240,3 +240,14 @@ pub fn compile_alter_drop_column(
         drop_col_name,
     )
 }
+
+/// Compile `ALTER TABLE <name> RENAME [COLUMN] <old> TO <new>` into a VDBE write program
+/// that rewrites the `sql` column of the table's `sqlite_schema` row (and any associated
+/// index/trigger rows). `edits` is the resolved set of schema-row edits.
+pub fn compile_alter_rename_column(
+    stmt: &AlterTableStmt,
+    current_schema_cookie: u32,
+    edits: &[alter::SchemaRowEdit],
+) -> Result<Program> {
+    alter::compile_alter_rename_column(stmt, current_schema_cookie, edits)
+}

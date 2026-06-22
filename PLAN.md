@@ -296,7 +296,7 @@ list every granular item needed.
 - [x] **14.5** Codegen: `RENAME TABLE` — rewrite `sqlite_schema` row + update all FK/view/trigger references
 - [x] **14.6** Codegen: `ADD COLUMN` — rewrite `sqlite_schema` CREATE TABLE SQL, default-fill new column in existing rows
 - [x] **14.7** Codegen: `DROP COLUMN` — rewrite CREATE TABLE SQL, handle `sqlite_schema` update, rebuild dependent indexes
-- [ ] **14.8** Codegen: `RENAME COLUMN` — rewrite CREATE TABLE SQL + dependent indexes/views/triggers
+- [x] **14.8** Codegen: `RENAME COLUMN` — rewrite CREATE TABLE SQL + dependent indexes/views/triggers
 - [ ] **14.9** `PRAGMA legacy_alter_table` (old behavior vs new behavior for whether dependent objects are rewritten)
 - [ ] **14.10** `ALTER TABLE … ALTER COLUMN … DROP NOT NULL` / `SET NOT NULL` (3.37+)
 

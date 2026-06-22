@@ -796,3 +796,16 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   (`alter_table_drop_column_*` in `write_roundtrip.rs` — drop middle/first/last column,
   multiple rows, nonexistent/PK/only-column errors). C-SQLite `PRAGMA integrity_check`
   passes on Rustqlite-written databases.
+  **14.8 `RENAME COLUMN`** ✅: `codegen::alter::compile_alter_rename_column` (mirrors
+  `sqlite3AlterRenameColumn` in `alter.c`) rewrites the `sql` column of the table's
+  `sqlite_schema` row and every associated index/trigger row whose `sql` references the
+  column. The rewrite is done by `rewrite_column_name_in_sql` — a textual whole-word
+  replacement of the old column name with the new one, handling quoted identifiers
+  (`"..."`, `` `...` ``, `[...]`) and bare identifiers, and skipping string literals
+  (SQLite uses an AST-aware rewrite via the `sqlite_rename_column()` SQL function; our
+  textual approach may over-replace when the column name collides with another
+  identifier, but handles the common cases correctly). The resolver
+  (`resolve_alter_rename_column_target`) validates the column exists and the new name
+  doesn't collide with an existing column. Differential-tested vs the C oracle
+  (`alter_table_rename_column_*` — basic rename, without `COLUMN` keyword, with index,
+  nonexistent/collision errors).

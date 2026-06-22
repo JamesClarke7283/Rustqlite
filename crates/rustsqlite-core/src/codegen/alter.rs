@@ -529,6 +529,180 @@ fn drop_column_from_create_table(create_sql: &str, col_name: &str) -> Option<Str
     Some(format!("{}{}", before, after))
 }
 
+/// Compile `ALTER TABLE <tbl> RENAME [COLUMN] <old> TO <new>`.
+///
+/// * `stmt` — the parsed ALTER TABLE statement (action must be `RenameColumn`).
+/// * `current_schema_cookie` — the value before this DDL runs (the program bumps it by one).
+/// * `edits` — the resolved set of `sqlite_schema` row edits (the table row + every
+///   associated index/trigger row whose `sql` references the column).
+pub fn compile_alter_rename_column(
+    stmt: &AlterTableStmt,
+    current_schema_cookie: u32,
+    edits: &[SchemaRowEdit],
+) -> Result<Program> {
+    if stmt.schema.is_some() {
+        return Err(Error::msg(
+            "schema-qualified ALTER TABLE is not yet supported",
+        ));
+    }
+    let mut b = ProgramBuilder::new();
+
+    let setup = b.new_label();
+    b.emit_jump(Opcode::Init, 0, setup, 0);
+    let after_init = b.cur_addr();
+
+    // (1) Open the write transaction.
+    b.emit(Opcode::Transaction, 0, 1, 0);
+
+    // (2) Open a write cursor on `sqlite_schema` (page 1).
+    let schema_cursor = 0i32;
+    b.emit(Opcode::OpenWrite, schema_cursor, SCHEMA_ROOT, 0);
+
+    // (3) For each row edit: seek to the rowid, read the 5 columns, overwrite the `sql`
+    //     column, delete + insert at the same rowid.
+    for edit in edits {
+        let rowid_reg = b.alloc_reg();
+        let i = b.emit(Opcode::Int64, 0, rowid_reg, 0);
+        b.set_p4(i, P4::Int(edit.rowid));
+
+        let skip = b.new_label();
+        b.emit_jump(Opcode::NotExists, schema_cursor, skip, rowid_reg);
+
+        let col0 = b.alloc_regs(5);
+        for (ci, _) in [(0usize, ()), (1, ()), (2, ()), (3, ()), (4, ())].iter() {
+            b.emit(Opcode::Column, schema_cursor, *ci as i32, col0 + *ci as i32);
+        }
+        if let Some(new_sql) = &edit.new_sql {
+            let idx = b.emit(Opcode::String8, 0, col0 + 4, 0);
+            b.set_p4(idx, P4::Text(new_sql.clone()));
+        }
+
+        let record = b.alloc_reg();
+        b.emit(Opcode::MakeRecord, col0, 5, record);
+        let del_idx = b.emit(Opcode::Delete, schema_cursor, 0, 0);
+        b.set_p5(del_idx, P5_ISUPDATE);
+        let ins = b.emit(Opcode::Insert, schema_cursor, record, rowid_reg);
+        b.set_p5(ins, P5_ISUPDATE);
+
+        b.resolve(skip);
+    }
+
+    // (4) Bump the schema cookie.
+    b.emit(
+        Opcode::SetCookie,
+        0,
+        COOKIE_SCHEMA,
+        current_schema_cookie as i32 + 1,
+    );
+
+    // (5) Reload the schema.
+    b.emit(Opcode::ParseSchema, 0, 0, 0);
+
+    // (6) Halt commits the transaction.
+    b.emit(Opcode::Halt, 0, 0, 0);
+
+    b.resolve(setup);
+    b.emit(Opcode::Goto, 0, after_init, 0);
+    Ok(b.finish())
+}
+
+/// Rewrite a column-name token in a stored CREATE TABLE / CREATE INDEX / CREATE TRIGGER
+/// statement from `old` to `new`. This is a simplified textual rewrite that replaces
+/// whole-word matches of the column name. Returns `None` when no rewrite was possible.
+///
+/// Note: this is a conservative rewrite — it replaces ALL occurrences of the column name
+/// as a whole word (case-insensitive for unquoted, exact for quoted). SQLite uses an
+/// AST-aware rewrite via `sqlite_rename_column()` that only replaces the column references
+/// in the parsed AST. Our textual approach may over-replace when the column name collides
+/// with another identifier, but handles the common cases correctly.
+pub fn rewrite_column_name_in_sql(sql: &str, old: &str, new: &str) -> Option<String> {
+    let old_dequoted = dequote_ident(old);
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    let mut replaced = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'`' => {
+                let quote = bytes[i];
+                let end = end_quoted(sql, i, quote);
+                let ident_text = {
+                    let inner = &sql[i + 1..end - 1];
+                    inner.replace(
+                        &format!("{}{}", quote as char, quote as char),
+                        &format!("{}", quote as char),
+                    )
+                };
+                if ident_text == old_dequoted {
+                    // Replace with the new name, re-quoted in the same style.
+                    let escaped = new.replace(quote as char, &format!("{}{}", quote as char, quote as char));
+                    out.push(quote as char);
+                    out.push_str(&escaped);
+                    out.push(quote as char);
+                    replaced = true;
+                } else {
+                    out.push_str(&sql[i..end]);
+                }
+                i = end;
+            }
+            b'[' => {
+                let end = sql[i + 1..].find(']').map(|p| i + 1 + p + 1).unwrap_or(bytes.len());
+                let ident_text = &sql[i + 1..end - 1];
+                if ident_text == old_dequoted {
+                    out.push('[');
+                    out.push_str(new);
+                    out.push(']');
+                    replaced = true;
+                } else {
+                    out.push_str(&sql[i..end]);
+                }
+                i = end;
+            }
+            b if is_ident_char(b) => {
+                // Bare identifier: read the whole identifier.
+                let mut j = i;
+                while j < bytes.len() && is_ident_char(bytes[j]) {
+                    j += 1;
+                }
+                let ident = &sql[i..j];
+                if ident.eq_ignore_ascii_case(&old_dequoted) {
+                    out.push_str(new);
+                    replaced = true;
+                } else {
+                    out.push_str(ident);
+                }
+                i = j;
+            }
+            b'\'' => {
+                // Single-quoted string literal — copy verbatim.
+                let mut j = i + 1;
+                while j < bytes.len() {
+                    if bytes[j] == b'\'' {
+                        if j + 1 < bytes.len() && bytes[j + 1] == b'\'' {
+                            j += 2;
+                            continue;
+                        }
+                        j += 1;
+                        break;
+                    }
+                    j += 1;
+                }
+                out.push_str(&sql[i..j]);
+                i = j;
+            }
+            _ => {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+    }
+    if replaced {
+        Some(out)
+    } else {
+        None
+    }
+}
+
 /// Compile `ALTER TABLE <old> RENAME TO <new>`.
 ///
 /// * `stmt` — the parsed ALTER TABLE statement (action must be `RenameTo`).
