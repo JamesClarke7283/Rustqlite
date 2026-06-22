@@ -1040,6 +1040,26 @@ impl Pager {
     fn journal_path(&self) -> String {
         format!("{}-journal", self.path)
     }
+
+    /// Run a WAL checkpoint (mirrors `sqlite3PagerCheckpoint` → `sqlite3WalCheckpoint`). Copies
+    /// committed frames from the `-wal` sidecar back into the database file, then optionally
+    /// resets the WAL (RESTART/TRUNCATE). A no-op (returning `(0, 0)`) when the database is not
+    /// in WAL mode or the WAL has no committed frames.
+    ///
+    /// Returns `(n_log, n_ckpt)` — the number of frames in the WAL and the number of frames
+    /// actually backfilled into the database. The caller (the VDBE `OP_Checkpoint` or the
+    /// `PRAGMA wal_checkpoint` codegen) surfaces these as the result-row columns.
+    pub async fn checkpoint(&self, mode: wal::CheckpointMode) -> Result<(u32, u32)> {
+        let wal = match &self.wal {
+            Some(w) => w,
+            None => return Ok((0, 0)),
+        };
+        let mut w = wal.lock().unwrap();
+        if w.mx_frame() == 0 {
+            return Ok((0, 0));
+        }
+        w.checkpoint(self.file.as_ref(), mode).await
+    }
 }
 
 /// Hot-journal recovery (`pager_playback` for `isHot=1`): if `<path>-journal` exists and carries a

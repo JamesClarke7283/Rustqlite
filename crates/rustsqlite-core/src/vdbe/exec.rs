@@ -1073,6 +1073,51 @@ impl Vdbe {
                     return Ok(StepResult::Done);
                 }
 
+                Opcode::Checkpoint => {
+                    // `OP_Checkpoint p1 p2 p3`: run a WAL checkpoint on database `p1` (always 0
+                    // — only `main` is supported) in mode `p2` (0=PASSIVE, 1=FULL, 2=RESTART,
+                    // 3=TRUNCATE), and write three result registers at `r[p3..p3+3]`:
+                    //   r[p3]   = 0 on success, 1 if busy (we never go busy in this iteration)
+                    //   r[p3+1] = number of frames in the WAL (`pnLog`)
+                    //   r[p3+2] = number of frames checkpointed (`pnCkpt`)
+                    // Mirrors `OP_Checkpoint` in `vdbe.c`. On error (not BUSY), `r[p3+1]` and
+                    // `r[p3+2]` are set to -1 (matching upstream's `aRes[1] = aRes[2] = -1`).
+                    let pager = self
+                        .pager
+                        .clone()
+                        .ok_or_else(|| Error::msg("no database is open"))?;
+                    let mode = match p2 {
+                        0 => crate::pager::wal::CheckpointMode::Passive,
+                        1 => crate::pager::wal::CheckpointMode::Full,
+                        2 => crate::pager::wal::CheckpointMode::Restart,
+                        3 => crate::pager::wal::CheckpointMode::Truncate,
+                        other => {
+                            return Err(Error::msg(format!(
+                                "OP_Checkpoint: invalid mode {other}"
+                            )));
+                        }
+                    };
+                    // Pre-fill the result registers with the "error" sentinel; on success they
+                    // are overwritten below.
+                    let base = p3 as usize;
+                    self.regs[base] = Value::Int(0);
+                    self.regs[base + 1] = Value::Int(-1);
+                    self.regs[base + 2] = Value::Int(-1);
+                    match pager.checkpoint(mode).await {
+                        Ok((n_log, n_ckpt)) => {
+                            self.regs[base] = Value::Int(0);
+                            self.regs[base + 1] = Value::Int(n_log as i64);
+                            self.regs[base + 2] = Value::Int(n_ckpt as i64);
+                        }
+                        Err(e) => {
+                            // Surface the error. Upstream only treats BUSY specially (it
+                            // sets `aRes[0] = 1` and continues); any other error aborts.
+                            return Err(e);
+                        }
+                    }
+                    self.pc += 1;
+                }
+
                 Opcode::OpenRead => {
                     let pager = self
                         .pager

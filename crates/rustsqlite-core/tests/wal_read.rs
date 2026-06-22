@@ -380,3 +380,278 @@ fn write_wal_mode_db_c_oracle_integrity_check() {
     assert_eq!(db.run("PRAGMA integrity_check;"), "ok");
     assert_eq!(db.run("SELECT count(*) FROM t;"), "100");
 }
+
+/// `PRAGMA wal_checkpoint(TRUNCATE)` issued through Rustqlite copies the WAL frames back into
+/// the database file and truncates the WAL to zero. After the checkpoint, a fresh connection
+/// sees the rows in the DB file (no WAL needed), and the `-wal` file is empty. Mirrors the
+/// `sqlite3_wal_checkpoint_v2` TRUNCATE mode.
+#[test]
+fn rustqlite_wal_checkpoint_truncate() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("ckptr");
+    db.run("PRAGMA journal_mode = wal;");
+    db.run("CREATE TABLE t(a, b);");
+    // The C oracle closes (auto-checkpointing the WAL); seed one row via Rustqlite so the
+    // WAL has frames when we run our checkpoint.
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');").expect("prepare");
+        match stmt.step() {
+            ResultCode::Done => {}
+            other => panic!("unexpected step result {other:?}: {}", stmt.errmsg()),
+        }
+    }
+
+    // Run PRAGMA wal_checkpoint(TRUNCATE) through Rustqlite.
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "PRAGMA wal_checkpoint(TRUNCATE);").expect("prepare");
+        let rows = collect(&mut stmt);
+        // PRAGMA wal_checkpoint returns one row with three columns: busy, log, checkpointed.
+        assert_eq!(rows.len(), 1);
+        // busy = 0 (no contention), log = N (frames were in the WAL), checkpointed = N.
+        assert_eq!(rows[0][0], Value::Int(0));
+        match rows[0][1] {
+            Value::Int(n) => assert!(n > 0, "expected frames in the WAL, got {n}"),
+            ref other => panic!("expected int log column, got {other:?}"),
+        }
+        match rows[0][2] {
+            Value::Int(n) => assert!(n > 0, "expected checkpointed frames, got {n}"),
+            ref other => panic!("expected int checkpointed column, got {other:?}"),
+        }
+    }
+
+    // After TRUNCATE, the WAL file is empty (zero bytes).
+    let wal_size_after = std::fs::metadata(format!("{}-wal", db.str()))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    assert_eq!(wal_size_after, 0, "WAL should be truncated to 0 bytes");
+
+    // A fresh Rustqlite connection reads the rows from the DB file (no WAL needed).
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;")
+            .expect("prepare");
+        let rows = collect(&mut stmt);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0], Value::Int(1));
+        assert_eq!(rows[0][1], Value::Text("one".to_string()));
+        assert_eq!(rows[1][0], Value::Int(2));
+        assert_eq!(rows[1][1], Value::Text("two".to_string()));
+        assert_eq!(rows[2][0], Value::Int(3));
+        assert_eq!(rows[2][1], Value::Text("three".to_string()));
+    }
+
+    // The C oracle also reads the rows back (the DB file is the source of truth now).
+    assert_eq!(db.run("SELECT count(*) FROM t;"), "3");
+    assert_eq!(db.run("SELECT a FROM t ORDER BY a;"), "1\n2\n3");
+    // C oracle's integrity_check on the Rustqlite-checkpointed DB passes.
+    assert_eq!(db.run("PRAGMA integrity_check;"), "ok");
+}
+
+/// `PRAGMA wal_checkpoint(PASSIVE)` copies the WAL frames into the DB file but leaves the WAL
+/// in place. A fresh connection that re-opens the WAL can still read the rows (from either the
+/// DB file or the WAL — both have them). The C oracle also sees the rows.
+#[test]
+fn rustqlite_wal_checkpoint_passive() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("ckppass");
+    db.run("PRAGMA journal_mode = wal;");
+    db.run("CREATE TABLE t(a);");
+    // Seed rows via Rustqlite so the WAL has frames at checkpoint time.
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (10), (20), (30);")
+            .expect("prepare");
+        match stmt.step() {
+            ResultCode::Done => {}
+            other => panic!("unexpected step result {other:?}: {}", stmt.errmsg()),
+        }
+    }
+
+    // Run a PASSIVE checkpoint through Rustqlite.
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "PRAGMA wal_checkpoint(PASSIVE);").expect("prepare");
+        let rows = collect(&mut stmt);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int(0)); // busy
+        match rows[0][2] {
+            Value::Int(n) => assert!(n > 0, "expected checkpointed frames, got {n}"),
+            ref other => panic!("expected int, got {other:?}"),
+        }
+    }
+
+    // The rows are visible through a fresh Rustqlite connection.
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a FROM t ORDER BY a;")
+            .expect("prepare");
+        let rows = collect(&mut stmt);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0], Value::Int(10));
+        assert_eq!(rows[1][0], Value::Int(20));
+        assert_eq!(rows[2][0], Value::Int(30));
+    }
+
+    // The C oracle sees the rows too.
+    assert_eq!(db.run("SELECT a FROM t ORDER BY a;"), "10\n20\n30");
+    assert_eq!(db.run("PRAGMA integrity_check;"), "ok");
+}
+
+/// `PRAGMA wal_checkpoint(RESTART)` resets the WAL salts so the next writer starts a fresh
+/// log. The WAL file is left in place (not truncated), but its frames are invalidated.
+#[test]
+fn rustqlite_wal_checkpoint_restart() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("ckprest");
+    db.run("PRAGMA journal_mode = wal;");
+    db.run("CREATE TABLE t(a);");
+    // Seed via Rustqlite so WAL has frames at checkpoint time.
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (1), (2);")
+            .expect("prepare");
+        match stmt.step() {
+            ResultCode::Done => {}
+            other => panic!("unexpected step result {other:?}: {}", stmt.errmsg()),
+        }
+    }
+
+    // RESTART checkpoint through Rustqlite.
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "PRAGMA wal_checkpoint(RESTART);").expect("prepare");
+        let rows = collect(&mut stmt);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int(0)); // busy
+    }
+
+    // A fresh Rustqlite connection sees the rows (in the DB file now).
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT count(*) FROM t;")
+            .expect("prepare");
+        let rows = collect(&mut stmt);
+        assert_eq!(rows[0][0], Value::Int(2));
+    }
+
+    // The C oracle also sees the rows and passes integrity_check.
+    assert_eq!(db.run("SELECT count(*) FROM t;"), "2");
+    assert_eq!(db.run("PRAGMA integrity_check;"), "ok");
+}
+
+/// `PRAGMA wal_checkpoint` (no mode argument) defaults to PASSIVE.
+#[test]
+fn rustqlite_wal_checkpoint_default_passive() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("ckpdef");
+    db.run("PRAGMA journal_mode = wal;");
+    db.run("CREATE TABLE t(a);");
+    // Seed row via Rustqlite so the WAL has frames.
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (42);")
+            .expect("prepare");
+        match stmt.step() {
+            ResultCode::Done => {}
+            other => panic!("unexpected step result {other:?}: {}", stmt.errmsg()),
+        }
+    }
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "PRAGMA wal_checkpoint;").expect("prepare");
+        let rows = collect(&mut stmt);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int(0)); // busy
+    }
+
+    // Row is visible to a fresh connection.
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a FROM t;").expect("prepare");
+        let rows = collect(&mut stmt);
+        assert_eq!(rows[0][0], Value::Int(42));
+    }
+}
+
+/// `PRAGMA wal_checkpoint` on a database that is NOT in WAL mode (rollback journal) is a
+/// no-op returning `(0, 0, 0)`. Mirrors upstream: `sqlite3WalCheckpoint` returns OK with
+/// `pnLog = 0` when there is no WAL.
+#[test]
+fn rustqlite_wal_checkpoint_on_rollback_mode_db() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("ckprb");
+    // Create a database in the default rollback-journal mode (no PRAGMA journal_mode = wal).
+    db.run("CREATE TABLE t(a);");
+    db.run("INSERT INTO t VALUES (7);");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "PRAGMA wal_checkpoint;").expect("prepare");
+        let rows = collect(&mut stmt);
+        // No WAL → (busy=0, log=0, checkpointed=0).
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int(0));
+        assert_eq!(rows[0][1], Value::Int(0));
+        assert_eq!(rows[0][2], Value::Int(0));
+    }
+
+    // The rows are untouched.
+    assert_eq!(db.run("SELECT a FROM t;"), "7");
+}
+
+/// After a TRUNCATE checkpoint, Rustqlite can write more rows (the next commit appends fresh
+/// frames to the truncated WAL, with the new salts). Verifies the WAL restart works.
+#[test]
+fn rustqlite_wal_write_after_truncate_checkpoint() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("ckpwa");
+    db.run("PRAGMA journal_mode = wal;");
+    db.run("CREATE TABLE t(a);");
+    db.run("INSERT INTO t VALUES (1);");
+
+    // Checkpoint TRUNCATE.
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "PRAGMA wal_checkpoint(TRUNCATE);").expect("prepare");
+        let _ = collect(&mut stmt);
+    }
+    let wal_size = std::fs::metadata(format!("{}-wal", db.str()))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    assert_eq!(wal_size, 0, "WAL should be truncated to 0 bytes");
+
+    // Rustqlite writes more rows after the checkpoint.
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (2), (3);")
+            .expect("prepare");
+        match stmt.step() {
+            ResultCode::Done => {}
+            other => panic!("unexpected step result {other:?}: {}", stmt.errmsg()),
+        }
+    }
+
+    // A fresh Rustqlite connection sees all 3 rows (via the WAL recovery).
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a FROM t ORDER BY a;")
+            .expect("prepare");
+        let rows = collect(&mut stmt);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0], Value::Int(1));
+        assert_eq!(rows[1][0], Value::Int(2));
+        assert_eq!(rows[2][0], Value::Int(3));
+    }
+
+    // The C oracle also sees all 3 rows.
+    assert_eq!(db.run("SELECT count(*) FROM t;"), "3");
+    assert_eq!(db.run("SELECT a FROM t ORDER BY a;"), "1\n2\n3");
+    assert_eq!(db.run("PRAGMA integrity_check;"), "ok");
+}

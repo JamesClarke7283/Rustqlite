@@ -150,6 +150,7 @@ fn synopsis(inst: &Instruction) -> String {
         Once => format!("once jmp to {p2}"),
         Program => format!("call subprogram r[{p3}]; on ignore jmp to {p2}"),
         Param => format!("r[{p2}]=parent r[{p1}+caller.p1]"),
+        Checkpoint => format!("checkpoint db {p1} mode {p2} -> r[{p3}..{}]", p3 + 3),
         // Cursor/scan/sorter/control opcodes have no concise value synopsis; leave blank.
         _ => String::new(),
     }

@@ -389,6 +389,11 @@ pub enum Opcode {
     /// `Prev p1 p2`: move cursor `p1` to the previous row; jump to `p2` if a row remains,
     /// fall through if at the beginning. Mirrors `OP_Prev` in `vdbe.c`.
     Prev,
+    /// `Checkpoint p1 p2 p3`: run a WAL checkpoint on database `p1` (always 0 — main only) in
+    /// mode `p2` (0=PASSIVE, 1=FULL, 2=RESTART, 3=TRUNCATE) and write three result registers at
+    /// `r[p3..p3+3]`: `r[p3]=0` on success or `1` if busy, `r[p3+1]=` number of frames in the WAL,
+    /// `r[p3+2]=` number of frames checkpointed. Mirrors `OP_Checkpoint` in `vdbe.c`.
+    Checkpoint,
 }
 
 impl Opcode {
@@ -502,6 +507,7 @@ impl Opcode {
             Opcode::ResetSorter => "ResetSorter",
             Opcode::Last => "Last",
             Opcode::Prev => "Prev",
+            Opcode::Checkpoint => "Checkpoint",
         }
     }
 }

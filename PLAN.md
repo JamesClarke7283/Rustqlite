@@ -277,8 +277,8 @@ list every granular item needed.
 - [x] **13.3** `-shm` shared memory file (lock-page, WAL index header, hash tables)
 - [x] **13.4** Pager: WAL mode read path (check WAL for page before reading DB file)
 - [x] **13.5** Pager: WAL mode write path (append frames to WAL instead of journaling DB pages)
-- [ ] **13.6** WAL checkpoint: `PRAGMA wal_checkpoint` (PASSIVE, FULL, RESTART, TRUNCATE)
-- [ ] **13.7** VDBE: `Checkpoint` opcode
+- [x] **13.6** WAL checkpoint: `PRAGMA wal_checkpoint` (PASSIVE, FULL, RESTART, TRUNCATE)
+- [x] **13.7** VDBE: `Checkpoint` opcode
 - [ ] **13.8** VDBE: `JournalMode` opcode (switch between delete/wal/memory/off)
 - [ ] **13.9** VFS: shared-memory `xShmMap`/`xShmLock`/`xShmBarrier`/`xShmUnmap` methods for WAL index
 - [ ] **13.10** `PRAGMA journal_mode` = wal / delete / memory / off / truncate / persist

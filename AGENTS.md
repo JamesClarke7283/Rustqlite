@@ -706,3 +706,26 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   limitation: `PRAGMA journal_mode = wal` (switching from rollback to WAL mode) is M13.10 —
   the database must already be in WAL mode (e.g. created by C SQLite) for the WAL write path
   to engage; `create_fresh` still starts in rollback-journal mode.
+  **13.6–13.7 WAL checkpoint + `OP_Checkpoint`** ✅: `Wal::checkpoint` (mirroring `walCheckpoint`
+  + `sqlite3WalCheckpoint` in `wal.c`) copies the committed frames from the `-wal` sidecar
+  back into the database file, truncates the DB to the committed `n_page`, syncs it (the
+  durable checkpoint commit point), then optionally resets the WAL: `Passive`/`Full` leave
+  the WAL in place; `Restart` writes new salts to the WAL header and resets `mx_frame = 0` so
+  the next writer starts a fresh log; `Truncate` does the same and truncates the `-wal` file
+  to zero bytes (matching `walRestartHdr` + `sqlite3OsTruncate(pWal->pWalFd, 0)`). `Pager::checkpoint`
+  drives it, passing the pager's DB file handle so frames land at the right offset. The new
+  `OP_Checkpoint p1 p2 p3` opcode (mirrors `OP_Checkpoint` in `vdbe.c`) runs the checkpoint
+  in mode `p2` (0=PASSIVE, 1=FULL, 2=RESTART, 3=TRUNCATE — the `SQLITE_CHECKPOINT_*` constants)
+  and writes three result registers at `r[p3..p3+3]`: `r[p3]` = busy flag (0/1), `r[p3+1]` =
+  `pnLog` (frames in the WAL), `r[p3+2]` = `pnCkpt` (frames backfilled). The `PRAGMA
+  wal_checkpoint [ = passive|full|restart|truncate ]` handler (mirrors `PragTyp_WAL_CHECKPOINT`
+  in `pragma.c`) runs the checkpoint synchronously and returns one result row of three
+  columns (`busy`, `log`, `checkpointed`) — the same shape as the C oracle. A no-op
+  `(0, 0, 0)` is returned when the database is not in WAL mode or the WAL is empty. The
+  `CheckpointMode` enum + `CheckpointMode::from_name` parse the mode argument
+  case-insensitively, matching upstream's `sqlite3StrICmp` ladder; an unknown name falls
+  through to PASSIVE (the default). Differential-tested vs the C oracle (5 new cases in
+  `wal_read.rs`: TRUNCATE/PASSIVE/RESTART/default-PASSIVE checkpoints copy frames into the DB
+  file and the C oracle reads them back + `PRAGMA integrity_check` passes; `wal_checkpoint`
+  on a rollback-mode database is a no-op `(0, 0, 0)`; and writes after a TRUNCATE checkpoint
+  append fresh frames to the truncated WAL with the new salts — the WAL restart works).

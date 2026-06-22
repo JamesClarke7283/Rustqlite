@@ -600,6 +600,163 @@ impl Wal {
         self.frame_cksum = Some(running);
         Ok(())
     }
+
+    /// Run a checkpoint: copy the committed frames from the WAL back into the database file,
+    /// then optionally reset the WAL (mirrors `walCheckpoint` + `sqlite3WalCheckpoint` in
+    /// `wal.c`). `db_file` is the open database file (the pager's `self.file`); the WAL frames
+    /// are written into it at their page's offset, and the database is truncated to the
+    /// committed `n_page` and synced (the durable commit point for the checkpoint).
+    ///
+    /// `mode` selects the checkpoint flavor:
+    ///   * `Passive` — copy whatever frames are committed at the moment and return. Does not
+    ///     wait for readers (we have no concurrent readers in this iteration, so this is the
+    ///     same as `Full` for now).
+    ///   * `Full` — copy all committed frames; in this iteration (no concurrent readers), it
+    ///     is identical to `Passive`.
+    ///   * `Restart` — copy all committed frames AND reset the WAL so the next writer starts
+    ///     a fresh log (new salts, `mx_frame = 0`). The WAL file is left in place but with new
+    ///     salts in the header so any pre-restart frames are invalidated.
+    ///   * `Truncate` — like `Restart`, but also truncate the WAL file to zero bytes.
+    ///
+    /// Returns `(n_log, n_ckpt)` — the number of frames in the WAL before the checkpoint and
+    /// the number of frames actually copied (which equals `n_log` when the whole WAL was
+    /// backfilled, the only case we support without concurrent readers). On `Busy` the
+    /// caller surfaces `SQLITE_BUSY`; we never return it here (no concurrent readers yet).
+    pub async fn checkpoint(
+        &mut self,
+        db_file: &dyn VfsFile,
+        mode: CheckpointMode,
+    ) -> Result<(u32, u32)> {
+        let n_log = self.mx_frame;
+        if n_log == 0 {
+            // Nothing to checkpoint.
+            return Ok((0, 0));
+        }
+        let page_size = self.page_size as usize;
+        let frame_size = page_size + WAL_FRAME_HEADER_SIZE;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| Error::corrupt("wal::checkpoint: no WAL file open"))?;
+
+        // Walk frames 1..=mx_frame in order, read each frame's page data, and write it into
+        // the database file at the page's offset. Upstream uses a WalIterator over the
+        // wal-index; since we have the in-memory blocks in frame order and no concurrent
+        // readers can be mid-frame, we re-read each frame from the WAL file directly (matches
+        // `walCheckpoint`'s `sqlite3OsRead(pWal->pWalFd, zBuf, szPage, iOffset)` loop).
+        let mut buf = vec![0u8; frame_size];
+        let salts = [self.header.salt1, self.header.salt2];
+        let mut n_ckpt: u32 = 0;
+        for i_frame in 1..=n_log {
+            let offset = WAL_HEADER_SIZE as u64 + (i_frame as u64 - 1) * frame_size as u64;
+            let n = file.read_at(offset, &mut buf).await?;
+            if n < frame_size {
+                // Truncated tail — stop. This shouldn't happen for committed frames (recovery
+                // already validated them), but a concurrent writer could have extended the
+                // file; the loop walks only the committed prefix so this is unreachable.
+                return Err(Error::corrupt(format!(
+                    "wal::checkpoint: short read for frame {i_frame}"
+                )));
+            }
+            let fh = WalFrameHeader::decode(&buf[..WAL_FRAME_HEADER_SIZE])?;
+            // Validate the salts (a frame from a prior WAL would mismatch and must be
+            // ignored — this is the same check `recover` makes).
+            if fh.salt1 != salts[0] || fh.salt2 != salts[1] {
+                break;
+            }
+            // The page data follows the 24-byte frame header.
+            let data = &buf[WAL_FRAME_HEADER_SIZE..];
+            let db_offset = (fh.page_number as u64 - 1) * page_size as u64;
+            db_file.write_at(db_offset, data).await?;
+            n_ckpt += 1;
+        }
+
+        // Truncate the database to the committed size and sync (the durable commit point).
+        let db_size = self.n_page as u64 * page_size as u64;
+        db_file.truncate(db_size).await?;
+        db_file.sync().await?;
+
+        // For RESTART/TRUNCATE, reset the WAL so the next writer starts a fresh log. New
+        // salts invalidate any stale frames (matches `walRestartHdr`); `mx_frame = 0` makes
+        // the WAL appear empty to a fresh reader. The WAL file is left in place (RESTART) or
+        // truncated to zero (TRUNCATE).
+        match mode {
+            CheckpointMode::Passive | CheckpointMode::Full => {
+                // Leave the WAL state as-is. Upstream keeps the frames in place after a
+                // PASSIVE/FULL checkpoint (a subsequent writer appends at `mx_frame + 1`).
+                // We don't reset `mx_frame` — readers would see the WAL as empty and miss
+                // the un-reset frames. The next commit extends the WAL; this is fine for
+                // single-writer usage (no concurrent readers to confuse).
+                //
+                // NOTE: This is a simplification — upstream's `nBackfill` tracks how much
+                // has been copied so a reader that opens after the checkpoint still finds
+                // the frames via the WAL until a subsequent writer resets the log. We have
+                // no `nBackfill` field; the in-memory index is rebuilt from scratch on
+                // every `Wal::open`, so a fresh reader post-checkpoint re-reads the WAL
+                // (still containing the frames) and re-sees them — that is correct for
+                // PASSIVE/FULL. The frames will be re-copied by the next checkpoint, which
+                // is a wasted effort but not a correctness issue.
+            }
+            CheckpointMode::Restart | CheckpointMode::Truncate => {
+                // Reset the WAL: new salts, mx_frame = 0, drop the in-memory index. The
+                // next writer starts a fresh log at frame 1.
+                let salt1 = next_wal_salt();
+                let salt2 = next_wal_salt();
+                self.header.salt1 = salt1;
+                self.header.salt2 = salt2;
+                self.header.checkpoint_seq = self.header.checkpoint_seq.wrapping_add(1);
+                // Recompute the header checksum over the first 24 bytes.
+                let mut hdr_buf = [0u8; WAL_HEADER_SIZE];
+                self.header.encode(&mut hdr_buf);
+                let big = self.header.checksum_big_endian();
+                let (c0, c1) = wal_checksum(&hdr_buf[0..24], big, 0, 0);
+                self.header.checksum1 = c0;
+                self.header.checksum2 = c1;
+                hdr_buf[24..28].copy_from_slice(&c0.to_be_bytes());
+                hdr_buf[28..32].copy_from_slice(&c1.to_be_bytes());
+                file.write_at(0, &hdr_buf).await?;
+                file.sync().await?;
+                if mode == CheckpointMode::Truncate {
+                    file.truncate(0).await?;
+                }
+                // Reset the in-memory index.
+                self.blocks.clear();
+                self.mx_frame = 0;
+                self.n_page = 0;
+                self.frame_cksum = Some([c0, c1]);
+            }
+        }
+
+        Ok((n_log, n_ckpt))
+    }
+}
+
+/// The checkpoint mode (mirrors the `SQLITE_CHECKPOINT_*` constants in `sqlite3.h`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointMode {
+    /// `SQLITE_CHECKPOINT_PASSIVE` — checkpoint as much as possible without waiting.
+    Passive,
+    /// `SQLITE_CHECKPOINT_FULL` — wait for readers (no-op here; we have no concurrent readers).
+    Full,
+    /// `SQLITE_CHECKPOINT_RESTART` — like FULL, then reset the WAL so the next writer starts
+    /// a fresh log (new salts).
+    Restart,
+    /// `SQLITE_CHECKPOINT_TRUNCATE` — like RESTART, then truncate the WAL file to zero bytes.
+    Truncate,
+}
+
+impl CheckpointMode {
+    /// Parse the `PRAGMA wal_checkpoint(<mode>)` argument (case-insensitive). Matches
+    /// upstream's `sqlite3StrICmp` ladder in `pragma.c`.
+    pub fn from_name(name: &str) -> Option<CheckpointMode> {
+        match name.to_ascii_lowercase().as_str() {
+            "passive" => Some(CheckpointMode::Passive),
+            "full" => Some(CheckpointMode::Full),
+            "restart" => Some(CheckpointMode::Restart),
+            "truncate" => Some(CheckpointMode::Truncate),
+            _ => None,
+        }
+    }
 }
 
 /// Generate a fresh non-zero salt value for the WAL header (mirrors

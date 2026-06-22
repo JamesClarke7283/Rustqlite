@@ -1154,6 +1154,7 @@ fn compile_pragma(db: &mut Sqlite3, sql: &str, pragma: &PragmaStmt) -> Result<Sq
         "integrity_check" | "quick_check" => {
             compile_pragma_integrity_check(db, sql, pragma, name == "quick_check")
         }
+        "wal_checkpoint" => compile_pragma_wal_checkpoint(db, sql, pragma),
         _ => Err(Error::msg(format!("PRAGMA {name} is not supported yet"))),
     }
 }
@@ -1173,6 +1174,61 @@ fn compile_pragma_integrity_check(
         sql: sql.to_string(),
         program: Arc::new(Program::empty()),
         column_names: vec!["integrity_check".to_string()],
+        backing: Backing::Static {
+            rows,
+            cur: None,
+            pos: 0,
+        },
+        explain: 0,
+        counts: None,
+        last_error: None,
+    })
+}
+
+/// `PRAGMA wal_checkpoint [ = passive|full|restart|truncate ]` — checkpoint the WAL into the
+/// database file, returning a single row of three columns: `busy` (0/1), `log` (frames in the
+/// WAL), `checkpointed` (frames backfilled). Mirrors the `PragTyp_WAL_CHECKPOINT` handler in
+/// `pragma.c` which emits `OP_Checkpoint iBt eMode 1` + `OP_ResultRow 1 3`.
+///
+/// The mode maps to `OP_Checkpoint`'s `p2`: PASSIVE=0, FULL=1, RESTART=2, TRUNCATE=3
+/// (the `SQLITE_CHECKPOINT_*` constants). `PRAGMA wal_checkpoint` (no value) defaults to
+/// PASSIVE. An unknown mode name is silently treated as PASSIVE (matching upstream's ladder
+/// that falls through to the default `eMode = SQLITE_CHECKPOINT_PASSIVE`).
+///
+/// If the database is not in WAL mode (no `-wal` sidecar / the pager's `wal` field is `None`),
+/// the checkpoint is a no-op returning `(0, 0, 0)`. Upstream returns the same for a non-WAL
+/// database (it opens the WAL lazily; when there is no WAL, `mxFrame == 0` and `pnLog == 0`).
+fn compile_pragma_wal_checkpoint(
+    db: &mut Sqlite3,
+    sql: &str,
+    pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    use crate::pager::wal::CheckpointMode;
+    // Parse the mode from the value (if any). Upstream accepts `= <mode>` or `(<mode>)` and
+    // defaults to PASSIVE. Unknown names fall through to PASSIVE.
+    let mode = match &pragma.value {
+        Some(PragmaValue::Equal(kind)) | Some(PragmaValue::Paren(kind)) => match kind {
+            PragmaValueKind::Ident(s) => {
+                CheckpointMode::from_name(s).unwrap_or(CheckpointMode::Passive)
+            }
+            _ => CheckpointMode::Passive,
+        },
+        _ => CheckpointMode::Passive,
+    };
+    // Run the checkpoint synchronously (the engine's async path is driven through `block_on`
+    // from the C-API, and a PRAGMA is a one-shot statement — there is no benefit to compiling
+    // it into the VDBE here; the result is captured as a Static row set).
+    let pager = db.pager_arc()?;
+    let (n_log, n_ckpt) = block_on(pager.checkpoint(mode))?;
+    let rows = vec![vec![
+        Value::Int(0), // busy flag (we never go busy in this iteration)
+        Value::Int(n_log as i64),
+        Value::Int(n_ckpt as i64),
+    ]];
+    Ok(Sqlite3Stmt {
+        sql: sql.to_string(),
+        program: Arc::new(Program::empty()),
+        column_names: vec!["busy".to_string(), "log".to_string(), "checkpointed".to_string()],
         backing: Backing::Static {
             rows,
             cur: None,
