@@ -96,8 +96,16 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
 - **M2 — Parser**: 🚧 a working subset grammar (`SELECT`/`CREATE TABLE`/`INSERT` + the full expression
   atom/operator set, including `IS NOT` and **JOIN syntax**); full `parse.y` port pending. Known gap: a bare integer literal
   larger than `i64` (e.g. the exact `-9223372036854775808`) is parsed as REAL rather than special-cased.
-  Most M2 tasks (2.1–2.72) are now done; remaining: 2.73 AST walker, 2.74 name resolution. Note:
-  `build_qualified_name`
+  Most M2 tasks (2.1–2.73) are now done; remaining: 2.74 name resolution. The **2.73 AST walker**
+  (`crates/rustqlite-parser/src/walker.rs`, mirroring `walker.c`) exposes a read-only pre-order
+  [`Visitor`] trait with [`WalkControl::Continue`/`Prune`/`Abort`] semantics and free functions
+  `walk_expr`/`walk_expr_list`/`walk_select`/`walk_select_expr`/`walk_select_from`/`walk_stmt`
+  (plus `walk_window` for window specs). It descends into subqueries, compound arms, CTE bodies,
+  trigger bodies, and the `WINDOW` clause; `Prune` lets a visitor skip a node's children without
+  stopping the walk (e.g. `contains_aggregate` would prune on `Exists`/`Subquery`). Existing manual
+  walks (`contains_aggregate`, `collect_aggregates`, `rewrite_aggregates`, `rewrite_expr`) are
+  not yet migrated — the walker is the infrastructure for 2.74 name resolution and future passes.
+  Note: `build_qualified_name`
   preserves quoted-identifier quotes (e.g. `"col"` stays `"col"`, not unquoted to `col`); unquoting
   is deferred to the full parse.y port. `INDEXED`/`MATCH`/`REGEXP` etc. are reserved in our grammar
   (upstream uses `%fallback ID` so they're contextually reserved); this is a minor divergence.

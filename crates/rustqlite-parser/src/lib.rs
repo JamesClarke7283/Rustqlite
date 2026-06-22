@@ -15,6 +15,7 @@
 mod ast;
 mod error;
 mod expr;
+pub mod walker;
 
 pub use ast::*;
 pub use error::ParseError;

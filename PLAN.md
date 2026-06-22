@@ -1226,5 +1226,5 @@ list every granular item needed.
 
 ### M2 — Parser (Additional Items — Final)
 
-- [ ] **2.73** AST walker infrastructure (`walker.c`-equivalent): tree traversal for expression optimization, name resolution, and constraint checking
+- [x] **2.73** AST walker infrastructure (`walker.c`-equivalent): tree traversal for expression optimization, name resolution, and constraint checking
 - [ ] **2.74** Name resolution (`resolve.c`-equivalent): resolve table/column references, bind parameters, function lookups, and validate types
