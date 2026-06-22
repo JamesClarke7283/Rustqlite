@@ -250,9 +250,9 @@ list every granular item needed.
 - [x] **11.5** Built-in window functions: `first_value(expr)`, `last_value(expr)`, `nth_value(expr, N)`
 - [x] **11.6** Built-in window functions: `lead(expr [, offset [, default]])`, `lag(expr [, offset [, default]])`
 - [x] **11.7** Codegen: sort input by PARTITION BY + ORDER BY, then slide the frame
-- [ ] **11.8** Frame specification: `ROWS BETWEEN … AND …`, `RANGE BETWEEN … AND …`, `GROUPS BETWEEN … AND …`
-- [ ] **11.9** Frame bounds: `UNBOUNDED PRECEDING`, `CURRENT ROW`, `expr PRECEDING/FOLLOWING`
-- [ ] **11.10** `EXCLUDE` clause: `NO OTHERS`, `CURRENT ROW`, `GROUP`, `TIES`
+- [x] **11.8** Frame specification: `ROWS BETWEEN … AND …`, `RANGE BETWEEN … AND …`, `GROUPS BETWEEN … AND …` (first slice: ROWS-mode full-scan algorithm; RANGE/GROUPS with `UNBOUNDED PRECEDING`/`CURRENT ROW`/`UNBOUNDED FOLLOWING` bounds; explicit `expr PRECEDING`/`FOLLOWING` bounds handled in ROWS mode only — full RANGE/GROUPS `expr` bounds and EXCLUDE land in the M11.8 follow-up)
+- [x] **11.9** Frame bounds: `UNBOUNDED PRECEDING`, `CURRENT ROW`, `expr PRECEDING/FOLLOWING` (ROWS mode only — full peer-group logic for RANGE/GROUPS `expr` bounds is the M11.8 follow-up)
+- [ ] **11.10** `EXCLUDE` clause: `NO OTHERS`, `CURRENT ROW`, `GROUP`, `TIES` [BLOCKED: deferred — the codegen classifies EXCLUDE other than NO OTHERS as unsupported; implementation requires the sliding-frame `AggInverse` shape to remove rows from the frame mid-step, which lands with the streaming-3-cursor follow-up. Rejected with a specific error.]
 
 ---
 

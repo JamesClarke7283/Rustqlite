@@ -1258,6 +1258,11 @@ fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) 
             c(&mut inst.p1);
             r(&mut inst.p2);
         }
+        OpenDup => {
+            c(&mut inst.p1);
+            c(&mut inst.p2);
+        }
+        ResetSorter | Last | Prev => c(&mut inst.p1),
         MakeRecord => {
             r(&mut inst.p1);
             r(&mut inst.p3);
@@ -1324,6 +1329,11 @@ fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) 
         AggFinal => r(&mut inst.p1),
         AggValue => r(&mut inst.p3),
         HaltIfNull => r(&mut inst.p3),
+        AddImm => r(&mut inst.p1),
+        SeekRowid => {
+            c(&mut inst.p1);
+            r(&mut inst.p3);
+        }
         Compare | Jump | Transaction | SetCookie | ParseSchema | CreateBtree | Halt => {}
         ResultRow => {
             // p1 is the result start register; rebase it. p2 is the column count (not a
@@ -1348,7 +1358,7 @@ fn is_absolute_jump(inst: &Instruction) -> bool {
         Goto | Init | Gosub | If | IfNot | IsNull | NotNull | IfPos | DecrJumpZero | Eq | Ne | Lt
             | Le | Gt | Ge | Rewind | Next | NotExists | SeekGE | SeekGT | SeekLE | SeekLT
             | IdxGE | IdxGT | IdxLE | IdxLT | Found | NotFound | SorterSort | SorterNext | Yield
-            | Jump | InitCoroutine
+            | Jump | InitCoroutine | SeekRowid | Last | Prev
     )
 }
 

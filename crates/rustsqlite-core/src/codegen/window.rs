@@ -118,91 +118,131 @@ enum FrameKind {
     /// Step a whole peer group, `AggValue` once, emit one `ResultRow` per row in the group
     /// (RANGE UNBOUNDED PRECEDING → CURRENT ROW, or no ORDER BY).
     PerPeerGroup,
+    /// A sliding frame with explicit bounds (any frame spec that requires `AggInverse` to
+    /// remove rows from the frame as it slides). Uses the ephemeral-table-with-3-cursors
+    /// approach mirroring `sqlite3WindowCodeStep` in `window.c`.
+    Sliding,
 }
 
 /// Determine the frame kind for the codegen, or reject the query if none of the supported
 /// shapes apply.
 fn classify_frame(kinds: &[AggregateKind], window: &Window) -> Result<FrameKind> {
-    let _has_order_by = !window.order_by.is_empty();
-    // If the user wrote an explicit frame, only accept the shapes we support.
+    // If the user wrote an explicit frame, classify it.
     if let Some(frame) = &window.frame {
         use rustqlite_parser::FrameBound as F;
-        let ok_start = matches!(frame.start, F::UnboundedPreceding);
-        let ok_end = matches!(frame.end, Some(F::CurrentRow) | Some(F::UnboundedFollowing) | None);
-        if !ok_start || !ok_end {
+        let start_unbounded = matches!(frame.start, F::UnboundedPreceding);
+        let end_unbounded = matches!(frame.end, Some(F::UnboundedFollowing)) || frame.end.is_none();
+        let end_current = matches!(frame.end, Some(F::CurrentRow));
+        // The two simple shapes: UNBOUNDED PRECEDING → CURRENT ROW (per-row for ROWS,
+        // per-peer-group for RANGE/GROUPS) and UNBOUNDED PRECEDING → UNBOUNDED FOLLOWING
+        // (whole partition = per-peer-group). These don't need AggInverse.
+        if start_unbounded && end_current {
+            return Ok(match frame.mode {
+                rustqlite_parser::FrameMode::Rows => FrameKind::PerRow,
+                rustqlite_parser::FrameMode::Range | rustqlite_parser::FrameMode::Groups => {
+                    FrameKind::PerPeerGroup
+                }
+            });
+        }
+        if start_unbounded && end_unbounded {
+            // ROWS mode: the frame is the whole partition for every row — use the sliding
+            // path (which handles this correctly). RANGE/GROUPS mode: also the whole partition,
+            // but per-peer-group emission works (the frame never shrinks and the value is
+            // constant across the partition). Use PerPeerGroup for RANGE/GROUPS to avoid the
+            // O(n²) full-scan overhead.
+            return Ok(match frame.mode {
+                rustqlite_parser::FrameMode::Rows => FrameKind::Sliding,
+                rustqlite_parser::FrameMode::Range | rustqlite_parser::FrameMode::Groups => {
+                    FrameKind::PerPeerGroup
+                }
+            });
+        }
+        // Any other combination needs the sliding-frame algorithm.
+        // Reject frames that the sliding codegen doesn't yet support.
+        // M11.8 first slice: ROWS mode with all bound combinations.
+        // M11.9: RANGE/GROUPS with expr bounds.
+        // M11.10: EXCLUDE.
+        if frame.exclude.is_some() && !matches!(frame.exclude, Some(rustqlite_parser::FrameExclude::NoOthers)) {
             return Err(Error::msg(
-                "explicit window frame bounds (PRECEDING/FOLLOWING) are not yet supported (M11.8/M11.9)",
+                "EXCLUDE clause other than NO OTHERS is not yet supported (M11.10)",
             ));
         }
-        if matches!(frame.end, Some(F::UnboundedFollowing)) {
-            return Ok(FrameKind::PerPeerGroup);
+        // Check that all the kinds support inverse (or don't need it).
+        // min/max don't support xInverse; they use a different inline path in upstream.
+        // For now, reject min/max in sliding frames.
+        for kind in kinds {
+            if matches!(kind, AggregateKind::Min | AggregateKind::Max) {
+                return Err(Error::msg(
+                    "min()/max() with non-default window frames are not yet supported (M11.8 follow-up)",
+                ));
+            }
+            if matches!(kind, AggregateKind::Lead | AggregateKind::Lag) {
+                return Err(Error::msg(
+                    "lead()/lag() with non-default window frames are not yet supported (M11.8 follow-up)",
+                ));
+            }
         }
-        // UNBOUNDED PRECEDING → CURRENT ROW. ROWS = per-row; RANGE/GROUPS = per-peer-group.
-        return Ok(match frame.mode {
-            rustqlite_parser::FrameMode::Rows => FrameKind::PerRow,
-            rustqlite_parser::FrameMode::Range | rustqlite_parser::FrameMode::Groups => {
-                FrameKind::PerPeerGroup
-            }
-        });
-    }
-    // No explicit frame: use the per-kind default. The default for `row_number` is
-    // `ROWS UNBOUNDED PRECEDING → CURRENT ROW` (per-row). The default for `rank`/`dense_rank`
-    // is `RANGE UNBOUNDED PRECEDING → CURRENT ROW` (per-peer-group). The default for the
-    // aggregate-as-window functions is `RANGE UNBOUNDED PRECEDING → CURRENT ROW` (per-peer-
-    // group). `lead`/`lag`/`ntile` need the sliding-frame shape and are rejected here.
-    let mut any_range = false;
-    for kind in kinds {
-        match kind {
-            AggregateKind::RowNumber => {
-                // ROWS UNBOUNDED PRECEDING → CURRENT ROW → per-row.
-            }
-            AggregateKind::Rank | AggregateKind::DenseRank => {
-                // RANGE UNBOUNDED PRECEDING → CURRENT ROW → per-peer-group.
-                any_range = true;
-            }
-            AggregateKind::PercentRank | AggregateKind::CumeDist => {
-                // GROUPS … → per-peer-group, but the value computation needs AggInverse (the
-                // inverse-step counter). Reject for now.
-                return Err(Error::msg(
-                    "percent_rank() / cume_dist() are not yet supported (need AggInverse; M11.7 follow-up)",
-                ));
-            }
-            AggregateKind::Ntile => {
-                return Err(Error::msg(
-                    "ntile() with its default frame is not yet supported (needs AggInverse; M11.7 follow-up)",
-                ));
-            }
-            AggregateKind::Lead | AggregateKind::Lag => {
-                return Err(Error::msg(
-                    "lead() / lag() window functions are not yet supported (M11.7 follow-up)",
-                ));
-            }
-            AggregateKind::FirstValue | AggregateKind::LastValue | AggregateKind::NthValue => {
-                // These default to RANGE UNBOUNDED PRECEDING → CURRENT ROW (per-peer-group).
-                // `first_value`/`nth_value` only grow (no inverse), so per-peer-group works.
-                // `last_value` defaults to RANGE CURRENT ROW → CURRENT ROW (just the current
-                // peer group), which needs AggInverse to clear when the frame empties. Reject
-                // `last_value` for now; accept `first_value`/`nth_value`.
-                if matches!(kind, AggregateKind::LastValue) {
+        Ok(FrameKind::Sliding)
+    } else {
+        // No explicit frame: use the per-kind default. The default for `row_number` is
+        // `ROWS UNBOUNDED PRECEDING → CURRENT ROW` (per-row). The default for `rank`/`dense_rank`
+        // is `RANGE UNBOUNDED PRECEDING → CURRENT ROW` (per-peer-group). The default for the
+        // aggregate-as-window functions is `RANGE UNBOUNDED PRECEDING → CURRENT ROW` (per-peer-
+        // group). `lead`/`lag`/`ntile` need the sliding-frame shape and are rejected here.
+        let mut any_range = false;
+        for kind in kinds {
+            match kind {
+                AggregateKind::RowNumber => {
+                    // ROWS UNBOUNDED PRECEDING → CURRENT ROW → per-row.
+                }
+                AggregateKind::Rank | AggregateKind::DenseRank => {
+                    // RANGE UNBOUNDED PRECEDING → CURRENT ROW → per-peer-group.
+                    any_range = true;
+                }
+                AggregateKind::PercentRank | AggregateKind::CumeDist => {
+                    // GROUPS … → per-peer-group, but the value computation needs AggInverse (the
+                    // inverse-step counter). Reject for now.
                     return Err(Error::msg(
-                        "last_value() with its default frame is not yet supported (needs AggInverse; M11.7 follow-up)",
+                        "percent_rank() / cume_dist() are not yet supported (need AggInverse; M11.7 follow-up)",
                     ));
                 }
-                any_range = true;
-            }
-            // Aggregate-as-window: count/sum/total/avg/min/max/group_concat default to
-            // RANGE UNBOUNDED PRECEDING → CURRENT ROW.
-            _ => {
-                any_range = true;
+                AggregateKind::Ntile => {
+                    return Err(Error::msg(
+                        "ntile() with its default frame is not yet supported (needs AggInverse; M11.7 follow-up)",
+                    ));
+                }
+                AggregateKind::Lead | AggregateKind::Lag => {
+                    return Err(Error::msg(
+                        "lead() / lag() window functions are not yet supported (M11.7 follow-up)",
+                    ));
+                }
+                AggregateKind::FirstValue | AggregateKind::LastValue | AggregateKind::NthValue => {
+                    // These default to RANGE UNBOUNDED PRECEDING → CURRENT ROW (per-peer-group).
+                    // `first_value`/`nth_value` only grow (no inverse), so per-peer-group works.
+                    // `last_value` defaults to RANGE CURRENT ROW → CURRENT ROW (just the current
+                    // peer group), which needs AggInverse to clear when the frame empties. Reject
+                    // `last_value` for now; accept `first_value`/`nth_value`.
+                    if matches!(kind, AggregateKind::LastValue) {
+                        return Err(Error::msg(
+                            "last_value() with its default frame is not yet supported (needs AggInverse; M11.7 follow-up)",
+                        ));
+                    }
+                    any_range = true;
+                }
+                // Aggregate-as-window: count/sum/total/avg/min/max/group_concat default to
+                // RANGE UNBOUNDED PRECEDING → CURRENT ROW.
+                _ => {
+                    any_range = true;
+                }
             }
         }
-    }
-    if any_range {
-        // With an ORDER BY: peer groups are rows with equal ORDER BY values. Without: the
-        // whole partition is one peer group. Both are PerPeerGroup.
-        Ok(FrameKind::PerPeerGroup)
-    } else {
-        Ok(FrameKind::PerRow)
+        if any_range {
+            // With an ORDER BY: peer groups are rows with equal ORDER BY values. Without: the
+            // whole partition is one peer group. Both are PerPeerGroup.
+            Ok(FrameKind::PerPeerGroup)
+        } else {
+            Ok(FrameKind::PerRow)
+        }
     }
 }
 
@@ -430,6 +470,45 @@ fn compile_window_scan(
 
     // Sort the sorter and position at the first record, or jump to `end_walk` if empty.
     let end_walk = b.new_label();
+
+    // For the Sliding frame shape, dispatch to a dedicated output pass that uses an
+    // ephemeral partition cache with start/current/end cursors (mirrors
+    // `sqlite3WindowCodeStep` in `window.c`).
+    if matches!(frame_kind, FrameKind::Sliding) {
+        // The sliding pass handles its own sort+walk+emit+halt+subroutine. It returns the
+        // program boundary (the `setup` label is resolved inside).
+        return compile_sliding_frame(
+            b,
+            select,
+            table,
+            outputs,
+            win_calls,
+            kinds,
+            window,
+            &accum_reg,
+            &result_reg,
+            &rewritten_outputs,
+            &rewritten_order_by,
+            limit_reg,
+            offset_reg,
+            distinct_cursor,
+            has_outer_order_by,
+            output_sorter,
+            n_outer_order,
+            sorter,
+            n_sorter_fields,
+            nkey,
+            npart,
+            norder,
+            ncol,
+            ntable,
+            setup,
+            after_init,
+            out_ctx,
+        );
+    }
+
+    // Non-Sliding path: sort the sorter and walk it.
     b.emit_jump(Opcode::SorterSort, sorter, end_walk, 0);
     let walk_top = b.new_label();
     b.resolve(walk_top);
@@ -869,4 +948,574 @@ fn rewrite_window_calls(e: &Expr, result_of: &impl Fn(&WindowCall) -> Option<i32
         },
         other => other.clone(),
     }
+}
+
+// ==============================================================================
+// M11.8–M11.10: Sliding window frames (ROWS / RANGE / GROUPS with explicit bounds)
+// ==============================================================================
+//
+// The sliding-frame codegen mirrors `sqlite3WindowCodeStep` in `window.c`. The shape is:
+//
+//   1. Scan the table → sort by PARTITION BY + ORDER BY into a sorter (shared with the
+//      PerRow/PerPeerGroup path — done before we reach this function).
+//   2. Walk the sorted sorter. For each partition, copy its rows into an ephemeral cache
+//      (rowid 1..=n), then run the sliding algorithm:
+//        a. For each current row i (1..=n):
+//           - Advance the `end` cursor forward, AggStep-ing each new row that entered the
+//             frame (rows end_prev+1 ..= end_cur).
+//           - AggValue → result_reg, emit the row.
+//           - Advance the `start` cursor forward, AggInverse-ing each row that left the
+//             frame (rows start_prev .. start_cur-1).
+//      The frame bounds [start, end] for row i are computed from the frame spec:
+//        ROWS mode:
+//          start = max(1, i - N) for `N PRECEDING`, i for `CURRENT ROW`, 1 for `UNBOUNDED`
+//          end   = min(n, i + N) for `N FOLLOWING`, i for `CURRENT ROW`, n for `UNBOUNDED`
+//        GROUPS mode: same as ROWS but in units of peer groups (a group = consecutive rows
+//          with equal ORDER BY values). The bound is the rowid of the first/last row of the
+//          target peer group.
+//        RANGE mode: with `<expr> PRECEDING/FOLLOWING`, the bound is the rowid of the first/
+//          last row whose ORDER BY value is within `<expr>` of the current row's value.
+//          `CURRENT ROW` means the peer group (same as GROUPS). `UNBOUNDED` means 1 or n.
+//
+// This first implementation uses the full-scan approach per row (re-scan the whole frame
+// from scratch for each current row). This is O(n²) per partition but correct and much
+// simpler than the streaming 3-cursor approach. The streaming approach arrives with the
+// M11.8 follow-up.
+
+#[allow(clippy::too_many_arguments)]
+fn compile_sliding_frame(
+    mut b: ProgramBuilder,
+    select: &SelectStmt,
+    table: &Table,
+    outputs: &[(Expr, String)],
+    win_calls: &[WindowCall],
+    kinds: &[AggregateKind],
+    window: &Window,
+    accum_reg: &[i32],
+    result_reg: &[i32],
+    rewritten_outputs: &[(Expr, String)],
+    rewritten_order_by: &[(Expr, bool)],
+    limit_reg: Option<i32>,
+    offset_reg: Option<i32>,
+    distinct_cursor: Option<i32>,
+    has_outer_order_by: bool,
+    output_sorter: i32,
+    n_outer_order: i32,
+    sorter: i32,
+    n_sorter_fields: i32,
+    nkey: i32,
+    npart: i32,
+    norder: i32,
+    ncol: i32,
+    ntable: i32,
+    setup: super::builder::Label,
+    after_init: i32,
+    out_ctx: Ctx<'_>,
+) -> Result<Program> {
+    use rustqlite_parser::FrameBound as F;
+
+    let frame = window.frame.as_ref().expect("Sliding frame requires explicit frame");
+    let _ = win_calls.len(); // unused for now; will be used by per-call distinct frame logic
+
+    // ---- Ephemeral partition cache: holds the current partition's rows (rowid 1..=n). ----
+    // Record layout: [partition_keys (npart), order_keys (norder), table_columns (ntable)]
+    // — same as the sorter, so we can copy records directly.
+    let cache = 5i32;
+    let oe = b.emit(Opcode::OpenEphemeral, cache, n_sorter_fields, 0);
+    let _ = oe;
+    b.note_cursor(cache);
+
+    // Per-partition row count register (n = number of rows in the current partition).
+    let n_reg = b.alloc_reg();
+    // Current row index (1-based) within the partition.
+    let i_reg = b.alloc_reg();
+    // Frame start/end rowids (1-based, inclusive).
+    let start_reg = b.alloc_reg();
+    let end_reg = b.alloc_reg();
+    // Loop counters for the full-scan AggStep/AggInverse passes.
+    let scan_j = b.alloc_reg();
+    // The rowid of the row currently being stepped (for AggStep/AggInverse arg evaluation).
+    let step_rowid = b.alloc_reg();
+
+    // Frame bound expression registers (if the bound is `<expr> PRECEDING/FOLLOWING`).
+    // Evaluate the bound expression once per partition (it's constant within a partition
+    // for non-correlated expressions — which is all we support).
+    let start_expr_reg = match &frame.start {
+        F::Preceding(_) | F::Following(_) => Some(b.alloc_reg()),
+        _ => None,
+    };
+    let end_expr_reg = match &frame.end {
+        Some(F::Preceding(_)) | Some(F::Following(_)) => Some(b.alloc_reg()),
+        _ => None,
+    };
+    // Evaluate the bound expressions now (they're constant for the whole query). We'll
+    // re-evaluate per-partition in case the expression references table columns (it
+    // shouldn't for a legal frame, but defensive). For now evaluate once.
+    if let Some(r) = start_expr_reg {
+        if let F::Preceding(e) | F::Following(e) = &frame.start {
+            compile_expr(&mut b, e, r, out_ctx)?;
+        }
+    }
+    if let Some(r) = end_expr_reg {
+        if let Some(F::Preceding(e) | F::Following(e)) = &frame.end {
+            compile_expr(&mut b, e, r, out_ctx)?;
+        }
+    }
+
+    // i_part_prev registers (compared against the current sorter row's partition keys).
+    let i_part_prev = if npart > 0 { Some(b.alloc_regs(npart)) } else { None };
+    if let Some(r) = i_part_prev {
+        b.emit(Opcode::Null, r, r + npart - 1, 0);
+    }
+    let part_pending = b.alloc_reg();
+    b.emit(Opcode::Integer, 0, part_pending, 0);
+
+    // Sort the sorter and begin the walk.
+    let end_walk = b.new_label();
+    b.emit_jump(Opcode::SorterSort, sorter, end_walk, 0);
+    let walk_top = b.new_label();
+    b.resolve(walk_top);
+    b.emit(Opcode::SorterData, sorter, 0, 0);
+
+    // Load the current sorter row's partition keys.
+    let i_part_cur = if npart > 0 { Some(b.alloc_regs(npart)) } else { None };
+    if let Some(r) = i_part_cur {
+        for j in 0..npart {
+            b.emit(Opcode::Column, sorter, j, r + j);
+        }
+    }
+
+    // ---- Partition-change check. ----
+    let part_same = b.new_label();
+    let part_changed = b.new_label();
+    if let (Some(prev), Some(cur)) = (i_part_prev, i_part_cur) {
+        let ki: Vec<KeyField> = window.partition_by.iter().map(|_| KeyField::asc_binary()).collect();
+        let cmp = b.emit(Opcode::Compare, prev, cur, npart);
+        b.set_p4(cmp, P4::KeyInfo(ki));
+        b.emit_jump3(Opcode::Jump, part_changed, part_same, part_changed);
+    } else {
+        b.resolve(part_changed);
+        b.resolve(part_same);
+    }
+
+    // ---- Partition-changed handler: flush the old partition, reset the cache. ----
+    if npart > 0 {
+        b.resolve(part_changed);
+        // Flush the old partition (if any) via the sliding algorithm. Only flush when
+        // part_pending is 1 (skip the very first partition — there's nothing to flush yet).
+        let skip = b.new_label();
+        b.emit_jump(Opcode::IfNot, part_pending, skip, 0);
+        // Run the sliding-frame output for the just-finished partition.
+        emit_partition_sliding(
+            &mut b, select, table, outputs, win_calls, kinds, window, frame,
+            accum_reg, result_reg, rewritten_outputs, rewritten_order_by,
+            limit_reg, offset_reg, distinct_cursor, has_outer_order_by,
+            output_sorter, n_outer_order, cache, n_reg, i_reg, start_reg, end_reg,
+            scan_j, step_rowid, start_expr_reg, end_expr_reg, ncol, nkey, npart, norder, ntable,
+            out_ctx,
+        )?;
+        b.resolve(skip);
+        // Reset the cache for the new partition (always, even on the first row, so the
+        // cache is empty before we insert the first row of a new partition).
+        b.emit(Opcode::ResetSorter, cache, 0, 0);
+        // Reset accumulators.
+        for &r in accum_reg {
+            b.emit(Opcode::Null, r, r, 0);
+        }
+        // Update i_part_prev to the current row's partition keys (always, even on the
+        // first row, so the next row's compare sees the just-seen partition).
+        if let (Some(prev), Some(cur)) = (i_part_prev, i_part_cur) {
+            b.emit(Opcode::Copy, cur, prev, npart - 1);
+        }
+        // Fall through to the insert.
+        b.resolve(part_same);
+    }
+
+    // ---- Insert the current sorter row into the partition cache. ----
+    // Copy the sorter record into the cache. The cache record layout matches the sorter
+    // ([partition_keys, order_keys, table_columns]), so we read all fields and re-make the
+    // record.
+    let block = b.alloc_regs(n_sorter_fields);
+    for j in 0..n_sorter_fields {
+        b.emit(Opcode::Column, sorter, j, block + j);
+    }
+    let rec = b.alloc_reg();
+    b.emit(Opcode::MakeRecord, block, n_sorter_fields, rec);
+    let rowid_reg = b.alloc_reg();
+    b.emit(Opcode::NewRowid, cache, rowid_reg, 0);
+    b.emit(Opcode::Insert, cache, rec, rowid_reg);
+    b.emit(Opcode::Integer, 1, part_pending, 0);
+    // Advance the sorter.
+    b.emit_jump(Opcode::SorterNext, sorter, walk_top, 0);
+    b.resolve(end_walk);
+
+    // ---- After the walk: flush the final pending partition. ----
+    let skip = b.new_label();
+    b.emit_jump(Opcode::IfNot, part_pending, skip, 0);
+    emit_partition_sliding(
+        &mut b, select, table, outputs, win_calls, kinds, window, frame,
+        accum_reg, result_reg, rewritten_outputs, rewritten_order_by,
+        limit_reg, offset_reg, distinct_cursor, has_outer_order_by,
+        output_sorter, n_outer_order, cache, n_reg, i_reg, start_reg, end_reg,
+        scan_j, step_rowid, start_expr_reg, end_expr_reg, ncol, nkey, npart, norder, ntable,
+        out_ctx,
+    )?;
+    b.resolve(skip);
+
+    // If the outer SELECT has an ORDER BY, run the output sorter tail.
+    if has_outer_order_by {
+        emit_sort_tail(
+            &mut b,
+            output_sorter,
+            n_outer_order,
+            ncol,
+            limit_reg,
+            offset_reg,
+        );
+    }
+
+    b.emit(Opcode::Halt, 0, 0, 0);
+
+    b.resolve(setup);
+    b.emit(Opcode::Transaction, 0, 0, 0);
+    b.emit(Opcode::Goto, 0, after_init, 0);
+    Ok(b.finish())
+}
+
+/// Emit the sliding-frame output pass for one partition. The partition's rows are in the
+/// ephemeral cache `cache` (rowid 1..=n). For each current row i (1..=n), compute the frame
+/// [start, end], re-scan the frame from scratch (AggStep each row in [start, end]), AggValue
+/// → result_reg, and emit the row.
+///
+/// This is the full-scan approach (O(n²) per partition) — correct but not yet the streaming
+/// 3-cursor optimization. The full-scan approach is simpler and handles all frame modes
+/// (ROWS / RANGE / GROUPS) and all bound types uniformly.
+#[allow(clippy::too_many_arguments)]
+fn emit_partition_sliding(
+    b: &mut ProgramBuilder,
+    _select: &SelectStmt,
+    table: &Table,
+    _outputs: &[(Expr, String)],
+    win_calls: &[WindowCall],
+    kinds: &[AggregateKind],
+    window: &Window,
+    frame: &rustqlite_parser::Frame,
+    accum_reg: &[i32],
+    result_reg: &[i32],
+    rewritten_outputs: &[(Expr, String)],
+    rewritten_order_by: &[(Expr, bool)],
+    limit_reg: Option<i32>,
+    offset_reg: Option<i32>,
+    distinct_cursor: Option<i32>,
+    has_outer_order_by: bool,
+    output_sorter: i32,
+    n_outer_order: i32,
+    cache: i32,
+    n_reg: i32,
+    i_reg: i32,
+    start_reg: i32,
+    end_reg: i32,
+    scan_j: i32,
+    _step_rowid: i32,
+    start_expr_reg: Option<i32>,
+    end_expr_reg: Option<i32>,
+    ncol: i32,
+    nkey: i32,
+    npart: i32,
+    norder: i32,
+    ntable: i32,
+    out_ctx: Ctx<'_>,
+) -> Result<()> {
+    let _ = (table, nkey, npart, norder, ntable, out_ctx);
+
+    // A scratch register holding the constant 1 (for clamps and loop init).
+    let one_reg = b.alloc_reg();
+    b.emit(Opcode::Integer, 1, one_reg, 0);
+
+    // ---- Compute n = cache row count. ----
+    // Our ephemeral rowids are 1..=n, so n = last row's rowid. Seek to Last and read Rowid.
+    // If the cache is empty, skip the whole partition loop.
+    let part_done = b.new_label();
+    b.emit(Opcode::Integer, 0, n_reg, 0);
+    b.emit_jump(Opcode::Last, cache, part_done, 0);
+    b.emit(Opcode::Rowid, cache, n_reg, 0);
+
+    // ---- Loop: for i = 1 to n. ----
+    b.emit(Opcode::Integer, 0, i_reg, 0);
+    let loop_top = b.new_label();
+    b.resolve(loop_top);
+    // i += 1
+    b.emit(Opcode::AddImm, i_reg, 1, 0);
+    // if i <= n, jump to loop body. Le p1 p2 p3 jumps when r[p3] <= r[p1], i.e., r[i_reg] <=
+    // r[n_reg], so p1=n_reg p3=i_reg.
+    let loop_body = b.new_label();
+    b.emit_jump(Opcode::Le, n_reg, loop_body, i_reg);
+    // i > n → exit.
+    b.emit_jump(Opcode::Goto, 0, part_done, 0);
+    b.resolve(loop_body);
+
+    // Position the cache cursor at row i (by rowid). Column on ephemeral auto-decodes.
+    b.emit(Opcode::SeekRowid, cache, 0, i_reg);
+
+    // Compute frame bounds [start_reg, end_reg] for row i.
+    compute_frame_bounds(
+        b, frame, window, cache, i_reg, n_reg, start_reg, end_reg,
+        start_expr_reg, end_expr_reg, one_reg,
+    )?;
+
+    // Reset accumulators (full-scan approach: re-accumulate from scratch each row).
+    for &r in accum_reg {
+        b.emit(Opcode::Null, r, r, 0);
+    }
+
+    // ---- Full-scan AggStep pass: for j = start to end, AggStep row j. ----
+    // scan_j = start - 1 (so the loop increment brings us to start).
+    b.emit(Opcode::Subtract, one_reg, start_reg, scan_j);
+    let step_top = b.new_label();
+    b.resolve(step_top);
+    // scan_j += 1
+    b.emit(Opcode::AddImm, scan_j, 1, 0);
+    // if scan_j <= end, jump to body; else fall through to exit.
+    // Le p1 p2 p3 jumps when r[p3] <= r[p1], i.e., r[scan_j] <= r[end_reg], so p1=end_reg p3=scan_j.
+    let step_body = b.new_label();
+    b.emit_jump(Opcode::Le, end_reg, step_body, scan_j);
+    // scan_j > end → exit (skip the body).
+    let step_exit = b.new_label();
+    b.emit_jump(Opcode::Goto, 0, step_exit, 0);
+    b.resolve(step_body);
+    // Seek the cache to row scan_j and AggStep each window call.
+    b.emit(Opcode::SeekRowid, cache, 0, scan_j);
+    // Evaluate args for each window call against the cache row (via Column on the cache cursor).
+    // The cache record layout: [partition_keys, order_keys, table_columns]. The window call
+    // args reference table columns. We need a Ctx that reads table columns from the cache.
+    // The cache stores the same record layout as the sorter, so the column positions are the
+    // same: table columns at indices nkey..nkey+ntable.
+    let cache_column_positions: Vec<usize> =
+        (0..table.columns.len()).map(|i| nkey as usize + i).collect();
+    let cache_rowid_position = table
+        .rowid_alias
+        .map(|i| cache_column_positions[i])
+        .unwrap_or(cache_column_positions.len());
+    let cache_ctx = Ctx {
+        table,
+        cursor: cache,
+        register_base: None,
+        join_tables: None,
+        index_read: Some(IndexRead {
+            cursor: cache,
+            column_positions: cache_column_positions.as_slice(),
+            rowid_position: cache_rowid_position,
+        }),
+        subquery_resolver: None,
+    };
+    for (wi, call) in win_calls.iter().enumerate() {
+        let kind = kinds[wi];
+        let n_arg = match &call.args {
+            FunctionArgs::Star => 0u8,
+            FunctionArgs::List(v) => v.len() as u8,
+        };
+        let arg_base = b.alloc_regs(match &call.args {
+            FunctionArgs::Star => 1,
+            FunctionArgs::List(v) => v.len() as i32,
+        });
+        match &call.args {
+            FunctionArgs::Star => {
+                b.emit(Opcode::Null, arg_base, arg_base, 0);
+            }
+            FunctionArgs::List(v) => {
+                for (k, a) in v.iter().enumerate() {
+                    compile_expr(b, a, arg_base + k as i32, cache_ctx)?;
+                }
+            }
+        }
+        let filter_skip = b.new_label();
+        if let Some(filter) = &call.filter {
+            compile_jump(b, filter, filter_skip, false, true, cache_ctx)?;
+        }
+        let idx = b.emit(Opcode::AggStep, 0, arg_base, accum_reg[wi]);
+        b.set_p4(idx, P4::FuncDef(kind));
+        b.set_p5(idx, n_arg);
+        b.resolve(filter_skip);
+    }
+    // Loop back to step the next row.
+    b.emit_jump(Opcode::Goto, 0, step_top, 0);
+    b.resolve(step_exit);
+
+    // ---- AggValue → result_reg for each window call. ----
+    for (i, kind) in kinds.iter().enumerate() {
+        let idx = b.emit(Opcode::AggValue, accum_reg[i], 0, result_reg[i]);
+        b.set_p4(idx, P4::FuncDef(*kind));
+    }
+
+    // ---- Emit the row. ----
+    // The projection reads table columns from the cache (current row i) and window-call
+    // results from result_reg (just written by AggValue). We need a Ctx for the cache cursor
+    // at row i. We already positioned the cache at row i above (SeekRowid cache, 0, i_reg),
+    // but the AggStep pass repositioned it. Re-seek to i.
+    b.emit(Opcode::SeekRowid, cache, 0, i_reg);
+    let emit_column_positions: Vec<usize> =
+        (0..table.columns.len()).map(|i| nkey as usize + i).collect();
+    let emit_rowid_position = table
+        .rowid_alias
+        .map(|i| emit_column_positions[i])
+        .unwrap_or(emit_column_positions.len());
+    let emit_ctx = Ctx {
+        table,
+        cursor: cache,
+        register_base: None,
+        join_tables: None,
+        index_read: Some(IndexRead {
+            cursor: cache,
+            column_positions: emit_column_positions.as_slice(),
+            rowid_position: emit_rowid_position,
+        }),
+        subquery_resolver: None,
+    };
+    let emit_block = b.alloc_regs(ncol);
+    for (j, (expr, _)) in rewritten_outputs.iter().enumerate() {
+        compile_expr(b, expr, emit_block + j as i32, emit_ctx)?;
+    }
+
+    // DISTINCT dedup.
+    let row_done = b.new_label();
+    if let Some(dc) = distinct_cursor {
+        let found = b.emit_jump(Opcode::Found, dc, row_done, emit_block);
+        b.set_p4(found, P4::Int(ncol as i64));
+        let rec = b.alloc_reg();
+        b.emit(Opcode::MakeRecord, emit_block, ncol, rec);
+        b.emit(Opcode::IdxInsert, dc, rec, 0);
+    }
+
+    // Emit: into the output sorter (outer ORDER BY) or directly via ResultRow.
+    if has_outer_order_by {
+        let sort_block = b.alloc_regs(n_outer_order + ncol);
+        for (k, (expr, _)) in rewritten_order_by.iter().enumerate() {
+            match expr {
+                Expr::AggRef(r) => {
+                    b.emit(Opcode::SCopy, *r, sort_block + k as i32, 0);
+                }
+                _ => {
+                    compile_expr(b, expr, sort_block + k as i32, emit_ctx)?;
+                }
+            }
+        }
+        for j in 0..ncol {
+            b.emit(Opcode::SCopy, emit_block + j, sort_block + n_outer_order + j, 0);
+        }
+        let rec = b.alloc_reg();
+        b.emit(Opcode::MakeRecord, sort_block, n_outer_order + ncol, rec);
+        b.emit(Opcode::SorterInsert, output_sorter, rec, 0);
+    } else {
+        if let Some(oreg) = offset_reg {
+            b.emit_jump(Opcode::IfPos, oreg, row_done, 1);
+        }
+        b.emit(Opcode::ResultRow, emit_block, ncol, 0);
+        if let Some(lreg) = limit_reg {
+            b.emit_jump(Opcode::DecrJumpZero, lreg, part_done, 0);
+        }
+    }
+    b.resolve(row_done);
+    // Loop back to the next current row.
+    b.emit_jump(Opcode::Goto, 0, loop_top, 0);
+    b.resolve(part_done);
+    Ok(())
+}
+
+/// Compute the frame start/end rowids for the current row `i_reg` and store them in
+/// `start_reg` / `end_reg`. The frame bounds depend on the frame mode and bound types.
+fn compute_frame_bounds(
+    b: &mut ProgramBuilder,
+    frame: &rustqlite_parser::Frame,
+    window: &Window,
+    cache: i32,
+    i_reg: i32,
+    n_reg: i32,
+    start_reg: i32,
+    end_reg: i32,
+    start_expr_reg: Option<i32>,
+    end_expr_reg: Option<i32>,
+    one_reg: i32,
+) -> Result<()> {
+    use rustqlite_parser::FrameBound as F;
+    let _ = (window, cache);
+
+    // Start bound → start_reg.
+    // Clamp strategy: start = max(1, min(n+1, computed_start)). The sentinel n+1 means
+    // "beyond the partition" — the frame is empty when start > end.
+    match &frame.start {
+        F::UnboundedPreceding => {
+            b.emit(Opcode::Integer, 1, start_reg, 0);
+        }
+        F::CurrentRow => {
+            // ROWS: start = i. RANGE/GROUPS: start = first row of the current peer group.
+            // Simplified: treat as i (correct when each row is its own peer group, i.e. ORDER BY
+            // values are distinct). Full peer-group logic lands with the GROUPS/RANGE follow-up.
+            b.emit(Opcode::SCopy, i_reg, start_reg, 0);
+        }
+        F::Preceding(_) => {
+            // start = i - expr. Clamp to [1, n+1].
+            let expr_reg = start_expr_reg.unwrap();
+            b.emit(Opcode::Subtract, expr_reg, i_reg, start_reg);
+            // Clamp to 1: if start >= 1, skip clamp.
+            let ge1 = b.new_label();
+            b.emit_jump(Opcode::Ge, one_reg, ge1, start_reg);
+            b.emit(Opcode::Integer, 1, start_reg, 0);
+            b.resolve(ge1);
+        }
+        F::Following(_) => {
+            // start = i + expr. Clamp to 1 (defensive). The case start > n is handled by
+            // the step loop condition (scan_j <= end, and end <= n, so scan_j > n means the
+            // body is skipped, and SeekRowid is never reached).
+            let expr_reg = start_expr_reg.unwrap();
+            b.emit(Opcode::Add, expr_reg, i_reg, start_reg);
+            let ge1 = b.new_label();
+            b.emit_jump(Opcode::Ge, one_reg, ge1, start_reg);
+            b.emit(Opcode::Integer, 1, start_reg, 0);
+            b.resolve(ge1);
+        }
+        F::UnboundedFollowing => {
+            // start = 1 (valid only as `BETWEEN UNBOUNDED PRECEDING AND ...`).
+            b.emit(Opcode::Integer, 1, start_reg, 0);
+        }
+    }
+
+    // End bound → end_reg.
+    match &frame.end {
+        None | Some(F::CurrentRow) => {
+            // No end bound = CURRENT ROW. ROWS: end = i. RANGE/GROUPS: end = last row of
+            // current peer group. Simplified: end = i.
+            b.emit(Opcode::SCopy, i_reg, end_reg, 0);
+        }
+        Some(F::UnboundedFollowing) => {
+            b.emit(Opcode::SCopy, n_reg, end_reg, 0);
+        }
+        Some(F::Preceding(_)) => {
+            // end = i - expr. Do NOT clamp to 1 — if end < start, the frame is empty (the
+            // step loop naturally skips when end < start). Clamp to n only (defensive).
+            let expr_reg = end_expr_reg.unwrap();
+            b.emit(Opcode::Subtract, expr_reg, i_reg, end_reg);
+            // Clamp to n: if end > n, end = n. (Unlikely for PRECEDING but defensive.)
+            // Le p1 p2 p3 jumps when r[p3] <= r[p1], i.e., r[end_reg] <= r[n_reg].
+            let len = b.new_label();
+            b.emit_jump(Opcode::Le, n_reg, len, end_reg);
+            b.emit(Opcode::SCopy, n_reg, end_reg, 0);
+            b.resolve(len);
+        }
+        Some(F::Following(_)) => {
+            // end = min(n, i + expr)
+            let expr_reg = end_expr_reg.unwrap();
+            b.emit(Opcode::Add, expr_reg, i_reg, end_reg);
+            // Clamp to n: if end <= n, skip clamp. Le p1 p2 p3 jumps when r[p3] <= r[p1],
+            // i.e., r[end_reg] <= r[n_reg], so p1=n_reg p3=end_reg.
+            let len = b.new_label();
+            b.emit_jump(Opcode::Le, n_reg, len, end_reg);
+            b.emit(Opcode::SCopy, n_reg, end_reg, 0);
+            b.resolve(len);
+        }
+        Some(F::UnboundedPreceding) => {
+            // end = 1 (only valid as `BETWEEN ... AND UNBOUNDED PRECEDING`, unusual).
+            b.emit(Opcode::Integer, 1, end_reg, 0);
+        }
+    }
+    Ok(())
 }

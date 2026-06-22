@@ -492,12 +492,38 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   `FILTER (WHERE expr)`, multiple window calls sharing one `OVER` spec, outer `WHERE`/
   `ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT`, and the aggregate-as-window functions
   (`count`/`sum`/`total`/`avg`/`min`/`max`/`group_concat`). Differential-tested vs the C
-  oracle (`window_functions` — 40+ queries covering all supported shapes). Still M11:
-  **11.8** the full frame-spec (`ROWS`/`RANGE`/`GROUPS` bounds with `<expr> PRECEDING`/
-  `FOLLOWING`), **11.9** frame bound expressions, and **11.10** the `EXCLUDE` clause. Known
-  gaps: `lead`/`lag`/`ntile`/`last_value`/`percent_rank`/`cume_dist` are rejected at codegen
-  time (their default frames need the sliding-frame `AggInverse` shape, which lands with the
-  M11.7 follow-up); multiple *different* `OVER` specs in one query are rejected (the follow-up
-  lowers each distinct window separately); `ORDER BY` on the outer query that references
-  non-projection columns in the PerPeerGroup flush pass may read NULL (the peer-buf only
-  carries projection columns — the follow-up carries the full row).
+  oracle (`window_functions` — 40+ queries covering all supported shapes).
+  **11.8–11.9 sliding window frames (first slice)** ✅: `codegen::window::compile_sliding_frame`
+  lowers a `SELECT` with an explicit `OVER (ORDER BY … <frame>)` (any frame spec other than
+  the two simple shapes handled by PerRow/PerPeerGroup) to a VDBE program using the
+  full-scan-per-row approach (mirrors `sqlite3WindowCodeStep` in `window.c` at a coarser
+  granularity): walk the sorted sorter, copying each partition's rows into an ephemeral
+  partition cache (rowid 1..=n), then for each current row i re-scan the cache from
+  `[start, end]` (computed from the frame bounds), AggStep each row, AggValue → result_reg,
+  emit. This is O(n²) per partition but correct and uniform across frame modes; the
+  streaming-3-cursor optimization lands with the follow-up. Supports: `ROWS BETWEEN <bound>
+  AND <bound>` with `UNBOUNDED PRECEDING`/`CURRENT ROW`/`expr PRECEDING`/`expr FOLLOWING`/
+  `UNBOUNDED FOLLOWING` bounds; `PARTITION BY` (partition cache reset between partitions);
+  `count`/`sum`/`total`/`avg`/`group_concat` in a sliding frame; outer `WHERE`/`ORDER BY`/
+  `LIMIT`/`OFFSET`; `RANGE`/`GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`/`UNBOUNDED
+  FOLLOWING` (routed to the PerPeerGroup path — same result, lower overhead). New VDBE
+  opcodes: `AddImm` (short-form integer add for counters), `SeekRowid` (ephemeral cursor
+  seek by rowid), `ResetSorter` (clear ephemeral/sorter without closing), `Last`
+  (position cursor at last row), `Prev` (reverse-step cursor), `OpenDup` (open a second
+  cursor sharing an ephemeral's storage — runtime infrastructure for the streaming-3-cursor
+  follow-up). The `Ephemeral` struct was refactored to hold its shared state in an
+  `Rc<RefCell<EphemeralData>>` so `OpenDup` can clone the cursor and share storage; gained
+  `seek_rowid`/`len`/`rowid`/`reset`/`dup` helpers. `rebase_operands`/`is_absolute_jump` in
+  `codegen::compound` and `codegen::subquery` learned the new opcodes for sub-program
+  inlining. Differential-tested vs the C oracle (`window_function_frame_specs` — 25+
+  queries; `window_function_frame_spec_unsupported` — verifies graceful error, not crash,
+  for `min()`/`max()` in non-default frames). Still M11: **11.10** the `EXCLUDE` clause
+  (rejected with a specific error in this slice — needs the streaming-3-cursor
+  `AggInverse` shape to remove rows mid-step), full RANGE/GROUPS `<expr>` bounds
+  (peer-group logic for `CURRENT ROW`/`<expr>` — this slice treats `CURRENT ROW` as `i`,
+  which is correct only when ORDER BY values are distinct), and the streaming-3-cursor
+  optimization. Known gaps: `lead`/`lag`/`ntile`/`last_value`/`percent_rank`/`cume_dist`
+  are still rejected at codegen time (their default frames need `AggInverse`); multiple
+  *different* `OVER` specs in one query are still rejected; `ORDER BY` on the outer query
+  that references non-projection columns in the PerPeerGroup flush pass may read NULL (the
+  peer-buf only carries projection columns — the follow-up carries the full row).

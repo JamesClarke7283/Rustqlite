@@ -86,6 +86,14 @@ impl Sorter {
             .and_then(|vals| vals.get(i).cloned())
             .unwrap_or(Value::Null)
     }
+
+    /// Clear all records and reset the iteration position. Used by `OP_ResetSorter` to reset
+    /// a sorter cursor without closing it (mirrors `OP_ResetSorter` in `vdbe.c`).
+    pub fn clear(&mut self) {
+        self.records.clear();
+        self.pos = 0;
+        self.current = None;
+    }
 }
 
 /// Compare two records by their leading sort-key fields, applying each key's DESC flag and

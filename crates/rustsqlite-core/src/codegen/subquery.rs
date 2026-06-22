@@ -831,6 +831,13 @@ fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) 
             c(&mut inst.p1);
             r(&mut inst.p2); // register
         }
+        OpenDup => {
+            c(&mut inst.p1);
+            c(&mut inst.p2);
+        }
+        ResetSorter | Last | Prev => {
+            c(&mut inst.p1);
+        }
         // Record building.
         MakeRecord => {
             r(&mut inst.p1); // source start
@@ -912,6 +919,13 @@ fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) 
             r(&mut inst.p3); // result reg
         }
         HaltIfNull => {
+            r(&mut inst.p3);
+        }
+        AddImm => {
+            r(&mut inst.p1);
+        }
+        SeekRowid => {
+            c(&mut inst.p1);
             r(&mut inst.p3);
         }
         // Opcodes that don't appear in a scalar subquery scan body — leave as-is.

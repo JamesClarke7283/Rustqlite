@@ -309,6 +309,11 @@ pub enum Opcode {
     /// from the register's record blob. Used by recursive CTEs to expose the single "Current"
     /// row to the recursive query's scan. Mirrors `OP_OpenPseudo` in `vdbe.c`.
     OpenPseudo,
+    /// `OpenDup p1 p2`: open a new cursor `p1` that shares the underlying storage of the
+    /// existing ephemeral cursor `p2`. Used by the window-function sliding-frame algorithm to
+    /// keep multiple cursors (start/current/end) on the same partition cache. Mirrors
+    /// `OP_OpenDup` in `vdbe.c`.
+    OpenDup,
     /// `RowData p1 p2`: copy the full record blob of cursor `p1`'s current row into `r[p2]`.
     /// Used by recursive CTEs to transfer a row from the Queue ephemeral into the Current
     /// pseudo-cursor's register. Mirrors `OP_RowData` in `vdbe.c`.
@@ -342,6 +347,24 @@ pub enum Opcode {
     /// error whose message is `p4`. Used by WITHOUT ROWID inserts to enforce the implicit
     /// NOT NULL on PRIMARY KEY columns. Mirrors `OP_HaltIfNull` in `vdbe.c`.
     HaltIfNull,
+    /// `AddImm p1 p2`: `r[p1] += p2`. Mirrors `OP_AddImm` in `vdbe.c` — a short-form integer
+    /// add used by the window-function sliding-frame counters.
+    AddImm,
+    /// `SeekRowid p1 p2 p3`: position table cursor `p1` at the row whose rowid equals `r[p3]`;
+    /// jump to `p2` if no such row exists. Mirrors `OP_SeekRowid` in `vdbe.c`. For ephemeral
+    /// cursors, our rowids are sequential 1..=n, so this maps rowid → index.
+    SeekRowid,
+    /// `ResetSorter p1`: clear all records from sorter/ephemeral cursor `p1` but keep the
+    /// cursor open. Used by the window-function codegen to reset the partition cache between
+    /// partitions. Mirrors `OP_ResetSorter` in `vdbe.c`.
+    ResetSorter,
+    /// `Last p1 p2`: position cursor `p1` at its last row; jump to `p2` if the b-tree is empty.
+    /// Mirrors `OP_Last` in `vdbe.c` — used by reverse scans (e.g. `min`/`max` optimization and
+    /// the window-function sliding-frame end cursor).
+    Last,
+    /// `Prev p1 p2`: move cursor `p1` to the previous row; jump to `p2` if a row remains,
+    /// fall through if at the beginning. Mirrors `OP_Prev` in `vdbe.c`.
+    Prev,
 }
 
 impl Opcode {
@@ -438,6 +461,7 @@ impl Opcode {
             Opcode::SorterNext => "SorterNext",
             Opcode::OpenEphemeral => "OpenEphemeral",
             Opcode::OpenPseudo => "OpenPseudo",
+            Opcode::OpenDup => "OpenDup",
             Opcode::RowData => "RowData",
             Opcode::DecrJumpZero => "DecrJumpZero",
             Opcode::IfPos => "IfPos",
@@ -446,6 +470,11 @@ impl Opcode {
             Opcode::AggFinal => "AggFinal",
             Opcode::AggValue => "AggValue",
             Opcode::HaltIfNull => "HaltIfNull",
+            Opcode::AddImm => "AddImm",
+            Opcode::SeekRowid => "SeekRowid",
+            Opcode::ResetSorter => "ResetSorter",
+            Opcode::Last => "Last",
+            Opcode::Prev => "Prev",
         }
     }
 }

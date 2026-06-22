@@ -622,6 +622,99 @@ impl Vdbe {
                     }
                     self.pc += 1;
                 }
+                Opcode::AddImm => {
+                    // `AddImm p1 p2`: `r[p1] += p2`. Short-form integer add used by the
+                    // window-function sliding-frame counters.
+                    let v = self.regs[p1 as usize].as_i64();
+                    self.regs[p1 as usize] = Value::Int(v + p2 as i64);
+                    self.pc += 1;
+                }
+                Opcode::SeekRowid => {
+                    // `SeekRowid p1 p2 p3`: position cursor p1 at the row whose rowid is r[p3];
+                    // jump to p2 if no such row exists. For ephemeral cursors our rowids are
+                    // sequential 1..=n, so we map rowid → index.
+                    let rowid = self.regs[p3 as usize].as_i64();
+                    let slot = self
+                        .cursors
+                        .get_mut(p1 as usize)
+                        .and_then(|c| c.as_mut());
+                    let found = match slot {
+                        Some(VdbeCursor::Ephemeral(e)) => e.seek_rowid(rowid),
+                        _ => {
+                            return Err(Error::msg(
+                                "SeekRowid on an unsupported cursor type (only ephemeral supported)",
+                            ))
+                        }
+                    };
+                    if found {
+                        self.pc += 1;
+                    } else {
+                        self.pc = p2 as usize;
+                    }
+                }
+                Opcode::ResetSorter => {
+                    // `ResetSorter p1`: clear all records from sorter/ephemeral cursor p1.
+                    let slot = self
+                        .cursors
+                        .get_mut(p1 as usize)
+                        .and_then(|c| c.as_mut());
+                    match slot {
+                        Some(VdbeCursor::Ephemeral(e)) => e.clear(),
+                        Some(VdbeCursor::Sorter(s)) => s.clear(),
+                        _ => return Err(Error::msg("ResetSorter on an unsupported cursor type")),
+                    }
+                    self.pc += 1;
+                }
+                Opcode::Last => {
+                    // `Last p1 p2`: position cursor p1 at its last row; jump to p2 if empty.
+                    let slot = self
+                        .cursors
+                        .get_mut(p1 as usize)
+                        .and_then(|c| c.as_mut());
+                    let nonempty = match slot {
+                        Some(VdbeCursor::Ephemeral(e)) => {
+                            // Position at the last record.
+                            let n = e.len();
+                            if n == 0 {
+                                false
+                            } else {
+                                e.seek_rowid(n as i64)
+                            }
+                        }
+                        _ => return Err(Error::msg("Last on an unsupported cursor type")),
+                    };
+                    if nonempty {
+                        self.pc += 1;
+                    } else {
+                        self.pc = p2 as usize;
+                    }
+                }
+                Opcode::Prev => {
+                    // `Prev p1 p2`: move cursor p1 to the previous row; jump to p2 if a row
+                    // remains, fall through if at the beginning. Mirrors `OP_Prev`.
+                    let slot_mut = self
+                        .cursors
+                        .get_mut(p1 as usize)
+                        .and_then(|c| c.as_mut());
+                    let has_prev = match slot_mut {
+                        Some(VdbeCursor::Ephemeral(e)) => {
+                            // Our ephemeral rowids are 1..=n (sequential); rowid = pos + 1.
+                            // If pos > 0, seek to (pos - 1) + 1 = pos (the previous row's rowid).
+                            let cur = e.current_position();
+                            if cur > 0 {
+                                e.seek_rowid(cur as i64)
+                            } else {
+                                false
+                            }
+                        }
+                        _ => return Err(Error::msg("Prev on an unsupported cursor type")),
+                    };
+                    if has_prev {
+                        self.pc = p2 as usize;
+                    } else {
+                        self.pc += 1;
+                    }
+                }
                 Opcode::Transaction => {
                     // p2 != 0 opens a WRITE transaction (the rollback journal). A read
                     // transaction is implicit in our engine, so p2 == 0 is a no-op marker.
@@ -815,7 +908,19 @@ impl Vdbe {
                 }
 
                 Opcode::Rowid => {
-                    let rowid = self.table_cursor(p1)?.rowid()?;
+                    // For table cursors, read the b-tree rowid. For ephemeral cursors, the rowid
+                    // is pos+1 (our ephemeral rowids are sequential 1..=n).
+                    let slot = self
+                        .cursors
+                        .get(p1 as usize)
+                        .and_then(|c| c.as_ref());
+                    let rowid = match slot {
+                        Some(VdbeCursor::Table(_)) => {
+                            self.table_cursor(p1)?.rowid()?
+                        }
+                        Some(VdbeCursor::Ephemeral(e)) => e.rowid(),
+                        _ => return Err(Error::msg("Rowid on an unsupported cursor type")),
+                    };
                     self.regs[p2 as usize] = Value::Int(rowid);
                     self.pc += 1;
                 }
@@ -1417,6 +1522,21 @@ impl Vdbe {
                     // Used by recursive CTEs to expose the "Current" row to the recursive query.
                     let pseudo = PseudoCursor::new(p2, self.encoding);
                     self.set_cursor(p1 as usize, VdbeCursor::Pseudo(pseudo));
+                    self.pc += 1;
+                }
+                Opcode::OpenDup => {
+                    // `OpenDup p1 p2`: open a new cursor p1 sharing the underlying storage of
+                    // the existing ephemeral cursor p2. Used by the window-function sliding-
+                    // frame algorithm to keep multiple cursors (start/current/end) on the same
+                    // partition cache. Mirrors `OP_OpenDup` in `vdbe.c`.
+                    let src = self
+                        .cursors
+                        .get(p2 as usize)
+                        .and_then(|c| c.as_ref())
+                        .and_then(|c| c.as_ephemeral())
+                        .ok_or_else(|| Error::msg("OpenDup source is not an ephemeral cursor"))?;
+                    let dup = src.dup();
+                    self.set_cursor(p1 as usize, VdbeCursor::Ephemeral(dup));
                     self.pc += 1;
                 }
 

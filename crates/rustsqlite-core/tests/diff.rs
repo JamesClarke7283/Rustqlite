@@ -1781,4 +1781,95 @@ fn window_functions() {
     }
 }
 
+/// Window functions with explicit frame specifications (M11.8–M11.10): `ROWS`/`RANGE`/`GROUPS
+/// `BETWEEN ... AND ...` with `UNBOUNDED PRECEDING`/`CURRENT ROW`/`expr PRECEDING`/`expr FOLLOWING`/
+/// `UNBOUNDED FOLLOWING` bounds. Tests the sliding-frame codegen (full-scan approach) against
+/// the C oracle.
+#[test]
+fn window_function_frame_specs() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup(
+        "CREATE TABLE t(a INT, b INT);\
+         INSERT INTO t(a,b) VALUES\
+             (1, 10),\
+             (1, 20),\
+             (2, 30),\
+             (2, 40),\
+             (3, 50),\
+             (3, 60);",
+    );
+    for q in [
+        // ROWS BETWEEN ... AND ... — the simplest sliding frame.
+        "SELECT sum(b) OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t;",
+        "SELECT sum(b) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;",
+        "SELECT sum(b) OVER (ORDER BY a ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t;",
+        "SELECT sum(b) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;",
+        "SELECT sum(b) OVER (ORDER BY a ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) FROM t;",
+        "SELECT sum(b) OVER (ORDER BY a ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM t;",
+        "SELECT sum(b) OVER (ORDER BY a ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM t;",
+        "SELECT sum(b) OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t;",
+        "SELECT sum(b) OVER (ORDER BY a ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING) FROM t;",
+        "SELECT sum(b) OVER (ORDER BY a ROWS BETWEEN 1 FOLLOWING AND 3 FOLLOWING) FROM t;",
+        // count with sliding frame.
+        "SELECT count(*) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;",
+        "SELECT count(*) OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t;",
+        // avg with sliding frame.
+        "SELECT avg(b) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;",
+        // total with sliding frame.
+        "SELECT total(b) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;",
+        // group_concat with sliding frame.
+        "SELECT group_concat(b) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;",
+        // PARTITION BY + ROWS frame.
+        "SELECT sum(b) OVER (PARTITION BY a ORDER BY b ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;",
+        "SELECT sum(b) OVER (PARTITION BY a ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t;",
+        "SELECT sum(b) OVER (PARTITION BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;",
+        // row_number with explicit ROWS frame (same as default).
+        "SELECT row_number() OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t;",
+        // rank/dense_rank with explicit RANGE frame.
+        "SELECT rank() OVER (ORDER BY a RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t;",
+        "SELECT dense_rank() OVER (ORDER BY a RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t;",
+        // RANGE/GROUPS CURRENT ROW (per-peer-group — same as default).
+        "SELECT sum(b) OVER (ORDER BY a RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t;",
+        "SELECT sum(b) OVER (ORDER BY a GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t;",
+        // Outer WHERE / ORDER BY / LIMIT.
+        "SELECT a, b, sum(b) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t WHERE b > 15;",
+        "SELECT a, b, sum(b) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY b DESC;",
+        "SELECT a, b, sum(b) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t LIMIT 3;",
+    ] {
+        assert_same(db.str(), q);
+    }
+}
+
+/// Window functions with frame specs that our engine doesn't yet support should produce
+/// an error (not a crash). The oracle accepts them; we reject with a specific message.
+#[test]
+fn window_function_frame_spec_unsupported() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup("CREATE TABLE t(a INT, b INT); INSERT INTO t VALUES (1, 10), (2, 20);");
+    // min/max with non-default frames — rejected by our engine.
+    for q in [
+        "SELECT min(b) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;",
+        "SELECT max(b) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;",
+    ] {
+        // The oracle succeeds; our engine should error (not crash).
+        match rustsqlite_rows(db.str(), q) {
+            Ok(got) => panic!("expected error for `{q}`, got rows: {got:?}"),
+            Err(e) => {
+                assert!(
+                    e.contains("min()/max()") || e.contains("not yet supported"),
+                    "wrong error for `{q}`: {e}"
+                );
+            }
+        }
+    }
+}
+
 

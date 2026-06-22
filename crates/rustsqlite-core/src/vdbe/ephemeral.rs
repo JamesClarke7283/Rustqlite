@@ -8,6 +8,15 @@
 //! the table variant stores records with an auto-incremented rowid and reads them back
 //! sequentially via `Column`; the index variant stores record blobs as dedup keys, supports
 //! `find` for `OP_Found`, and is never read back via `Column`.
+//!
+//! `OP_OpenDup` (M7.12) opens a second cursor sharing the same underlying record storage as
+//! an existing ephemeral cursor — used by the window-function sliding-frame algorithm to
+//! keep multiple cursors (start/current/end) on the same partition cache. The shared data is
+//! held in an `Rc<RefCell<EphemeralData>>`; the per-cursor iteration state (`pos`, `current`)
+//! is owned by each `Ephemeral` wrapper.
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use crate::error::Result;
 use crate::format::{decode_record, encode_record, TextEncoding};
@@ -24,29 +33,40 @@ pub enum EphemeralKind {
     Index,
 }
 
-/// A rowid-keyed in-memory table or a record-keyed in-memory index.
-pub struct Ephemeral {
+/// The shared, cursor-independent state of an ephemeral table: the record buffer, the next
+/// rowid counter, and the encoding/kind metadata. Held in an `Rc<RefCell<>>` so that
+/// `OP_OpenDup` can share it across multiple cursors.
+struct EphemeralData {
     records: Vec<Vec<u8>>,
     /// Rowid of the next insert (starts at 1, like upstream's `NewRowid`). Table variant only.
     next_rowid: i64,
+    encoding: TextEncoding,
+    kind: EphemeralKind,
+}
+
+/// A rowid-keyed in-memory table or a record-keyed in-memory index. The shared data lives in
+/// an `Rc<RefCell<EphemeralData>>` so that `OP_OpenDup` can clone the cursor and share storage
+/// with the original.
+pub struct Ephemeral {
+    data: Rc<RefCell<EphemeralData>>,
     /// Iteration position after [`rewind`](Self::rewind).
     pos: usize,
     /// Decoded current record for `Column` reads.
     current: Option<Vec<Value>>,
-    encoding: TextEncoding,
-    kind: EphemeralKind,
 }
 
 impl Ephemeral {
     /// Open an ephemeral table that will hold `nfield`-column records.
     pub fn new(_nfield: usize, encoding: TextEncoding) -> Ephemeral {
         Ephemeral {
-            records: Vec::new(),
-            next_rowid: 1,
+            data: Rc::new(RefCell::new(EphemeralData {
+                records: Vec::new(),
+                next_rowid: 1,
+                encoding,
+                kind: EphemeralKind::Table,
+            })),
             pos: 0,
             current: None,
-            encoding,
-            kind: EphemeralKind::Table,
         }
     }
 
@@ -54,24 +74,37 @@ impl Ephemeral {
     /// with a non-null `P4` KeyInfo. `_nfield` is the column count of the key record.
     pub fn new_index(_nfield: usize, encoding: TextEncoding) -> Ephemeral {
         Ephemeral {
-            records: Vec::new(),
-            next_rowid: 1,
+            data: Rc::new(RefCell::new(EphemeralData {
+                records: Vec::new(),
+                next_rowid: 1,
+                encoding,
+                kind: EphemeralKind::Index,
+            })),
             pos: 0,
             current: None,
-            encoding,
-            kind: EphemeralKind::Index,
+        }
+    }
+
+    /// Clone the shared storage into a new cursor with a fresh iteration position. Used by
+    /// `OP_OpenDup` to open a second cursor on the same ephemeral table (e.g. the
+    /// window-function start/current/end cursors over the partition cache).
+    pub fn dup(&self) -> Ephemeral {
+        Ephemeral {
+            data: Rc::clone(&self.data),
+            pos: 0,
+            current: None,
         }
     }
 
     /// Which kind of ephemeral this is.
     pub fn kind(&self) -> EphemeralKind {
-        self.kind
+        self.data.borrow().kind
     }
 
     /// Allocate and return the next integer rowid, advancing the cursor. Table variant only.
     pub fn next_rowid(&mut self) -> i64 {
-        let rowid = self.next_rowid;
-        self.next_rowid += 1;
+        let rowid = self.data.borrow().next_rowid;
+        self.data.borrow_mut().next_rowid += 1;
         rowid
     }
 
@@ -80,7 +113,7 @@ impl Ephemeral {
         // The ephemeral table is append-only; callers always pass the rowid that was just
         // returned by `next_rowid`.
         let _ = rowid;
-        self.records.push(record);
+        self.data.borrow_mut().records.push(record);
     }
 
     /// Insert a record blob as a dedup key (mirrors `OP_IdxInsert` on an ephemeral index).
@@ -91,7 +124,7 @@ impl Ephemeral {
         if self.find_record(record)? {
             return Ok(false);
         }
-        self.records.push(record.to_vec());
+        self.data.borrow_mut().records.push(record.to_vec());
         Ok(true)
     }
 
@@ -107,7 +140,7 @@ impl Ephemeral {
     /// equality with NULL-equality (NULL serializes as serial type 0, and any two NULLs encode
     /// identically). This matches `OP_Found` on an ephemeral index under BINARY collation.
     fn find_record(&self, needle: &[u8]) -> Result<bool> {
-        for rec in &self.records {
+        for rec in &self.data.borrow().records {
             if rec.as_slice() == needle {
                 return Ok(true);
             }
@@ -119,12 +152,12 @@ impl Ephemeral {
     pub fn rewind(&mut self) -> bool {
         self.pos = 0;
         self.current = None;
-        !self.records.is_empty()
+        !self.data.borrow().records.is_empty()
     }
 
     /// Whether the cursor is on a valid row.
     pub fn is_valid(&self) -> bool {
-        self.pos < self.records.len()
+        self.pos < self.data.borrow().records.len()
     }
 
     /// Advance to the next record.
@@ -135,8 +168,10 @@ impl Ephemeral {
 
     /// Decode the current record so `Column` can read it.
     pub fn data(&mut self) -> Result<()> {
-        if let Some(rec) = self.records.get(self.pos) {
-            self.current = Some(decode_record(rec, self.encoding)?);
+        let pos = self.pos;
+        let rec = self.data.borrow().records.get(pos).cloned();
+        if let Some(rec) = rec {
+            self.current = Some(decode_record(&rec, self.data.borrow().encoding)?);
         }
         Ok(())
     }
@@ -157,28 +192,66 @@ impl Ephemeral {
 
     /// The raw record bytes at position `pos`, or `None` if out of range.
     pub fn record_at(&self, pos: usize) -> Option<Vec<u8>> {
-        self.records.get(pos).cloned()
+        self.data.borrow().records.get(pos).cloned()
     }
 
     /// Remove the record at the current position, shifting subsequent records down. Used by
     /// the recursive CTE loop to drain the Queue as rows are processed.
     pub fn delete_current(&mut self) {
-        if self.pos < self.records.len() {
-            self.records.remove(self.pos);
+        let pos = self.pos;
+        if pos < self.data.borrow().records.len() {
+            self.data.borrow_mut().records.remove(pos);
             self.current = None;
         }
     }
 
     /// Whether the ephemeral is empty (no records).
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+        self.data.borrow().records.is_empty()
     }
 
     /// Remove all records and reset the iteration position. Used by `OP_Clear` on an
     /// ephemeral cursor (window-function peer-buf reset between peer groups).
     pub fn clear(&mut self) {
-        self.records.clear();
-        self.next_rowid = 1;
+        self.data.borrow_mut().records.clear();
+        self.data.borrow_mut().next_rowid = 1;
+        self.pos = 0;
+        self.current = None;
+    }
+
+    // ---- window-function sliding-frame support (M11.8) ----
+
+    /// The number of records currently stored. Used by the window codegen to size the frame.
+    pub fn len(&self) -> usize {
+        self.data.borrow().records.len()
+    }
+
+    /// Position the cursor at row `pos` (0-indexed). Returns `true` if valid.
+    /// Used by the window-function sliding-frame codegen to seek the start/current/end cursors
+    /// to specific rowids in the partition cache (mirrors upstream's `OP_SeekRowid` on the
+    /// ephemeral table, but our ephemeral is rowid-numbered 1..=n so we map rowid → index).
+    pub fn seek_rowid(&mut self, rowid: i64) -> bool {
+        // Our ephemeral rowids are 1..=n (sequential), so rowid R is index R-1.
+        let idx = (rowid - 1) as usize;
+        if idx < self.data.borrow().records.len() {
+            self.pos = idx;
+            self.current = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The rowid of the current row (1-indexed). Used by the window codegen to read the
+    /// current row's position in the partition cache.
+    pub fn rowid(&self) -> i64 {
+        (self.pos + 1) as i64
+    }
+
+    /// Reset the cursor to before the first row (so the next `next` advances to row 0).
+    /// Mirrors upstream's `OP_Rewind` followed by no `data()` call. Used by the window
+    /// codegen to reposition cursors before the sliding-frame loop.
+    pub fn reset(&mut self) {
         self.pos = 0;
         self.current = None;
     }
