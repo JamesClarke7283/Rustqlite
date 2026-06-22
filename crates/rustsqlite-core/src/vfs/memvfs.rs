@@ -79,12 +79,25 @@ impl Vfs for MemVfs {
     }
 }
 
-struct MemFile {
+pub struct MemFile {
     data: Arc<Mutex<Vec<u8>>>,
     lock_level: AtomicU8,
     /// Shared per-path lock state for named files; `None` for `:memory:` (no contention
     /// possible — a private file).
     lock_state: Option<Arc<Mutex<LockState>>>,
+}
+
+impl MemFile {
+    /// Construct an empty in-memory file (as a boxed `VfsFile`) with no lock state. Used as
+    /// a no-op placeholder where a `VfsFile` is required by type but never actually read or
+    /// written (e.g. the WAL-mode `WriteTxn` carries a dummy journal that is never touched).
+    pub fn empty_boxed() -> Box<dyn VfsFile> {
+        Box::new(MemFile {
+            data: Arc::new(Mutex::new(Vec::new())),
+            lock_level: AtomicU8::new(LockLevel::Unlocked as u8),
+            lock_state: None,
+        })
+    }
 }
 
 #[async_trait]

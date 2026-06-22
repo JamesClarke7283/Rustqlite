@@ -678,3 +678,31 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   the DB file, 200-row database reads across multiple b-tree leaf pages from the WAL, and
   `sqlite_schema` reads through the WAL). Known limitation: this is a read-only WAL reader;
   Rustqlite-written WAL-mode databases are not yet crash-safe (M13.5 write path pending).
+  **13.5 WAL mode write path** ✅: `Wal::write_frames` (mirrors `walFrames` in `wal.c`) appends
+  frames for a set of dirty pages to the `-wal` sidecar, then syncs (the durable commit
+  point), then extends the in-memory wal-index with the new page numbers. On the first write
+  to a fresh WAL (when `mx_frame == 0`), the WAL header is written first: magic
+  `0x377f0683` (big-endian checksum), format `3007000`, the page size, fresh random salts, and
+  the header checksum; the running checksum seeds from the header. Each frame's header
+  carries the page number, the commit size (non-zero on the last frame of a transaction — the
+  commit marker), the salts (copied from the WAL header), and the running checksum over the
+  first 8 bytes of the frame header + the page data. After the frames are synced,
+  `mx_frame`/`n_page`/`frame_cksum` are advanced to the new last commit frame. `Pager::begin_write`
+  in WAL mode skips the rollback journal setup (a no-op in-memory `MemFile` placeholder
+  satisfies the `WriteTxn` type) and `Pager::commit` branches on WAL mode: it collects the
+  dirty pages in page-number order, calls `Wal::write_frames` with the frames + the new db
+  page count, promotes the pages into the clean cache, and ends the transaction (the database
+  file is NOT written — pages stay in the WAL until a checkpoint copies them into the DB
+  file, M13.6). `Pager::journal_page` is a no-op in WAL mode (no pre-image replay is needed —
+  rollback discards the dirty overlay, and uncommitted frames are never written to the WAL).
+  `Pager::rollback` in WAL mode just discards the dirty overlay (no frames were written to
+  the WAL — frames are only written at commit). The `Wal` file handle is `Arc<dyn VfsFile>`
+  (shared via `file_clone`) so `get_page` can read a frame without holding the `Wal` mutex
+  across an `await` (which would make the future `!Send`); `frame_data_offset` exposes the
+  WAL offset for the same reason. Differential-tested vs the C oracle (3 new cases in
+  `wal_read.rs`: Rustqlite writes to a C-SQLite-created WAL-mode DB and the C oracle reads the
+  rows back via WAL recovery; Rustqlite writes then reads back in a fresh connection; the C
+  oracle's `PRAGMA integrity_check` passes on a Rustqlite-written WAL-mode database). Known
+  limitation: `PRAGMA journal_mode = wal` (switching from rollback to WAL mode) is M13.10 —
+  the database must already be in WAL mode (e.g. created by C SQLite) for the WAL write path
+  to engage; `create_fresh` still starts in rollback-journal mode.

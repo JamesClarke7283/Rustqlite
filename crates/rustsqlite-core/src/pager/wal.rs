@@ -41,6 +41,8 @@
 //! `mxFrame` is the index of that last commit frame, matching upstream's "the WAL is the
 //! durable prefix ending at the last commit frame" rule.
 
+use std::sync::Arc;
+
 use crate::error::{Error, Result};
 use crate::format::wal::{
     wal_checksum, WalFrameHeader, WalHeader, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
@@ -99,9 +101,16 @@ impl IndexBlock {
 /// endianness), the in-memory index blocks, and the `mxFrame`/`nPage` carried by the last
 /// commit frame (the durable prefix visible to readers).
 pub struct Wal {
-    /// The open `-wal` sidecar file. `None` when there is no WAL file (the database is in WAL
-    /// mode but nothing is logged yet — every page lookup falls back to the database file).
-    file: Option<Box<dyn VfsFile>>,
+    /// The open `-wal` sidecar file. `None` when there is no WAL file yet (the database is in
+    /// WAL mode but nothing is logged yet — every page lookup falls back to the database file,
+    /// and the file is created lazily on the first write). Shared via `Arc` so a reader can
+    /// clone the handle and read a frame without holding the `Wal` across an `await`.
+    file: Option<Arc<dyn VfsFile>>,
+    /// The VFS used to open the WAL file lazily on the first write. `None` only in the
+    /// unit-test `empty` constructor (no VFS available).
+    vfs: Option<Arc<dyn Vfs>>,
+    /// The WAL file path (`<db>-wal`), used for the lazy open.
+    path: String,
     /// The parsed WAL header. When `file` is `None`, this is a placeholder with zeroes.
     header: WalHeader,
     /// The database page size (a copy of `header.page_size` for convenience).
@@ -115,6 +124,10 @@ pub struct Wal {
     /// The database size in pages carried by the last commit frame (the `nTruncate` field).
     /// Readers see this as the database size, not the file size of the DB file.
     n_page: u32,
+    /// The running checksum seed carried from the last commit frame (the `aFrameCksum` in
+    /// upstream's `WalIndexHdr`). The next transaction's frames extend it. `None` when no
+    /// commit frame has been written yet (the seed is the WAL header checksum).
+    frame_cksum: Option<[u32; 2]>,
 }
 
 impl Wal {
@@ -129,33 +142,41 @@ impl Wal {
     /// header over the WAL header on mismatch (a stale WAL from before a `VACUUM`/page-size
     /// change would have a different page size; upstream's `walIndexRecover` rejects a WAL
     /// whose page size differs from the pager's).
-    pub async fn open(vfs: &dyn Vfs, path: &str, page_size: u32) -> Result<Wal> {
+    ///
+    /// The WAL file is opened read-write (mirrors upstream's
+    /// `SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|SQLITE_OPEN_WAL`), so the same handle serves
+    /// both the read path (`read_frame`) and the write path (`write_frames`). A read-only
+    /// database would fail to open the WAL read-write; that case is not yet supported (a
+    /// read-only WAL-mode database is M13.12 concurrency work).
+    pub async fn open(vfs: Arc<dyn Vfs>, path: &str, page_size: u32) -> Result<Wal> {
         let wal_path = format!("{path}-wal");
         if !vfs.exists(&wal_path).await? {
             // No WAL file — return an empty WAL (the database is in WAL mode but nothing is
             // logged yet). The handle carries no index blocks and `mx_frame = 0`, so every
-            // page lookup falls back to the database file.
-            return Ok(Wal::empty(page_size));
+            // page lookup falls back to the database file. The file is opened lazily on the
+            // first write.
+            return Ok(Wal::placeholder(None, vfs, wal_path, page_size));
         }
-        let file = vfs.open(&wal_path, crate::vfs::OpenFlags::READONLY).await?;
+        let file = vfs.open(&wal_path, crate::vfs::OpenFlags::READWRITE_CREATE).await?;
         let file_size = file.file_size().await?;
         if file_size < WAL_HEADER_SIZE as u64 {
-            // The WAL file exists but is too short to hold a header — treat it as empty.
-            return Ok(Wal::empty(page_size));
+            // The WAL file exists but is too short to hold a header — treat it as empty, but
+            // keep the file handle (a writer will overwrite it).
+            return Ok(Wal::placeholder(Some(file), vfs, wal_path, page_size));
         }
 
         // Read and parse the WAL header.
         let mut hdr_buf = [0u8; WAL_HEADER_SIZE];
         let n = file.read_at(0, &mut hdr_buf).await?;
         if n < WAL_HEADER_SIZE {
-            return Ok(Wal::empty(page_size));
+            return Ok(Wal::placeholder(Some(file), vfs, wal_path, page_size));
         }
         let header = WalHeader::decode(&hdr_buf)?;
 
         // Validate the page size against the database header's. A mismatch means the WAL is
         // stale (from a different database file that happened to share the path); ignore it.
         if header.page_size != page_size {
-            return Ok(Wal::empty(page_size));
+            return Ok(Wal::placeholder(Some(file), vfs, wal_path, page_size));
         }
 
         // Verify the WAL header checksum (over the first 24 bytes). A bad checksum means the
@@ -163,27 +184,37 @@ impl Wal {
         let big = header.checksum_big_endian();
         let (c0, c1) = wal_checksum(&hdr_buf[0..24], big, 0, 0);
         if c0 != header.checksum1 || c1 != header.checksum2 {
-            return Ok(Wal::empty(page_size));
+            return Ok(Wal::placeholder(Some(file), vfs, wal_path, page_size));
         }
 
         let mut wal = Wal {
-            file: Some(file),
+            file: Some(Arc::from(file)),
+            vfs: Some(vfs),
+            path: wal_path,
             header: header.clone(),
             page_size,
             blocks: Vec::new(),
             mx_frame: 0,
             n_page: 0,
+            frame_cksum: Some([header.checksum1, header.checksum2]),
         };
         wal.recover(file_size).await?;
         Ok(wal)
     }
 
-    /// Build an empty WAL handle (no committed frames; every page lookup misses). No `-wal`
-    /// file is attached — `find_frame` returns `0` before ever touching `file`, and
-    /// `read_frame` is never called on an empty WAL.
-    fn empty(page_size: u32) -> Wal {
+    /// Build a placeholder WAL (no recovered frames). Used when the `-wal` file is missing,
+    /// empty, or fails validation. The `file` is `Some` when the file exists (so a writer can
+    /// overwrite it) and `None` when it doesn't (the writer creates it lazily).
+    fn placeholder(
+        file: Option<Box<dyn VfsFile>>,
+        vfs: Arc<dyn Vfs>,
+        path: String,
+        page_size: u32,
+    ) -> Wal {
         Wal {
-            file: None,
+            file: file.map(|f| Arc::from(f)),
+            vfs: Some(vfs),
+            path,
             header: WalHeader {
                 magic: 0,
                 format_version: 0,
@@ -198,6 +229,7 @@ impl Wal {
             blocks: Vec::new(),
             mx_frame: 0,
             n_page: 0,
+            frame_cksum: None,
         }
     }
 
@@ -215,6 +247,24 @@ impl Wal {
     /// The index of the last committed frame (`0` means the WAL is empty/uncommitted).
     pub fn mx_frame(&self) -> u32 {
         self.mx_frame
+    }
+
+    /// Clone the WAL file handle as an `Arc` so the caller can read a frame without holding
+    /// the `Wal` lock across an `await`. Returns `None` when the WAL file is not open (the
+    /// empty-WAL case — `find_frame` returns `0` before this is ever called for a missing
+    /// page, so the caller never reaches the read when `file_clone` would be `None`).
+    pub fn file_clone(&self) -> Option<Arc<dyn VfsFile>> {
+        self.file.clone()
+    }
+
+    /// The byte offset within the WAL file of the page data for frame `i_frame` (the frame
+    /// header is `WAL_FRAME_HEADER_SIZE` bytes before this). Exposed so the pager can read
+    /// a frame's data directly via the cloned file handle without going through the `Wal`
+    /// (which would require holding the `Wal` lock across an `await`).
+    pub fn frame_data_offset(&self, i_frame: u32) -> u64 {
+        WAL_HEADER_SIZE as u64
+            + ((i_frame as u64 - 1) * (self.page_size as u64 + WAL_FRAME_HEADER_SIZE as u64))
+            + WAL_FRAME_HEADER_SIZE as u64
     }
 
     /// Rebuild the in-memory wal-index by scanning the WAL frames (mirrors `walIndexRecover`).
@@ -313,10 +363,14 @@ impl Wal {
         self.mx_frame = last_commit_frame;
         self.n_page = last_commit_npage;
         // The running checksum at the last commit frame becomes the seed for the next
-        // transaction (this is the `aFrameCksum` carried in the wal-index header). The read
-        // path doesn't need it (it only matters for appending more frames), but we keep it
-        // for future M13.5 continuity.
-        let _ = last_commit_cksum;
+        // transaction (this is the `aFrameCksum` carried in the wal-index header). When no
+        // commit frame was recovered, the seed is the WAL header checksum (so the next
+        // transaction's first frame extends the header's checksum).
+        self.frame_cksum = Some(if last_commit_frame == 0 {
+            [self.header.checksum1, self.header.checksum2]
+        } else {
+            last_commit_cksum
+        });
         Ok(())
     }
 
@@ -414,10 +468,8 @@ impl Wal {
                 self.page_size
             )));
         }
-        let offset = WAL_HEADER_SIZE as i64
-            + ((i_frame as i64 - 1) * (self.page_size as i64 + WAL_FRAME_HEADER_SIZE as i64))
-            + WAL_FRAME_HEADER_SIZE as i64;
-        let n = file.read_at(offset as u64, out).await?;
+        let offset = self.frame_data_offset(i_frame);
+        let n = file.read_at(offset, out).await?;
         if n != self.page_size as usize {
             return Err(Error::corrupt(format!(
                 "wal::read_frame: short read for frame {i_frame}: got {n} of {} bytes",
@@ -426,6 +478,143 @@ impl Wal {
         }
         Ok(())
     }
+
+    /// Append frames for a set of dirty pages to the WAL, then sync, then update the in-memory
+    /// wal-index so the new frames are visible to readers (mirrors `walFrames` in `wal.c`).
+    ///
+    /// `frames` is a list of `(page_number, page_data)` pairs in the order they should be
+    /// written (the page data must be exactly `page_size` bytes). `n_truncate` is the database
+    /// size in pages after this commit (the `nTruncate` field carried by the last frame's
+    /// header — non-zero on a commit, zero mid-transaction). This is a **commit** write: the
+    /// last frame carries `n_truncate` as its `commit_size`, making the transaction durable.
+    ///
+    /// On the first write to a fresh WAL (when `mx_frame == 0` and the file is empty/missing),
+    /// the WAL header is written first: magic `0x377f0683` (big-endian checksum), format
+    /// `3007000`, the page size, fresh random salts, and the header checksum. The running
+    /// checksum seeds from the header checksum.
+    ///
+    /// After the frames are written and synced, the in-memory index blocks are extended with
+    /// the new page numbers (via `append_frame`), and `mx_frame`/`n_page`/`frame_cksum` are
+    /// advanced to the new last commit frame. Readers opening a fresh `Wal` on the same file
+    /// will recover and see these frames.
+    pub async fn write_frames(
+        &mut self,
+        frames: &[(u32, Vec<u8>)],
+        n_truncate: u32,
+    ) -> Result<()> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+        // Ensure the WAL file is open. If `file` is `None` (the WAL didn't exist on open),
+        // create it now (mirrors `walFrames` writing the WAL header on the first frame).
+        let need_header = self.mx_frame == 0;
+        if self.file.is_none() {
+            let vfs = self.vfs.as_ref().expect("vfs missing").clone();
+            let file: Box<dyn VfsFile> = vfs.open(&self.path, crate::vfs::OpenFlags::READWRITE_CREATE).await?;
+            self.file = Some(Arc::from(file));
+        }
+        let file = self.file.as_ref().expect("wal file open");
+
+        // On the first write to a fresh WAL, write the WAL header (magic, format, page size,
+        // fresh salts, checksum). Mirrors `walFrames`'s `if (iFrame == 0)` branch.
+        let mut running = if need_header {
+            // Fresh random salts (mirrors `sqlite3_randomness(8, pWal->hdr.aSalt)`). We use a
+            // simple splitmix64 over the process id + a counter; the exact values don't
+            // matter as long as they're non-zero and change across checkpoints (the salts
+            // invalidate stale frames after a restart).
+            let salt1 = next_wal_salt();
+            let salt2 = next_wal_salt();
+            self.header = WalHeader {
+                magic: crate::format::wal::WAL_MAGIC_BE,
+                format_version: crate::format::wal::WAL_FORMAT_VERSION,
+                page_size: self.page_size,
+                checkpoint_seq: 0,
+                salt1,
+                salt2,
+                checksum1: 0,
+                checksum2: 0,
+            };
+            let mut hdr_buf = [0u8; WAL_HEADER_SIZE];
+            self.header.encode(&mut hdr_buf);
+            let (c0, c1) = wal_checksum(&hdr_buf[0..24], true, 0, 0);
+            self.header.checksum1 = c0;
+            self.header.checksum2 = c1;
+            hdr_buf[24..28].copy_from_slice(&c0.to_be_bytes());
+            hdr_buf[28..32].copy_from_slice(&c1.to_be_bytes());
+            file.write_at(0, &hdr_buf).await?;
+            file.sync().await?;
+            [c0, c1]
+        } else {
+            // The running checksum seed is the last commit frame's checksum (or the WAL
+            // header checksum when no commit has happened yet — set by `recover`/`open`).
+            self.frame_cksum.unwrap_or([self.header.checksum1, self.header.checksum2])
+        };
+
+        // Append the frames. The last frame carries `n_truncate` as its `commit_size` (the
+        // commit marker); earlier frames carry `0`.
+        let mut i_frame = self.mx_frame;
+        let big = self.header.checksum_big_endian();
+        let salts = [self.header.salt1, self.header.salt2];
+        let frame_size = self.page_size as usize + WAL_FRAME_HEADER_SIZE;
+        let mut frame_buf = vec![0u8; frame_size];
+        for (idx, (pgno, data)) in frames.iter().enumerate() {
+            if data.len() != self.page_size as usize {
+                return Err(Error::corrupt(format!(
+                    "wal::write_frames: page {pgno} is {} bytes, expected {}",
+                    data.len(),
+                    self.page_size
+                )));
+            }
+            i_frame += 1;
+            let commit_size = if idx == frames.len() - 1 { n_truncate } else { 0 };
+            // Build the frame header: page_number, commit_size, salts.
+            frame_buf[0..4].copy_from_slice(&pgno.to_be_bytes());
+            frame_buf[4..8].copy_from_slice(&commit_size.to_be_bytes());
+            frame_buf[8..12].copy_from_slice(&salts[0].to_be_bytes());
+            frame_buf[12..16].copy_from_slice(&salts[1].to_be_bytes());
+            frame_buf[WAL_FRAME_HEADER_SIZE..].copy_from_slice(data);
+            // Extend the running checksum over the first 8 bytes + page data.
+            let (s0, s1) = wal_checksum(&frame_buf[0..8], big, running[0], running[1]);
+            let (s0, s1) = wal_checksum(&frame_buf[WAL_FRAME_HEADER_SIZE..], big, s0, s1);
+            frame_buf[16..20].copy_from_slice(&s0.to_be_bytes());
+            frame_buf[20..24].copy_from_slice(&s1.to_be_bytes());
+            running = [s0, s1];
+            // Write the frame at the next WAL offset.
+            let offset = WAL_HEADER_SIZE as u64
+                + (i_frame as u64 - 1) * frame_size as u64;
+            file.write_at(offset, &frame_buf).await?;
+        }
+
+        // Sync the WAL (the durable commit point — frames before the sync are not durable).
+        file.sync().await?;
+
+        // Update the in-memory wal-index with the new frames (mirrors `walIndexAppend`).
+        let first_new_frame = self.mx_frame;
+        for (idx, (pgno, _)) in frames.iter().enumerate() {
+            self.append_frame(first_new_frame + 1 + idx as u32, *pgno);
+        }
+
+        // Advance the WAL state to the new last commit frame.
+        self.mx_frame = i_frame;
+        self.n_page = n_truncate;
+        self.frame_cksum = Some(running);
+        Ok(())
+    }
+}
+
+/// Generate a fresh non-zero salt value for the WAL header (mirrors
+/// `sqlite3_randomness(8, ...)` but with a simple splitmix64 over pid + counter). The exact
+/// values don't matter for file-format faithfulness — the salts only need to be non-zero and
+/// change across WAL resets so stale frames are invalidated.
+fn next_wal_salt() -> u32 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let bump = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut seed = (u64::from(std::process::id()) << 32) ^ bump.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    seed = (seed ^ (seed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    seed = (seed ^ (seed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    let v = (seed ^ (seed >> 31)) as u32;
+    if v == 0 { 1 } else { v }
 }
 
 /// The wal-index block index that contains frame `i_frame` (mirrors `walFramePage`). Block 0
@@ -490,8 +679,8 @@ mod tests {
     #[test]
     fn empty_wal_when_no_sidecar() {
         rt().block_on(async {
-            let vfs = MemVfs::new();
-            let wal = Wal::open(&vfs, "db", 4096).await.unwrap();
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
+            let wal = Wal::open(vfs.clone(), "db", 4096).await.unwrap();
             assert_eq!(wal.page_size(), 4096);
             assert_eq!(wal.mx_frame(), 0);
             assert_eq!(wal.n_page(), 0);
@@ -503,7 +692,7 @@ mod tests {
     #[test]
     fn recover_single_commit_frame() {
         rt().block_on(async {
-            let vfs = MemVfs::new();
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
             // Build a WAL with one commit frame for page 1.
             let wal_path = "db-wal";
             let page_size: u32 = 4096;
@@ -519,7 +708,7 @@ mod tests {
             file.write_at(0, &hdr).await.unwrap();
             file.write_at(WAL_HEADER_SIZE as u64, &frame).await.unwrap();
 
-            let wal = Wal::open(&vfs, "db", page_size).await.unwrap();
+            let wal = Wal::open(vfs.clone(), "db", page_size).await.unwrap();
             assert_eq!(wal.page_size(), page_size);
             assert_eq!(wal.mx_frame(), 1);
             assert_eq!(wal.n_page(), 5);
@@ -536,7 +725,7 @@ mod tests {
     #[test]
     fn recover_multiple_frames_latest_wins() {
         rt().block_on(async {
-            let vfs = MemVfs::new();
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
             let page_size: u32 = 4096;
             let salt1 = 0xaaaaaaaa;
             let salt2 = 0xbbbbbbbb;
@@ -563,7 +752,7 @@ mod tests {
             off += frame2.len() as u64;
             file.write_at(off, &frame3).await.unwrap();
 
-            let wal = Wal::open(&vfs, "db", page_size).await.unwrap();
+            let wal = Wal::open(vfs.clone(), "db", page_size).await.unwrap();
             assert_eq!(wal.mx_frame(), 3);
             assert_eq!(wal.n_page(), 2);
             // Page 1's latest frame is 3.
@@ -580,7 +769,7 @@ mod tests {
     #[test]
     fn uncommitted_tail_is_dropped() {
         rt().block_on(async {
-            let vfs = MemVfs::new();
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
             let page_size: u32 = 4096;
             let salt1 = 0xcccccccc;
             let salt2 = 0xdddddddd;
@@ -598,7 +787,7 @@ mod tests {
             file.write_at(WAL_HEADER_SIZE as u64, &f1).await.unwrap();
             file.write_at(WAL_HEADER_SIZE as u64 + f1.len() as u64, &f2).await.unwrap();
 
-            let wal = Wal::open(&vfs, "db", page_size).await.unwrap();
+            let wal = Wal::open(vfs.clone(), "db", page_size).await.unwrap();
             assert_eq!(wal.mx_frame(), 1);
             assert_eq!(wal.n_page(), 1);
             assert_eq!(wal.find_frame(1), 1);
@@ -610,7 +799,7 @@ mod tests {
     #[test]
     fn salt_mismatch_stops_recovery() {
         rt().block_on(async {
-            let vfs = MemVfs::new();
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
             let page_size: u32 = 4096;
             let salt1 = 0xeeeeeeee;
             let salt2 = 0xffffffff;
@@ -628,7 +817,7 @@ mod tests {
             file.write_at(WAL_HEADER_SIZE as u64, &f1).await.unwrap();
             file.write_at(WAL_HEADER_SIZE as u64 + f1.len() as u64, &f2).await.unwrap();
 
-            let wal = Wal::open(&vfs, "db", page_size).await.unwrap();
+            let wal = Wal::open(vfs.clone(), "db", page_size).await.unwrap();
             assert_eq!(wal.mx_frame(), 1);
             assert_eq!(wal.find_frame(1), 1);
             assert_eq!(wal.find_frame(2), 0);
@@ -638,7 +827,7 @@ mod tests {
     #[test]
     fn bad_checksum_stops_recovery() {
         rt().block_on(async {
-            let vfs = MemVfs::new();
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
             let page_size: u32 = 4096;
             let salt1 = 0x01020304;
             let salt2 = 0x05060708;
@@ -658,7 +847,7 @@ mod tests {
             file.write_at(WAL_HEADER_SIZE as u64, &f1).await.unwrap();
             file.write_at(WAL_HEADER_SIZE as u64 + f1.len() as u64, &f2).await.unwrap();
 
-            let wal = Wal::open(&vfs, "db", page_size).await.unwrap();
+            let wal = Wal::open(vfs.clone(), "db", page_size).await.unwrap();
             assert_eq!(wal.mx_frame(), 1);
             assert_eq!(wal.find_frame(1), 1);
             assert_eq!(wal.find_frame(2), 0);
@@ -668,16 +857,108 @@ mod tests {
     #[test]
     fn empty_wal_file_treated_as_empty() {
         rt().block_on(async {
-            let vfs = MemVfs::new();
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
             let page_size: u32 = 4096;
             // Create an empty -wal file (just the header, no frames).
             let hdr = build_wal_header(page_size, 0, 0);
             let file = vfs.open("db-wal", OpenFlags::READWRITE_CREATE).await.unwrap();
             file.write_at(0, &hdr).await.unwrap();
 
-            let wal = Wal::open(&vfs, "db", page_size).await.unwrap();
+            let wal = Wal::open(vfs.clone(), "db", page_size).await.unwrap();
             assert_eq!(wal.mx_frame(), 0);
             assert_eq!(wal.n_page(), 0);
+        });
+    }
+
+    #[test]
+    fn write_frames_to_fresh_wal() {
+        rt().block_on(async {
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
+            let page_size: u32 = 4096;
+            // Open an empty WAL (no -wal file yet).
+            let mut wal = Wal::open(vfs.clone(), "db", page_size).await.unwrap();
+            assert_eq!(wal.mx_frame(), 0);
+
+            // Write two frames committing a 2-page database.
+            let data1 = vec![0x11u8; page_size as usize];
+            let data2 = vec![0x22u8; page_size as usize];
+            wal.write_frames(&[(1, data1.clone()), (2, data2.clone())], 2)
+                .await
+                .unwrap();
+            assert_eq!(wal.mx_frame(), 2);
+            assert_eq!(wal.n_page(), 2);
+            // The frames are visible via find_frame.
+            assert_eq!(wal.find_frame(1), 1);
+            assert_eq!(wal.find_frame(2), 2);
+
+            // Reopen the WAL from the same file and verify the frames survive recovery.
+            let wal2 = Wal::open(vfs.clone(), "db", page_size).await.unwrap();
+            assert_eq!(wal2.mx_frame(), 2);
+            assert_eq!(wal2.n_page(), 2);
+            assert_eq!(wal2.find_frame(1), 1);
+            assert_eq!(wal2.find_frame(2), 2);
+
+            // Read the frame data back and verify the bytes.
+            let mut out = vec![0u8; page_size as usize];
+            wal2.read_frame(1, &mut out).await.unwrap();
+            assert_eq!(out[0], 0x11);
+            wal2.read_frame(2, &mut out).await.unwrap();
+            assert_eq!(out[0], 0x22);
+        });
+    }
+
+    #[test]
+    fn write_frames_appends_to_existing_wal() {
+        rt().block_on(async {
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
+            let page_size: u32 = 4096;
+            // First transaction: write page 1, commit_size=1.
+            let mut wal = Wal::open(vfs.clone(), "db", page_size).await.unwrap();
+            wal.write_frames(&[(1, vec![0x11u8; page_size as usize])], 1)
+                .await
+                .unwrap();
+            assert_eq!(wal.mx_frame(), 1);
+
+            // Second transaction: write page 2, commit_size=2.
+            wal.write_frames(&[(2, vec![0x22u8; page_size as usize])], 2)
+                .await
+                .unwrap();
+            assert_eq!(wal.mx_frame(), 2);
+            assert_eq!(wal.n_page(), 2);
+
+            // Reopen and verify both frames survive.
+            let wal2 = Wal::open(vfs.clone(), "db", page_size).await.unwrap();
+            assert_eq!(wal2.mx_frame(), 2);
+            assert_eq!(wal2.n_page(), 2);
+            assert_eq!(wal2.find_frame(1), 1);
+            assert_eq!(wal2.find_frame(2), 2);
+        });
+    }
+
+    #[test]
+    fn write_frames_overwrites_page_in_new_frame() {
+        rt().block_on(async {
+            let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
+            let page_size: u32 = 4096;
+            // Transaction 1: write page 1 with value 0x11, commit_size=1.
+            let mut wal = Wal::open(vfs.clone(), "db", page_size).await.unwrap();
+            wal.write_frames(&[(1, vec![0x11u8; page_size as usize])], 1)
+                .await
+                .unwrap();
+            // Transaction 2: write page 1 again with value 0x22, commit_size=1.
+            wal.write_frames(&[(1, vec![0x22u8; page_size as usize])], 1)
+                .await
+                .unwrap();
+            assert_eq!(wal.mx_frame(), 2);
+            // The latest frame for page 1 is frame 2.
+            assert_eq!(wal.find_frame(1), 2);
+
+            // Reopen and verify recovery sees the latest frame.
+            let wal2 = Wal::open(vfs.clone(), "db", page_size).await.unwrap();
+            assert_eq!(wal2.find_frame(1), 2);
+            let mut out = vec![0u8; page_size as usize];
+            wal2.read_frame(2, &mut out).await.unwrap();
+            assert_eq!(out[0], 0x22);
         });
     }
 }

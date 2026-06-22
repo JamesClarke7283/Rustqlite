@@ -70,7 +70,7 @@ pub struct Pager {
     /// M13.4; the write path (appending frames) is M13.5 (not yet implemented — the pager still
     /// writes through the rollback journal even in WAL mode, so a WAL-mode database written by
     /// Rustqlite is not yet durable across a crash without a checkpoint).
-    wal: Option<wal::Wal>,
+    wal: Option<Mutex<wal::Wal>>,
 }
 
 /// One entry on the pager's savepoint stack (mirrors `PagerSavepoint` in `pager.c`).
@@ -169,7 +169,7 @@ impl Pager {
         // the pager must consult the `-wal` sidecar before reading any page. The WAL handle
         // recovers the in-memory wal-index from the WAL frames (M13.4).
         let wal = if header.write_version == 2 || header.read_version == 2 {
-            Some(wal::Wal::open(vfs.as_ref(), &path, page_size as u32).await?)
+            Some(Mutex::new(wal::Wal::open(vfs.clone(), &path, page_size as u32).await?))
         } else {
             None
         };
@@ -258,13 +258,16 @@ impl Pager {
     }
 
     pub fn page_count(&self) -> u32 {
-        // In WAL mode with a non-empty WAL, the WAL's `n_page` (carried by the last commit
-        // frame) is the durable database size a reader must observe — it may be larger than
-        // the file's page count if pages were added in the WAL but not yet checkpointed. When
-        // the WAL is empty/missing, the file's page count is authoritative.
         let st_count = self.state.lock().unwrap().page_count;
         match &self.wal {
-            Some(w) if w.mx_frame() != 0 => w.n_page().max(st_count),
+            Some(w) => {
+                let w = w.lock().unwrap();
+                if w.mx_frame() != 0 {
+                    w.n_page().max(st_count)
+                } else {
+                    st_count
+                }
+            }
             _ => st_count,
         }
     }
@@ -332,7 +335,14 @@ impl Pager {
             // is the durable size (it may be larger than the file if pages were added in the
             // WAL but not yet checkpointed). Otherwise the file's page count is authoritative.
             let effective_count = match &self.wal {
-                Some(w) if w.mx_frame() != 0 => w.n_page().max(st.page_count),
+                Some(w) => {
+                    let w = w.lock().unwrap();
+                    if w.mx_frame() != 0 {
+                        w.n_page().max(st.page_count)
+                    } else {
+                        st.page_count
+                    }
+                }
                 _ => st.page_count,
             };
             if pgno == 0 || pgno > effective_count {
@@ -348,10 +358,22 @@ impl Pager {
 
         // In WAL mode, consult the WAL before the database file (mirrors `pagerWalRead`).
         if let Some(wal) = &self.wal {
-            let i_frame = wal.find_frame(pgno);
+            // Find the frame under the lock, then clone the file Arc and release the lock
+            // before the async read (so we don't hold a `std::sync::MutexGuard` across an
+            // `await` — that would make the future `!Send`).
+            let (i_frame, file, offset) = {
+                let w = wal.lock().unwrap();
+                let i_frame = w.find_frame(pgno);
+                if i_frame == 0 {
+                    (0, None, 0u64)
+                } else {
+                    (i_frame, w.file_clone(), w.frame_data_offset(i_frame))
+                }
+            };
             if i_frame != 0 {
+                let file = file.expect("wal frame exists, file must be open");
                 let mut buf = vec![0u8; self.page_size];
-                wal.read_frame(i_frame, &mut buf).await?;
+                file.read_at(offset, &mut buf).await?;
                 let page: PageRef = Arc::new(buf);
                 let mut st = self.state.lock().unwrap();
                 if let Some(page) = st.dirty.get(&pgno).or_else(|| st.cache.get(&pgno)).cloned() {
@@ -400,6 +422,12 @@ impl Pager {
     /// allocated page (beyond the original size) needs no journal record — rollback simply truncates
     /// the file back to the original size.
     async fn journal_page(&self, pgno: u32, preimage: &[u8]) -> Result<()> {
+        // In WAL mode, the rollback journal is not used — dirty pages are appended as frames
+        // to the `-wal` sidecar at commit time, and rollback discards the dirty overlay (no
+        // pre-image replay is needed). Skip journaling entirely.
+        if self.wal.is_some() {
+            return Ok(());
+        }
         // Reserve the record slot under the txn lock, then write it without holding the lock.
         let (journal, offset, cksum_init) = {
             let mut guard = self.txn.lock().unwrap();
@@ -653,6 +681,28 @@ impl Pager {
         self.file.lock(target).await?;
 
         let db_orig_size = self.page_count();
+
+        // In WAL mode, the rollback journal is not used — dirty pages are appended as frames
+        // to the `-wal` sidecar at commit time (mirrors `pager.c`'s `pPager->pWal != 0` branch
+        // in `sqlite3PagerBegin`). We still open a `WriteTxn` to track the transaction boundary
+        // (the db_orig_size for rollback and the `in_write_txn` flag), but the `journal` field
+        // is unused — `commit` writes to the WAL instead of the journal + DB file.
+        if self.wal.is_some() {
+            // A no-op journal placeholder so `in_write_txn`/`rollback` work without a real
+            // journal file. The `journal` field is never read in the WAL commit path.
+            let journal: Arc<dyn VfsFile> =
+                Arc::from(crate::vfs::memvfs::MemFile::empty_boxed());
+            *self.txn.lock().unwrap() = Some(WriteTxn {
+                journal,
+                cksum_init: 0,
+                db_orig_size,
+                nrec: 0,
+                journal_off: 0,
+                journaled: HashSet::new(),
+            });
+            return Ok(());
+        }
+
         let cksum_init = next_cksum_init();
 
         let jfile = self
@@ -719,6 +769,41 @@ impl Pager {
         let mut page1 = self.read_page_for_write(1).await?;
         page1[0..100].copy_from_slice(&header_bytes);
         self.write_page(1, page1)?;
+
+        // In WAL mode, append the dirty pages as frames to the `-wal` sidecar (mirrors
+        // `sqlite3WalFrames`). The WAL sync is the durable commit point. The database file is
+        // NOT written — the pages stay in the WAL until a checkpoint copies them into the DB
+        // file (M13.6, not yet implemented). Readers see the new pages via the wal-index.
+        if self.wal.is_some() {
+            // Collect the dirty pages in page-number order (deterministic frame order; upstream
+            // writes in dirty-list order, which is arbitrary but consistent — page-number order
+            // is a faithful-enough stand-in and makes the WAL byte-identical across runs).
+            let pending: Vec<(u32, PageRef)> = {
+                let mut st = self.state.lock().unwrap();
+                let mut pairs: Vec<(u32, PageRef)> = st.dirty.drain().collect();
+                pairs.sort_by_key(|(pgno, _)| *pgno);
+                pairs
+            };
+            let frames: Vec<(u32, Vec<u8>)> = pending
+                .iter()
+                .map(|(pgno, data)| (*pgno, (**data).clone()))
+                .collect();
+            self.wal
+                .as_ref().unwrap()
+                .lock().unwrap()
+                .write_frames(&frames, page_count)
+                .await?;
+            // Promote the committed pages into the clean cache.
+            {
+                let mut st = self.state.lock().unwrap();
+                for (pgno, data) in pending {
+                    st.cache.insert(pgno, data);
+                }
+            }
+            // End the transaction (release the writer lock; the dummy journal is in-memory and
+            // needs no deletion).
+            return self.end_txn().await;
+        }
 
         // CommitPhaseOne: make the journal durable, then record how many pages it holds.
         let (journal, nrec) = {

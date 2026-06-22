@@ -269,3 +269,114 @@ fn read_wal_mode_db_schema() {
         .collect();
     assert_eq!(names, vec!["bar".to_string(), "foo".to_string()]);
 }
+
+/// Rustqlite writes to a WAL-mode database (created by the C oracle) and the C oracle reads
+/// the new rows back. This exercises the M13.5 WAL write path — `Pager::commit` appends frames
+/// to the `-wal` sidecar instead of journaling + writing the DB file. The C oracle then opens
+/// the same file (recovering the WAL) and sees the rows Rustqlite wrote.
+#[test]
+fn write_wal_mode_db_rustqlite_reads_back_via_c_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("rwrite");
+    // The C oracle sets up a WAL-mode database with a table and one row.
+    db.run("PRAGMA journal_mode = wal;");
+    db.run("CREATE TABLE t(a, b);");
+    db.run("INSERT INTO t VALUES (1, 'one');");
+
+    // Rustqlite opens the WAL-mode database and inserts more rows. The write path appends
+    // frames to the -wal sidecar (the DB file is untouched — only the schema page is there).
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (2, 'two'), (3, 'three');").expect("prepare");
+        match stmt.step() {
+            ResultCode::Done => {}
+            other => panic!("unexpected step result {other:?}: {}", stmt.errmsg()),
+        }
+    }
+    // The Rustqlite connection is dropped (closing the WAL). The C oracle opens the file
+    // and reads back — it must recover the WAL (including the frames Rustqlite wrote) and
+    // see all three rows.
+    assert_eq!(db.run("SELECT count(*) FROM t;"), "3");
+    assert_eq!(
+        db.run("SELECT a FROM t ORDER BY a;"),
+        "1\n2\n3"
+    );
+    assert_eq!(
+        db.run("SELECT b FROM t WHERE a = 3;"),
+        "three"
+    );
+}
+
+/// Rustqlite writes to a WAL-mode database and Rustqlite itself reads the rows back (without
+/// the C oracle). This verifies the round-trip through our own WAL write + read path: the
+/// commit appends frames, a fresh connection recovers the WAL and serves the pages from the
+/// frames.
+#[test]
+fn write_then_read_wal_mode_db_roundtrip() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("rwround");
+    // The C oracle puts the database into WAL mode (so the header has write_version=2). We
+    // need the C oracle here because Rustqlite doesn't yet implement `PRAGMA journal_mode =
+    // wal` (M13.10) — `create_fresh` always starts in rollback-journal mode.
+    db.run("PRAGMA journal_mode = wal;");
+    db.run("CREATE TABLE t(a);");
+
+    // Rustqlite inserts rows.
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        for i in 0..50 {
+            let sql = format!("INSERT INTO t VALUES ({i});");
+            let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, &sql).expect("prepare");
+            match stmt.step() {
+                ResultCode::Done => {}
+                other => panic!("unexpected step result {other:?}: {}", stmt.errmsg()),
+            }
+        }
+    }
+
+    // Rustqlite reads them back in a fresh connection (recovering the WAL Rustqlite wrote).
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT count(*) FROM t;").expect("prepare");
+        let rows = collect(&mut stmt);
+        assert_eq!(rows[0][0], Value::Int(50));
+        let (mut stmt2, _) = sqlite3_prepare_v2(&mut conn, "SELECT a FROM t ORDER BY a;").expect("prepare");
+        let got = collect(&mut stmt2);
+        assert_eq!(got.len(), 50);
+        for (i, row) in got.iter().enumerate() {
+            assert_eq!(row[0], Value::Int(i as i64));
+        }
+    }
+
+    // The C oracle also reads them back (cross-engine WAL compatibility).
+    assert_eq!(db.run("SELECT count(*) FROM t;"), "50");
+}
+
+/// Rustqlite writes to a WAL-mode database and the C oracle's `PRAGMA integrity_check` passes.
+/// This verifies that the WAL frames Rustqlite writes are byte-format-valid.
+#[test]
+fn write_wal_mode_db_c_oracle_integrity_check() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("rwinteg");
+    db.run("PRAGMA journal_mode = wal;");
+    db.run("CREATE TABLE t(a, b);");
+    db.run("INSERT INTO t VALUES (0, 'seed');");
+
+    // Rustqlite inserts rows.
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        for i in 1..100 {
+            let sql = format!("INSERT INTO t VALUES ({i}, 'row{i}');");
+            let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, &sql).expect("prepare");
+            match stmt.step() {
+                ResultCode::Done => {}
+                other => panic!("unexpected step result {other:?}: {}", stmt.errmsg()),
+            }
+        }
+    }
+
+    // The C oracle checks integrity. It must recover the WAL (the frames Rustqlite wrote)
+    // and the b-tree must be consistent.
+    assert_eq!(db.run("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.run("SELECT count(*) FROM t;"), "100");
+}
