@@ -289,11 +289,11 @@ list every granular item needed.
 
 ## M14 — ALTER TABLE
 
-- [ ] **14.1** Parser: `ALTER TABLE … RENAME TO new_name`
-- [ ] **14.2** Parser: `ALTER TABLE … ADD [COLUMN] col_def`
-- [ ] **14.3** Parser: `ALTER TABLE … DROP COLUMN name`
-- [ ] **14.4** Parser: `ALTER TABLE … RENAME COLUMN old TO new`
-- [ ] **14.5** Codegen: `RENAME TABLE` — rewrite `sqlite_schema` row + update all FK/view/trigger references
+- [x] **14.1** Parser: `ALTER TABLE … RENAME TO new_name`
+- [x] **14.2** Parser: `ALTER TABLE … ADD [COLUMN] col_def`
+- [x] **14.3** Parser: `ALTER TABLE … DROP COLUMN name`
+- [x] **14.4** Parser: `ALTER TABLE … RENAME COLUMN old TO new`
+- [x] **14.5** Codegen: `RENAME TABLE` — rewrite `sqlite_schema` row + update all FK/view/trigger references
 - [ ] **14.6** Codegen: `ADD COLUMN` — rewrite `sqlite_schema` CREATE TABLE SQL, default-fill new column in existing rows
 - [ ] **14.7** Codegen: `DROP COLUMN` — rewrite CREATE TABLE SQL, handle `sqlite_schema` update, rebuild dependent indexes
 - [ ] **14.8** Codegen: `RENAME COLUMN` — rewrite CREATE TABLE SQL + dependent indexes/views/triggers

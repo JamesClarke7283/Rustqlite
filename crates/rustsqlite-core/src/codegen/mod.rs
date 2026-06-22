@@ -7,6 +7,7 @@
 //! (value and jump forms), and [`select`] lays out the scan/sorter/limit structure. The write
 //! path and the planner's index selection arrive in later milestones.
 
+pub mod alter;
 pub mod builder;
 pub mod compound;
 pub mod create;
@@ -35,8 +36,8 @@ use crate::schema::{IndexObject, Table};
 use crate::vdbe::Program;
 
 use rustqlite_parser::{
-    CreateIndex, CreateTable, DeleteStmt, DropIndexStmt, DropTableStmt, InsertStmt, SelectStmt,
-    TransactionStmt, UpdateStmt,
+    AlterTableStmt, CreateIndex, CreateTable, DeleteStmt, DropIndexStmt, DropTableStmt,
+    InsertStmt, SelectStmt, TransactionStmt, UpdateStmt,
 };
 /// Compile a single-table (or constant) `SELECT` into a VDBE program plus its result column
 /// names. `table` is the resolved table for the lone `FROM` entry, or `None` for a `SELECT`
@@ -185,4 +186,16 @@ pub fn compile_from_subquery(
 /// are rejected (the pager savepoint stack is M12.4/M12.5).
 pub fn compile_transaction(stmt: &TransactionStmt) -> Result<Program> {
     transaction::compile_transaction(stmt)
+}
+
+/// Compile `ALTER TABLE <name> RENAME TO <new>` into a VDBE write program that rewrites the
+/// matching `sqlite_schema` rows. `current_schema_cookie` is the value before this DDL runs
+/// (the program bumps it by one). `edits` is the resolved set of schema-row edits (the table
+/// row + every associated index/trigger row whose `tbl_name` matches the old name).
+pub fn compile_alter_rename_table(
+    stmt: &AlterTableStmt,
+    current_schema_cookie: u32,
+    edits: &[alter::SchemaRowEdit],
+) -> Result<Program> {
+    alter::compile_alter_rename_table(stmt, current_schema_cookie, edits)
 }

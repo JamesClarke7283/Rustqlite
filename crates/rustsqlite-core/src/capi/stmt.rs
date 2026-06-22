@@ -9,8 +9,8 @@
 use std::sync::{Arc, Mutex};
 
 use rustqlite_parser::{
-    parse, DropIndexStmt, DropTableStmt, ExplainKind, InsertSource, Literal, PragmaStmt,
-    PragmaValue, PragmaValueKind, SelectStmt, Stmt,
+    parse, AlterTableAction, AlterTableStmt, DropIndexStmt, DropTableStmt, ExplainKind,
+    InsertSource, Literal, PragmaStmt, PragmaValue, PragmaValueKind, SelectStmt, Stmt,
 };
 
 use crate::codegen;
@@ -18,7 +18,9 @@ use crate::codegen::returning::Returning;
 use crate::codegen::SubqueryResolver;
 use crate::error::{Error, Result, ResultCode};
 use crate::pager::Pager;
-use crate::schema::{read_catalog, schema_cookie, IndexObject, Table};
+use crate::schema::{
+    dequote_ident, read_catalog, schema_cookie, IndexObject, Table,
+};
 use crate::types::Value;
 use crate::vdbe::{explain, Instruction, Opcode, Program, StepResult, Vdbe};
 
@@ -336,9 +338,27 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 last_error: None,
             })
         }
-        Stmt::AlterTable(_) => {
-            // ALTER TABLE parsing is implemented (M2.25–M2.28) but codegen is deferred to M14.
-            Err(Error::msg("ALTER TABLE is not supported yet"))
+        Stmt::AlterTable(alter) => {
+            // ALTER TABLE: resolve the target table from the catalog and dispatch on the
+            // action. M14.5 implements `RENAME TO`; the other actions (ADD/DROP/RENAME
+            // COLUMN, ALTER COLUMN, ADD/DROP CONSTRAINT) are deferred.
+            let pager = db.pager_arc()?;
+            let (edits, schema_cookie) = resolve_alter_target(&pager, &alter)?;
+            let program = Arc::new(codegen::compile_alter_rename_table(
+                &alter,
+                schema_cookie,
+                &edits,
+            )?);
+            let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
+            Ok(Sqlite3Stmt {
+                sql: sql.to_string(),
+                program,
+                column_names: Vec::new(),
+                backing: Backing::Vdbe(vdbe),
+                explain: 0,
+                counts: Some(db.counts_handle()),
+                last_error: None,
+            })
         }
         Stmt::CreateView(_) => {
             // CREATE VIEW parsing is implemented (M2.29) but codegen is deferred to M15.
@@ -551,6 +571,115 @@ fn resolve_drop_target(pager: &Arc<Pager>, drop: &DropTableStmt) -> Result<(Opti
     Ok((table, cookie))
 }
 
+/// Resolve an `ALTER TABLE` target: validates the table exists, dispatches on the action,
+/// and produces the list of `sqlite_schema` row edits the codegen should perform. Returns
+/// `(edits, schema_cookie)`.
+///
+/// `RENAME TO new_name` collects:
+///   * the table row itself — `name` and `tbl_name` set to `new_name`, `sql` rewritten,
+///   * every associated index/trigger row whose `tbl_name` matches the old name — `tbl_name`
+///     set to `new_name`, `sql` rewritten (when the rewrite succeeds).
+///
+/// Other actions return an error at codegen time (M14.6+ will handle them).
+fn resolve_alter_target(
+    pager: &Arc<Pager>,
+    alter: &AlterTableStmt,
+) -> Result<(Vec<codegen::alter::SchemaRowEdit>, u32)> {
+    if alter.schema.is_some() {
+        return Err(Error::msg(
+            "schema-qualified ALTER TABLE is not yet supported",
+        ));
+    }
+    let catalog = block_on(read_catalog(pager))?;
+    let cookie = schema_cookie(pager);
+    let new_name = match &alter.action {
+        AlterTableAction::RenameTo(n) => n.clone(),
+        _ => {
+            return Err(Error::msg(format!(
+                "ALTER TABLE action {:?} is not supported yet",
+                alter.action
+            )));
+        }
+    };
+    // Reject renaming a system table (sqlite_*) — upstream's `isAlterableTable`.
+    if alter.table.starts_with("sqlite_") {
+        return Err(Error::msg(format!("table {} may not be altered", alter.table)));
+    }
+    // The table must exist.
+    let table_obj = catalog
+        .find_table(&alter.table)
+        .ok_or_else(|| Error::msg(format!("no such table: {}", alter.table)))?;
+    // The new name must not collide with an existing table or index.
+    if catalog.find_table(&new_name).is_some()
+        || catalog.find_index(&new_name).is_some()
+    {
+        return Err(Error::msg(format!(
+            "there is already another table or index with this name: {}",
+            new_name
+        )));
+    }
+    // Reject reserved-name targets (sqlite_*).
+    if new_name.starts_with("sqlite_") {
+        return Err(Error::msg(format!(
+            "object name reserved for internal use: {}",
+            new_name
+        )));
+    }
+
+    let old_name = &alter.table;
+    // Dequote the new name: SQLite stores the *dequoted* form in the `name`/`tbl_name`
+    // columns of `sqlite_schema` (the parser keeps the quote characters in the AST string,
+    // which is correct for the `sql` column text but not for the name columns).
+    let new_name_dequoted = codegen::alter::dequote_ident(&new_name);
+    let old_name_dequoted = codegen::alter::dequote_ident(old_name);
+    let mut edits: Vec<codegen::alter::SchemaRowEdit> = Vec::new();
+
+    // The table row: update name, tbl_name, and sql.
+    let table_sql_rewrite = table_obj
+        .sql
+        .as_deref()
+        .and_then(|s| {
+            codegen::alter::rewrite_table_name_in_sql(s, &old_name_dequoted, &new_name_dequoted)
+        });
+    let table_edit = codegen::alter::SchemaRowEdit {
+        rowid: table_obj.rowid,
+        new_name: Some(new_name_dequoted.clone()),
+        new_tbl_name: Some(new_name_dequoted.clone()),
+        new_sql: table_sql_rewrite,
+    };
+    edits.push(table_edit);
+
+    // Associated rows (indexes, triggers) whose tbl_name matches the old name: update
+    // tbl_name and rewrite sql. The `name` column of these rows is NOT changed (the index
+    // keeps its own name; only the table-association changes).
+    for obj in &catalog.objects {
+        if obj.rowid == table_obj.rowid {
+            continue; // already handled above
+        }
+        if !dequote_ident(&obj.tbl_name).eq_ignore_ascii_case(&old_name_dequoted) {
+            continue;
+        }
+        // Only rewrite index/trigger rows whose tbl_name matches. (Views are separate.)
+        if !(obj.is_index() || obj.obj_type == "trigger") {
+            continue;
+        }
+        let sql_rewrite = obj
+            .sql
+            .as_deref()
+            .and_then(|s| {
+                codegen::alter::rewrite_table_name_in_sql(s, &old_name_dequoted, &new_name_dequoted)
+            });
+        edits.push(codegen::alter::SchemaRowEdit {
+            rowid: obj.rowid,
+            new_name: None,
+            new_tbl_name: Some(new_name_dequoted.clone()),
+            new_sql: sql_rewrite,
+        });
+    }
+
+    Ok((edits, cookie))
+}
+
 /// Resolve the index a `DROP INDEX` targets from the current catalog. Returns
 /// `(Some(IndexObject), rowid)` when found, `(None, 0)` when missing and `IF EXISTS` was
 /// given. Errors with `no such index` when missing and `IF EXISTS` was not given.
@@ -562,7 +691,10 @@ fn resolve_drop_index_target(
     // Use the actual b-tree rowid (preserved on each `SchemaObject` by the catalog reader) so
     // the `Delete` opcode targets the right row even when other rows have been deleted.
     for obj in catalog.objects.iter() {
-        if obj.is_index() && obj.name.eq_ignore_ascii_case(&di.name) {
+        if obj.is_index()
+            && dequote_ident(&obj.name)
+                .eq_ignore_ascii_case(&dequote_ident(&di.name))
+        {
             let idx = IndexObject::from_schema_object(obj)?;
             return Ok((Some(idx), obj.rowid));
         }

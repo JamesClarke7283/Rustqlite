@@ -77,18 +77,23 @@ impl Catalog {
         self.objects.iter().filter(|o| o.is_index())
     }
 
-    /// Find a table by name (case-insensitive, as SQLite resolves identifiers).
+    /// Find a table by name (case-insensitive, as SQLite resolves identifiers). Both the
+    /// stored name and the lookup key are dequoted before comparison, so a table created as
+    /// `"My Table"` (stored with quotes by the parser) is found by either `"My Table"` or
+    /// `My Table`.
     pub fn find_table(&self, name: &str) -> Option<&SchemaObject> {
+        let key = dequote_ident(name);
         self.objects
             .iter()
-            .find(|o| o.is_table() && o.name.eq_ignore_ascii_case(name))
+            .find(|o| o.is_table() && dequote_ident(&o.name).eq_ignore_ascii_case(&key))
     }
 
-    /// Find an index by name (case-insensitive).
+    /// Find an index by name (case-insensitive, dequoted).
     pub fn find_index(&self, name: &str) -> Option<&SchemaObject> {
+        let key = dequote_ident(name);
         self.objects
             .iter()
-            .find(|o| o.is_index() && o.name.eq_ignore_ascii_case(name))
+            .find(|o| o.is_index() && dequote_ident(&o.name).eq_ignore_ascii_case(&key))
     }
 
     /// Find an index on `table_name` that covers `column_name` (a single-column, equality-
@@ -99,9 +104,10 @@ impl Catalog {
         table_name: &str,
         column_name: &str,
     ) -> Option<&SchemaObject> {
+        let key = dequote_ident(table_name);
         self.objects.iter().find(|o| {
             o.is_index()
-                && o.tbl_name.eq_ignore_ascii_case(table_name)
+                && dequote_ident(&o.tbl_name).eq_ignore_ascii_case(&key)
                 && o.sql
                     .as_deref()
                     .is_some_and(|sql| index_covers_column(sql, column_name))
@@ -187,5 +193,35 @@ fn int_at(values: &[Value], i: usize) -> i64 {
     match values.get(i) {
         Some(Value::Int(n)) => *n,
         _ => 0,
+    }
+}
+
+/// Dequote a SQL identifier string if it is wrapped in `"..."`, `` `...` ``, or `[...]`.
+/// Doubled quote characters within the string are collapsed. Returns the input unchanged
+/// when it is not quoted. Mirrors `sqlite3Dequote` for the identifier-name comparison case.
+pub fn dequote_ident(s: &str) -> String {
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 {
+        return s.to_string();
+    }
+    match bytes[0] {
+        b'"' | b'`' => {
+            let quote = bytes[0];
+            if bytes[bytes.len() - 1] != quote {
+                return s.to_string();
+            }
+            let inner = &s[1..bytes.len() - 1];
+            inner.replace(
+                &format!("{}{}", quote as char, quote as char),
+                &format!("{}", quote as char),
+            )
+        }
+        b'[' => {
+            if bytes[bytes.len() - 1] != b']' {
+                return s.to_string();
+            }
+            s[1..bytes.len() - 1].to_string()
+        }
+        _ => s.to_string(),
     }
 }

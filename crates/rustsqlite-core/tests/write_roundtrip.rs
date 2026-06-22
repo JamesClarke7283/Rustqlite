@@ -1513,3 +1513,157 @@ fn pragma_integrity_check_returns_ok_on_healthy_db() {
     // The C oracle agrees.
     assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
 }
+
+#[test]
+fn alter_table_rename_to_roundtrip_and_c_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("alter_rename");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x'), (2, 'y');");
+        exec(&mut conn, "ALTER TABLE t RENAME TO u;");
+
+        // The renamed table is visible by its new name.
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM u ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("x".into())],
+            vec![Value::Int(2), Value::Text("y".into())],
+        ]);
+
+        // The old name is gone.
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "SELECT count(*) FROM sqlite_schema WHERE name='t';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(0)]]);
+
+        // The new name is present.
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "SELECT count(*) FROM sqlite_schema WHERE name='u';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(1)]]);
+
+        // The CREATE TABLE sql in sqlite_schema reflects the new name.
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "SELECT sql FROM sqlite_schema WHERE name='u';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Text("CREATE TABLE u(a, b)".to_string())]]);
+
+        let _ = conn;
+    }
+
+    // The C oracle can read the renamed table and its rows.
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM u ORDER BY a;"), "1|x\n2|y");
+    assert_eq!(db.query("SELECT sql FROM sqlite_schema WHERE name='u';"), "CREATE TABLE u(a, b)");
+}
+
+#[test]
+fn alter_table_rename_to_with_index_updates_index_tbl_name() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("alter_rename_index");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE INDEX idx_a ON t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x'), (2, 'y');");
+        exec(&mut conn, "ALTER TABLE t RENAME TO u;");
+
+        // The index is still present, now associated with `u`.
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "SELECT tbl_name FROM sqlite_schema WHERE name='idx_a';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Text("u".to_string())]]);
+
+        // The index still works for queries on the renamed table.
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a FROM u WHERE a=2;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(2)]]);
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT tbl_name FROM sqlite_schema WHERE name='idx_a';"), "u");
+    assert_eq!(db.query("SELECT a FROM u WHERE a=2;"), "2");
+}
+
+#[test]
+fn alter_table_rename_to_nonexistent_errors() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("alter_rename_nonexistent");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let result = sqlite3_prepare_v2(&mut conn, "ALTER TABLE nope RENAME TO u;");
+        assert!(result.is_err(), "expected error for renaming nonexistent table");
+        let _ = conn;
+    }
+}
+
+#[test]
+fn alter_table_rename_to_collision_errors() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("alter_rename_collision");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a);");
+        exec(&mut conn, "CREATE TABLE u(a);");
+        let result = sqlite3_prepare_v2(&mut conn, "ALTER TABLE t RENAME TO u;");
+        assert!(result.is_err(), "expected error for renaming to existing name");
+        let _ = conn;
+    }
+}
+
+#[test]
+fn alter_table_rename_to_preserves_data_and_schema() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("alter_rename_preserves");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT, c REAL);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x', 1.5), (2, 'y', 2.5);");
+        exec(&mut conn, "ALTER TABLE t RENAME TO renamed;");
+
+        // The rowid alias still works (a is INTEGER PRIMARY KEY).
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "SELECT a, b, c FROM renamed ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("x".into()), Value::Real(1.5)],
+            vec![Value::Int(2), Value::Text("y".into()), Value::Real(2.5)],
+        ]);
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b, c FROM renamed ORDER BY a;"), "1|x|1.5\n2|y|2.5");
+}
+#[test]
+fn alter_table_rename_to_quoted_name() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("alter_rename_quoted");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE \"My Table\"(a);");
+        exec(&mut conn, "INSERT INTO \"My Table\" VALUES (1);");
+        exec(&mut conn, "ALTER TABLE \"My Table\" RENAME TO \"Other Name\";");
+
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "SELECT a FROM \"Other Name\";").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(1)]]);
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a FROM \"Other Name\";"), "1");
+}
