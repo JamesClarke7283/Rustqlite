@@ -306,8 +306,8 @@ list every granular item needed.
 
 - [x] **15.1** Parser: `CREATE [TEMP] VIEW [IF NOT EXISTS] name (cols) AS SELECT …`
 - [x] **15.2** Parser: `DROP VIEW [IF EXISTS] name`
-- [ ] **15.3** Codegen: `CREATE VIEW` — write entry to `sqlite_schema` (type='view')
-- [ ] **15.4** Codegen: `DROP VIEW` — remove `sqlite_schema` entry + invalidate schema
+- [x] **15.3** Codegen: `CREATE VIEW` — write entry to `sqlite_schema` (type='view')
+- [x] **15.4** Codegen: `DROP VIEW` — remove `sqlite_schema` entry + invalidate schema
 - [ ] **15.5** View expansion: when a view appears in `FROM`, substitute its SELECT body (coroutine or materialization)
 - [ ] **15.6** `sqlitemaster` view compatibility (`sqlite_master` vs `sqlite_schema` alias)
 - [ ] **15.7** `INSTEAD OF` triggers on views (depends on M18 triggers)

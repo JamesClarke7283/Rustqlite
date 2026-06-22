@@ -2115,3 +2115,122 @@ fn alter_table_rename_column_with_index() {
     assert_eq!(db.query("SELECT sql FROM sqlite_schema WHERE name='idx_b';"), "CREATE INDEX idx_b ON t(c)");
     assert_eq!(db.query("SELECT a FROM t WHERE c='y';"), "2");
 }
+
+#[test]
+fn create_view_writes_schema_row() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("create_view");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x');");
+        exec(&mut conn, "CREATE VIEW v AS SELECT a FROM t;");
+
+        // The view is present in sqlite_schema with type='view' and rootpage=0.
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT type, name, tbl_name, rootpage FROM sqlite_schema WHERE name='v';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![
+            Value::Text("view".to_string()),
+            Value::Text("v".to_string()),
+            Value::Text("v".to_string()),
+            Value::Int(0),
+        ]]);
+
+        // The sql column holds the verbatim CREATE VIEW text.
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT sql FROM sqlite_schema WHERE name='v';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Text("CREATE VIEW v AS SELECT a FROM t".to_string())]]);
+
+        let _ = conn;
+    }
+
+    // The C oracle can read the view's schema row.
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT type, name, rootpage FROM sqlite_schema WHERE name='v';"), "view|v|0");
+    assert_eq!(db.query("SELECT sql FROM sqlite_schema WHERE name='v';"), "CREATE VIEW v AS SELECT a FROM t");
+}
+
+#[test]
+fn create_view_if_not_exists_is_noop() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("create_view_if_not_exists");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a);");
+        exec(&mut conn, "CREATE VIEW v AS SELECT a FROM t;");
+        // IF NOT EXISTS against a pre-existing view is a no-op.
+        exec(&mut conn, "CREATE VIEW IF NOT EXISTS v AS SELECT a FROM t;");
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT count(*) FROM sqlite_schema WHERE name='v';"), "1");
+}
+
+#[test]
+fn create_view_collision_errors() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("create_view_collision");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a);");
+        exec(&mut conn, "CREATE VIEW v AS SELECT a FROM t;");
+        let result = sqlite3_prepare_v2(&mut conn, "CREATE VIEW v AS SELECT a FROM t;");
+        assert!(result.is_err(), "expected error for duplicate view name");
+        let _ = conn;
+    }
+}
+
+#[test]
+fn drop_view_removes_schema_row() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("drop_view");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a);");
+        exec(&mut conn, "CREATE VIEW v AS SELECT a FROM t;");
+        exec(&mut conn, "DROP VIEW v;");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT count(*) FROM sqlite_schema WHERE name='v';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(0)]]);
+
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT count(*) FROM sqlite_schema WHERE name='v';"), "0");
+}
+
+#[test]
+fn drop_view_if_exists_missing_is_noop() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("drop_view_if_exists");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a);");
+        // IF EXISTS against a missing view is a no-op.
+        exec(&mut conn, "DROP VIEW IF EXISTS nope;");
+        let _ = conn;
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+}
+
+#[test]
+fn drop_view_nonexistent_errors() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("drop_view_nonexistent");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let result = sqlite3_prepare_v2(&mut conn, "DROP VIEW nope;");
+        assert!(result.is_err(), "expected error for dropping nonexistent view");
+        let _ = conn;
+    }
+}

@@ -96,6 +96,23 @@ impl Catalog {
             .find(|o| o.is_index() && dequote_ident(&o.name).eq_ignore_ascii_case(&key))
     }
 
+    /// Find any schema object (table, view, index, trigger) by name (case-insensitive,
+    /// dequoted). Used by DDL that needs to check for name collisions across object types.
+    pub fn find_object(&self, name: &str) -> Option<&SchemaObject> {
+        let key = dequote_ident(name);
+        self.objects
+            .iter()
+            .find(|o| dequote_ident(&o.name).eq_ignore_ascii_case(&key))
+    }
+
+    /// Find a view by name (case-insensitive, dequoted).
+    pub fn find_view(&self, name: &str) -> Option<&SchemaObject> {
+        let key = dequote_ident(name);
+        self.objects
+            .iter()
+            .find(|o| o.obj_type == "view" && dequote_ident(&o.name).eq_ignore_ascii_case(&key))
+    }
+
     /// Find an index on `table_name` that covers `column_name` (a single-column, equality-
     /// usable index). The first match (in catalog order) is returned; multi-column indexes
     /// are skipped in the M5.1 first slice.

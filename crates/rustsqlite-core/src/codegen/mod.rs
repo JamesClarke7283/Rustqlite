@@ -27,6 +27,7 @@ pub mod select;
 pub mod subquery;
 pub mod transaction;
 pub mod update;
+pub mod view;
 pub mod window;
 
 pub use expr::SubqueryResolver;
@@ -36,8 +37,8 @@ use crate::schema::{IndexObject, Table};
 use crate::vdbe::Program;
 
 use rustqlite_parser::{
-    AlterTableStmt, CreateIndex, CreateTable, DeleteStmt, DropIndexStmt, DropTableStmt,
-    InsertStmt, SelectStmt, TransactionStmt, UpdateStmt,
+    AlterTableStmt, CreateIndex, CreateTable, CreateView, DeleteStmt, DropIndexStmt,
+    DropTableStmt, DropViewStmt, InsertStmt, SelectStmt, TransactionStmt, UpdateStmt,
 };
 /// Compile a single-table (or constant) `SELECT` into a VDBE program plus its result column
 /// names. `table` is the resolved table for the lone `FROM` entry, or `None` for a `SELECT`
@@ -250,4 +251,26 @@ pub fn compile_alter_rename_column(
     edits: &[alter::SchemaRowEdit],
 ) -> Result<Program> {
     alter::compile_alter_rename_column(stmt, current_schema_cookie, edits)
+}
+
+/// Compile a `CREATE VIEW` into a VDBE write program. `sql_text` is stored verbatim in the
+/// new `sqlite_schema` row's `sql` column; `schema_cookie` is the current cookie (the
+/// program bumps it by one).
+pub fn compile_create_view(cv: &CreateView, sql_text: &str, schema_cookie: u32) -> Result<Program> {
+    view::compile_create_view(cv, sql_text, schema_cookie)
+}
+
+/// Compile a `DROP VIEW [IF EXISTS] [schema.]name` into a VDBE write program.
+/// `schema_rowid` is the rowid of the view's `sqlite_schema` row (0 for a no-op
+/// `IF EXISTS` against a missing view).
+pub fn compile_drop_view(
+    dv: &DropViewStmt,
+    schema_cookie: u32,
+    schema_rowid: i64,
+) -> Result<Program> {
+    if schema_rowid == 0 {
+        Ok(view::compile_drop_view_noop())
+    } else {
+        view::compile_drop_view(dv, schema_cookie, schema_rowid)
+    }
 }

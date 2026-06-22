@@ -809,3 +809,15 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   doesn't collide with an existing column. Differential-tested vs the C oracle
   (`alter_table_rename_column_*` — basic rename, without `COLUMN` keyword, with index,
   nonexistent/collision errors).
+- **M15 — Views** 🚧: **15.1–15.2** ✅ (parser shipped in M2.29/M2.30). **15.3 `CREATE
+  VIEW`** ✅ / **15.4 `DROP VIEW`** ✅: `codegen::view::compile_create_view` (mirrors
+  `sqlite3CreateView` in `build.c`) writes a `sqlite_schema` row with `type='view'`,
+  `rootpage=0`, and the verbatim `CREATE VIEW` text; `compile_drop_view` removes the row.
+  The `Catalog` gained `find_view` and `find_object` helpers (dequoted, case-insensitive)
+  so the resolver can check for name collisions across tables, views, and indexes, and so
+  `DROP VIEW` can resolve the view's rowid. `IF NOT EXISTS` against a pre-existing view is
+  a no-op; `IF EXISTS` against a missing view is a no-op. Differential-tested vs the C
+  oracle (`create_view_*` / `drop_view_*` in `write_roundtrip.rs` — schema row, IF NOT
+  EXISTS, collision error, DROP VIEW, IF EXISTS, nonexistent error). Still M15+: 15.5
+  view expansion (substituting a view's SELECT body when it appears in FROM), 15.6
+  `sqlite_master` alias, 15.7 `INSTEAD OF` triggers (depends on M16).

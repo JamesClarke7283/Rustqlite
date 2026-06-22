@@ -41,3 +41,16 @@ pub fn index_schema_row(name: &str, tbl_name: &str, rootpage: i64, sql: &str) ->
         Value::Text(sql.to_string()),
     ]
 }
+
+/// Build the five-value `sqlite_schema` row for a `CREATE VIEW`:
+/// `('view', name, name, 0, sql)`. The `rootpage` is 0 because a view has no b-tree (it
+/// is a saved SELECT statement expanded at query time).
+pub fn view_schema_row(name: &str, sql: &str) -> Vec<Value> {
+    vec![
+        Value::Text("view".to_string()),
+        Value::Text(name.to_string()),
+        Value::Text(name.to_string()),
+        Value::Int(0),
+        Value::Text(sql.to_string()),
+    ]
+}

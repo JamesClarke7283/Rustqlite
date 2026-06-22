@@ -440,13 +440,73 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 ))),
             }
         }
-        Stmt::CreateView(_) => {
-            // CREATE VIEW parsing is implemented (M2.29) but codegen is deferred to M15.
-            Err(Error::msg("CREATE VIEW is not supported yet"))
+        Stmt::CreateView(cv) => {
+            // CREATE VIEW: write a sqlite_schema row with type='view', rootpage=0, and the
+            // verbatim CREATE VIEW text. View expansion (M15.5) is deferred.
+            let pager = db.ensure_pager()?;
+            let catalog = block_on(read_catalog(&pager))?;
+            // IF NOT EXISTS against a pre-existing view is a no-op.
+            if cv.if_not_exists && catalog.find_view(&cv.name).is_some() {
+                return Ok(Sqlite3Stmt {
+                    sql: sql.to_string(),
+                    program: Arc::new(Program::empty()),
+                    column_names: Vec::new(),
+                    backing: Backing::Vdbe(vdbe_for(Arc::new(Program::empty()), None, db)),
+                    explain: 0,
+                    counts: Some(db.counts_handle()),
+                    last_error: None,
+                });
+            }
+            // Reject if a table, view, or index with this name already exists.
+            if catalog.find_object(&cv.name).is_some() {
+                return Err(Error::msg(format!(
+                    "there is already another table or index with this name: {}",
+                    cv.name
+                )));
+            }
+            let schema_cookie = schema_cookie(&pager);
+            let sql_text = create_table_text(sql);
+            let program = Arc::new(codegen::compile_create_view(&cv, sql_text, schema_cookie)?);
+            let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
+            Ok(Sqlite3Stmt {
+                sql: sql.to_string(),
+                program,
+                column_names: Vec::new(),
+                backing: Backing::Vdbe(vdbe),
+                explain: 0,
+                counts: Some(db.counts_handle()),
+                last_error: None,
+            })
         }
-        Stmt::DropView(_) => {
-            // DROP VIEW parsing is implemented (M2.30) but codegen is deferred to M15.
-            Err(Error::msg("DROP VIEW is not supported yet"))
+        Stmt::DropView(dv) => {
+            // DROP VIEW: resolve the view's sqlite_schema rowid, then compile a write
+            // program that deletes it. IF EXISTS against a missing view is a no-op.
+            let pager = db.pager_arc()?;
+            let catalog = block_on(read_catalog(&pager))?;
+            let mut schema_rowid = 0i64;
+            let mut found = false;
+            for obj in &catalog.objects {
+                if obj.obj_type == "view" && dequote_ident(&obj.name).eq_ignore_ascii_case(&dequote_ident(&dv.name)) {
+                    schema_rowid = obj.rowid;
+                    found = true;
+                    break;
+                }
+            }
+            if !found && !dv.if_exists {
+                return Err(Error::msg(format!("no such view: {}", dv.name)));
+            }
+            let schema_cookie = schema_cookie(&pager);
+            let program = Arc::new(codegen::compile_drop_view(&dv, schema_cookie, schema_rowid)?);
+            let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
+            Ok(Sqlite3Stmt {
+                sql: sql.to_string(),
+                program,
+                column_names: Vec::new(),
+                backing: Backing::Vdbe(vdbe),
+                explain: 0,
+                counts: Some(db.counts_handle()),
+                last_error: None,
+            })
         }
         Stmt::CreateTrigger(_) => {
             // CREATE TRIGGER parsing is implemented (M2.31) but codegen is deferred to M16.
