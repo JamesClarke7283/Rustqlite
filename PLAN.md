@@ -266,7 +266,7 @@ list every granular item needed.
 - [x] **12.6** `Transaction` opcode: deferred vs immediate vs exclusive locking
 - [x] **12.7** VFS: proper shared/exclusive lock escalation for IMMEDIATE/EXCLUSIVE transactions
 - [x] **12.8** Conflict resolution: `OR ROLLBACK`, `OR FAIL`, `OR IGNORE`, `OR REPLACE` semantics (parser parses; codegen must enforce)
-- [ ] **12.9** `ON CONFLICT` column/table constraints (unique, not null, check) triggering constraint abort vs ignore
+- [x] **12.9** `ON CONFLICT` column/table constraints (unique, not null, check) triggering constraint abort vs ignore
 
 ---
 

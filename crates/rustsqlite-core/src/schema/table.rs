@@ -15,6 +15,7 @@ use rustqlite_parser::{parse, ColumnConstraint, CreateIndex, CreateTable, Stmt};
 use crate::error::{Error, Result};
 use crate::schema::SchemaObject;
 use crate::types::{affinity_of, Affinity, Collation};
+use crate::vdbe::oe::OeAction;
 
 /// One column of a table.
 #[derive(Clone, Debug, PartialEq)]
@@ -26,6 +27,9 @@ pub struct Column {
     pub pk: bool,
     /// The column's `DEFAULT` expression, if any. `None` means the default is NULL.
     pub default: Option<rustqlite_parser::Expr>,
+    /// The per-column NOT NULL conflict-resolution action (`OE_Abort` when no `ON CONFLICT`
+    /// clause was given). M12.9.
+    pub notnull_oe: OeAction,
 }
 
 /// A resolved table: its name, root b-tree page, columns, and (if any) the column that aliases
@@ -76,6 +80,10 @@ pub struct IndexObject {
     /// This mirrors SQLite's `Index.uniqNotNull`: uniqueness is only enforced on rows where
     /// none of the key columns are NULL (NULL != NULL in SQL).
     pub unique_not_null: bool,
+    /// The per-index conflict-resolution action for the UNIQUE constraint (`OE_Abort` when no
+    /// `ON CONFLICT` clause was given on the declaring `PRIMARY KEY`/`UNIQUE` constraint).
+    /// M12.9.
+    pub unique_oe: OeAction,
     /// Optional partial-index predicate (`WHERE expr`). From M5.2.9 onward.
     pub where_clause: Option<rustqlite_parser::Expr>,
 }
@@ -175,14 +183,25 @@ impl Table {
         for (i, cd) in ct.columns.iter().enumerate() {
             let affinity = affinity_of(cd.type_name.as_deref());
             let mut notnull = false;
+            let mut notnull_oe = OeAction::None;
             let mut pk = false;
             let mut default: Option<rustqlite_parser::Expr> = None;
             for c in &cd.constraints {
                 match c {
-                    ColumnConstraint::NotNull => notnull = true,
-                    ColumnConstraint::PrimaryKey { desc, .. } => {
+                    ColumnConstraint::NotNull { on_conflict } => {
+                        notnull = true;
+                        notnull_oe = OeAction::from_parser(*on_conflict);
+                    }
+                    ColumnConstraint::PrimaryKey { desc, on_conflict, .. } => {
                         pk = true;
                         pk_cols.push((i, *desc));
+                        // A column-level PRIMARY KEY is also NOT NULL (upstream's
+                        // `sqlite3AddPrimaryKey` sets `pCol->notNull = OE_Abort` unless the
+                        // column is NULL-tolerant or the table is WITHOUT ROWID). We record
+                        // the PK's OE so M12.9 can apply it.
+                        if notnull_oe == OeAction::None {
+                            notnull_oe = OeAction::from_parser(*on_conflict);
+                        }
                     }
                     ColumnConstraint::Default(e) => {
                         default = Some(e.clone());
@@ -197,6 +216,7 @@ impl Table {
                 notnull,
                 pk,
                 default,
+                notnull_oe,
             });
         }
 
@@ -204,8 +224,9 @@ impl Table {
         // it establishes the PK set. Upstream disallows mixing; we follow the same rule by
         // taking whichever was declared (the table-level wins when both are present, matching
         // `sqlite3AddPrimaryKey`'s behavior of erroring on a duplicate, which we approximate).
+        let mut table_pk_oe: Option<OeAction> = None;
         for c in &ct.constraints {
-            if let rustqlite_parser::TableConstraintBody::PrimaryKey { columns } = &c.body {
+            if let rustqlite_parser::TableConstraintBody::PrimaryKey { columns, on_conflict } = &c.body {
                 pk_cols.clear();
                 for pkc in columns {
                     if let Some(idx) = ct
@@ -216,6 +237,14 @@ impl Table {
                         pk_cols.push((idx, pkc.desc));
                     }
                 }
+                table_pk_oe = Some(OeAction::from_parser(*on_conflict));
+            }
+        }
+        // A table-level `PRIMARY KEY (...) ON CONFLICT <action>` applies the OE to each PK
+        // column's implicit NOT NULL (mirrors `sqlite3AddPrimaryKey` setting `pCol->notNull`).
+        if let Some(oe) = table_pk_oe {
+            for &(idx, _) in &pk_cols {
+                columns[idx].notnull_oe = oe;
             }
         }
 
@@ -470,6 +499,7 @@ impl IndexObject {
             columns,
             unique: ci.unique,
             unique_not_null,
+            unique_oe: OeAction::Abort,
             where_clause: ci.where_clause.clone(),
         }
     }

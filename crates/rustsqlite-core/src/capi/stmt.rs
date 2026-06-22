@@ -493,6 +493,7 @@ fn resolve_sqlite_schema(pager: &Arc<Pager>) -> Result<Table> {
                 notnull: false,
                 pk: false,
                 default: None,
+                notnull_oe: crate::vdbe::oe::OeAction::None,
             },
             crate::schema::Column {
                 name: "name".to_string(),
@@ -501,6 +502,7 @@ fn resolve_sqlite_schema(pager: &Arc<Pager>) -> Result<Table> {
                 notnull: false,
                 pk: false,
                 default: None,
+                notnull_oe: crate::vdbe::oe::OeAction::None,
             },
             crate::schema::Column {
                 name: "tbl_name".to_string(),
@@ -509,6 +511,7 @@ fn resolve_sqlite_schema(pager: &Arc<Pager>) -> Result<Table> {
                 notnull: false,
                 pk: false,
                 default: None,
+                notnull_oe: crate::vdbe::oe::OeAction::None,
             },
             crate::schema::Column {
                 name: "rootpage".to_string(),
@@ -517,6 +520,7 @@ fn resolve_sqlite_schema(pager: &Arc<Pager>) -> Result<Table> {
                 notnull: false,
                 pk: false,
                 default: None,
+                notnull_oe: crate::vdbe::oe::OeAction::None,
             },
             crate::schema::Column {
                 name: "sql".to_string(),
@@ -525,6 +529,7 @@ fn resolve_sqlite_schema(pager: &Arc<Pager>) -> Result<Table> {
                 notnull: false,
                 pk: false,
                 default: None,
+                notnull_oe: crate::vdbe::oe::OeAction::None,
             },
         ],
         rowid_alias: None,

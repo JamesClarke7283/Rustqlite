@@ -242,6 +242,12 @@ pub struct Vdbe {
     /// that already completed its setup). Mirrors the statement sub-journal in upstream's
     /// `sqlite3VdbeMakeReady`/`sqlite3VdbeHalt`.
     stmt_savepoint: Option<String>,
+    /// Per-constraint OE override set by `HaltIfNull`/`IdxInsert` when a per-constraint `ON
+    /// CONFLICT <action>` clause fires (M12.9). When `Some`, `step()`'s error path uses this OE
+    /// instead of `program.default_oe` for the cleanup, mirroring how upstream's `OP_Halt` sets
+    /// `p->errorAction = pOp->p2` before calling `sqlite3VdbeHalt`. Cleared on each `step()`
+    /// entry (a fresh statement starts with no override).
+    oe_override: Option<u8>,
 }
 
 impl Vdbe {
@@ -272,6 +278,7 @@ impl Vdbe {
             once_done: std::collections::HashSet::new(),
             frames: Vec::new(),
             stmt_savepoint: None,
+            oe_override: None,
         }
     }
 
@@ -378,21 +385,28 @@ impl Vdbe {
         match self.step_inner().await {
             Ok(r) => Ok(r),
             Err(e) => {
-                let oe = crate::vdbe::oe::OeAction::from_u8(self.program.default_oe);
+                // A per-constraint `ON CONFLICT <action>` clause (M12.9) sets `oe_override` when
+                // it fires; that OE wins over the statement-level `OR <action>` for the cleanup,
+                // mirroring upstream's `p->errorAction = pOp->p2` in `OP_Halt`. The override is
+                // consumed here (cleared after the cleanup).
+                let oe_byte = self.oe_override.take().unwrap_or(self.program.default_oe);
+                let oe = crate::vdbe::oe::OeAction::from_u8(oe_byte);
                 if self.write_txn {
                     if let Some(pager) = &self.pager {
                         match oe {
                             crate::vdbe::oe::OeAction::Fail => {
                                 // Keep all prior changes (including earlier rows from this
-                                // statement). Only drop the implicit statement savepoint so a
-                                // later COMMIT/ROLLBACK sees a clean savepoint stack. The
-                                // write transaction stays open under an explicit BEGIN; under
-                                // autocommit there is nothing to keep — the changes stay in
-                                // the dirty overlay until COMMIT, which the caller still
-                                // drives (matches upstream: FAIL under autocommit commits the
-                                // successful rows).
+                                // statement). Under an explicit BEGIN, drop the implicit
+                                // statement savepoint so a later COMMIT/ROLLBACK sees a clean
+                                // savepoint stack — the write transaction stays open. Under
+                                // autocommit, commit the successful rows now (mirrors upstream:
+                                // `sqlite3VdbeHalt` commits when `errorAction == OE_Fail` even
+                                // on a non-OK `rc`, because FAIL is a "soft" error).
                                 if let Some(name) = self.stmt_savepoint.take() {
                                     let _ = pager.release_savepoint(&name);
+                                } else if self.autocommit() {
+                                    let _ = pager.commit().await;
+                                    self.write_txn = false;
                                 }
                             }
                             crate::vdbe::oe::OeAction::Rollback => {
@@ -698,6 +712,33 @@ impl Vdbe {
                         }
                         continue;
                     }
+                    if p1 != 0 {
+                        // Error halt: build the error message from `p4` (and `p5`'s constraint-
+                        // type prefix when set), set the per-constraint OE override (when `p2 !=
+                        // 0`), and return the error so `step()` runs the OE-aware cleanup.
+                        // Mirrors the `p->errorAction = pOp->p2` + `sqlite3VdbeHalt` path in
+                        // `vdbe.c`.
+                        let base = match &inst.p4 {
+                            P4::Text(s) => s.clone(),
+                            _ => String::new(),
+                        };
+                        let msg = if p5 != 0 && !base.is_empty() {
+                            let kind = match p5 {
+                                1 => "NOT NULL constraint failed: ",
+                                2 => "UNIQUE constraint failed: ",
+                                3 => "CHECK constraint failed: ",
+                                4 => "FOREIGN KEY constraint failed: ",
+                                _ => "",
+                            };
+                            format!("{kind}{base}")
+                        } else {
+                            base
+                        };
+                        if p2 != 0 {
+                            self.oe_override = Some(p2 as u8);
+                        }
+                        return Err(Error::new(crate::error::ResultCode::Constraint, msg));
+                    }
                     // A successful top-level Halt commits an open write transaction (the
                     // durable commit point) — but only in autocommit mode. When the connection
                     // is inside an explicit `BEGIN` (autocommit is false), the write transaction
@@ -723,10 +764,15 @@ impl Vdbe {
                     return Ok(StepResult::Done);
                 }
                 Opcode::HaltIfNull => {
-                    // p3 names a register; p4 carries the constraint message. If the register
-                    // is NULL, abort the statement with a NOT NULL constraint error (the
-                    // in-flight write transaction is rolled back by `Halt` semantics).
+                    // p1 carries the result code (Constraint), p2 carries the per-constraint OE
+                    // action (0 = use the program's `default_oe`); p3 names the register to test
+                    // for NULL; p4 carries the constraint message. If NULL, abort the statement.
+                    // The per-constraint OE (when non-zero) overrides `default_oe` for the cleanup
+                    // that `step()` does, mirroring upstream's `p->errorAction = pOp->p2`.
                     if self.regs[p3 as usize].is_null() {
+                        if p2 != 0 {
+                            self.oe_override = Some(p2 as u8);
+                        }
                         let msg = match &inst.p4 {
                             P4::Text(s) => s.clone(),
                             _ => "NOT NULL constraint failed".to_string(),
@@ -856,7 +902,7 @@ impl Vdbe {
                         let already_write = self.write_txn;
                         pager.begin_write(p2 >= 2).await?;
                         self.write_txn = true;
-                        // Open an implicit statement savepoint so an `OE_Abort` constraint
+                        // Open an implicit "statement savepoint" so an `OE_Abort` constraint
                         // violation can roll back just this statement's changes when the
                         // connection is inside an explicit `BEGIN` (autocommit off). Under
                         // autocommit, the whole transaction is this one statement, so a full
@@ -1339,9 +1385,17 @@ impl Vdbe {
                     };
                     let key_info = self.index_key_info(p1);
                     let unique = p5 & P5_UNIQUE != 0;
+                    // The per-constraint `ON CONFLICT <action>` clause on the declaring
+                    // `PRIMARY KEY`/`UNIQUE` constraint is encoded in p5 bits 4-7 (M12.9). When
+                    // non-zero, it overrides the program's `default_oe` for the cleanup that
+                    // `step()` runs after the constraint error propagates.
+                    let per_constraint_oe = ((p5 >> 4) & 0x0F) as u8;
                     match btree::index_insert(pager, root, &record, &key_info, unique).await {
                         Ok(()) => {}
                         Err(e) if e.code == crate::error::ResultCode::Constraint && unique => {
+                            if per_constraint_oe != 0 {
+                                self.oe_override = Some(per_constraint_oe);
+                            }
                             let msg = match &inst.p4 {
                                 P4::Text(s) => s.clone(),
                                 _ => "UNIQUE constraint failed".to_string(),

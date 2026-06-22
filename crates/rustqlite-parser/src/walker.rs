@@ -506,7 +506,7 @@ fn walk_table_constraint<V: Visitor + ?Sized>(
     c: &TableConstraint,
 ) -> WalkResult<V::Break> {
     match &c.body {
-        TableConstraintBody::Check(e) => walk_expr(v, e),
+        TableConstraintBody::Check { expr, .. } => walk_expr(v, expr),
         _ => Ok(()),
     }
 }

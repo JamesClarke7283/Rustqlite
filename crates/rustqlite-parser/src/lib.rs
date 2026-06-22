@@ -753,20 +753,35 @@ fn build_column_constraint(pair: Pair<'_, Rule>) -> ColumnConstraint {
         Rule::c_primary_key => {
             let mut desc = false;
             let mut autoincrement = false;
+            let mut on_conflict = None;
             for part in inner.into_inner() {
                 match part.as_rule() {
                     Rule::K_DESC => desc = true,
                     Rule::K_AUTOINCREMENT => autoincrement = true,
+                    Rule::onconf => on_conflict = Some(build_onconf(part)),
                     _ => {}
                 }
             }
             ColumnConstraint::PrimaryKey {
                 desc,
                 autoincrement,
+                on_conflict,
             }
         }
-        Rule::c_not_null => ColumnConstraint::NotNull,
-        Rule::c_unique => ColumnConstraint::Unique,
+        Rule::c_not_null => {
+            let on_conflict = inner
+                .into_inner()
+                .find(|p| p.as_rule() == Rule::onconf)
+                .map(build_onconf);
+            ColumnConstraint::NotNull { on_conflict }
+        }
+        Rule::c_unique => {
+            let on_conflict = inner
+                .into_inner()
+                .find(|p| p.as_rule() == Rule::onconf)
+                .map(build_onconf);
+            ColumnConstraint::Unique { on_conflict }
+        }
         Rule::c_default => {
             let mut children = inner.into_inner();
             let kind = children.next().expect("c_default has K_DEFAULT");
@@ -875,19 +890,34 @@ fn build_constraint_body(pair: Pair<'_, Rule>) -> TableConstraintBody {
     match inner.as_rule() {
         Rule::tc_primary_key => {
             let columns = build_sortlist(&inner);
-            TableConstraintBody::PrimaryKey { columns }
+            let on_conflict = inner
+                .into_inner()
+                .find(|p| p.as_rule() == Rule::onconf)
+                .map(build_onconf);
+            TableConstraintBody::PrimaryKey { columns, on_conflict }
         }
         Rule::tc_unique => {
             let columns = build_sortlist(&inner);
-            TableConstraintBody::Unique { columns }
+            let on_conflict = inner
+                .into_inner()
+                .find(|p| p.as_rule() == Rule::onconf)
+                .map(build_onconf);
+            TableConstraintBody::Unique { columns, on_conflict }
         }
         Rule::tc_check => {
-            let e = inner
-                .into_inner()
-                .find(|p| p.as_rule() == Rule::expr)
-                .map(expr::build_expr)
-                .expect("tc_check has an expr");
-            TableConstraintBody::Check(e)
+            let mut on_conflict = None;
+            let mut expr: Option<Expr> = None;
+            for part in inner.into_inner() {
+                match part.as_rule() {
+                    Rule::expr => expr = Some(expr::build_expr(part)),
+                    Rule::onconf => on_conflict = Some(build_onconf(part)),
+                    _ => {}
+                }
+            }
+            TableConstraintBody::Check {
+                expr: expr.expect("tc_check has an expr"),
+                on_conflict,
+            }
         }
         Rule::tc_foreign_key => {
             let mut columns: Vec<String> = Vec::new();
@@ -1365,6 +1395,22 @@ fn build_returning(pair: Pair<'_, Rule>) -> Vec<ResultColumn> {
 
 fn build_or_action(pair: Pair<'_, Rule>) -> ConflictAction {
     // or_action = { K_OR ~ (K_ROLLBACK | K_ABORT | K_FAIL | K_IGNORE | K_REPLACE) }
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::K_ROLLBACK => return ConflictAction::Rollback,
+            Rule::K_ABORT => return ConflictAction::Abort,
+            Rule::K_FAIL => return ConflictAction::Fail,
+            Rule::K_IGNORE => return ConflictAction::Ignore,
+            Rule::K_REPLACE => return ConflictAction::Replace,
+            _ => {}
+        }
+    }
+    ConflictAction::Abort
+}
+
+/// Build the `onconf` rule: `ON CONFLICT (K_ROLLBACK | K_ABORT | K_FAIL | K_IGNORE | K_REPLACE)`.
+/// Returns the `ConflictAction` for the constraint's `ON CONFLICT` clause.
+fn build_onconf(pair: Pair<'_, Rule>) -> ConflictAction {
     for part in pair.into_inner() {
         match part.as_rule() {
             Rule::K_ROLLBACK => return ConflictAction::Rollback,
@@ -2198,7 +2244,7 @@ mod tests {
         ));
         assert!(matches!(
             ct.columns[1].constraints[0],
-            ColumnConstraint::NotNull
+            ColumnConstraint::NotNull { .. }
         ));
         assert_eq!(
             ct.columns[2].constraints[0],
@@ -2217,7 +2263,7 @@ mod tests {
         assert_eq!(ct.columns.len(), 2);
         assert_eq!(ct.constraints.len(), 1);
         match &ct.constraints[0].body {
-            TableConstraintBody::PrimaryKey { columns } => {
+            TableConstraintBody::PrimaryKey { columns, .. } => {
                 assert_eq!(columns.len(), 2);
                 assert_eq!(columns[0].name, "a");
                 assert!(!columns[0].desc);
@@ -2242,7 +2288,7 @@ mod tests {
         else {
             panic!()
         };
-        assert!(matches!(ct.constraints[0].body, TableConstraintBody::Check(_)));
+        assert!(matches!(ct.constraints[0].body, TableConstraintBody::Check { .. }));
 
         // FOREIGN KEY (cols) REFERENCES parent (cols) ON DELETE CASCADE ON UPDATE SET NULL DEFERRABLE INITIALLY DEFERRED
         let Stmt::CreateTable(ct) = &parse(
@@ -2741,6 +2787,7 @@ mod tests {
 
     #[test]
     fn column_constraint_on_conflict() {
+        use crate::ConflictAction;
         // Column-level ON CONFLICT clauses.
         let Stmt::CreateTable(ct) = &parse(
             "CREATE TABLE t(a INTEGER PRIMARY KEY ON CONFLICT REPLACE, b TEXT NOT NULL ON CONFLICT IGNORE, c UNIQUE ON CONFLICT ABORT);",
@@ -2751,8 +2798,47 @@ mod tests {
         };
         // Verify it parses without error (the onconf is accepted).
         assert_eq!(ct.columns.len(), 3);
+        // Verify the per-constraint OE is captured (M12.9).
+        assert!(matches!(
+            &ct.columns[0].constraints[0],
+            ColumnConstraint::PrimaryKey { on_conflict: Some(ConflictAction::Replace), .. }
+        ));
+        assert!(matches!(
+            &ct.columns[1].constraints[0],
+            ColumnConstraint::NotNull { on_conflict: Some(ConflictAction::Ignore) }
+        ));
+        assert!(matches!(
+            &ct.columns[2].constraints[0],
+            ColumnConstraint::Unique { on_conflict: Some(ConflictAction::Abort) }
+        ));
         // Bad syntax: invalid conflict action.
         assert!(parse("CREATE TABLE t(a INTEGER PRIMARY KEY ON CONFLICT BOGUS);").is_err());
+    }
+
+    #[test]
+    fn table_constraint_on_conflict() {
+        use crate::{ConflictAction, TableConstraintBody};
+        // Table-level ON CONFLICT clauses on PRIMARY KEY / UNIQUE / CHECK.
+        let Stmt::CreateTable(ct) = &parse(
+            "CREATE TABLE t(a, b, c, PRIMARY KEY(a) ON CONFLICT IGNORE, UNIQUE(b) ON CONFLICT FAIL, CHECK(c > 0) ON CONFLICT ROLLBACK);",
+        )
+        .unwrap()[0]
+        else {
+            panic!("expected CREATE TABLE")
+        };
+        assert_eq!(ct.constraints.len(), 3);
+        assert!(matches!(
+            &ct.constraints[0].body,
+            TableConstraintBody::PrimaryKey { on_conflict: Some(ConflictAction::Ignore), .. }
+        ));
+        assert!(matches!(
+            &ct.constraints[1].body,
+            TableConstraintBody::Unique { on_conflict: Some(ConflictAction::Fail), .. }
+        ));
+        assert!(matches!(
+            &ct.constraints[2].body,
+            TableConstraintBody::Check { on_conflict: Some(ConflictAction::Rollback), .. }
+        ));
     }
 
     #[test]
@@ -3143,7 +3229,7 @@ mod tests {
                 assert_eq!(c.name, "b");
                 assert_eq!(c.type_name.as_deref(), Some("INTEGER"));
                 assert_eq!(c.constraints.len(), 1);
-                assert!(matches!(c.constraints[0], ColumnConstraint::NotNull));
+                assert!(matches!(c.constraints[0], ColumnConstraint::NotNull { .. }));
             }
             other => panic!("expected AddColumn, got {other:?}"),
         }

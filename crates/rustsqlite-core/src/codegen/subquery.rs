@@ -78,6 +78,7 @@ pub fn compile_from_subquery(
                 notnull: false,
                 pk: false,
                 default: None,
+                notnull_oe: crate::vdbe::oe::OeAction::None,
             })
             .collect(),
         rowid_alias: None,

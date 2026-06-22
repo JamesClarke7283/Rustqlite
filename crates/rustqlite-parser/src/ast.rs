@@ -590,11 +590,21 @@ pub struct TableConstraint {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableConstraintBody {
     /// `PRIMARY KEY (cols)` — composite primary key. The columns carry optional sort order.
-    PrimaryKey { columns: Vec<PrimaryKeyColumn> },
+    PrimaryKey {
+        columns: Vec<PrimaryKeyColumn>,
+        /// Optional `ON CONFLICT <action>` on this PK constraint (`None` = OE_Default).
+        on_conflict: Option<ConflictAction>,
+    },
     /// `UNIQUE (cols)`.
-    Unique { columns: Vec<PrimaryKeyColumn> },
+    Unique {
+        columns: Vec<PrimaryKeyColumn>,
+        on_conflict: Option<ConflictAction>,
+    },
     /// `CHECK (expr)`.
-    Check(Expr),
+    Check {
+        expr: Expr,
+        on_conflict: Option<ConflictAction>,
+    },
     /// `FOREIGN KEY (cols) REFERENCES parent [(parent_cols)] [refargs] [deferrable]`.
     ForeignKey {
         columns: Vec<String>,
@@ -655,9 +665,19 @@ pub struct ColumnDef {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnConstraint {
-    PrimaryKey { desc: bool, autoincrement: bool },
-    NotNull,
-    Unique,
+    PrimaryKey {
+        desc: bool,
+        autoincrement: bool,
+        /// Optional `ON CONFLICT <action>` on this PK constraint (`None` = OE_Default, use the
+        /// statement's `OR <action>` or the default ABORT). M2.66 parses this; M12.9 enforces it.
+        on_conflict: Option<ConflictAction>,
+    },
+    NotNull {
+        on_conflict: Option<ConflictAction>,
+    },
+    Unique {
+        on_conflict: Option<ConflictAction>,
+    },
     Default(Expr),
     /// Column-level `REFERENCES parent [(cols)] [refargs] [deferrable]`. M2.44 parses this;
     /// enforcement is M17 (foreign keys).

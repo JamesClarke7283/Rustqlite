@@ -180,27 +180,26 @@ fn compile_insert_values(
             b.emit(Opcode::NewRowid, cursor, rowid_reg, 0);
         }
 
-        // Conflict-resolution pre-checks (IGNORE / REPLACE only). For IGNORE, on conflict we
-        // jump to `row_skip` — BEFORE the table Insert — so the conflicting row is never
-        // written. For REPLACE, on conflict we delete the existing row (from the table and
-        // every index) and fall through to the new Insert. For the default ABORT/FAIL/
-        // ROLLBACK, no pre-check is emitted here; the `IdxInsert` below raises the constraint
-        // error and `step()` does the right cleanup. Mirrors the order in upstream's
-        // `sqlite3GenerateConstraintChecks` (constraint checks before the table Insert).
+        // Conflict-resolution pre-checks (all OEs). For IGNORE, on conflict we jump to
+        // `row_skip` — BEFORE the table Insert — so the conflicting row is never written. For
+        // REPLACE, on conflict we delete the existing row (from the table and every index) and
+        // fall through to the new Insert. For ABORT/FAIL/ROLLBACK, on conflict we emit a `Halt`
+        // with the constraint message — BEFORE the table Insert — so the failing row's partial
+        // writes are never made and prior rows in the same statement stay clean (mirrors
+        // upstream's "OE_Fail and OE_Ignore must happen before any changes are made" rule in
+        // `sqlite3GenerateConstraintChecks`).
         let row_skip = b.new_label();
-        if matches!(oe, OeAction::Ignore | OeAction::Replace) {
-            emit_conflict_prechecks(
-                &mut b,
-                indexes,
-                table,
-                rec_start,
-                rowid_reg,
-                index_cursor_base,
-                cursor,
-                oe,
-                row_skip,
-            )?;
-        }
+        emit_conflict_prechecks(
+            &mut b,
+            indexes,
+            table,
+            rec_start,
+            rowid_reg,
+            index_cursor_base,
+            cursor,
+            oe,
+            row_skip,
+        )?;
 
         let record = b.alloc_reg();
         b.emit(Opcode::MakeRecord, rec_start, ncol as i32, record);
@@ -335,6 +334,17 @@ fn compile_insert_without_rowid(
             .collect();
         format!("UNIQUE constraint failed: {}", names.join(", "))
     };
+    // The bare column-list for the Halt-based pre-check path (where p5 = P5_ConstraintUnique
+    // supplies the "UNIQUE constraint failed: " prefix, mirroring upstream's
+    // `sqlite3HaltConstraint`).
+    let pk_columns_msg = {
+        let names: Vec<String> = table
+            .pk_columns
+            .iter()
+            .map(|&(c, _)| format!("{}.{}", table.name, table.columns[c].name))
+            .collect();
+        names.join(", ")
+    };
 
     for row in &rows {
         if row.len() != expected {
@@ -370,11 +380,47 @@ fn compile_insert_without_rowid(
         }
 
         // NOT NULL on PK columns is enforced at codegen time via a per-row HaltIfNull check
-        // (mirrors upstream's `OP_HaltIfNull` for NOT NULL columns in WITHOUT ROWID PKs).
+        // (mirrors upstream's `OP_HaltIfNull` for NOT NULL columns in WITHOUT ROWID PKs). The
+        // per-constraint `ON CONFLICT <action>` clause on the declaring `PRIMARY KEY` constraint
+        // (M12.9) is carried in p2: 0 means "use the statement-level `OR <action>` / default
+        // ABORT" (the existing behavior); a non-zero OE value overrides it for this constraint.
+        // OE_Ignore is handled here by emitting an `IsNull` jump to `row_skip` instead of
+        // `HaltIfNull`, mirroring upstream's `OP_IsNull iReg, ignoreDest` path.
+        let null_row_skip = b.new_label();
+        let mut any_null_skip = false;
         for &(pk_idx, _) in &table.pk_columns {
             let reg = col_start + pk_idx as i32;
-            let halt = b.emit(Opcode::HaltIfNull, 0, 0, reg);
-            b.set_p4(halt, P4::Text(format!("NOT NULL constraint failed: {}.{}", table.name, table.columns[pk_idx].name)));
+            let col_oe = table.columns[pk_idx].notnull_oe;
+            let msg = format!(
+                "NOT NULL constraint failed: {}.{}",
+                table.name, table.columns[pk_idx].name
+            );
+            match col_oe {
+                OeAction::Ignore => {
+                    // OE_Ignore: skip the row when NULL (upstream's `OP_IsNull iReg, ignoreDest`).
+                    b.emit_jump(Opcode::IsNull, reg, null_row_skip, 0);
+                    any_null_skip = true;
+                }
+                OeAction::Replace => {
+                    // OE_Replace on NOT NULL: REPLACE can only help if the column has a non-NULL
+                    // DEFAULT; otherwise upstream falls back to OE_Abort (`b2ndPass || pCol->iDflt==0`).
+                    // Our WITHOUT ROWID PK columns are typically NOT NULL with no DEFAULT, so we
+                    // treat REPLACE as ABORT here (the common case). Mirrors upstream's fallback.
+                    let halt = b.emit(Opcode::HaltIfNull, 0, 0, reg);
+                    b.set_p4(halt, P4::Text(msg));
+                }
+                other if other != OeAction::None => {
+                    // A per-constraint OE (Fail/Rollback/Abort) overrides the statement-level OR.
+                    let halt = b.emit(Opcode::HaltIfNull, 0, other as i32, reg);
+                    b.set_p4(halt, P4::Text(msg));
+                }
+                _ => {
+                    // No per-constraint OE: use the statement-level `default_oe` (the existing
+                    // behavior — `p2 = 0` means "use `program.default_oe`").
+                    let halt = b.emit(Opcode::HaltIfNull, 0, 0, reg);
+                    b.set_p4(halt, P4::Text(msg));
+                }
+            }
         }
 
         // Permute into storage order: PK cols first (in declared order), then non-PK cols in
@@ -393,11 +439,77 @@ fn compile_insert_without_rowid(
             out_pos += 1;
         }
 
+        // The effective OE for the WITHOUT ROWID PK's UNIQUE constraint: the per-constraint `ON
+        // CONFLICT <action>` overrides the statement-level `OR <action>` when set (M12.9).
+        // Upstream's `overrideError` (the statement-level OR) only applies when the per-
+        // constraint OE is `OE_Default`; our `OeAction::None` stands in for `OE_Default`.
+        let pk_per_constraint_oe = table
+            .pk_columns
+            .first()
+            .map(|&(c, _)| table.columns[c].notnull_oe)
+            .unwrap_or(OeAction::None);
+        let pk_oe = if pk_per_constraint_oe != OeAction::None {
+            pk_per_constraint_oe
+        } else {
+            oe
+        };
+
+        // Pre-check the PK uniqueness when the effective OE is not `OE_None`, mirroring
+        // `emit_conflict_prechecks` for the rowid path. For ABORT/FAIL/ROLLBACK the pre-check
+        // raises the constraint error BEFORE the `IdxInsert` (which writes the row), so the
+        // failing row's partial writes are never made and prior rows in the same statement stay
+        // clean (mirrors upstream's "OE_Fail and OE_Ignore must happen before any changes are
+        // made" rule). For Ignore/Replace the pre-check skips/replaces the conflicting row.
+        if pk_oe != OeAction::None {
+            let no_conflict = b.new_label();
+            let nfield = table.pk_columns.len() as i32;
+            let nc = b.emit_jump(Opcode::NoConflict, cursor, no_conflict, key_start);
+            b.set_p4(nc, P4::Int(nfield as i64));
+            match pk_oe {
+                OeAction::Ignore => {
+                    b.emit_jump(Opcode::Goto, 0, null_row_skip, 0);
+                    any_null_skip = true;
+                }
+                OeAction::Replace => {
+                    // Delete the conflicting row (the storage-order key matches the new row's PK
+                    // prefix) from the table b-tree. The subsequent `IdxInsert` will then succeed.
+                    b.emit(Opcode::IdxDelete, cursor, key_start, storage_width as i32);
+                }
+                OeAction::Abort | OeAction::Fail | OeAction::Rollback => {
+                    // Halt BEFORE the IdxInsert so the failing row's partial writes are never
+                    // made. `p2 = OE` so `step()` does the right cleanup; `p5 = 2` for the
+                    // "UNIQUE constraint failed: ..." prefix.
+                    let halt = b.emit(
+                        Opcode::Halt,
+                        crate::error::ResultCode::Constraint as i32,
+                        pk_oe as i32,
+                        0,
+                    );
+                    b.set_p4(halt, P4::Text(pk_columns_msg.clone()));
+                    b.set_p5(halt, 2); // P5_ConstraintUnique
+                }
+                _ => unreachable!(),
+            }
+            b.resolve(no_conflict);
+        }
+
         let key_rec = b.alloc_reg();
         b.emit(Opcode::MakeRecord, key_start, storage_width as i32, key_rec);
         let ins_idx = b.emit(Opcode::IdxInsert, cursor, key_rec, 0);
         b.set_p4(ins_idx, P4::Text(pk_message.clone()));
-        b.set_p5(ins_idx, P5_NCHANGE | P5_UNIQUE);
+        // Encode the PK constraint's OE in p5 bits 4-7 so the executor can override the
+        // statement-level `OR <action>` for this constraint's UNIQUE violation (M12.9). A zero
+        // high nibble means "no per-constraint override; use `default_oe`". For Ignore/Replace
+        // the pre-check above already handled the conflict; the encoded OE is still useful for
+        // any path that bypasses the pre-check.
+        if pk_per_constraint_oe != OeAction::None {
+            b.set_p5(
+                ins_idx,
+                P5_NCHANGE | P5_UNIQUE | ((pk_per_constraint_oe as u8 & 0x0F) << 4),
+            );
+        } else {
+            b.set_p5(ins_idx, P5_NCHANGE | P5_UNIQUE);
+        }
 
         // Secondary index maintenance. The user-declared indexes on a WITHOUT ROWID table end
         // their key with the PK columns (not a rowid); `emit_index_inserts_without_rowid` does
@@ -414,6 +526,12 @@ fn compile_insert_without_rowid(
 
         if let Some(ref ret) = returning {
             ret.emit_buffer_row(&mut b, table, cursor, col_start)?;
+        }
+
+        // The OE_Ignore path for NOT NULL jumps here, skipping the rest of this row's insert
+        // (mirrors upstream's `ignoreDest`).
+        if any_null_skip {
+            b.resolve(null_row_skip);
         }
     }
 
@@ -508,6 +626,14 @@ fn emit_index_inserts_without_rowid(
         let mut p5 = P5_NCHANGE;
         if idx.unique {
             p5 |= P5_UNIQUE;
+            // Encode the per-index OE in p5 bits 4-7 so the executor can override the statement
+            // level `OR <action>` for this index's UNIQUE violation (M12.9). Today the OE is
+            // always `OE_Abort` because `CREATE [UNIQUE] INDEX` doesn't accept `ON CONFLICT`;
+            // autoindex-creating PK/UNIQUE constraints would thread their OE here too. A zero
+            // high nibble means "no per-constraint override; use `default_oe`".
+            if idx.unique_oe != OeAction::Abort {
+                p5 |= (idx.unique_oe as u8 & 0x0F) << 4;
+            }
             if let Some(msg) = idx.unique_constraint_message(table) {
                 b.set_p4(ins_idx, P4::Text(msg));
             } else {
@@ -928,6 +1054,14 @@ fn emit_index_inserts(
         let mut p5 = P5_NCHANGE;
         if idx.unique {
             p5 |= P5_UNIQUE;
+            // Encode the per-index OE in p5 bits 4-7 so the executor can override the statement
+            // level `OR <action>` for this index's UNIQUE violation (M12.9). Today the OE is
+            // always `OE_Abort` because `CREATE [UNIQUE] INDEX` doesn't accept `ON CONFLICT`;
+            // autoindex-creating PK/UNIQUE constraints would thread their OE here too. A zero
+            // high nibble means "no per-constraint override; use `default_oe`".
+            if idx.unique_oe != OeAction::Abort {
+                p5 |= (idx.unique_oe as u8 & 0x0F) << 4;
+            }
             if let Some(msg) = idx.unique_constraint_message(table) {
                 b.set_p4(ins_idx, P4::Text(msg));
             } else {
@@ -973,9 +1107,10 @@ fn validate_indexes(table: &Table, indexes: &[IndexObject]) -> Result<()> {
 /// * `OE_Replace`: fetch the conflicting row's rowid via `IdxRowid`, seek the table cursor
 ///   to it, delete its entries from every index, delete the table row, then fall through
 ///   (the subsequent table Insert + IdxInserts will now succeed because the conflict is gone).
-///
-/// For the default `OE_Abort`/`OE_Fail`/`OE_Rollback` this helper is not called — the
-/// `IdxInsert` opcode raises the constraint error itself and `step()` does the cleanup.
+/// * `OE_Abort`/`OE_Fail`/`OE_Rollback`: emit a `Halt` with the constraint message BEFORE the
+///   table Insert so the failing row's partial writes are never made and prior rows in the
+///   same statement stay clean (mirrors upstream's "OE_Fail and OE_Ignore must happen before
+///   any changes are made" rule in `sqlite3GenerateConstraintChecks`).
 fn emit_conflict_prechecks(
     b: &mut ProgramBuilder,
     indexes: &[IndexObject],
@@ -987,6 +1122,12 @@ fn emit_conflict_prechecks(
     oe: OeAction,
     row_skip: super::builder::Label,
 ) -> Result<()> {
+    // For OE_None (no conflict resolution requested) there's nothing to pre-check — the
+    // IdxInsert's P5_UNIQUE will raise the error after the table Insert (the legacy behavior,
+    // kept for compatibility with code paths that don't set an OE).
+    if oe == OeAction::None {
+        return Ok(());
+    }
     for (i, idx) in indexes.iter().enumerate() {
         if !idx.unique {
             continue;
@@ -1103,7 +1244,21 @@ fn emit_conflict_prechecks(
                 // rowid above) so the post-Insert IdxInsert sees the correct new entry.
                 b.emit(Opcode::SCopy, rowid_reg, key_start + nfield, 0);
             }
-            _ => unreachable!("emit_conflict_prechecks only for Ignore/Replace"),
+            OeAction::Abort | OeAction::Fail | OeAction::Rollback => {
+                // Halt BEFORE the table Insert so the failing row's partial writes are never
+                // made. `p1 = SQLITE_CONSTRAINT`, `p2 = OE` so `step()` does the right cleanup,
+                // `p4` carries the column-list message (the executor's `Halt` arm prepends the
+                // "UNIQUE constraint failed: " prefix from `p5 = P5_ConstraintUnique` = 2),
+                // mirroring upstream's `sqlite3UniqueConstraint` → `sqlite3HaltConstraint`.
+                let msg = idx
+                    .unique_constraint_message(table)
+                    .map(|m| m.strip_prefix("UNIQUE constraint failed: ").unwrap_or(&m).to_string())
+                    .unwrap_or_default();
+                let halt = b.emit(Opcode::Halt, crate::error::ResultCode::Constraint as i32, oe as i32, 0);
+                b.set_p4(halt, P4::Text(msg));
+                b.set_p5(halt, 2); // P5_ConstraintUnique
+            }
+            _ => unreachable!("emit_conflict_prechecks: unexpected OE {oe:?}"),
         }
 
         b.resolve(no_conflict);

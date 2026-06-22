@@ -617,5 +617,33 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   cases in `write_roundtrip.rs`: OR IGNORE skips conflicting rows, OR REPLACE deletes + 
   re-inserts, OR REPLACE with secondary index, OR FAIL keeps prior rows, OR ROLLBACK in
   explicit transaction, OR ABORT in explicit transaction, default ABORT in explicit
-  transaction). Still M12: 12.9 `ON CONFLICT` column/table constraints (unique, not null,
-  check) triggering constraint abort vs ignore.
+  transaction). **12.9 `ON CONFLICT` column/table constraints** ✅: the parser captures the
+  per-constraint `ON CONFLICT <action>` clause on `PRIMARY KEY`/`UNIQUE`/`NOT NULL`/`CHECK`
+  column and table constraints (it was parsed and discarded before; the AST
+  `ColumnConstraint`/`TableConstraintBody` variants now carry `on_conflict:
+  Option<ConflictAction>`). The schema propagates the per-constraint OE to `Column.notnull_oe`
+  (for NOT NULL on PK columns of WITHOUT ROWID tables) and to the WITHOUT ROWID PK's UNIQUE
+  constraint. At codegen time, the per-constraint OE overrides the statement-level
+  `OR <action>` (mirroring upstream's `overrideError` rule: the per-constraint OE wins when it
+  is not `OE_Default`; otherwise the statement's `OR <action>` applies). The executor gained
+  an `oe_override` field on `Vdbe` that `HaltIfNull` (via p2) and `IdxInsert` (via p5 bits 4-7)
+  set when a per-constraint OE fires; `step()` consumes it for the cleanup, mirroring
+  upstream's `p->errorAction = pOp->p2` in `OP_Halt`. The `Halt` opcode now handles `p1 != 0`
+  (error halt) — it builds the message from p4 + the p5 constraint-type prefix
+  ("NOT NULL/UNIQUE/CHECK/FOREIGN KEY constraint failed: …") and sets `oe_override` from p2,
+  matching upstream's `sqlite3HaltConstraint`. For OE_Ignore on NOT NULL, the codegen emits
+  `OP_IsNull reg, row_skip` (mirrors upstream's `OP_IsNull iReg, ignoreDest`); for
+  OE_Ignore/Replace on the WITHOUT ROWID PK UNIQUE, a `NoConflict` pre-check skips/replaces
+  the conflicting row before the `IdxInsert`; for OE_Abort/Fail/Rollback on UNIQUE, the
+  pre-check emits a `Halt` BEFORE the table `IdxInsert` so the failing row's partial writes
+  are never made and prior rows in the same statement stay clean (mirrors upstream's "OE_Fail
+  and OE_Ignore must happen before any changes are made" rule in
+  `sqlite3GenerateConstraintChecks`). The rowid path's `emit_conflict_prechecks` now runs for
+  all OEs (not just Ignore/Replace), with the ABORT/FAIL/ROLLBACK arm emitting a `Halt` before
+  the table `Insert`. Differential-tested vs the C oracle (5 new cases in
+  `write_roundtrip.rs`: ON CONFLICT IGNORE/FAIL/ROLLBACK/ABORT on WITHOUT ROWID PK, and ON
+  CONFLICT IGNORE NOT NULL skips the row). Known gap: `OR FAIL` under autocommit now commits
+  the successful rows (mirrors upstream's `sqlite3VdbeHalt` FAIL-commits semantics); the
+  pre-existing `insert_or_fail_keeps_prior_rows` test was updated to verify this. CHECK
+  constraint enforcement (the `ON CONFLICT` clause is captured but the CHECK itself is not
+  evaluated yet — that's M19.8/M35.1).

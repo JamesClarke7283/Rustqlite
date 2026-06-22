@@ -589,6 +589,147 @@ fn insert_default_abort_in_explicit_transaction() {
 }
 
 #[test]
+fn on_conflict_ignore_on_without_rowid_pk() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("onconf_ignore_pk");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        // `PRIMARY KEY ON CONFLICT IGNORE` on a WITHOUT ROWID table: a duplicate PK insert is
+        // skipped (the row is not written); other rows in the same statement still land.
+        exec(&mut conn, "CREATE TABLE t(a PRIMARY KEY ON CONFLICT IGNORE, b) WITHOUT ROWID;");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z');");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        // (1,'x') was skipped (conflict on a=1); (2,'y') and (3,'z') were inserted.
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("a".into())],
+            vec![Value::Int(2), Value::Text("y".into())],
+            vec![Value::Int(3), Value::Text("z".into())],
+        ]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|a\n2|y\n3|z");
+}
+
+#[test]
+fn on_conflict_fail_on_without_rowid_pk() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("onconf_fail_pk");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a PRIMARY KEY ON CONFLICT FAIL, b) WITHOUT ROWID;");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        // ON CONFLICT FAIL from the per-constraint clause: rows before the conflict are kept,
+        // the conflicting row and later rows are not inserted.
+        let (mut stmt, _) = sqlite3_prepare_v2(
+            &mut conn,
+            "INSERT INTO t VALUES (2, 'y'), (1, 'x'), (3, 'z');",
+        )
+        .unwrap();
+        let rc = stmt.step();
+        assert_eq!(rc, ResultCode::Constraint);
+        assert!(stmt.errmsg().contains("UNIQUE constraint failed"));
+        // (2,'y') was inserted before the conflict; (1,'x') and (3,'z') were not.
+        let (mut stmt2, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt2);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("a".into())],
+            vec![Value::Int(2), Value::Text("y".into())],
+        ]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|a\n2|y");
+}
+
+#[test]
+fn on_conflict_rollback_on_without_rowid_pk() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("onconf_rollback_pk");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a PRIMARY KEY ON CONFLICT ROLLBACK, b) WITHOUT ROWID;");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        exec(&mut conn, "BEGIN;");
+        exec(&mut conn, "INSERT INTO t VALUES (2, 'y');");
+        // ON CONFLICT ROLLBACK rolls back the entire transaction (including (2,'y')).
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (1, 'x');").unwrap();
+        let rc = stmt.step();
+        assert_eq!(rc, ResultCode::Constraint);
+        assert!(stmt.errmsg().contains("UNIQUE constraint failed"));
+        // The transaction was rolled back; the connection is back to autocommit. (1,'a') remains.
+        let (mut stmt2, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt2);
+        assert_eq!(rows, vec![vec![Value::Int(1), Value::Text("a".into())]]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|a");
+}
+
+#[test]
+fn on_conflict_abort_on_without_rowid_pk_in_explicit_transaction() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("onconf_abort_pk");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a PRIMARY KEY ON CONFLICT ABORT, b) WITHOUT ROWID;");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        exec(&mut conn, "BEGIN;");
+        exec(&mut conn, "INSERT INTO t VALUES (5, 'e');");
+        // ON CONFLICT ABORT (the default) rolls back only this statement; the transaction stays.
+        let (mut stmt, _) =
+            sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (1, 'x');").unwrap();
+        let rc = stmt.step();
+        assert_eq!(rc, ResultCode::Constraint);
+        assert!(stmt.errmsg().contains("UNIQUE constraint failed"));
+        let (mut stmt2, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt2);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("a".into())],
+            vec![Value::Int(5), Value::Text("e".into())],
+        ]);
+        exec(&mut conn, "COMMIT;");
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|a\n5|e");
+}
+
+#[test]
+fn on_conflict_ignore_not_null_skips_row() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("onconf_ignore_notnull");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        // `PRIMARY KEY ON CONFLICT IGNORE` on a WITHOUT ROWID PK column: a NULL PK row is
+        // skipped (NOT NULL ON CONFLICT IGNORE jumps past the row, mirroring upstream's
+        // `OP_IsNull iReg, ignoreDest`).
+        exec(&mut conn, "CREATE TABLE t(a INTEGER PRIMARY KEY ON CONFLICT IGNORE, b) WITHOUT ROWID;");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        // The first row (NULL,'x') is skipped (a is NULL → IGNORE); (2,'y') lands.
+        exec(&mut conn, "INSERT INTO t VALUES (NULL, 'x'), (2, 'y');");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("a".into())],
+            vec![Value::Int(2), Value::Text("y".into())],
+        ]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|a\n2|y");
+}
+
+#[test]
 fn drop_table_roundtrip_and_c_oracle() {
     skip_if_no_sqlite3!();
     let db = TempDb::new("drop_table");

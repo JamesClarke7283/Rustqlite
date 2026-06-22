@@ -53,7 +53,7 @@ pub fn compile_create_table(
             }
         }
         for c in &ct.constraints {
-            if let rustqlite_parser::TableConstraintBody::PrimaryKey { columns } = &c.body {
+            if let rustqlite_parser::TableConstraintBody::PrimaryKey { columns, .. } = &c.body {
                 pk_count = columns.len();
             }
         }
