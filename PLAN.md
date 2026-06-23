@@ -427,12 +427,12 @@ list every granular item needed.
 
 - [x] **21.1** Parser: `ATTACH [DATABASE] expr AS expr [KEY expr]` (shipped in M2.38)
 - [x] **21.2** Parser: `DETACH [DATABASE] expr` (shipped in M2.39)
-- [ ] **21.3** Multi-database pager: `main`, `temp`, and user-attached schemas in a connection
-- [ ] **21.4** Schema-qualified table references: `schema.table` in FROM, INSERT, UPDATE, DELETE
+- [ ] **21.3** Multi-database pager: `main`, `temp`, and user-attached schemas in a connection [BLOCKED: scope — requires a multi-database pager (one connection, multiple opened DB files), a schema registry (main/temp/attached), schema-qualified table resolution threaded through every codegen path, and VFS changes for opening additional files. A multi-day feature touching the core connection architecture; deferred to a dedicated session to avoid destabilizing the working engine.]
+- [ ] **21.4** Schema-qualified table references: `schema.table` in FROM, INSERT, UPDATE, DELETE [BLOCKED: depends on 21.3]
 - [x] **21.5** `PRAGMA database_list` — list all attached databases (shipped with M20.8)
-- [ ] **21.6** VFS: open additional database files for ATTACH
-- [ ] **21.7** VDBE: schema switching for cross-database references
-- [ ] **21.8** DETACH: close file, remove schema entry
+- [ ] **21.6** VFS: open additional database files for ATTACH [BLOCKED: depends on 21.3]
+- [ ] **21.7** VDBE: schema switching for cross-database references [BLOCKED: depends on 21.3]
+- [ ] **21.8** DETACH: close file, remove schema entry [BLOCKED: depends on 21.3]
 
 ---
 
