@@ -77,6 +77,7 @@ Check these before web searching (load with Read tool as needed):
 - @docs/row-value-expressions.md - SQLite `TK_VECTOR` grammar, row-value comparisons, and `IN (subquery)` forms
 - @docs/autovacuum-ptrmap.md - auto-vacuum/ptrmap page math, header meta[] layout, and Rustqlite implementation notes
 - @docs/wal-shm-vfs-methods.md - WAL shared-memory VFS methods (`xShmMap`/`xShmLock`/`xShmBarrier`/`xShmUnmap`), lock slot indices, and the in-process `a_lock` array
+- @docs/json-internals.md - SQLite JSON internals (`json.c`): JSONB binary form, `JsonParse` struct, parser return conventions, depth limit, rendering, path notation, and Rustqlite M24.1 tree-parser note
 
 ## Build / run / test
 - Build: `cargo build`
