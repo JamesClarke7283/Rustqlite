@@ -468,8 +468,8 @@ list every granular item needed.
 
 - [x] **24.1** JSON parser (RFC 8259): parse JSON text into internal tree representation
 - [x] **24.2** `json(X)` / `jsonb(X)` — validate and format JSON
-- [ ] **24.3** `json_array(...)` — create JSON array from arguments
-- [ ] **24.4** `json_object(...)` — create JSON object from key-value pairs
+- [x] **24.3** `json_array(...)` — create JSON array from arguments
+- [x] **24.4** `json_object(...)` — create JSON object from key-value pairs
 - [ ] **24.5** `json_extract(X, ...)` / `jsonb_extract(X, ...)` — extract value at path
 - [ ] **24.6** `json_insert(X, ...)` / `json_replace(X, ...)` / `json_set(X, ...)` — modify JSON
 - [ ] **24.7** `json_remove(X, ...)` — remove element at path

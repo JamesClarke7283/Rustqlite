@@ -614,6 +614,65 @@ pub fn value_to_json(arg: &Value) -> Result<JsonNode> {
     }
 }
 
+/// Append the JSON rendering of an SQL value to `out`, the way `jsonAppendSqlValue` does in
+/// `json.c`. NULL → `null`, INTEGER → decimal text, REAL → `fp_to_text`, TEXT → quoted JSON
+/// string (unless it carries the JSON subtype — not yet modeled, so always quoted), BLOB →
+/// "JSON cannot hold BLOB values" error.
+fn append_sql_value(arg: &Value, out: &mut String) -> Result<()> {
+    match arg {
+        Value::Null => out.push_str("null"),
+        Value::Int(i) => out.push_str(&i.to_string()),
+        Value::Real(r) => out.push_str(&crate::util::fp::fp_to_text(*r)),
+        Value::Text(s) => render_string(s, out),
+        Value::Blob(_) => return Err(Error::msg("JSON cannot hold BLOB values")),
+    }
+    Ok(())
+}
+
+/// `json_array(...)` — build a JSON array from the arguments. Each argument is rendered per
+/// [`append_sql_value`]: NULL/INTEGER/REAL as JSON scalars, TEXT as a quoted JSON string, BLOB
+/// as an error. Zero arguments → `[]`.
+pub fn json_array_fn(args: &[Value]) -> Result<Value> {
+    let mut out = String::new();
+    out.push('[');
+    for (i, arg) in args.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        append_sql_value(arg, &mut out)?;
+    }
+    out.push(']');
+    Ok(Value::Text(out))
+}
+
+/// `json_object(K1, V1, K2, V2, ...)` — build a JSON object from key/value pairs. Keys must
+/// be TEXT (matching the oracle's "json_object() labels must be TEXT"); values are rendered
+/// per [`append_sql_value`]. An odd argument count is an error.
+pub fn json_object_fn(args: &[Value]) -> Result<Value> {
+    if args.len() % 2 != 0 {
+        return Err(Error::msg(
+            "json_object() requires an even number of arguments",
+        ));
+    }
+    let mut out = String::new();
+    out.push('{');
+    for (i, pair) in args.chunks(2).enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match &pair[0] {
+            Value::Text(k) => render_string(k, &mut out),
+            _ => {
+                return Err(Error::msg("json_object() labels must be TEXT"));
+            }
+        }
+        out.push(':');
+        append_sql_value(&pair[1], &mut out)?;
+    }
+    out.push('}');
+    Ok(Value::Text(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,5 +900,63 @@ mod tests {
 
     fn t(s: &str) -> Value {
         Value::Text(s.to_string())
+    }
+
+    // ---- M24.3 json_array() / M24.4 json_object() tests ----
+
+    #[test]
+    fn json_array_fn_builds_array() {
+        assert_eq!(json_array_fn(&[]).unwrap(), t("[]"));
+        assert_eq!(
+            json_array_fn(&[Value::Int(1), Value::Int(2), Value::Int(3)]).unwrap(),
+            t("[1,2,3]")
+        );
+        assert_eq!(
+            json_array_fn(&[Value::Int(1), t("two"), Value::Null, Value::Real(3.5)]).unwrap(),
+            t("[1,\"two\",null,3.5]")
+        );
+        // Empty string is a valid JSON string value.
+        assert_eq!(json_array_fn(&[t("")]).unwrap(), t("[\"\"]"));
+        // String with special chars gets escaped.
+        assert_eq!(
+            json_array_fn(&[t("a\nb")]).unwrap(),
+            t("[\"a\\nb\"]")
+        );
+    }
+
+    #[test]
+    fn json_array_fn_rejects_blob() {
+        assert!(json_array_fn(&[Value::Blob(vec![1, 2])]).is_err());
+    }
+
+    #[test]
+    fn json_object_fn_builds_object() {
+        assert_eq!(json_object_fn(&[]).unwrap(), t("{}"));
+        assert_eq!(
+            json_object_fn(&[t("a"), Value::Int(1), t("b"), t("two")]).unwrap(),
+            t("{\"a\":1,\"b\":\"two\"}")
+        );
+        // NULL value.
+        assert_eq!(
+            json_object_fn(&[t("x"), Value::Null]).unwrap(),
+            t("{\"x\":null}")
+        );
+        // Key with special chars is escaped.
+        assert_eq!(
+            json_object_fn(&[t("a\"b"), Value::Int(1)]).unwrap(),
+            t("{\"a\\\"b\":1}")
+        );
+    }
+
+    #[test]
+    fn json_object_fn_errors() {
+        // Odd arg count.
+        assert!(json_object_fn(&[t("a")]).is_err());
+        assert!(json_object_fn(&[t("a"), Value::Int(1), t("b")]).is_err());
+        // Non-TEXT key.
+        assert!(json_object_fn(&[Value::Int(1), Value::Int(2)]).is_err());
+        assert!(json_object_fn(&[Value::Null, Value::Int(1)]).is_err());
+        // BLOB value.
+        assert!(json_object_fn(&[t("a"), Value::Blob(vec![1])]).is_err());
     }
 }

@@ -2466,3 +2466,68 @@ fn json_function() {
         assert_same(db.str(), q);
     }
 }
+
+/// `json_array(...)` and `json_object(...)` (M24.3, M24.4), differential-tested against the
+/// system `sqlite3` oracle. Covers: empty array/object, scalars, NULL, strings with escapes,
+/// reals, and the error cases (odd arg count, non-TEXT key, BLOB value).
+#[test]
+fn json_array_and_object() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    for q in [
+        // json_array — empty and scalars.
+        "SELECT json_array();",
+        "SELECT json_array(1);",
+        "SELECT json_array(1,2,3);",
+        "SELECT json_array('a','b');",
+        "SELECT json_array(NULL);",
+        "SELECT json_array(1.5);",
+        "SELECT json_array(1, 'two', NULL, 3.5);",
+        // String with escape.
+        "SELECT json_array('a\nb');",
+        "SELECT json_array('');",
+        "SELECT json_array('\"quoted\"');",
+        // json_object — empty and pairs.
+        "SELECT json_object();",
+        "SELECT json_object('a',1);",
+        "SELECT json_object('a',1,'b',2);",
+        "SELECT json_object('x',NULL);",
+        "SELECT json_object('x','str');",
+        "SELECT json_object('x',1.5);",
+        // Key with escape.
+        "SELECT json_object('a\"b',1);",
+        // Multiple pairs with mixed value types.
+        "SELECT json_object('a',1,'b','two','c',NULL,'d',3.5);",
+    ] {
+        assert_same(db.str(), q);
+    }
+    // Known divergence: a TEXT value returned from json() carries the JSON subtype upstream,
+    // so json_array(json('[1,2]')) inlines the array as [[1,2]], while our engine (without
+    // subtype tracking) quotes it as a string ["[1,2]"]. Skip until M24.20 (subtype support).
+    // Error cases — both engines should error.
+    for q in [
+        "SELECT json_object('a');",
+        "SELECT json_object('a',1,'b');",
+        "SELECT json_object(1,2);",
+        "SELECT json_array(x'0102');",
+        "SELECT json_object('a', x'0102');",
+    ] {
+        let oracle_err = std::process::Command::new("sqlite3")
+            .arg("-batch")
+            .arg(db.str())
+            .arg(q)
+            .output()
+            .expect("run sqlite3");
+        assert!(!oracle_err.status.success(), "oracle should error on: {q}");
+        match rustsqlite_rows(db.str(), q) {
+            Ok(rows) => panic!("rustsqlite should error on `{q}`, got: {rows:?}"),
+            Err(e) => assert!(
+                e.contains("json_object()") || e.contains("json_object labels") || e.contains("JSON cannot hold BLOB values"),
+                "wrong error for `{q}`: {e}"
+            ),
+        }
+    }
+}
