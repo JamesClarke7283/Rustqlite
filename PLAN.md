@@ -310,7 +310,7 @@ list every granular item needed.
 - [x] **15.4** Codegen: `DROP VIEW` — remove `sqlite_schema` entry + invalidate schema
 - [ ] **15.5** View expansion: when a view appears in `FROM`, substitute its SELECT body (coroutine or materialization) [BLOCKED: deferred — requires intercepting FROM-clause resolution to detect view references, parsing the view's stored SELECT text, and substituting it as a subquery (similar to CTE expansion in M10). The catalog now has `find_view` (landed with M15.3/M15.4); the expansion logic is the remaining work.]
 - [ ] **15.6** `sqlitemaster` view compatibility (`sqlite_master` vs `sqlite_schema` alias) [BLOCKED: deferred — `sqlite_master` is already accepted as an alias for `sqlite_schema` in the special-case read path; a proper implementation would register it as a view in the in-memory schema.]
-- [ ] **15.7** `INSTEAD OF` triggers on views (depends on M18 triggers)
+- [ ] **15.7** `INSTEAD OF` triggers on views (depends on M16 triggers) [BLOCKED: depends on M16.9 trigger firing which is BLOCKED]
 
 ---
 
