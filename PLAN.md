@@ -843,7 +843,7 @@ list every granular item needed.
 
 ### M8 — Subqueries (Additional Items)
 
-- [ ] **8.12** Subquery flattening optimization: merge `FROM (SELECT …)` into outer query when safe
+- [x] **8.12** Subquery flattening optimization: merge `FROM (SELECT …)` into outer query when safe
 - [ ] **8.13** Correlated subquery re-materialization when outer row changes
 - [ ] **8.14** Automatic index creation for correlated subqueries (autoindex)
 

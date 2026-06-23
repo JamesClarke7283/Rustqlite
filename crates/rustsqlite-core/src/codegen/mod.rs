@@ -16,6 +16,7 @@ pub mod delete;
 pub mod drop;
 pub mod drop_index;
 pub mod expr;
+pub mod flatten;
 pub mod index;
 pub mod index_planner;
 pub mod insert;

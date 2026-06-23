@@ -422,6 +422,28 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   emit `OP_Program` (no trigger/view sub-programs compiled yet) — these opcodes are the
   runtime infrastructure for M15 views, M16 triggers, and M8.13 correlated-subquery
   re-materialization.
+  **8.12 Subquery flattening** ✅: `codegen::flatten::try_flatten_subquery` (mirrors
+  `flattenSubquery` in `select.c`) rewrites a `FROM (subquery) AS alias` entry into the
+  outer query when the subquery is a simple non-aggregate single-core SELECT — splicing
+  the subquery's FROM entries into the outer FROM, combining the WHERE clauses
+  (`sub_where AND outer_where`), substituting outer projection / GROUP BY / HAVING /
+  ORDER BY references to the subquery's output columns with the subquery's projection
+  expressions (a bare `col` matching a subquery output name is replaced; an `alias.col`
+  reference is replaced when the alias matches), expanding `SELECT *` and `alias.*` to
+  the subquery's output columns, and transferring the subquery's ORDER BY / LIMIT /
+  OFFSET to the outer query when the outer has none. The upstream restriction set is
+  enforced faithfully (restrictions 4, 7, 8, 9, 11, 13, 14, 16, 19, 21, 22, 25; aggregate
+  subqueries are never flattened per the modern upstream decision; window functions in
+  either side block flattening; a subquery with OFFSET or a compound/VALUES body is not
+  flattened). When flattening is not safe, the caller falls back to the M8.6
+  materialization path. The dispatch in `capi::stmt::compile_select` tries flattening
+  first, then materialization; `CompiledSelect` now carries the rewritten
+  `compiled_select` so `EXPLAIN QUERY PLAN` renders the flattened plan (`SCAN t` instead
+  of `SCAN <alias>`). Differential-tested vs the C oracle (`subquery_flattening`,
+  `eqp_flattened_subquery_shows_inner_table` — flattenable subqueries match the oracle
+  byte-for-byte, and the EQP shows the inner table). Still M8+: 8.13 correlated-subquery
+  re-materialization, 8.14 automatic index for correlated subqueries; the compound-
+  subquery flattening (UNION ALL subqueries) and join-involving flattening are deferred.
 
 - **M9 — Compound SELECT** ✅: `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT` via the merge
   algorithm with coroutines (`codegen::compound`, mirrors `multiSelectByMerge` in `select.c`).

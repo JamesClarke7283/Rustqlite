@@ -266,17 +266,16 @@ fn query_plan_details_match_oracle() {
     let got = rustqlite_eqp_details(&rows);
     assert_eq!(got, vec!["SCAN 2-ROW VALUES CLAUSE"]);
 
-    // FROM (subquery) AS alias: the outer scan is over the materialized ephemeral. We emit
-    // "SCAN <alias>" for the outer scan (the oracle flattens simple subqueries into the outer
-    // FROM, producing "SCAN t" — a divergence we accept until subquery flattening lands with
-    // M8.12; the materialized non-flattenable shape the oracle renders as "CO-ROUTINE <alias>"
-    // + "SCAN <alias>" is a follow-up). Here we only assert our own output, not the oracle.
+    // FROM (subquery) AS alias: M8.12 subquery flattening rewrites the SELECT so the
+    // subquery's FROM table is spliced into the outer FROM. The EQP now matches the oracle
+    // ("SCAN t"). A non-flattenable subquery (aggregate, DISTINCT, LIMIT, …) still
+    // materializes and would render "SCAN <alias>"; the flattenable case is the common one.
     let (_c, rows) = collect(
         db.str(),
         "EXPLAIN QUERY PLAN SELECT * FROM (SELECT a, b FROM t WHERE a > 1) AS sq;",
     );
     let got = rustqlite_eqp_details(&rows);
-    assert_eq!(got, vec!["SCAN sq"]);
+    assert_eq!(got, vec!["SCAN t"]);
 }
 
 #[test]

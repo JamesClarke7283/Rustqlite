@@ -1162,7 +1162,11 @@ fn prepare_explain(
                 .collect(),
         ),
         ExplainKind::QueryPlan => (
-            explain::query_plan_rows(&select, table_name, compiled.index_plan_info.as_ref()),
+            explain::query_plan_rows(
+                &compiled.compiled_select,
+                table_name,
+                compiled.index_plan_info.as_ref(),
+            ),
             explain::QUERY_PLAN_HEADER
                 .iter()
                 .map(|s| s.to_string())
@@ -1192,8 +1196,10 @@ fn prepare_explain(
 }
 
 /// A compiled SELECT plus everything the prepare path needs from it: the program, the result
-/// column names, the owned `Arc<Pager>` (for a live VDBE), and the resolved table (for EXPLAIN
-/// QUERY PLAN's `SCAN <name>` detail).
+/// column names, the owned `Arc<Pager>` (for a live VDBE), the resolved table (for EXPLAIN
+/// QUERY PLAN's `SCAN <name>` detail), and the SELECT that was actually compiled (which may
+/// differ from the user's input when subquery flattening / CTE rewriting applied — used by
+/// `EXPLAIN QUERY PLAN` rendering).
 struct CompiledSelect {
     program: Program,
     column_names: Vec<String>,
@@ -1202,6 +1208,10 @@ struct CompiledSelect {
     /// The index-plan summary for `EXPLAIN QUERY PLAN`. `None` for a table scan / VALUES /
     /// constant SELECT.
     index_plan_info: Option<crate::vdbe::explain::IndexPlanInfo>,
+    /// The SELECT whose plan `program`/`index_plan_info` describe. This is the user's SELECT
+    /// after any AST rewriting (CTE expansion, subquery flattening) — `EXPLAIN QUERY PLAN`
+    /// rendering uses it so the plan reflects the rewritten shape, not the original.
+    compiled_select: SelectStmt,
 }
 
 /// Apply the USING/NATURAL JOIN rewrite to `select` if its top-level FROM join is a
@@ -1298,6 +1308,7 @@ fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelec
                 pager: cte.pager,
                 table: None,
                 index_plan_info: None,
+                compiled_select: select.clone(),
             });
         }
     }
@@ -1309,29 +1320,48 @@ fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelec
         select
     };
 
-    // `FROM (subquery) AS alias` path: materialize the subquery into an ephemeral table and
-    // scan it. Single-entry FROM with a subquery (no joins). M8.6.
-    if !select.from.is_empty() && select.values.is_empty() && select.from.len() == 1 {
-        if let rustqlite_parser::TableOrJoin::Subquery { query, alias } = &select.from[0] {
-            // Resolve the subquery's own FROM table (if any) so the inner body can be compiled.
-            // A subquery with a join in its own FROM is not yet supported (M7+).
-            let (sub_table, sub_indexes, pager) = resolve_subquery_source(db, query)?;
-            let (program, column_names) = codegen::compile_from_subquery(
-                select,
-                query,
-                alias,
-                sub_table.as_ref(),
-                &sub_indexes,
-            )?;
-            return Ok(CompiledSelect {
-                program,
-                column_names,
-                pager,
-                table: None,
-                index_plan_info: None,
-            });
+    // `FROM (subquery) AS alias` path. First try to flatten the subquery into the outer
+    // query (M8.12, mirrors `flattenSubquery` in `select.c`); when flattening succeeds the
+    // rewritten SELECT has a plain-table FROM and is compiled below by the regular
+    // single-table / join paths. When flattening is not safe, fall back to materializing
+    // the subquery into an ephemeral table and scanning it (M8.6).
+    let flattened_owned: SelectStmt;
+    let select: &SelectStmt = if !select.from.is_empty()
+        && select.values.is_empty()
+        && select.from.len() == 1
+        && matches!(select.from[0], rustqlite_parser::TableOrJoin::Subquery { .. })
+    {
+        match codegen::flatten::try_flatten_subquery(select)? {
+            Some(flattened) => {
+                flattened_owned = flattened;
+                &flattened_owned
+            }
+            None => {
+                // Materialization fallback (M8.6).
+                if let rustqlite_parser::TableOrJoin::Subquery { query, alias } = &select.from[0] {
+                    let (sub_table, sub_indexes, pager) = resolve_subquery_source(db, query)?;
+                    let (program, column_names) = codegen::compile_from_subquery(
+                        select,
+                        query,
+                        alias,
+                        sub_table.as_ref(),
+                        &sub_indexes,
+                    )?;
+                    return Ok(CompiledSelect {
+                        program,
+                        column_names,
+                        pager,
+                        table: None,
+                        index_plan_info: None,
+                        compiled_select: select.clone(),
+                    });
+                }
+                select
+            }
         }
-    }
+    } else {
+        select
+    };
 
     // Multi-table (join) path: when the FROM clause is a cross/inner join of plain tables,
     // resolve each table from the catalog and compile via the join codegen. This returns
@@ -1411,6 +1441,7 @@ fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelec
                     pager: Some(pager),
                     table: Some(resolved[0].0.clone()),
                     index_plan_info: None,
+                    compiled_select: select_for_codegen,
                 });
             }
         }
@@ -1503,6 +1534,7 @@ fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelec
         pager,
         table,
         index_plan_info,
+        compiled_select: select.clone(),
     })
 }
 

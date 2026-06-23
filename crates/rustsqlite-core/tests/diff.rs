@@ -2306,4 +2306,73 @@ fn date_time_current_functions() {
     assert_eq!(rows, vec!["1".to_string()]);
 }
 
+/// Subquery flattening (M8.12, mirrors `flattenSubquery` in `select.c`). A `FROM (subquery)
+/// AS alias` whose body is a simple non-aggregate single-core SELECT is flattened into the
+/// outer query — the subquery's FROM entries are spliced into the outer FROM and the outer
+/// expressions are rewritten to reference the substituted projection. This avoids the
+/// ephemeral materialization of M8.6 and lets the planner use indexes on the inner tables.
+/// The oracle is the system `sqlite3`, which flattens the same shapes.
+#[test]
+fn subquery_flattening() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = standard_fixture();
+    for q in [
+        // Flattenable: subquery over a real table, plain projection.
+        "SELECT * FROM (SELECT a, b FROM t WHERE a > 1) AS sq;",
+        "SELECT a FROM (SELECT a, b FROM t WHERE a > 1) AS sq;",
+        "SELECT * FROM (SELECT a, b FROM t WHERE a > 1) AS sq WHERE a < 10;",
+        "SELECT a FROM (SELECT a, b FROM t WHERE a > 1) AS sq ORDER BY a;",
+        "SELECT a FROM (SELECT a, b FROM t WHERE a > 1) AS sq ORDER BY a DESC;",
+        "SELECT a FROM (SELECT a, b FROM t WHERE a > 1) AS sq LIMIT 2;",
+        "SELECT a FROM (SELECT a, b FROM t WHERE a > 1) AS sq LIMIT 2 OFFSET 1;",
+        // Computed projection in the subquery with an alias.
+        "SELECT a_plus FROM (SELECT a + 1 AS a_plus, b FROM t) AS sq WHERE a_plus > 2;",
+        // Outer WHERE references a computed subquery column.
+        "SELECT a_plus FROM (SELECT a + 1 AS a_plus FROM t WHERE a > 0) AS sq WHERE a_plus < 5;",
+        // `alias.col` reference in the outer query.
+        "SELECT sq.a FROM (SELECT a, b FROM t WHERE a > 1) AS sq;",
+        "SELECT sq.a, sq.b FROM (SELECT a, b FROM t WHERE a > 1) AS sq WHERE sq.a < 10;",
+        // Subquery ORDER BY transferred to the outer query.
+        "SELECT a FROM (SELECT a FROM t ORDER BY a DESC) AS sq;",
+        // Subquery LIMIT transferred to the outer query (no outer WHERE — restriction (19)).
+        "SELECT a FROM (SELECT a FROM t LIMIT 3) AS sq;",
+        // Outer DISTINCT with a flattenable subquery.
+        "SELECT DISTINCT a FROM (SELECT a FROM t WHERE a > 0) AS sq;",
+        // No outer WHERE, no outer ORDER BY — subquery WHERE is the only filter.
+        "SELECT a, b FROM (SELECT a, b FROM t WHERE b IS NOT NULL) AS sq;",
+    ] {
+        assert_same(db.str(), q);
+    }
+}
+
+/// `EXPLAIN QUERY PLAN` for flattenable `FROM (subquery) AS alias` should now show the inner
+/// table, matching the oracle (which flattens the same shapes). Before M8.12 we rendered
+/// `SCAN <alias>`; the flattener rewrites the SELECT so the EQP rendering sees the spliced-in
+/// inner FROM table.
+#[test]
+fn eqp_flattened_subquery_shows_inner_table() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = standard_fixture();
+    // A flattenable subquery: the EQP should show `SCAN t`, not `SCAN sq`. We compare the
+    // last non-empty line (the detail row) since the oracle wraps it in "QUERY PLAN" /
+    // "`--" formatting while rustsqlite returns the raw detail row.
+    let expected = sqlite3_rows(db.str(), "EXPLAIN QUERY PLAN SELECT * FROM (SELECT a, b FROM t WHERE a > 1) AS sq;");
+    let expected_detail = expected.iter().rev().find(|l| !l.is_empty()).cloned().unwrap_or_default();
+    let got = rustsqlite_rows(db.str(), "EXPLAIN QUERY PLAN SELECT * FROM (SELECT a, b FROM t WHERE a > 1) AS sq;")
+        .expect("rustsqlite eqp");
+    let got_detail = got.iter().rev().find(|l| !l.is_empty()).cloned().unwrap_or_default();
+    // Both should contain "SCAN t" (the oracle wraps it as "`--SCAN t"; rustsqlite emits
+    // "SCAN t" as the raw detail string).
+    assert!(got_detail.contains("SCAN t"), "expected SCAN t in EQP, got: {got_detail}");
+    assert!(!got_detail.contains("sq"), "unexpected SCAN sq in EQP: {got_detail}");
+    // The oracle's detail line should also mention t.
+    assert!(expected_detail.contains("SCAN t"), "oracle EQP mismatch: {expected_detail}");
+}
+
 
