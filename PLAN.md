@@ -403,10 +403,10 @@ list every granular item needed.
 - [x] **20.19** `PRAGMA foreign_keys` — read/set FK enforcement
 - [x] **20.20** `PRAGMA encoding` — read/set text encoding (UTF-8 only for now)
 - [x] **20.21** `PRAGMA compile_options` — list compile-time options
-- [ ] **20.22** `PRAGMA function_list` — list registered functions
+- [x] **20.22** `PRAGMA function_list` — list registered functions
 - [x] **20.23** `PRAGMA collation_list` — list collations
-- [ ] **20.24** `PRAGMA collist` — list columns
-- [ ] **20.25** `PRAGMA optimize` — trigger ANALYZE
+- [x] **20.24** `PRAGMA collist` — list columns
+- [x] **20.25** `PRAGMA optimize` — trigger ANALYZE
 - [x] **20.26** `PRAGMA wal_checkpoint` — checkpoint WAL
 - [x] **20.27** `PRAGMA busy_timeout` — read/set busy timeout
 - [x] **20.28** `PRAGMA case_sensitive_like` — toggle LIKE case sensitivity
@@ -872,21 +872,21 @@ list every granular item needed.
 
 ### M20 — PRAGMA (Additional Items)
 
-- [ ] **20.39** `PRAGMA full_column_names` / `PRAGMA short_column_names` — column naming mode
-- [ ] **20.40** `PRAGMA count_changes` — return rows-affected as query result
-- [ ] **20.41** `PRAGMA empty_result_callbacks` — callback on empty result sets
-- [ ] **20.42** `PRAGMA fullfsync` / `PRAGMA checkpoint_fullfsync` — full fsync control
+- [x] **20.39** `PRAGMA full_column_names` / `PRAGMA short_column_names` — column naming mode
+- [x] **20.40** `PRAGMA count_changes` — return rows-affected as query result
+- [x] **20.41** `PRAGMA empty_result_callbacks` — callback on empty result sets
+- [x] **20.42** `PRAGMA fullfsync` / `PRAGMA checkpoint_fullfsync` — full fsync control
 - [x] **20.43** `PRAGMA data_version` — read data version (readonly)
 - [x] **20.44** `PRAGMA default_cache_size` — legacy cache size setting
 - [x] **20.45** `PRAGMA mmap_size` — read/set memory-mapped I/O limit
 - [x] **20.46** `PRAGMA temp_store` — read/set (DEFAULT, FILE, MEMORY)
 - [x] **20.47** `PRAGMA max_page_count` — read/set maximum pages
-- [ ] **20.48** `PRAGMA shrink_memory` — release unused memory
-- [ ] **20.49** `PRAGMA threads` — read/set worker thread count
-- [ ] **20.50** `PRAGMA soft_heap_limit` / `PRAGMA hard_heap_limit` — memory limits
-- [ ] **20.51** `PRAGMA analysis_limit` — limit ANALYZE sampling
-- [ ] **20.52** `PRAGMA module_list` — list registered virtual table modules
-- [ ] **20.53** `PRAGMA parser_trace` — debug parser tracing (debug build only)
+- [x] **20.48** `PRAGMA shrink_memory` — release unused memory
+- [x] **20.49** `PRAGMA threads` — read/set worker thread count
+- [x] **20.50** `PRAGMA soft_heap_limit` / `PRAGMA hard_heap_limit` — memory limits
+- [x] **20.51** `PRAGMA analysis_limit` — limit ANALYZE sampling
+- [x] **20.52** `PRAGMA module_list` — list registered virtual table modules
+- [x] **20.53** `PRAGMA parser_trace` — debug parser tracing (debug build only)
 
 ### M27 — Query Planner (Additional Items)
 

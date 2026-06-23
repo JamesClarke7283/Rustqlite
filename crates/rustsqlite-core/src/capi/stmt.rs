@@ -1741,6 +1741,22 @@ fn compile_pragma(db: &mut Sqlite3, sql: &str, pragma: &PragmaStmt) -> Result<Sq
         "max_page_count" => compile_pragma_max_page_count(db, sql, pragma),
         "data_version" => compile_pragma_data_version(db, sql, pragma),
         "stats" => compile_pragma_stats(db, sql, pragma),
+        "function_list" => compile_pragma_function_list(db, sql, pragma),
+        "collist" => compile_pragma_collist(db, sql, pragma),
+        "optimize" => compile_pragma_noop_rows(db, sql, pragma),
+        "shrink_memory" => compile_pragma_noop_rows(db, sql, pragma),
+        "threads" => compile_pragma_threads(db, sql, pragma),
+        "soft_heap_limit" => compile_pragma_heap_limit(db, sql, pragma),
+        "hard_heap_limit" => compile_pragma_heap_limit(db, sql, pragma),
+        "analysis_limit" => compile_pragma_analysis_limit(db, sql, pragma),
+        "module_list" => compile_pragma_noop_rows(db, sql, pragma),
+        "parser_trace" => compile_pragma_noop_rows(db, sql, pragma),
+        "count_changes" => compile_pragma_flag(db, sql, pragma, "count_changes"),
+        "full_column_names" => compile_pragma_flag(db, sql, pragma, "full_column_names"),
+        "short_column_names" => compile_pragma_flag(db, sql, pragma, "short_column_names"),
+        "empty_result_callbacks" => compile_pragma_flag(db, sql, pragma, "empty_result_callbacks"),
+        "fullfsync" => compile_pragma_flag(db, sql, pragma, "fullfsync"),
+        "checkpoint_fullfsync" => compile_pragma_flag(db, sql, pragma, "checkpoint_fullfsync"),
         _ => Err(Error::msg(format!("PRAGMA {name} is not supported yet"))),
     }
 }
@@ -3013,6 +3029,116 @@ fn compile_pragma_stats(
     _pragma: &PragmaStmt,
 ) -> Result<Sqlite3Stmt> {
     Ok(empty_static_stmt(sql, &["table", "rowid", "height", "pgno", "nrow"]))
+}
+
+/// `PRAGMA function_list` — list registered scalar/aggregate functions. Returns (name,
+/// builtin, type, enc, narg, flags). A subset of the built-in functions is listed (the
+/// full list is not statically registered; this is an approximation for introspection).
+fn compile_pragma_function_list(
+    _db: &mut Sqlite3,
+    sql: &str,
+    _pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    let names = [
+        "abs", "avg", "cast", "ceil", "char", "coalesce", "concat", "count", "date",
+        "datetime", "final", "floor", "group_concat", "hex", "ifnull", "iif", "instr",
+        "julianday", "length", "like", "lower", "ltrim", "max", "min", "mod", "nullif",
+        "pi", "printf", "quote", "random", "randomblob", "replace", "round", "rtrim",
+        "sin", "sqrt", "sqlite_sourceid", "sqlite_version", "strftime", "substr",
+        "sum", "time", "total", "trim", "typeof", "unicode", "upper", "unhex",
+    ];
+    let rows = names
+        .iter()
+        .map(|n| {
+            vec![
+                Value::Text((*n).into()),
+                Value::Int(1),
+                Value::Text("scalar".into()),
+                Value::Text("utf8".into()),
+                Value::Int(-1),
+                Value::Int(0),
+            ]
+        })
+        .collect();
+    Ok(static_stmt_rows(
+        sql,
+        &["name", "builtin", "type", "enc", "narg", "flags"],
+        rows,
+    ))
+}
+
+/// `PRAGMA collist` — list columns (an internal debug pragma). Returns one row per column
+/// in the schema. Not widely used; we return the columns of the first table (or no rows
+/// when there are no tables).
+fn compile_pragma_collist(
+    db: &mut Sqlite3,
+    sql: &str,
+    _pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    let pager = db.ensure_pager()?;
+    let catalog = block_on(read_catalog(&pager))?;
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    for obj in catalog.tables() {
+        if obj.obj_type != "table" {
+            continue;
+        }
+        if let Ok(t) = Table::from_schema_object(obj) {
+            for (ci, col) in t.columns.iter().enumerate() {
+                rows.push(vec![
+                    Value::Text("main".into()),
+                    Value::Text(t.name.clone()),
+                    Value::Text(col.name.clone()),
+                    Value::Int(ci as i64),
+                ]);
+            }
+        }
+    }
+    Ok(static_stmt_rows(sql, &["schema", "table", "column", "cid"], rows))
+}
+
+/// A pragma that returns no rows (a no-op read or an accepted write with no output).
+fn compile_pragma_noop_rows(
+    _db: &mut Sqlite3,
+    sql: &str,
+    _pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    Ok(empty_static_stmt(sql, &[]))
+}
+
+/// `PRAGMA threads` — read/set the worker thread count. Per-connection; informational
+/// (always 0 — we use a single-threaded async runtime).
+fn compile_pragma_threads(
+    _db: &mut Sqlite3,
+    sql: &str,
+    _pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    Ok(static_stmt_rows(sql, &["threads"], vec![vec![Value::Int(0)]]))
+}
+
+/// `PRAGMA soft_heap_limit` / `PRAGMA hard_heap_limit` — read/set the memory limit.
+/// Per-connection; informational (always 0 = unlimited — we don't enforce memory limits).
+fn compile_pragma_heap_limit(
+    _db: &mut Sqlite3,
+    sql: &str,
+    pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    match &pragma.value {
+        Some(PragmaValue::Equal(kind)) | Some(PragmaValue::Paren(kind)) => {
+            let _v = pragma_value_as_int(kind)?;
+            Ok(empty_static_stmt(sql, &["heap_limit"]))
+        }
+        _ => Ok(static_stmt_rows(sql, &["heap_limit"], vec![vec![Value::Int(0)]])),
+    }
+}
+
+/// `PRAGMA analysis_limit` — read/set the ANALYZE sampling limit. Per-connection;
+/// informational (always 0 = default — ANALYZE is not implemented yet).
+fn compile_pragma_analysis_limit(
+    _db: &mut Sqlite3,
+    sql: &str,
+    _pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    Ok(static_stmt_rows(sql, &["analysis_limit"], vec![vec![Value::Int(0)]]))
 }
 
 
