@@ -1005,3 +1005,48 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   UPDATE path, and the `UPDATE ... FROM` path. Differential-tested vs the C oracle
   (`notnull_constraint_enforcement_matches_oracle`: INSERT NULL fails, INSERT non-NULL
   succeeds, OR IGNORE skips, UPDATE to NULL fails, multiple NOT NULL columns).
+- **M23 — Date/Time Functions** ✅: a faithful port of `date.c`
+  (`crates/rustsqlite-core/src/func/date.rs`). The `DateTime` struct mirrors the C
+  struct (julian-day-times-`86_400_000` `iJD`, lazy Y/M/D + H/M/S fields, the
+  `validJD`/`validYMD`/`validHMS`/`nFloor`/`rawS`/`useSubsec`/`isUtc`/`isLocal` flags);
+  `get_digits` mirrors the fixed-width integer parser (including the asymmetric
+  last-group 3-byte terminator); `parse_yyyy_mm_dd`/`parse_hhmmss`/`parse_timezone`
+  cover the `YYYY-MM-DD[THH:MM:SS[.FFF]][Z|±HH:MM]` and `HH:MM:SS[.FFF]` forms;
+  `parse_date_or_time` accepts a bare julian day number, `now`, and `subsec`
+  (numeric input requires the *entire* string be the number, matching
+  `sqlite3AtoF`'s signed-return-value trick — so `date('2023-13-01')` is NULL,
+  not julian-day 2023); `parse_modifier` covers `auto`/`ceiling`/`floor`/
+  `julianday`/`localtime`/`utc`/`unixepoch`/`weekday N`/`start of
+  month|year|day`/`subsec`/`subsecond` and the `±NNN <unit>` (second/minute/hour/
+  day/month/year), `±YYYY-MM-DD[ HH:MM]`, and `±HH:MM:SS[.FFF]` numeric forms
+  (the month/year modifiers carry the fractional remainder into `iJD` after the
+  integer part, matching the C special-case processing). The rendering
+  functions `date`/`time`/`datetime`/`julianday`/`unixepoch`/`strftime`/`timediff`
+  are exposed; `strftime` supports every conversion specifier in `date.c`
+  (`%d`/`%e`/`%f`/`%F`/`%G`/`%g`/`%H`/`%k`/`%I`/`%l`/`%j`/`%J`/`%m`/`%M`/`%p`/`%P`/
+  `%R`/`%s`/`%S`/`%T`/`%u`/`%w`/`%U`/`%V`/`%W`/`%Y`/`%%`); an unknown specifier
+  returns NULL (matching upstream's `sqlite3_str_reset`). The volatile
+  `now`/`subsec`/`localtime`/`utc` and the `current_date`/`current_time`/
+  `current_timestamp` zero-arg keyword-functions need the per-statement wall
+  clock, so the VDBE executor intercepts them in the `Function` arm and reaches
+  into a new `RuntimeCtx::date_ctx: Option<DateCtx>` (lazily cached per statement
+  from `SystemTime` — `DateCtx::now()` mirrors `sqlite3StmtCurrentTime64`; the
+  cache keeps `date('now') == current_date` stable within one statement, matching
+  upstream). `current_date`/`current_time`/`current_timestamp` are keywords
+  (upstream `TK_CTIME_KW` in `mkkeywordhash.c`, not the `%fallback ID` list), so
+  they are added to the pest `keyword` rule and parsed via a new `ctime_expr`
+  primary that lowers to a zero-arg `Expr::Function`; this means `current_date()`
+  with parens is a syntax error (matches the oracle), and `CREATE TABLE
+  current_date(...)` is rejected (a minor divergence from the oracle's
+  context-sensitive `%fallback ID` reclassification — the full fallback modeling
+  is deferred to the full `parse.y` port). `localtime`/`utc` modifiers are
+  accepted as no-ops that flip the `is_local`/`is_utc` flags (the OS `localtime_r`
+  integration is deferred — they don't shift the value, which is correct for a
+  UTC-only engine but diverges from the oracle when the host TZ is non-UTC).
+  Differential-tested vs the C oracle (`date_time_functions`,
+  `date_time_subsec`, `date_time_current_functions` in `diff.rs`): deterministic
+  functions match byte-for-byte across 60+ queries covering basic rendering,
+  overflowed-date normalization, julian day, unix epoch, all modifiers, every
+  `strftime` specifier, `timediff`, numeric julian-day input, NULL/bad input;
+  the volatile `current_*` are checked for type/shape and self-consistency
+  (`date('now') == current_date`).

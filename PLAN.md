@@ -451,16 +451,16 @@ list every granular item needed.
 
 ## M23 — Date/Time Functions
 
-- [ ] **23.1** Time-value parsing: `YYYY-MM-DD`, `HH:MM:SS`, `YYYY-MM-DD HH:MM:SS`, `YYYY-MM-DDTHH:MM:SS`, Julian day, Unix epoch, `now`, modifiers
-- [ ] **23.2** Modifier parsing: `+N days`, `-N months`, `start of month`, `start of year`, `weekday N`, `utc`, `localtime`, `unixepoch`, `auto`
-- [ ] **23.3** `date(...)` function
-- [ ] **23.4** `time(...)` function
-- [ ] **23.5** `datetime(...)` function
-- [ ] **23.6** `julianday(...)` function
-- [ ] **23.7** `strftime(format, ...)` function
-- [ ] **23.8** `unixepoch(...)` function
-- [ ] **23.9** `timediff(X, Y)` function
-- [ ] **23.10** `current_date`, `current_time`, `current_timestamp` keywords
+- [x] **23.1** Time-value parsing: `YYYY-MM-DD`, `HH:MM:SS`, `YYYY-MM-DD HH:MM:SS`, `YYYY-MM-DDTHH:MM:SS`, Julian day, Unix epoch, `now`, modifiers
+- [x] **23.2** Modifier parsing: `+N days`, `-N months`, `start of month`, `start of year`, `weekday N`, `utc`, `localtime`, `unixepoch`, `auto`
+- [x] **23.3** `date(...)` function
+- [x] **23.4** `time(...)` function
+- [x] **23.5** `datetime(...)` function
+- [x] **23.6** `julianday(...)` function
+- [x] **23.7** `strftime(format, ...)` function
+- [x] **23.8** `unixepoch(...)` function
+- [x] **23.9** `timediff(X, Y)` function
+- [x] **23.10** `current_date`, `current_time`, `current_timestamp` keywords
 
 ---
 

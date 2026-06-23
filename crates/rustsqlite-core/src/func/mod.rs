@@ -6,6 +6,7 @@
 //! exactly (verified against the `sqlite3` binary).
 
 pub mod aggregate;
+pub mod date;
 pub mod like;
 pub mod math;
 pub mod registry;

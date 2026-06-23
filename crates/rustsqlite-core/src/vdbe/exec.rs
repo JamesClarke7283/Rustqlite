@@ -63,6 +63,11 @@ pub struct RuntimeCtx {
     /// connection's `last_insert_rowid` — a statement that only ran the write side of an
     /// `UPDATE` must not clobber it.
     pub did_insert: bool,
+    /// The per-statement date context for `now`/`subsec`/`localtime`/`utc` and the
+    /// `current_date`/`current_time`/`current_timestamp` functions. Built once per statement
+    /// (mirrors `sqlite3StmtCurrentTime`), so `now` is stable across calls within one
+    /// statement. `None` until first needed (lazy — most statements never touch it).
+    pub date_ctx: Option<crate::func::date::DateCtx>,
 }
 
 impl Default for RuntimeCtx {
@@ -90,6 +95,7 @@ impl RuntimeCtx {
             total_changes: 0,
             last_insert_rowid: 0,
             did_insert: false,
+            date_ctx: None,
         }
     }
 
@@ -115,6 +121,15 @@ impl RuntimeCtx {
         }
         out.truncate(n);
         out
+    }
+
+    /// Get or build the per-statement `DateCtx` for `now`/`current_*`/`subsec` (lazily cached
+    /// so `now` is stable across multiple calls within one statement).
+    pub fn date_ctx(&mut self) -> Option<crate::func::date::DateCtx> {
+        if self.date_ctx.is_none() {
+            self.date_ctx = crate::func::date::DateCtx::now();
+        }
+        self.date_ctx
     }
 }
 
@@ -1835,6 +1850,48 @@ impl Vdbe {
                         "total_changes" => Value::Int(self.ctx.total_changes),
                         "last_insert_rowid" => Value::Int(self.ctx.last_insert_rowid),
                         "sqlite_version" => Value::Text(crate::SQLITE_VERSION.to_string()),
+                        // Date/time functions need the per-statement DateCtx (for `now`/
+                        // `subsec`/`localtime`/`utc` and the `current_*` zero-arg forms).
+                        "date" => {
+                            let ctx = self.ctx.date_ctx();
+                            crate::func::date::date_fn(&args, ctx.as_ref())?
+                        }
+                        "time" => {
+                            let ctx = self.ctx.date_ctx();
+                            crate::func::date::time_fn(&args, ctx.as_ref())?
+                        }
+                        "datetime" => {
+                            let ctx = self.ctx.date_ctx();
+                            crate::func::date::datetime_fn(&args, ctx.as_ref())?
+                        }
+                        "julianday" => {
+                            let ctx = self.ctx.date_ctx();
+                            crate::func::date::julianday_fn(&args, ctx.as_ref())?
+                        }
+                        "unixepoch" => {
+                            let ctx = self.ctx.date_ctx();
+                            crate::func::date::unixepoch_fn(&args, ctx.as_ref())?
+                        }
+                        "strftime" => {
+                            let ctx = self.ctx.date_ctx();
+                            crate::func::date::strftime_fn(&args, ctx.as_ref())?
+                        }
+                        "timediff" => {
+                            let ctx = self.ctx.date_ctx();
+                            crate::func::date::timediff_fn(&args, ctx.as_ref())?
+                        }
+                        "current_date" => {
+                            let ctx = self.ctx.date_ctx();
+                            crate::func::date::current_date_fn(ctx.as_ref())?
+                        }
+                        "current_time" => {
+                            let ctx = self.ctx.date_ctx();
+                            crate::func::date::current_time_fn(ctx.as_ref())?
+                        }
+                        "current_timestamp" => {
+                            let ctx = self.ctx.date_ctx();
+                            crate::func::date::current_timestamp_fn(ctx.as_ref())?
+                        }
                         _ => func::call_scalar(&name, &args)?,
                     };
                     self.regs[p3 as usize] = result;

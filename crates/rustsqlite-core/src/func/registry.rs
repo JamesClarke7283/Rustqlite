@@ -155,6 +155,14 @@ pub fn check(name: &str, n_arg: usize) -> Result<()> {
         }
         "randomblob" => Some(n_arg == 1),
 
+        // date/time functions (M23): handled in the VDBE executor's Function arm (they need
+        // the per-statement DateCtx for `now`/`current_*`/`localtime`/`utc`), so `check` only
+        // validates arity as the codegen gatekeeper. Arity -1 = variadic.
+        "date" | "datetime" | "julianday" | "unixepoch" | "strftime" => Some(true),
+        "time" => Some(true),
+        "timediff" => Some(n_arg == 2),
+        "current_date" | "current_time" | "current_timestamp" => Some(n_arg == 0),
+
         _ => None,
     };
     match arity_ok {

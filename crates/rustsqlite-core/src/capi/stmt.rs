@@ -3040,12 +3040,13 @@ fn compile_pragma_function_list(
     _pragma: &PragmaStmt,
 ) -> Result<Sqlite3Stmt> {
     let names = [
-        "abs", "avg", "cast", "ceil", "char", "coalesce", "concat", "count", "date",
-        "datetime", "final", "floor", "group_concat", "hex", "ifnull", "iif", "instr",
-        "julianday", "length", "like", "lower", "ltrim", "max", "min", "mod", "nullif",
-        "pi", "printf", "quote", "random", "randomblob", "replace", "round", "rtrim",
-        "sin", "sqrt", "sqlite_sourceid", "sqlite_version", "strftime", "substr",
-        "sum", "time", "total", "trim", "typeof", "unicode", "upper", "unhex",
+        "abs", "avg", "cast", "ceil", "char", "coalesce", "concat", "count", "current_date",
+        "current_time", "current_timestamp", "date", "datetime", "final", "floor",
+        "group_concat", "hex", "ifnull", "iif", "instr", "julianday", "length", "like",
+        "lower", "ltrim", "max", "min", "mod", "nullif", "pi", "printf", "quote", "random",
+        "randomblob", "replace", "round", "rtrim", "sin", "sqrt", "sqlite_sourceid",
+        "sqlite_version", "strftime", "substr", "sum", "time", "timediff", "total", "trim",
+        "typeof", "unicode", "unixepoch", "upper", "unhex",
     ];
     let rows = names
         .iter()

@@ -184,6 +184,9 @@ K_UNBOUNDED   = @{ ^"unbounded"   ~ !ident_cont }
 K_PRECEDING   = @{ ^"preceding"   ~ !ident_cont }
 K_FOLLOWING   = @{ ^"following"   ~ !ident_cont }
 K_CURRENT      = @{ ^"current"       ~ !ident_cont }
+K_CURRENT_DATE     = @{ ^"current_date"     ~ !ident_cont }
+K_CURRENT_TIME     = @{ ^"current_time"     ~ !ident_cont }
+K_CURRENT_TIMESTAMP = @{ ^"current_timestamp" ~ !ident_cont }
 K_EXCLUDE      = @{ ^"exclude"      ~ !ident_cont }
 K_OTHERS       = @{ ^"others"        ~ !ident_cont }
 K_TIES         = @{ ^"ties"          ~ !ident_cont }
@@ -245,6 +248,7 @@ keyword = @{
     | K_WINDOW | K_OVER | K_FILTER | K_PARTITION | K_RANGE | K_ROWS | K_GROUPS
     | K_UNBOUNDED | K_PRECEDING | K_FOLLOWING | K_CURRENT | K_EXCLUDE | K_OTHERS | K_TIES
     | K_NULLS | K_FIRST | K_LAST
+    | K_CURRENT_DATE | K_CURRENT_TIME | K_CURRENT_TIMESTAMP
 }
 
 // ---- Top level: a list of statements separated/terminated by ';' ----
@@ -665,7 +669,7 @@ is_distinct_suffix = { K_IS ~ K_NOT? ~ K_DISTINCT ~ K_FROM ~ prefix* ~ primary }
 // `SELECT EXISTS(...)` / `SELECT CAST(...)` / `SELECT CASE ... END` work without a dummy prefix.
 // `row_value` is tried before the generic parenthesised expression so `(a, b)` parses as a row
 // value (>=2 entries) rather than backtracking through `"(" ~ expr ~ ")"`.
-primary = _{ literal | exists_expr | cast_expr | case_expr | func_call | column_ref | subquery | row_value | "(" ~ expr ~ ")" }
+primary = _{ literal | ctime_expr | exists_expr | cast_expr | case_expr | func_call | column_ref | subquery | row_value | "(" ~ expr ~ ")" }
 
 // Row value `(e0, e1, …)` (>=2 entries), matching upstream's `LP nexprlist COMMA expr RP` rule.
 // A parenthesised single expression `(e)` is *not* a row value and is handled by the trailing
@@ -692,6 +696,11 @@ literal = { number | string | blob | bind_param | K_NULL | K_TRUE | K_FALSE }
 func_call = { func_name ~ "(" ~ (func_star | arg_list)? ~ ")" ~ filter_over? }
 func_name = @{ ident }
 func_star = { "*" }
+
+// `current_date` / `current_time` / `current_timestamp` — these are keywords
+// (TK_CTIME_KW in upstream) that the parser turns into zero-argument function
+// calls.  They are reserved so they cannot be used as column names.
+ctime_expr = { K_CURRENT_DATE | K_CURRENT_TIME | K_CURRENT_TIMESTAMP }
 arg_list = { K_DISTINCT? ~ expr ~ ("," ~ expr)* }
 
 // ---- Window function FILTER / OVER (M2.55) ----

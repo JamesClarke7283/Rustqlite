@@ -110,7 +110,9 @@ fn fold_expr(pairs: Pairs<'_, Rule>) -> Expr {
     if pairs.len() == 1 {
         let single = pairs.into_iter().next().unwrap();
         let folded = match single.as_rule() {
-            Rule::literal | Rule::column_ref | Rule::func_call => map_primary(single),
+            Rule::literal | Rule::column_ref | Rule::func_call | Rule::ctime_expr => {
+                map_primary(single)
+            }
             Rule::expr | Rule::exists_expr | Rule::subquery | Rule::cast_expr | Rule::case_expr
             | Rule::row_value => map_primary(single),
             other => unreachable!("unexpected sole expr child {other:?}"),
@@ -479,6 +481,7 @@ fn map_primary(pair: Pair<'_, Rule>) -> Expr {
         Rule::literal => build_literal_expr(pair),
         Rule::column_ref => build_column_ref(pair),
         Rule::func_call => build_func_call(pair),
+        Rule::ctime_expr => build_ctime_expr(pair),
         Rule::row_value => Expr::Row(
             pair.into_inner()
                 .filter(|p| p.as_rule() == Rule::expr)
@@ -614,6 +617,30 @@ fn build_func_call(pair: Pair<'_, Rule>) -> Expr {
         args,
         filter,
         over,
+    }
+}
+
+/// Build a `current_date` / `current_time` / `current_timestamp` keyword
+/// primary (upstream `TK_CTIME_KW`) into a zero-argument `Expr::Function`.
+/// The keyword is emitted in canonical lowercase so the VDBE executor's
+/// case-insensitive match finds it.
+fn build_ctime_expr(pair: Pair<'_, Rule>) -> Expr {
+    let inner = pair
+        .into_inner()
+        .next()
+        .expect("ctime_expr has one keyword child");
+    let name = match inner.as_rule() {
+        Rule::K_CURRENT_DATE => "current_date",
+        Rule::K_CURRENT_TIME => "current_time",
+        Rule::K_CURRENT_TIMESTAMP => "current_timestamp",
+        _ => unreachable!("ctime_expr matched unexpected rule"),
+    };
+    Expr::Function {
+        name: name.to_string(),
+        distinct: false,
+        args: FunctionArgs::List(Vec::new()),
+        filter: None,
+        over: None,
     }
 }
 

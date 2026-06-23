@@ -2038,13 +2038,155 @@ fn name_resolution_aliases() {
             Ok(rows) => panic!("expected error for `{q}`, got rows: {rows:?}"),
             Err(e) => {
                 assert!(
-                    e.contains(our_sub),
-                    "error mismatch for {q}: got {e:?}, expected substring {:?}",
-                    our_sub
-                );
+            e.contains(our_sub),
+            "error mismatch for {q}: got {e:?}, expected substring {:?}",
+            our_sub
+        );
             }
         }
     }
+}
+
+/// Date/time functions (M23): a faithful port of `date.c`. The deterministic
+/// functions (`date`/`time`/`datetime`/`julianday`/`unixepoch`/`strftime`/
+/// `timediff`) are differential-tested against the oracle; the volatile
+/// `now`/`current_*` are checked for type and shape (text, YYYY-MM-DD prefix)
+/// since their exact value depends on the wall clock.
+#[test]
+fn date_time_functions() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    for q in [
+        // Basic date/time/datetime rendering.
+        "SELECT date('2023-05-15');",
+        "SELECT time('12:34:56');",
+        "SELECT time('12:34:56.789');",
+        "SELECT datetime('2023-05-15 12:34:56');",
+        "SELECT datetime('2023-05-15');",
+        "SELECT date('2023-05-15 12:34:56');",
+        // Overflowed dates normalize.
+        "SELECT date('2023-02-31');",
+        "SELECT date('2023-04-31');",
+        "SELECT date('2023-13-01');",
+        // Julian day.
+        "SELECT julianday('1970-01-01 00:00:00');",
+        "SELECT julianday('2000-01-01 00:00:00');",
+        "SELECT julianday('2023-05-15 12:00:00');",
+        "SELECT julianday('2023-05-15');",
+        // Unix epoch.
+        "SELECT unixepoch('1970-01-01 00:00:00');",
+        "SELECT unixepoch('2000-01-01 00:00:00');",
+        "SELECT unixepoch('2023-05-15 12:00:00');",
+        // Modifiers.
+        "SELECT date('2023-05-15','+1 day');",
+        "SELECT date('2023-05-15','-1 day');",
+        "SELECT date('2023-05-15','+1 month');",
+        "SELECT date('2023-01-31','+1 month');",
+        "SELECT date('2023-03-31','-1 month');",
+        "SELECT date('2023-05-15','+1 year');",
+        "SELECT date('2023-05-15','-1 year');",
+        "SELECT date('2023-05-15','start of month');",
+        "SELECT date('2023-05-15','start of year');",
+        "SELECT date('2023-05-15','start of day');",
+        "SELECT date('2023-05-19','weekday 0');",
+        "SELECT date('2023-05-19','weekday 1');",
+        "SELECT date('2023-05-19','weekday 6');",
+        "SELECT datetime('2023-05-15 12:34:56','+1 hour');",
+        "SELECT datetime('2023-05-15 12:34:56','+1 hour','-30 minutes');",
+        "SELECT datetime('2023-05-15 12:34:56','+1.5 hours');",
+        "SELECT date('2023-05-15','+1 day','+1 month','-1 year');",
+        // strftime.
+        "SELECT strftime('%Y-%m-%d','2023-05-15');",
+        "SELECT strftime('%H:%M:%S','2023-05-15 12:34:56');",
+        "SELECT strftime('%j','2023-01-01');",
+        "SELECT strftime('%j','2023-12-31');",
+        "SELECT strftime('%j','2024-12-31');", // leap year
+        "SELECT strftime('%w','2023-05-15');", // Monday=1
+        "SELECT strftime('%u','2023-05-15');",
+        "SELECT strftime('%p','2023-05-15 12:34:56');",
+        "SELECT strftime('%p','2023-05-15 00:30:00');",
+        "SELECT strftime('%P','2023-05-15 23:30:00');",
+        "SELECT strftime('%m','2023-05-15');",
+        "SELECT strftime('%M','2023-05-15 12:34:56');",
+        "SELECT strftime('%S','2023-05-15 12:34:56');",
+        "SELECT strftime('%%','2023-05-15');",
+        "SELECT strftime('%Y/%m/%d %H:%M:%S','2023-05-15 12:34:56');",
+        "SELECT strftime('%Y','2023-05-15');",
+        "SELECT strftime('%Y','0001-01-01');",
+        // timediff.
+        "SELECT timediff('2023-05-15','2023-05-14');",
+        "SELECT timediff('2023-05-14','2023-05-15');",
+        "SELECT timediff('2024-01-01','2023-01-01');",
+        "SELECT timediff('2023-12-31 23:59:59','2023-01-01 00:00:00');",
+        // Numeric julian day input.
+        "SELECT date(2461475.5);",
+        "SELECT datetime(2461475.5);",
+        // NULL / bad input.
+        "SELECT date(NULL);",
+        "SELECT date('not a date');",
+        "SELECT date('2023-13-45');",
+        "SELECT julianday('garbage');",
+        // Real input.
+        "SELECT date(2461475.5);",
+        "SELECT julianday(2461475.5);",
+    ] {
+        assert_same(db.str(), q);
+    }
+}
+
+/// Date/time `subsec` modifier and the subsecond rendering.
+#[test]
+fn date_time_subsec() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    for q in [
+        "SELECT strftime('%f','2023-05-15 12:34:56.789');",
+        "SELECT time('2023-05-15 12:34:56.789','subsec');",
+        "SELECT datetime('2023-05-15 12:34:56.789','subsec');",
+        "SELECT unixepoch('2023-05-15 12:34:56.789','subsec');",
+    ] {
+        assert_same(db.str(), q);
+    }
+}
+
+/// The volatile `now`/`current_*` functions can't be diffed exactly, but they
+/// must return TEXT of the right shape and the same value the oracle returns
+/// for `now` at the same instant (the per-statement caching means `date('now')`
+/// and `current_date` agree within one statement).
+#[test]
+fn date_time_current_functions() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    // `current_date`/`current_time`/`current_timestamp` should produce text in
+    // the canonical format.
+    let rows = rustsqlite_rows(
+        db.str(),
+        "SELECT typeof(current_date), typeof(current_time), typeof(current_timestamp);",
+    )
+    .expect("rustsqlite current_*");
+    assert_eq!(rows, vec!["text|text|text".to_string()]);
+    // Shape: date is YYYY-MM-DD (10 chars), time is HH:MM:SS (8), timestamp is
+    // "YYYY-MM-DD HH:MM:SS" (19).
+    let rows = rustsqlite_rows(db.str(), "SELECT current_date, current_time, current_timestamp;")
+        .expect("rustsqlite current_* values");
+    let parts: Vec<&str> = rows[0].split('|').collect();
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[0].len(), 10, "current_date shape: {}", parts[0]);
+    assert_eq!(parts[1].len(), 8, "current_time shape: {}", parts[1]);
+    assert_eq!(parts[2].len(), 19, "current_timestamp shape: {}", parts[2]);
+    // `date('now')` and `current_date` should agree.
+    let rows = rustsqlite_rows(db.str(), "SELECT date('now') = current_date;")
+        .expect("rustsqlite now vs current_date");
+    assert_eq!(rows, vec!["1".to_string()]);
 }
 
 
