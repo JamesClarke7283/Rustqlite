@@ -370,13 +370,13 @@ list every granular item needed.
 - [x] **19.1** `DELETE … ORDER BY … LIMIT …`
 - [x] **19.2** `UPDATE … ORDER BY … LIMIT …`
 - [ ] **19.3** `UPDATE … FROM from_clause …` (SQLite 3.33+)
-- [ ] **19.4** `RETURNING` clause on DELETE
-- [ ] **19.5** `RETURNING` clause on UPDATE
+- [x] **19.4** `RETURNING` clause on DELETE
+- [x] **19.5** `RETURNING` clause on UPDATE
 - [ ] **19.6** Conflict resolution enforcement for UPDATE (`OR ROLLBACK/ABORT/FAIL/IGNORE/REPLACE`)
 - [ ] **19.7** `UPDATE` of `INTEGER PRIMARY KEY` (rowid-alias column) — must delete+reinsert to move the row
 - [ ] **19.8** `CHECK` constraint enforcement on INSERT/UPDATE
 - [ ] **19.9** `NOT NULL` constraint enforcement on INSERT/UPDATE
-- [ ] **19.10** `UNIQUE` constraint enforcement on INSERT/UPDATE (via unique indexes, already partially done)
+- [x] **19.10** `UNIQUE` constraint enforcement on INSERT/UPDATE (via unique indexes, already done — `emit_conflict_prechecks` + `IdxInsert P5_UNIQUE`)
 
 ---
 
@@ -868,7 +868,7 @@ list every granular item needed.
 
 - [ ] **19.8** `CHECK` constraint evaluation on INSERT/UPDATE
 - [ ] **19.9** `NOT NULL` constraint enforcement on INSERT/UPDATE
-- [ ] **19.10** `UNIQUE` constraint enforcement on INSERT/UPDATE (via unique indexes, already partially done)
+- [x] **19.10** `UNIQUE` constraint enforcement on INSERT/UPDATE (via unique indexes, already done — `emit_conflict_prechecks` + `IdxInsert P5_UNIQUE`)
 
 ### M20 — PRAGMA (Additional Items)
 
