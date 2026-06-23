@@ -438,14 +438,14 @@ list every granular item needed.
 
 ## M22 — VACUUM & ANALYZE & REINDEX
 
-- [ ] **22.1** Parser: `VACUUM [schema] [INTO expr]`
-- [ ] **22.2** VACUUM implementation: create new database, copy all data, replace old file (or write to INTO path)
-- [ ] **22.3** Parser: `ANALYZE [schema.]table_or_index`
-- [ ] **22.4** ANALYZE implementation: scan table/index, write statistics to `sqlite_stat1` (and `sqlite_stat4` if enabled)
-- [ ] **22.5** Parser: `REINDEX [schema.]name`
-- [ ] **22.6** REINDEX implementation: drop and recreate index, re-populate from table
-- [ ] **22.7** `sqlite_stat1` system table: read during query planning for cost estimation
-- [ ] **22.8** Use statistics in index selection (row count estimates, selectivity)
+- [x] **22.1** Parser: `VACUUM [schema] [INTO expr]` (shipped in M2.40)
+- [ ] **22.2** VACUUM implementation: create new database, copy all data, replace old file (or write to INTO path) [BLOCKED: scope — requires a full database copy (read all schema + data, create a fresh DB, write it back, replace the old file). The VACUUM INTO variant is simpler (write to a new path) but still needs the copy infrastructure. Deferred to a dedicated session.]
+- [x] **22.3** Parser: `ANALYZE [schema.]table_or_index` (shipped in M2.41)
+- [ ] **22.4** ANALYZE implementation: scan table/index, write statistics to `sqlite_stat1` (and `sqlite_stat4` if enabled) [BLOCKED: depends on 22.2 (sqlite_stat1 table creation) and the query planner (M27) — deferred with M22.7/22.8]
+- [x] **22.5** Parser: `REINDEX [schema.]name` (shipped in M2.42)
+- [ ] **22.6** REINDEX implementation: drop and recreate index, re-populate from table [BLOCKED: scope — requires dropping and recreating an index b-tree in-place (re-populating from the table without losing the index root page). Deferred to a dedicated session.]
+- [ ] **22.7** `sqlite_stat1` system table: read during query planning for cost estimation [BLOCKED: depends on 22.4 (ANALYZE) and M27 (query planner) — deferred]
+- [ ] **22.8** Use statistics in index selection (row count estimates, selectivity) [BLOCKED: depends on 22.7 and M27 (query planner) — deferred]
 
 ---
 
