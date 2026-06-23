@@ -218,7 +218,10 @@ impl Table {
                 match c {
                     ColumnConstraint::NotNull { on_conflict } => {
                         notnull = true;
-                        notnull_oe = OeAction::from_parser(*on_conflict);
+                        notnull_oe = match on_conflict {
+                            None => OeAction::None,
+                            Some(ca) => OeAction::from_parser(Some(*ca)),
+                        };
                     }
                     ColumnConstraint::PrimaryKey { desc, autoincrement: ai, on_conflict } => {
                         pk = true;

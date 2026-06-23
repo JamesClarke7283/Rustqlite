@@ -287,6 +287,12 @@ fn compile_insert_values(
             emit_fk_checks(&mut b, fk_checks, table, rec_start, oe, row_skip)?;
         }
 
+        // M19.9: NOT NULL constraint enforcement. For each NOT NULL column (other than the
+        // rowid-alias column, whose NULL auto-assigns a rowid), emit a `HaltIfNull` (or `IsNull`
+        // for OE_Ignore) against the row's column register. The per-column `notnull_oe`
+        // overrides the statement-level `OR <action>`.
+        emit_notnull_checks(&mut b, table, rec_start, oe, row_skip)?;
+
         // M19.8: CHECK constraint enforcement. For each CHECK constraint on the table, evaluate
         // the expression against the row's column registers; a NULL or false result violates the
         // constraint. The per-constraint OE overrides the statement-level `OR <action>`.
@@ -512,6 +518,13 @@ fn compile_insert_without_rowid(
                     b.set_p4(halt, P4::Text(msg));
                 }
             }
+        }
+
+        // M19.9: NOT NULL enforcement for non-PK NOT NULL columns (PK columns are handled by
+        // the dedicated loop above). Returns whether the OE_Ignore row-skip label was used.
+        let nn_used_ignore = emit_notnull_checks(&mut b, table, col_start, oe, null_row_skip)?;
+        if nn_used_ignore {
+            any_null_skip = true;
         }
 
         // M19.8: CHECK constraint enforcement (same shape as the rowid-table INSERT path).
@@ -1285,6 +1298,70 @@ fn emit_fk_checks(
         b.resolve(ok_label);
     }
     Ok(())
+}
+
+/// M19.9: NOT NULL constraint enforcement. For each column marked NOT NULL, emit a check
+/// against the row's column register. The rowid-alias column is skipped (a NULL IPK value
+/// auto-assigns a rowid via `NewRowid`, so it's not a NOT NULL violation). The per-column
+/// `notnull_oe` (set by an `ON CONFLICT <action>` on the column's NOT NULL or PRIMARY KEY
+/// constraint) overrides the statement-level `OR <action>`: the per-column OE wins when it
+/// is not `OE_None`; otherwise the statement OE applies. `OE_Ignore` skips the row (jumps to
+/// `row_skip`); ABORT/FAIL/ROLLBACK/REPLACE halt with a "NOT NULL constraint failed: <tbl>.<col>"
+/// message (p5=1 prefix is implicit — `HaltIfNull` builds the message from p4 directly).
+pub(crate) fn emit_notnull_checks(
+    b: &mut ProgramBuilder,
+    table: &Table,
+    rec_start: i32,
+    stmt_oe: OeAction,
+    row_skip: Label,
+) -> Result<bool> {
+    let mut used_ignore = false;
+    for (ci, col) in table.columns.iter().enumerate() {
+        if !col.notnull {
+            continue;
+        }
+        // The rowid-alias column stores NULL in the record (the rowid is in a separate
+        // register); a NULL IPK auto-assigns, so it's not a NOT NULL violation.
+        if table.rowid_alias == Some(ci) {
+            continue;
+        }
+        // For WITHOUT ROWID tables, the PK columns' NOT NULL is enforced by the dedicated
+        // PK-specific loop in `compile_insert_without_rowid` (which handles the PK's
+        // per-constraint OE and the `null_row_skip` label). Skip them here to avoid
+        // duplicate checks.
+        if table.without_rowid && table.pk_columns.iter().any(|&(c, _)| c == ci) {
+            continue;
+        }
+        let reg = rec_start + ci as i32;
+        let oe = if col.notnull_oe != OeAction::None {
+            col.notnull_oe
+        } else {
+            stmt_oe
+        };
+        let msg = format!("NOT NULL constraint failed: {}.{}", table.name, col.name);
+        match oe {
+            OeAction::Ignore => {
+                b.emit_jump(Opcode::IsNull, reg, row_skip, 0);
+                used_ignore = true;
+            }
+            OeAction::Replace => {
+                // OE_Replace on NOT NULL: REPLACE can only help if the column has a non-NULL
+                // DEFAULT; otherwise upstream falls back to OE_Abort. We don't model column
+                // DEFAULTs yet, so treat REPLACE as ABORT (the common case).
+                let halt = b.emit(Opcode::HaltIfNull, 0, OeAction::Abort as i32, reg);
+                b.set_p4(halt, P4::Text(msg));
+            }
+            other if other != OeAction::None => {
+                let halt = b.emit(Opcode::HaltIfNull, 0, other as i32, reg);
+                b.set_p4(halt, P4::Text(msg));
+            }
+            _ => {
+                let halt = b.emit(Opcode::HaltIfNull, 0, 0, reg);
+                b.set_p4(halt, P4::Text(msg));
+            }
+        }
+    }
+    Ok(used_ignore)
 }
 
 /// M19.8: Evaluate each `CHECK (expr)` constraint on the table against the row's column

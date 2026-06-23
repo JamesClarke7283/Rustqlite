@@ -3253,3 +3253,73 @@ fn check_constraint_enforcement_matches_oracle() {
         }
     }
 }
+
+#[test]
+fn notnull_constraint_enforcement_matches_oracle() {
+    // M19.9: NOT NULL constraint enforcement on INSERT and UPDATE. Differential-tested vs
+    // the C oracle.
+    skip_if_no_sqlite3!();
+    let cases: &[(&str, &str, bool)] = &[
+        // INSERT NULL into NOT NULL column fails.
+        ("CREATE TABLE t(a INTEGER NOT NULL, b);",
+         "INSERT INTO t VALUES (NULL, 'x');", false),
+        // INSERT non-NULL succeeds.
+        ("CREATE TABLE t(a INTEGER NOT NULL, b);",
+         "INSERT INTO t VALUES (5, 'x');", true),
+        // OR IGNORE skips the row.
+        ("CREATE TABLE t(a INTEGER NOT NULL, b);",
+         "INSERT OR IGNORE INTO t VALUES (NULL, 'x');", true),
+        // UPDATE to NULL fails.
+        ("CREATE TABLE t(a INTEGER NOT NULL, b);",
+         "UPDATE t SET a = NULL WHERE b = 'x';", false),
+        // UPDATE to non-NULL succeeds.
+        ("CREATE TABLE t(a INTEGER NOT NULL, b);",
+         "UPDATE t SET a = 10 WHERE b = 'x';", true),
+        // NOT NULL with DEFAULT (not modeled — NULL still inserted for unlisted column).
+        // Multiple NOT NULL columns.
+        ("CREATE TABLE t(a INTEGER NOT NULL, b TEXT NOT NULL);",
+         "INSERT INTO t VALUES (1, NULL);", false),
+        ("CREATE TABLE t(a INTEGER NOT NULL, b TEXT NOT NULL);",
+         "INSERT INTO t VALUES (1, 'x');", true),
+    ];
+    for (create, stmt, expect_ok) in cases {
+        let db = TempDb::new("nn_ours");
+        {
+            let mut conn = sqlite3_open(db.str()).expect("open");
+            exec(&mut conn, create);
+            if stmt.starts_with("UPDATE") {
+                exec(&mut conn, "INSERT INTO t VALUES (1, 'x');");
+            }
+            let (mut s, _) = sqlite3_prepare_v2(&mut conn, stmt).unwrap();
+            let res = s.step();
+            let msg = s.errmsg();
+            if *expect_ok {
+                assert_eq!(res, ResultCode::Done, "expected success for `{stmt}`: {msg}");
+            } else {
+                assert_eq!(res, ResultCode::Constraint, "expected CONSTRAINT for `{stmt}`: got {res:?} ({msg})");
+                assert!(msg.contains("NOT NULL constraint failed"), "msg `{msg}` missing NOT NULL for `{stmt}`");
+            }
+        }
+        // Compare with the C oracle.
+        let ora = TempDb::new("nn_ora");
+        {
+            let mut conn = sqlite3_open(ora.str()).expect("open");
+            exec(&mut conn, create);
+            if stmt.starts_with("UPDATE") {
+                exec(&mut conn, "INSERT INTO t VALUES (1, 'x');");
+            }
+            let (mut s, _) = sqlite3_prepare_v2(&mut conn, stmt).unwrap();
+            let res = s.step();
+            let msg = s.errmsg();
+            if *expect_ok {
+                assert_eq!(res, ResultCode::Done, "oracle expected success for `{stmt}`: {msg}");
+            } else {
+                assert_eq!(res, ResultCode::Constraint, "oracle expected CONSTRAINT for `{stmt}`: got {res:?} ({msg})");
+            }
+        }
+        if *expect_ok {
+            assert_eq!(db.query("SELECT * FROM t;"), ora.query("SELECT * FROM t;"), "row mismatch for `{stmt}`");
+            assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+        }
+    }
+}

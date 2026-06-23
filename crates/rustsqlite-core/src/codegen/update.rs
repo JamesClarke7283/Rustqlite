@@ -412,6 +412,12 @@ pub fn compile_update(
     // statement-level `OR <action>`.
     super::insert::emit_check_constraints(&mut b, table, reg_new, oe, sort_next)?;
 
+    // (7c) M19.9: NOT NULL constraint enforcement. For each NOT NULL column (other than the
+    // rowid-alias column), emit a `HaltIfNull` (or `IsNull` for OE_Ignore) against the new
+    // row's column register. The per-column `notnull_oe` overrides the statement-level
+    // `OR <action>`.
+    super::insert::emit_notnull_checks(&mut b, table, reg_new, oe, sort_next)?;
+
     // (9) Make the record, delete the old row, re-insert at the same rowid. The Delete
     // and the Insert both carry `P5_ISUPDATE` so the change counters fire once.
     let reg_new_rec = b.alloc_reg();
@@ -1179,6 +1185,9 @@ fn compile_update_from(
 
     // M19.8: CHECK constraint enforcement (same shape as the plain UPDATE path).
     super::insert::emit_check_constraints(&mut b, table, reg_new, oe, sort_next)?;
+
+    // M19.9: NOT NULL constraint enforcement (same shape as the plain UPDATE path).
+    super::insert::emit_notnull_checks(&mut b, table, reg_new, oe, sort_next)?;
 
     let reg_new_rec = b.alloc_reg();
     b.emit(Opcode::MakeRecord, reg_new, ncol as i32, reg_new_rec);

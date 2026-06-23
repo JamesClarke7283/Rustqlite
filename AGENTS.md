@@ -990,6 +990,18 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   path, and the `UPDATE ... FROM` path. Differential-tested vs the C oracle
   (`check_constraint_enforcement_matches_oracle`: column-level + table-level CHECK,
   false/NULL/true, `OR IGNORE`, UPDATE violation, compound `AND` condition). Known
-  divergence: the message body is the table name, not the expression text (the oracle shows
+  divergence: the message body is the table name, not the expression text   (the oracle shows
   `CHECK constraint failed: a > 0`; we show `CHECK constraint failed: t`) — to be fixed when
   an AST-to-string unparser lands.
+- **M19.9 `NOT NULL` constraint enforcement** ✅: NOT NULL on regular (non-PK) columns is
+  now enforced on INSERT and UPDATE. The parser already parsed `NOT NULL` (M2.44); the
+  schema's `Column.notnull_oe` was fixed to use `OeAction::None` (instead of `Abort`) when
+  no `ON CONFLICT` clause was given, so the statement-level `OR <action>` applies. The
+  codegen's new `emit_notnull_checks` emits a `HaltIfNull` (or `IsNull` for OE_Ignore)
+  against each NOT NULL column's register; the rowid-alias column is skipped (a NULL IPK
+  auto-assigns a rowid via `NewRowid`, so it's not a NOT NULL violation); WITHOUT ROWID PK
+  columns are skipped (handled by the dedicated PK-specific loop). Wired into the
+  rowid-table INSERT path, the WITHOUT ROWID INSERT path (non-PK columns only), the plain
+  UPDATE path, and the `UPDATE ... FROM` path. Differential-tested vs the C oracle
+  (`notnull_constraint_enforcement_matches_oracle`: INSERT NULL fails, INSERT non-NULL
+  succeeds, OR IGNORE skips, UPDATE to NULL fails, multiple NOT NULL columns).
