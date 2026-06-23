@@ -3323,3 +3323,36 @@ fn notnull_constraint_enforcement_matches_oracle() {
         }
     }
 }
+
+#[test]
+fn pragma_table_info_matches_oracle() {
+    // M20.2: PRAGMA table_info(tbl) returns (cid, name, type, notnull, dflt_value, pk).
+    // Differential-tested vs the C oracle.
+    skip_if_no_sqlite3!();
+    let cases: &[&str] = &[
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT NOT NULL DEFAULT 'x', c REAL);",
+        "CREATE TABLE t(a, b, c);",
+        "CREATE TABLE t(a, b, c, PRIMARY KEY(b,c));",
+        "CREATE TABLE t(a INTEGER, b TEXT NOT NULL, c INT DEFAULT 5);",
+        "CREATE TABLE t(a DEFAULT NULL, b DEFAULT 1.5, c DEFAULT 'hi');",
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+    ];
+    for create in cases {
+        let db = TempDb::new("pragma_ti_ours");
+        {
+            let mut conn = sqlite3_open(db.str()).expect("open");
+            exec(&mut conn, create);
+            let (mut s, _) = sqlite3_prepare_v2(&mut conn, "PRAGMA table_info(t);").unwrap();
+            let rows = collect(&mut s);
+            // Compare with the C oracle.
+            let ora = TempDb::new("pragma_ti_ora");
+            {
+                let mut oconn = sqlite3_open(ora.str()).expect("open");
+                exec(&mut oconn, create);
+                let (mut os, _) = sqlite3_prepare_v2(&mut oconn, "PRAGMA table_info(t);").unwrap();
+                let oracle_rows = collect(&mut os);
+                assert_eq!(rows, oracle_rows, "PRAGMA table_info mismatch for `{create}`");
+            }
+        }
+    }
+}

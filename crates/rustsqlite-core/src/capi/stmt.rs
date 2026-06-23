@@ -20,7 +20,7 @@ use crate::codegen::SubqueryResolver;
 use crate::error::{Error, Result, ResultCode};
 use crate::pager::Pager;
 use crate::schema::{
-    dequote_ident, read_catalog, schema_cookie, IndexObject, Table,
+    dequote_ident, read_catalog, schema_cookie, IndexObject, SchemaObject, Table,
 };
 use crate::types::Value;
 use crate::vdbe::{explain, Instruction, Opcode, Program, StepResult, Vdbe};
@@ -776,6 +776,7 @@ fn resolve_sqlite_schema(pager: &Arc<Pager>) -> Result<Table> {
         columns: vec![
             crate::schema::Column {
                 name: "type".to_string(),
+                type_name: None,
                 affinity: Affinity::Text,
                 collation: crate::types::Collation::Binary,
                 notnull: false,
@@ -785,6 +786,7 @@ fn resolve_sqlite_schema(pager: &Arc<Pager>) -> Result<Table> {
             },
             crate::schema::Column {
                 name: "name".to_string(),
+                type_name: None,
                 affinity: Affinity::Text,
                 collation: crate::types::Collation::Binary,
                 notnull: false,
@@ -794,6 +796,7 @@ fn resolve_sqlite_schema(pager: &Arc<Pager>) -> Result<Table> {
             },
             crate::schema::Column {
                 name: "tbl_name".to_string(),
+                type_name: None,
                 affinity: Affinity::Text,
                 collation: crate::types::Collation::Binary,
                 notnull: false,
@@ -803,6 +806,7 @@ fn resolve_sqlite_schema(pager: &Arc<Pager>) -> Result<Table> {
             },
             crate::schema::Column {
                 name: "rootpage".to_string(),
+                type_name: None,
                 affinity: Affinity::Integer,
                 collation: crate::types::Collation::Binary,
                 notnull: false,
@@ -812,6 +816,7 @@ fn resolve_sqlite_schema(pager: &Arc<Pager>) -> Result<Table> {
             },
             crate::schema::Column {
                 name: "sql".to_string(),
+                type_name: None,
                 affinity: Affinity::Text,
                 collation: crate::types::Collation::Binary,
                 notnull: false,
@@ -1703,6 +1708,7 @@ fn compile_pragma(db: &mut Sqlite3, sql: &str, pragma: &PragmaStmt) -> Result<Sq
         "foreign_keys" => compile_pragma_foreign_keys(db, sql, pragma),
         "foreign_key_list" => compile_pragma_foreign_key_list(db, sql, pragma),
         "foreign_key_check" => compile_pragma_foreign_key_check(db, sql, pragma),
+        "table_info" => compile_pragma_table_info(db, sql, pragma),
         _ => Err(Error::msg(format!("PRAGMA {name} is not supported yet"))),
     }
 }
@@ -2218,6 +2224,112 @@ fn empty_static_stmt(sql: &str, column_names: &[&str]) -> Sqlite3Stmt {
         explain: 0,
         counts: None,
         last_error: None,
+    }
+}
+
+/// `PRAGMA table_info(tbl)` — return one row per column with (cid, name, type, notnull,
+/// dflt_value, pk). The `pk` column is 0 for non-PK columns, 1 for a single-column PK,
+/// and the 1-based position within the PK for a composite PK (mirrors upstream's
+/// `PragTyp_TABLE_INFO`).
+fn compile_pragma_table_info(
+    db: &mut Sqlite3,
+    sql: &str,
+    pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    let table_name = match &pragma.value {
+        Some(PragmaValue::Paren(PragmaValueKind::Ident(s))) => s.clone(),
+        Some(PragmaValue::Equal(PragmaValueKind::Ident(s))) => s.clone(),
+        _ => return Err(Error::msg("PRAGMA table_info: argument must be a table name")),
+    };
+    let pager = db.ensure_pager()?;
+    let catalog = block_on(read_catalog(&pager))?;
+    let Some(obj) = catalog.find_table(&table_name) else {
+        // Upstream silently returns no rows for a missing table.
+        return Ok(empty_static_stmt(
+            sql,
+            &["cid", "name", "type", "notnull", "dflt_value", "pk"],
+        ));
+    };
+    let table = Table::from_schema_object(obj)?;
+    // Determine the PK position for each column (1-based for PK columns in a composite PK,
+    // 1 for a single-column PK, 0 for non-PK). Mirrors upstream's `iPk` loop.
+    let pk_positions = compute_pk_positions(&table, obj);
+    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(table.columns.len());
+    for (ci, col) in table.columns.iter().enumerate() {
+        let type_str = col.type_name_str();
+        let dflt = format_default_expr(col.default.as_ref());
+        rows.push(vec![
+            Value::Int(ci as i64),
+            Value::Text(col.name.clone()),
+            Value::Text(type_str),
+            Value::Int(i64::from(col.notnull)),
+            dflt,
+            Value::Int(pk_positions[ci] as i64),
+        ]);
+    }
+    Ok(Sqlite3Stmt {
+        sql: sql.to_string(),
+        program: Arc::new(Program::empty()),
+        column_names: vec![
+            "cid".to_string(),
+            "name".to_string(),
+            "type".to_string(),
+            "notnull".to_string(),
+            "dflt_value".to_string(),
+            "pk".to_string(),
+        ],
+        backing: Backing::Static {
+            rows,
+            cur: None,
+            pos: 0,
+        },
+        explain: 0,
+        counts: None,
+        last_error: None,
+    })
+}
+
+/// Compute the PK position for each column (0 = not PK; 1..=n for the n-th PK column in a
+/// composite PK; 1 for a single-column PK). Mirrors upstream's `PragTyp_TABLE_INFO` `iPk`
+/// logic (which assigns `iPk = i+1` for PK columns in declared order).
+fn compute_pk_positions(table: &Table, _obj: &SchemaObject) -> Vec<i32> {
+    // For a rowid table with an INTEGER PRIMARY KEY alias, the alias column is PK position 1.
+    // For a WITHOUT ROWID table, each PK column gets its 1-based position in declared order.
+    // For a table-level PRIMARY KEY (cols), each named column gets its 1-based position.
+    let mut positions = vec![0i32; table.columns.len()];
+    if let Some(alias_idx) = table.rowid_alias {
+        positions[alias_idx] = 1;
+    } else if table.without_rowid {
+        for (i, &(idx, _)) in table.pk_columns.iter().enumerate() {
+            positions[idx] = (i + 1) as i32;
+        }
+    } else {
+        // A rowid table with a non-IPK PRIMARY KEY (cols) — the PK columns get positions.
+        for (i, &(idx, _)) in table.pk_columns.iter().enumerate() {
+            positions[idx] = (i + 1) as i32;
+        }
+    }
+    positions
+}
+
+/// Format a column's DEFAULT expression as the text `PRAGMA table_info` shows in the
+/// `dflt_value` column. `None` (no DEFAULT) → NULL; a text literal → `'...'` (quoted);
+/// a numeric literal → the number; NULL literal → `NULL` (the literal text). Other
+/// expression forms (function calls, etc.) are not yet supported and return NULL.
+fn format_default_expr(expr: Option<&rustqlite_parser::Expr>) -> Value {
+    use rustqlite_parser::{Expr, Literal};
+    let Some(expr) = expr else {
+        return Value::Null;
+    };
+    match expr {
+        Expr::Literal(Literal::Null) => Value::Text("NULL".into()),
+        Expr::Literal(Literal::Integer(n)) => Value::Text(n.to_string()),
+        Expr::Literal(Literal::Real(r)) => Value::Text(r.to_string()),
+        Expr::Literal(Literal::Text(s)) => Value::Text(format!("'{s}'")),
+        Expr::Literal(Literal::Blob(b)) => {
+            Value::Text(format!("X'{}'", b.iter().map(|b| format!("{b:02X}")).collect::<String>()))
+        }
+        _ => Value::Null,
     }
 }
 

@@ -431,6 +431,7 @@ pub fn compile_recursive(
             .iter()
             .map(|n| Column {
                 name: n.clone(),
+                type_name: None,
                 affinity: Affinity::Blob,
                 collation: Collation::Binary,
                 notnull: false,

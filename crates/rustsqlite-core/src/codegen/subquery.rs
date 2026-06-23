@@ -73,6 +73,7 @@ pub fn compile_from_subquery(
             .iter()
             .map(|n| Column {
                 name: n.clone(),
+                type_name: None,
                 affinity: Affinity::Blob,
                 collation: Collation::Binary,
                 notnull: false,

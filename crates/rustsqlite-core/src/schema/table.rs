@@ -21,6 +21,9 @@ use crate::vdbe::oe::OeAction;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Column {
     pub name: String,
+    /// The declared type text (e.g. `"INTEGER"`, `"VARCHAR(10)"`), as written. Affinity is
+    /// derived from this in the engine's `types` layer. `None` when no type was declared.
+    pub type_name: Option<String>,
     pub affinity: Affinity,
     pub collation: Collation,
     pub notnull: bool,
@@ -30,6 +33,14 @@ pub struct Column {
     /// The per-column NOT NULL conflict-resolution action (`OE_Abort` when no `ON CONFLICT`
     /// clause was given). M12.9.
     pub notnull_oe: OeAction,
+}
+
+impl Column {
+    /// The declared type text, or an empty string when no type was declared (matching
+    /// `PRAGMA table_info`'s `type` column for an untyped column).
+    pub fn type_name_str(&self) -> String {
+        self.type_name.clone().unwrap_or_default()
+    }
 }
 
 /// A resolved table: its name, root b-tree page, columns, and (if any) the column that aliases
@@ -256,6 +267,7 @@ impl Table {
             }
             columns.push(Column {
                 name: cd.name.clone(),
+                type_name: cd.type_name.clone(),
                 affinity,
                 collation: Collation::Binary,
                 notnull,
