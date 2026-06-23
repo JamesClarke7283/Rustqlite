@@ -1287,7 +1287,7 @@ fn emit_fk_checks(
 ///   table Insert so the failing row's partial writes are never made and prior rows in the
 ///   same statement stay clean (mirrors upstream's "OE_Fail and OE_Ignore must happen before
 ///   any changes are made" rule in `sqlite3GenerateConstraintChecks`).
-fn emit_conflict_prechecks(
+pub(crate) fn emit_conflict_prechecks(
     b: &mut ProgramBuilder,
     indexes: &[IndexObject],
     table: &Table,

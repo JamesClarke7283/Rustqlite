@@ -372,7 +372,7 @@ list every granular item needed.
 - [x] **19.3** `UPDATE … FROM from_clause …` (SQLite 3.33+)
 - [x] **19.4** `RETURNING` clause on DELETE
 - [x] **19.5** `RETURNING` clause on UPDATE
-- [ ] **19.6** Conflict resolution enforcement for UPDATE (`OR ROLLBACK/ABORT/FAIL/IGNORE/REPLACE`)
+- [x] **19.6** Conflict resolution enforcement for UPDATE (`OR ROLLBACK/ABORT/FAIL/IGNORE/REPLACE`)
 - [ ] **19.7** `UPDATE` of `INTEGER PRIMARY KEY` (rowid-alias column) — must delete+reinsert to move the row
 - [ ] **19.8** `CHECK` constraint enforcement on INSERT/UPDATE
 - [ ] **19.9** `NOT NULL` constraint enforcement on INSERT/UPDATE

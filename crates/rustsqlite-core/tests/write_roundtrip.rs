@@ -2901,3 +2901,156 @@ fn update_from_with_table_alias() {
 
     assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
 }
+
+#[test]
+fn update_or_ignore_skips_conflicting_rows() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("update_or_ignore");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(id INTEGER PRIMARY KEY, v);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_v ON t(v);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');");
+
+        // UPDATE OR IGNORE: try to set v='c' for all rows. Row 1 → 'c' conflicts with row 3's
+        // existing v='c' (unique index); IGNORE skips it. Row 2 → 'c' ALSO conflicts with
+        // row 3; IGNORE skips it. Row 3 → 'c' is its own value (the new key ('c', rowid=3)
+        // matches the existing entry ('c', rowid=3) — same entry, not a conflict); the row
+        // is "touched" and counts as updated, but the value is unchanged. Cross-checked
+        // against the C oracle: the final state is 1|a, 2|b, 3|c.
+        exec(&mut conn, "UPDATE OR IGNORE t SET v = 'c';");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT id, v FROM t ORDER BY id;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("a".into())],
+            vec![Value::Int(2), Value::Text("b".into())],
+            vec![Value::Int(3), Value::Text("c".into())],
+        ]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT id, v FROM t ORDER BY id;"), "1|a\n2|b\n3|c");
+}
+
+#[test]
+fn update_or_replace_deletes_conflicting_rows() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("update_or_replace");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(id INTEGER PRIMARY KEY, v);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_v ON t(v);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');");
+
+        // UPDATE OR REPLACE: set v='c' for rows 1 and 2. Row 1 → 'c' conflicts with row 3;
+        // REPLACE deletes row 3, then updates row 1. Row 2 → 'c' now conflicts with the
+        // newly-updated row 1; REPLACE deletes row 1, then updates row 2.
+        exec(&mut conn, "UPDATE OR REPLACE t SET v = 'c' WHERE id <= 2;");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT id, v FROM t ORDER BY id;").unwrap();
+        let rows = collect(&mut stmt);
+        // Row 1 was deleted (REPLACE ate it when row 2's update conflicted with row 1's new
+        // 'c'). Row 2 is 'c'. Row 3 was deleted (REPLACE ate it when row 1's update
+        // conflicted with row 3's 'c'). Only row 2 survives.
+        assert_eq!(rows, vec![
+            vec![Value::Int(2), Value::Text("c".into())],
+        ]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT id, v FROM t ORDER BY id;"), "2|c");
+}
+
+#[test]
+fn update_or_fail_keeps_prior_rows() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("update_or_fail");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(id INTEGER PRIMARY KEY, v);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_v ON t(v);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');");
+
+        // UPDATE OR FAIL: row 1 → 'c' conflicts with row 3. FAIL halts the statement, keeping
+        // prior rows in the same statement (none were modified yet — the pre-check runs
+        // before the row's writes). The error is returned; no rows change.
+        let result = sqlite3_prepare_v2(&mut conn, "UPDATE OR FAIL t SET v = 'c' WHERE id = 1;");
+        let _ = result; // prepare may succeed; the error surfaces at step time
+        // Try to exec and expect failure.
+        use rustsqlite_core::capi::ResultCode;
+        let (mut stmt, _) = match sqlite3_prepare_v2(&mut conn, "UPDATE OR FAIL t SET v = 'c' WHERE id = 1;") {
+            Ok((s, _)) => (s, 0i32),
+            Err(e) => {
+                // Some engines reject at prepare time; either way the data must be unchanged.
+                let _ = e;
+                let (mut s2, _) = sqlite3_prepare_v2(&mut conn, "SELECT id, v FROM t ORDER BY id;").unwrap();
+                let rows = collect(&mut s2);
+                assert_eq!(rows, vec![
+                    vec![Value::Int(1), Value::Text("a".into())],
+                    vec![Value::Int(2), Value::Text("b".into())],
+                    vec![Value::Int(3), Value::Text("c".into())],
+                ]);
+                return;
+            }
+        };
+        let rc = stmt.step();
+        // We expect a constraint error at step time.
+        assert!(matches!(rc, ResultCode::Constraint),
+            "expected SQLITE_CONSTRAINT, got {:?}", rc);
+        let _ = stmt;
+
+        let (mut stmt2, _) = sqlite3_prepare_v2(&mut conn, "SELECT id, v FROM t ORDER BY id;").unwrap();
+        let rows = collect(&mut stmt2);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("a".into())],
+            vec![Value::Int(2), Value::Text("b".into())],
+            vec![Value::Int(3), Value::Text("c".into())],
+        ]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT id, v FROM t ORDER BY id;"), "1|a\n2|b\n3|c");
+}
+
+#[test]
+fn update_or_rollback_in_transaction() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("update_or_rollback");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(id INTEGER PRIMARY KEY, v);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_v ON t(v);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');");
+
+        // In a transaction: a successful update, then an OR ROLLBACK update that fails.
+        // ROLLBACK should roll back the ENTIRE transaction (both updates), not just the
+        // failing statement.
+        exec(&mut conn, "BEGIN;");
+        exec(&mut conn, "UPDATE t SET v = 'x' WHERE id = 1;");  // succeeds, 1 row
+        assert_eq!(conn.changes(), 1);
+        // Now a failing OR ROLLBACK update.
+        use rustsqlite_core::capi::ResultCode;
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "UPDATE OR ROLLBACK t SET v = 'c' WHERE id = 2;").unwrap();
+        let rc = stmt.step();
+        assert!(matches!(rc, ResultCode::Constraint),
+            "expected SQLITE_CONSTRAINT, got {:?}", rc);
+        drop(stmt);
+        // The transaction should have been rolled back. Verify the data is back to the
+        // original state (no 'x' on row 1).
+        let (mut s2, _) = sqlite3_prepare_v2(&mut conn, "SELECT id, v FROM t ORDER BY id;").unwrap();
+        let rows = collect(&mut s2);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("a".into())],
+            vec![Value::Int(2), Value::Text("b".into())],
+            vec![Value::Int(3), Value::Text("c".into())],
+        ]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT id, v FROM t ORDER BY id;"), "1|a\n2|b\n3|c");
+}

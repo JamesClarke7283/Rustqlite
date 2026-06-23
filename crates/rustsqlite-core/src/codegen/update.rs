@@ -102,17 +102,12 @@ pub fn compile_update(
         ));
     }
     let oe = OeAction::from_parser(upd.or_action);
-    if matches!(oe, OeAction::Ignore | OeAction::Replace) {
-        // UPDATE with OR IGNORE / OR REPLACE on the rowid-alias column or on a UNIQUE index
-        // requires the same pre-check + delete-conflicting-row shape as INSERT, plus the
-        // OLD-row index maintenance the UPDATE path already does. The first slice supports
-        // the default ABORT/FAIL/ROLLBACK actions (which differ only in error cleanup, handled
-        // by `step()` via `Program::default_oe`); IGNORE/REPLACE land in a follow-up that
-        // threads the per-row conflict pre-checks through the two-pass sorter shape.
-        return Err(Error::msg(
-            "UPDATE OR IGNORE / OR REPLACE is not yet supported (only OR ROLLBACK/ABORT/FAIL)",
-        ));
-    }
+    // M19.6: OR IGNORE / OR REPLACE on UPDATE is supported via per-row conflict pre-checks
+    // (NoConflict probe per unique index) emitted before the OLD-key IdxDelete + table
+    // Delete + Insert. IGNORE skips the row on conflict; REPLACE fetches the conflicting
+    // row's rowid via IdxRowid, deletes its index entries + table row, then falls through to
+    // the normal Delete/Insert of the current row. ABORT/FAIL/ROLLBACK halt before any
+    // writes (mirrors `sqlite3GenerateConstraintChecks`).
     if upd.assignments.is_empty() {
         return Err(Error::msg("UPDATE must set at least one column"));
     }
@@ -382,6 +377,34 @@ pub fn compile_update(
     // and the Insert both carry `P5_ISUPDATE` so the change counters fire once.
     let reg_new_rec = b.alloc_reg();
     b.emit(Opcode::MakeRecord, reg_new, ncol as i32, reg_new_rec);
+
+    // (8b) M19.6: per-row conflict pre-checks for OR IGNORE / OR REPLACE. For each unique
+    // index, probe `NoConflict` against the NEW key. On conflict: IGNORE jumps to sort_next
+    // (skip the row); REPLACE fetches the conflicting row's rowid via IdxRowid, deletes its
+    // index entries + table row, then falls through to the normal Delete/Insert. ABORT/FAIL/
+    // ROLLBACK halt before any writes (the OLD-key IdxDelete pass below never runs for the
+    // failing row). The pre-checks run BEFORE the OLD-key IdxDelete so a REPLACE that deletes
+    // a different row's index entries doesn't race with the current row's own IdxDelete.
+    // `skip_indexes` is empty — the UPDATE path has no UPSERT target concept.
+    super::insert::emit_conflict_prechecks(
+        &mut b,
+        indexes,
+        table,
+        reg_new,
+        reg_old_rowid2,
+        index_cursor_base,
+        cursor,
+        oe,
+        sort_next,
+        &[],
+    )?;
+
+    // (8c) After the REPLACE pre-check may have moved the table cursor to the conflicting
+    // (now-deleted) row, re-seek it back to the current row so the OLD-key IdxDelete pass
+    // and the table Delete below operate on the right row. A no-op when no REPLACE fired
+    // (the cursor is already on the current row, and NotExists is a seek anyway). For
+    // OE_None / Ignore / Abort / Fail / Rollback this is also a no-op (no cursor movement).
+    b.emit_jump(Opcode::NotExists, cursor, sort_next, reg_old_rowid2);
 
     // (9b) Index maintenance: for each index, build the OLD composite key (using the
     // snapshotted old values captured at (6b) above) and IdxDelete it. The table Delete is
@@ -1029,6 +1052,27 @@ fn compile_update_from(
     let reg_new_rec = b.alloc_reg();
     b.emit(Opcode::MakeRecord, reg_new, ncol as i32, reg_new_rec);
 
+    // M19.6: per-row conflict pre-checks for OR IGNORE / OR REPLACE (same shape as the plain
+    // UPDATE path). Runs BEFORE the OLD-key IdxDelete pass; on REPLACE conflict, the
+    // conflicting (different) row is deleted, then the current row's normal Delete/Insert
+    // proceeds.
+    super::insert::emit_conflict_prechecks(
+        &mut b,
+        indexes,
+        table,
+        reg_new,
+        reg_old_rowid,
+        index_cursor_base,
+        target_cursor,
+        oe,
+        sort_next,
+        &[],
+    )?;
+
+    // After a REPLACE pre-check may have moved the target cursor to the conflicting
+    // (now-deleted) row, re-seek it to the current row. No-op when no REPLACE fired.
+    b.emit_jump(Opcode::NotExists, target_cursor, sort_next, reg_old_rowid);
+
     // Index maintenance: OLD-key IdxDelete, table Delete+Insert, NEW-key IdxInsert. This
     // mirrors the plain UPDATE path; the OLD keys are evaluated against `reg_old` and the
     // NEW keys against `reg_new`. Partial-index predicates are supported the same way.
@@ -1182,14 +1226,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_or_ignore_or_replace() {
+    fn accepts_or_ignore_or_replace() {
+        // M19.6: OR IGNORE / OR REPLACE on UPDATE are now supported via per-row conflict
+        // pre-checks (NoConflict probe per unique index). The codegen accepts them and sets
+        // the program's default_oe so step() does the right cleanup on a non-IGNORE/REPLACE
+        // constraint violation (e.g. a NOT NULL failure under ABORT/FAIL/ROLLBACK).
         let t = table_of("CREATE TABLE t(a, b)");
         let u = update_of("UPDATE OR REPLACE t SET a = 1;");
-        let err = compile_update(&u, &t, &[], &[]).unwrap_err();
-        assert!(err.to_string().contains("OR IGNORE / OR REPLACE"));
+        let prog = compile_update(&u, &t, &[], &[]).unwrap();
+        assert_eq!(prog.default_oe, OeAction::Replace as u8);
         let u = update_of("UPDATE OR IGNORE t SET a = 1;");
-        let err = compile_update(&u, &t, &[], &[]).unwrap_err();
-        assert!(err.to_string().contains("OR IGNORE / OR REPLACE"));
+        let prog = compile_update(&u, &t, &[], &[]).unwrap();
+        assert_eq!(prog.default_oe, OeAction::Ignore as u8);
     }
 
     #[test]
