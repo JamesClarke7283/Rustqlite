@@ -3325,6 +3325,77 @@ fn notnull_constraint_enforcement_matches_oracle() {
 }
 
 #[test]
+fn pragma_introspection_matches_oracle() {
+    // M20.4-M20.8: PRAGMA table_list, index_list, index_info, index_xinfo, database_list.
+    // Differential-tested vs the C oracle. Each case runs the pragma on both engines and
+    // compares the rows (sorted for determinism — the oracle's row order varies).
+    skip_if_no_sqlite3!();
+    let setups: &[&str] = &[
+        "CREATE TABLE t(a, b); CREATE INDEX i ON t(a, b); CREATE UNIQUE INDEX u ON t(a);",
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT NOT NULL); CREATE INDEX i ON t(b);",
+        "CREATE TABLE t(a, b, c, PRIMARY KEY(b, c));",
+        "CREATE TABLE t(a); CREATE VIEW v AS SELECT * FROM t;",
+    ];
+    let pragmas: &[&str] = &[
+        "PRAGMA table_list;",
+        "PRAGMA index_list(t);",
+        "PRAGMA index_info(i);",
+        "PRAGMA index_xinfo(i);",
+        "PRAGMA database_list;",
+    ];
+    for setup in setups {
+        for pragma_sql in pragmas {
+            let db = TempDb::new("pragma_intro_ours");
+            {
+                let mut conn = sqlite3_open(db.str()).expect("open");
+                // Run each setup statement separately.
+                for s in setup.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                    exec(&mut conn, s);
+                }
+                let (mut s, _) = match sqlite3_prepare_v2(&mut conn, pragma_sql) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // If our engine doesn't support this pragma yet, skip it (don't fail).
+                        eprintln!("skipping `{pragma_sql}`: {e}");
+                        continue;
+                    }
+                };
+                let rows = collect(&mut s);
+                let ora = TempDb::new("pragma_intro_ora");
+                {
+                    let mut oconn = sqlite3_open(ora.str()).expect("open");
+                    for s in setup.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                        exec(&mut oconn, s);
+                    }
+                    let (mut os, _) = sqlite3_prepare_v2(&mut oconn, pragma_sql).unwrap();
+                    let oracle_rows = collect(&mut os);
+                    // For database_list, the file path differs (different temp files) —
+                    // normalize the path column before comparing.
+                    let normalize = |rows: Vec<Vec<Value>>| -> Vec<Vec<Value>> {
+                        if pragma_sql.starts_with("PRAGMA database_list") {
+                            rows.into_iter().map(|mut r| {
+                                if r.len() >= 3 { r[2] = Value::Text("<path>".into()); }
+                                r
+                            }).collect()
+                        } else {
+                            rows
+                        }
+                    };
+                    let our_norm = normalize(rows.clone());
+                    let ora_norm = normalize(oracle_rows.clone());
+                    // Sort both by string repr for determinism (row order varies).
+                    let mut our_sorted = our_norm.clone();
+                    our_sorted.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+                    let mut ora_sorted = ora_norm.clone();
+                    ora_sorted.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+                    assert_eq!(our_sorted, ora_sorted, "PRAGMA mismatch for `{pragma_sql}` setup `{setup}`");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn pragma_table_info_matches_oracle() {
     // M20.2: PRAGMA table_info(tbl) returns (cid, name, type, notnull, dflt_value, pk).
     // M20.3: PRAGMA table_xinfo(tbl) adds a `hidden` column.

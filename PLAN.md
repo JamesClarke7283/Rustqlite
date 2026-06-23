@@ -385,11 +385,11 @@ list every granular item needed.
 - [x] **20.1** PRAGMA framework: parse `PRAGMA [schema.]name [= value] | (value)`, dispatch to handler
 - [x] **20.2** `PRAGMA table_info(tbl)` — column info (cid, name, type, notnull, dflt_value, pk)
 - [x] **20.3** `PRAGMA table_xinfo(tbl)` — like `table_info` plus hidden column flag
-- [ ] **20.4** `PRAGMA table_list` — list all tables
-- [ ] **20.5** `PRAGMA index_list(tbl)` — list indexes on a table
-- [ ] **20.6** `PRAGMA index_info(idx)` — columns in an index
-- [ ] **20.7** `PRAGMA index_xinfo(idx)` — like `index_info` plus sort order and collation
-- [ ] **20.8** `PRAGMA database_list` — list attached databases
+- [x] **20.4** `PRAGMA table_list` — list all tables
+- [x] **20.5** `PRAGMA index_list(tbl)` — list indexes on a table
+- [x] **20.6** `PRAGMA index_info(idx)` — columns in an index
+- [x] **20.7** `PRAGMA index_xinfo(idx)` — like `index_info` plus sort order and collation
+- [x] **20.8** `PRAGMA database_list` — list attached databases
 - [ ] **20.9** `PRAGMA schema_version` / `PRAGMA user_version` — read/write header fields
 - [ ] **20.10** `PRAGMA application_id` — read/write header field
 - [ ] **20.11** `PRAGMA page_size` — read; write only before first write

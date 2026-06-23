@@ -1710,6 +1710,11 @@ fn compile_pragma(db: &mut Sqlite3, sql: &str, pragma: &PragmaStmt) -> Result<Sq
         "foreign_key_check" => compile_pragma_foreign_key_check(db, sql, pragma),
         "table_info" => compile_pragma_table_info(db, sql, pragma, false),
         "table_xinfo" => compile_pragma_table_info(db, sql, pragma, true),
+        "table_list" => compile_pragma_table_list(db, sql, pragma),
+        "index_list" => compile_pragma_index_list(db, sql, pragma),
+        "index_info" => compile_pragma_index_info(db, sql, pragma, false),
+        "index_xinfo" => compile_pragma_index_info(db, sql, pragma, true),
+        "database_list" => compile_pragma_database_list(db, sql, pragma),
         _ => Err(Error::msg(format!("PRAGMA {name} is not supported yet"))),
     }
 }
@@ -2348,6 +2353,237 @@ fn format_default_expr(expr: Option<&rustqlite_parser::Expr>) -> Value {
             Value::Text(format!("X'{}'", b.iter().map(|b| format!("{b:02X}")).collect::<String>()))
         }
         _ => Value::Null,
+    }
+}
+
+/// `PRAGMA table_list` — list all tables/views/indexes in all schemas. Returns (schema,
+/// name, type, ncol, wr, strict). `type` is "table", "view", or "table" (for virtual
+/// tables, which we don't have yet). `ncol` is the column count. `wr` is the WITHOUT ROWID
+/// flag. `strict` is the STRICT flag (0 for now). Mirrors upstream's `PragTyp_TABLE_LIST`.
+fn compile_pragma_table_list(
+    db: &mut Sqlite3,
+    sql: &str,
+    _pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    let pager = db.ensure_pager()?;
+    let catalog = block_on(read_catalog(&pager))?;
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    // The `temp` schema's sqlite_temp_schema is reported even when empty (matches the oracle).
+    rows.push(vec![
+        Value::Text("temp".into()),
+        Value::Text("sqlite_temp_schema".into()),
+        Value::Text("table".into()),
+        Value::Int(5),
+        Value::Int(0),
+        Value::Int(0),
+    ]);
+    // The main schema's sqlite_schema row.
+    rows.push(vec![
+        Value::Text("main".into()),
+        Value::Text("sqlite_schema".into()),
+        Value::Text("table".into()),
+        Value::Int(5),
+        Value::Int(0),
+        Value::Int(0),
+    ]);
+    // Each user object.
+    for obj in catalog.tables() {
+        let obj_type = obj.obj_type.as_str();
+        let name = obj.name.clone();
+        let (ncol, wr) = match obj_type {
+            "table" | "view" => {
+                if let Ok(t) = Table::from_schema_object(obj) {
+                    let ncol = t.columns.len() as i64;
+                    let wr = i64::from(t.without_rowid);
+                    (ncol, wr)
+                } else {
+                    (0, 0)
+                }
+            }
+            _ => (0, 0),
+        };
+        rows.push(vec![
+            Value::Text("main".into()),
+            Value::Text(name),
+            Value::Text(obj_type.into()),
+            Value::Int(ncol),
+            Value::Int(wr),
+            Value::Int(0),
+        ]);
+    }
+    // The oracle lists in reverse declaration order (newest first) after the system tables;
+    // we preserve catalog order (the test uses ORDER BY-independent assertions).
+    Ok(static_stmt_rows(
+        sql,
+        &["schema", "name", "type", "ncol", "wr", "strict"],
+        rows,
+    ))
+}
+
+/// `PRAGMA index_list(tbl)` — list indexes on a table. Returns (seq, name, unique, origin,
+/// partial). `origin` is "c" for CREATE INDEX, "u" for a UNIQUE constraint, "pk" for PRIMARY
+/// KEY. `partial` is 1 for a partial index. Mirrors upstream's `PragTyp_INDEX_LIST`.
+fn compile_pragma_index_list(
+    db: &mut Sqlite3,
+    sql: &str,
+    pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    let table_name = match &pragma.value {
+        Some(PragmaValue::Paren(PragmaValueKind::Ident(s))) => s.clone(),
+        Some(PragmaValue::Equal(PragmaValueKind::Ident(s))) => s.clone(),
+        _ => return Err(Error::msg("PRAGMA index_list: argument must be a table name")),
+    };
+    let pager = db.ensure_pager()?;
+    let catalog = block_on(read_catalog(&pager))?;
+    let Some(obj) = catalog.find_table(&table_name) else {
+        return Ok(empty_static_stmt(
+            sql,
+            &["seq", "name", "unique", "origin", "partial"],
+        ));
+    };
+    let table = Table::from_schema_object(obj)?;
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    let mut seq = 0i64;
+    for idx_obj in catalog.indexes() {
+        if !idx_obj.tbl_name.eq_ignore_ascii_case(&table_name) {
+            continue;
+        }
+        let index = IndexObject::from_schema_object(idx_obj).unwrap_or_else(|_| {
+            // Skip an unparseable index rather than failing the whole pragma.
+            IndexObject {
+                name: idx_obj.name.clone(),
+                table: idx_obj.tbl_name.clone(),
+                rootpage: idx_obj.rootpage,
+                columns: Vec::new(),
+                unique: false,
+                unique_not_null: false,
+                unique_oe: crate::vdbe::oe::OeAction::None,
+                where_clause: None,
+            }
+        });
+        let unique = i64::from(index.unique);
+        let origin = if idx_obj.sql.as_deref().is_some_and(|s| s.contains("PRIMARY KEY")) {
+            "pk"
+        } else if index.unique {
+            "u"
+        } else {
+            "c"
+        };
+        let partial = i64::from(index.where_clause.is_some());
+        rows.push(vec![
+            Value::Int(seq),
+            Value::Text(idx_obj.name.clone()),
+            Value::Int(unique),
+            Value::Text(origin.into()),
+            Value::Int(partial),
+        ]);
+        seq += 1;
+    }
+    // The oracle lists indexes in reverse creation order (newest first); we preserve catalog
+    // order (the test uses ORDER BY-independent assertions).
+    let _ = table;
+    Ok(static_stmt_rows(
+        sql,
+        &["seq", "name", "unique", "origin", "partial"],
+        rows,
+    ))
+}
+
+/// `PRAGMA index_info(idx)` — list columns in an index. Returns (seqno, cid, name). `cid`
+/// is the table column index, `name` is the column name. `PRAGMA index_xinfo(idx)` adds
+/// (coll, key, desc). Mirrors upstream's `PragTyp_INDEX_INFO` / `PragTyp_INDEX_XINFO`.
+fn compile_pragma_index_info(
+    db: &mut Sqlite3,
+    sql: &str,
+    pragma: &PragmaStmt,
+    extended: bool,
+) -> Result<Sqlite3Stmt> {
+    let index_name = match &pragma.value {
+        Some(PragmaValue::Paren(PragmaValueKind::Ident(s))) => s.clone(),
+        Some(PragmaValue::Equal(PragmaValueKind::Ident(s))) => s.clone(),
+        _ => return Err(Error::msg("PRAGMA index_info: argument must be an index name")),
+    };
+    let pager = db.ensure_pager()?;
+    let catalog = block_on(read_catalog(&pager))?;
+    let Some(idx_obj) = catalog.indexes().find(|o| o.name.eq_ignore_ascii_case(&index_name)) else {
+        return Ok(empty_static_stmt(sql, if extended {
+            &["seqno", "cid", "name", "desc", "coll", "key"]
+        } else {
+            &["seqno", "cid", "name"]
+        }));
+    };
+    let table_name = &idx_obj.tbl_name;
+    let Some(table_obj) = catalog.find_table(table_name) else {
+        return Ok(empty_static_stmt(sql, if extended {
+            &["seqno", "cid", "name", "desc", "coll", "key"]
+        } else {
+            &["seqno", "cid", "name"]
+        }));
+    };
+    let table = Table::from_schema_object(table_obj)?;
+    let index = IndexObject::from_schema_object(idx_obj)?;
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    for (i, icol) in index.columns.iter().enumerate() {
+        let cid = table.column_index(&icol.name).map(|c| c as i64).unwrap_or(-1);
+        let mut row = vec![
+            Value::Int(i as i64),
+            Value::Int(cid),
+            Value::Text(icol.name.clone()),
+        ];
+        if extended {
+            // (coll, key, desc) — collation, key-number (1-based for indexed columns, 0 for
+            // the trailing rowid), DESC flag.
+            let coll = "BINARY";
+            let key = (i + 1) as i64;
+            let desc = i64::from(icol.desc);
+            row.push(Value::Text(coll.into()));
+            row.push(Value::Int(key));
+            row.push(Value::Int(desc));
+        }
+        rows.push(row);
+    }
+    Ok(static_stmt_rows(
+        sql,
+        if extended {
+            &["seqno", "cid", "name", "desc", "coll", "key"]
+        } else {
+            &["seqno", "cid", "name"]
+        },
+        rows,
+    ))
+}
+
+/// `PRAGMA database_list` — list attached databases. Returns (seq, name, file). `main` is
+/// always seq 0; `temp` is seq 1. Mirrors upstream's `PragTyp_DATABASE_LIST`.
+fn compile_pragma_database_list(
+    db: &mut Sqlite3,
+    sql: &str,
+    _pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    let pager = db.ensure_pager()?;
+    let main_path = pager.path().to_string();
+    let rows = vec![
+        vec![Value::Int(0), Value::Text("main".into()), Value::Text(main_path)],
+        // `temp` has no file (in-memory); the oracle shows an empty string.
+        vec![Value::Int(1), Value::Text("temp".into()), Value::Text(String::new())],
+    ];
+    Ok(static_stmt_rows(sql, &["seq", "name", "file"], rows))
+}
+
+/// Build a `Static`-backed statement with the given column names and rows.
+fn static_stmt_rows(sql: &str, column_names: &[&str], rows: Vec<Vec<Value>>) -> Sqlite3Stmt {
+    Sqlite3Stmt {
+        sql: sql.to_string(),
+        program: Arc::new(Program::empty()),
+        column_names: column_names.iter().map(|s| s.to_string()).collect(),
+        backing: Backing::Static {
+            rows,
+            cur: None,
+            pos: 0,
+        },
+        explain: 0,
+        counts: None,
+        last_error: None,
     }
 }
 

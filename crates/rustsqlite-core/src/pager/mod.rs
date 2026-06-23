@@ -352,6 +352,11 @@ impl Pager {
         self.state.lock().unwrap().header.largest_root_page != 0
     }
 
+    /// The database file path (as opened). Used by `PRAGMA database_list`.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
     /// Whether incremental-vacuum mode is enabled (header meta[7] != 0). Mirrors `pBt->incrVacuum`.
     pub fn incr_vacuum(&self) -> bool {
         self.state.lock().unwrap().header.incremental_vacuum != 0
