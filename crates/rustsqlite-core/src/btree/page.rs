@@ -460,4 +460,39 @@ mod tests {
         let page = vec![0u8; 4096];
         assert!(PageHeader::parse(&page, 0).is_err());
     }
+
+    #[test]
+    fn rejects_page_too_small_for_header() {
+        // 7 bytes is below the 8-byte minimum leaf header.
+        let page = vec![0u8; 7];
+        assert!(PageHeader::parse(&page, 0).is_err());
+    }
+
+    #[test]
+    fn rejects_interior_page_too_small_for_12_byte_header() {
+        // Interior pages need a 12-byte header; 10 bytes is too short.
+        let mut page = vec![0u8; 10];
+        page[0] = 0x05; // interior table
+        assert!(PageHeader::parse(&page, 0).is_err());
+    }
+
+    #[test]
+    fn cell_pointer_out_of_array_range_is_rejected() {
+        // A tiny 16-byte page: with a leaf header (8 bytes), only 4 cell-pointer slots fit
+        // (8 + 4*2 = 16). Asking for slot 4 (offset 16..18) is past the page end.
+        let mut page = vec![0u8; 16];
+        page[0] = 0x0d; // leaf table
+        page[3..5].copy_from_slice(&4u16.to_be_bytes()); // 4 cells declared
+        page[5..7].copy_from_slice(&16u16.to_be_bytes()); // content area = page end
+        let hdr = PageHeader::parse(&page, 0).unwrap();
+        assert!(hdr.cell_pointer(&page, 4).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_page_magic_via_db_header() {
+        // A file shorter than the 100-byte db header is rejected with NOTADB (corruption
+        // path for malformed databases).
+        let bytes = [0u8; 50];
+        assert!(crate::format::header::DbHeader::parse(&bytes).is_err());
+    }
 }

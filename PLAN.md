@@ -833,8 +833,8 @@ list every granular item needed.
 
 ### M5.3 — B-Tree (Additional Items)
 
-- [ ] **5.3.10** Recovery from corrupt databases: malformed page handling, wrong magic numbers, bad cell pointers
-- [ ] **5.3.11** Database file header: write all 100-byte header fields on creation (currently only partial fields)
+- [x] **5.3.10** Recovery from corrupt databases: malformed page handling, wrong magic numbers, bad cell pointers
+- [x] **5.3.11** Database file header: write all 100-byte header fields on creation (currently only partial fields)
 
 ### M6 — Aggregates (Additional Items)
 
