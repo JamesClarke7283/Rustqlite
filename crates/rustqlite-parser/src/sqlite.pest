@@ -562,7 +562,7 @@ pragma_value = { pragma_eq | pragma_paren }
 pragma_eq = { "=" ~ pragma_value_kind }
 pragma_paren = { "(" ~ pragma_value_kind ~ ")" }
 pragma_value_kind = { signed_number | pragma_kw_value | ident }
-pragma_kw_value = { K_ON | K_DELETE | K_DEFAULT }
+pragma_kw_value = { K_ON | K_DELETE | K_DEFAULT | K_TRUE | K_FALSE }
 
 // ---- Transactions & Savepoints (M2.34–M2.37) ----
 // `BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE] [TRANSACTION [name]]`

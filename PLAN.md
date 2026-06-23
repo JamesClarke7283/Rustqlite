@@ -337,10 +337,10 @@ list every granular item needed.
 
 ## M17 — Foreign Keys
 
-- [ ] **17.1** Parser: `REFERENCES parent_tbl(col) [ON DELETE|UPDATE action] [DEFERRABLE|NOT DEFERRABLE]`
-- [ ] **17.2** Parser: table-level `FOREIGN KEY (cols) REFERENCES parent_tbl(cols) …`
-- [ ] **17.3** `PRAGMA foreign_keys` — enable/disable FK enforcement
-- [ ] **17.4** `PRAGMA foreign_key_list(tbl)` — list FK constraints on a table
+- [x] **17.1** Parser: `REFERENCES parent_tbl(col) [ON DELETE|UPDATE action] [DEFERRABLE|NOT DEFERRABLE]`
+- [x] **17.2** Parser: table-level `FOREIGN KEY (cols) REFERENCES parent_tbl(cols) …`
+- [x] **17.3** `PRAGMA foreign_keys` — enable/disable FK enforcement
+- [x] **17.4** `PRAGMA foreign_key_list(tbl)` — list FK constraints on a table
 - [ ] **17.5** `PRAGMA foreign_key_check` — verify all FK constraints
 - [ ] **17.6** FK enforcement on INSERT: child row must reference an existing parent row (or be NULL)
 - [ ] **17.7** FK enforcement on DELETE from parent: cascade action (SET NULL, SET DEFAULT, CASCADE, RESTRICT, NO ACTION)

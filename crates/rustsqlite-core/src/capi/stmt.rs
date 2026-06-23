@@ -9,8 +9,9 @@
 use std::sync::{Arc, Mutex};
 
 use rustqlite_parser::{
-    parse, AlterTableAction, AlterTableStmt, DropIndexStmt, DropTableStmt, ExplainKind,
-    InsertSource, Literal, PragmaStmt, PragmaValue, PragmaValueKind, SelectStmt, Stmt,
+    parse, AlterTableAction, AlterTableStmt, ColumnConstraint, CreateTable, Deferrable,
+    DropIndexStmt, DropTableStmt, ExplainKind, InsertSource, Literal, PragmaStmt, PragmaValue,
+    PragmaValueKind, ReferenceAction, SelectStmt, Stmt, TableConstraintBody,
 };
 
 use crate::codegen;
@@ -1638,6 +1639,8 @@ fn compile_pragma(db: &mut Sqlite3, sql: &str, pragma: &PragmaStmt) -> Result<Sq
         }
         "wal_checkpoint" => compile_pragma_wal_checkpoint(db, sql, pragma),
         "journal_mode" => compile_pragma_journal_mode(db, sql, pragma),
+        "foreign_keys" => compile_pragma_foreign_keys(db, sql, pragma),
+        "foreign_key_list" => compile_pragma_foreign_key_list(db, sql, pragma),
         _ => Err(Error::msg(format!("PRAGMA {name} is not supported yet"))),
     }
 }
@@ -1800,6 +1803,298 @@ fn compile_pragma_journal_mode(
         counts: None,
         last_error: None,
     })
+}
+
+/// `PRAGMA foreign_keys` — read returns 0/1; set toggles FK enforcement.
+///
+/// Mirrors the `PragTyp_FLAG` path in `pragma.c` for the `SQLITE_ForeignKeys` mask. The read
+/// form (no `= value`) returns the current flag as a single-row, single-column result. The
+/// set form (`= ON`/`= OFF`/`= 0`/`= 1`/`(0)`/…) parses the value as a boolean (upstream's
+/// `sqlite3GetBoolean`, which accepts `ON`/`YES`/`TRUE`/non-zero numbers as true and anything
+/// else as false) and updates the connection flag.
+///
+/// Upstream refuses the change inside a transaction: `if db->autoCommit == 0: mask &=
+/// ~(SQLITE_ForeignKeys)` — so `PRAGMA foreign_keys = ON` inside a `BEGIN` is silently a
+/// no-op (the flag is not changed). We mirror that by checking `db.autocommit()` before
+/// mutating. Enforcement itself is M17.6+; this pragma is the read/write surface.
+fn compile_pragma_foreign_keys(
+    db: &mut Sqlite3,
+    sql: &str,
+    pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    match &pragma.value {
+        None => {
+            // Read: return the current flag.
+            let on = if db.foreign_keys() { 1 } else { 0 };
+            let rows = vec![vec![Value::Int(on)]];
+            Ok(Sqlite3Stmt {
+                sql: sql.to_string(),
+                program: Arc::new(Program::empty()),
+                column_names: vec!["foreign_keys".to_string()],
+                backing: Backing::Static {
+                    rows,
+                    cur: None,
+                    pos: 0,
+                },
+                explain: 0,
+                counts: None,
+                last_error: None,
+            })
+        }
+        Some(PragmaValue::Equal(kind)) | Some(PragmaValue::Paren(kind)) => {
+            // Set: parse the value as a boolean. Upstream's `sqlite3GetBoolean` accepts
+            // `ON`/`YES`/`TRUE` (case-insensitive) and any non-zero number as true; anything
+            // else (including `OFF`/`NO`/`FALSE`/0/NULL/empty text) is false.
+            let on = pragma_bool_value(kind);
+            // Refuse the change inside a transaction — upstream masks
+            // `SQLITE_ForeignKeys` out of the FLAG-pragma mask when `db->autoCommit == 0`,
+            // so the toggle is silently dropped. We mirror by checking autocommit.
+            if db.autocommit() {
+                db.set_foreign_keys(on);
+            }
+            // Upstream emits no result row for the set form (it's a `PragTyp_FLAG`, which
+            // only emits `OP_Expire` then halts). Return an empty result set.
+            Ok(Sqlite3Stmt {
+                sql: sql.to_string(),
+                program: Arc::new(Program::empty()),
+                column_names: Vec::new(),
+                backing: Backing::Static {
+                    rows: Vec::new(),
+                    cur: None,
+                    pos: 0,
+                },
+                explain: 0,
+                counts: None,
+                last_error: None,
+            })
+        }
+    }
+}
+
+/// Parse a pragma value as a boolean, mirroring `sqlite3GetBoolean` in `pragma.c`:
+/// `ON`/`YES`/`TRUE` (case-insensitive) and any non-zero number are true; `OFF`/`NO`/`FALSE`
+/// and zero are false; anything else is false (upstream's `getSafetyLevel` returns 0 for
+/// unrecognized strings when called via `sqlite3GetBoolean`). The `ON` keyword arrives as
+/// `PragmaValueKind::On`; identifiers as `Ident(s)`; TRUE/FALSE keywords arrive as
+/// `Ident("true")`/`Ident("false")` (the parser maps them so `sqlite3GetBoolean`'s
+/// string match still applies).
+fn pragma_bool_value(kind: &PragmaValueKind) -> bool {
+    match kind {
+        PragmaValueKind::On => true,
+        PragmaValueKind::Ident(s) => {
+            let lower = s.to_ascii_lowercase();
+            match lower.as_str() {
+                "on" | "yes" | "true" => true,
+                "off" | "no" | "false" => false,
+                _ => s.parse::<f64>().map(|n| n != 0.0).unwrap_or(false),
+            }
+        }
+        PragmaValueKind::Number(lit) => match lit {
+            Literal::Integer(n) => *n != 0,
+            Literal::Real(f) => *f != 0.0,
+            _ => false,
+        },
+        PragmaValueKind::Delete => false,
+        PragmaValueKind::Default => false,
+    }
+}
+
+/// `PRAGMA foreign_key_list(table)` — list the foreign-key constraints on `table`.
+///
+/// Mirrors `PragTyp_FOREIGN_KEY_LIST` in `pragma.c`. Returns one row per (constraint, column)
+/// pair, with eight columns: `id` (0-based constraint index), `seq` (0-based column index
+/// within the constraint), `table` (parent table), `from` (child column), `to` (parent
+/// column), `on_update` (action name), `on_delete` (action name), `match` (always "NONE" —
+/// SQLite accepts but ignores `MATCH`, always reporting "NONE").
+///
+/// The constraints are sourced by parsing the table's stored `CREATE TABLE` text and walking
+/// the column-level `REFERENCES` clauses and table-level `FOREIGN KEY (cols) REFERENCES`
+/// clauses. Constraint order follows declaration order in the parsed AST (column-level
+/// constraints in column order, then table-level constraints in declared order). Upstream's
+/// order is the order `sqlite3AddForeignKey` appended them to `pTab->u.tab.pFKey`, which is
+/// column-level first (in column order) then table-level (in declared order) — matching this.
+fn compile_pragma_foreign_key_list(
+    db: &mut Sqlite3,
+    sql: &str,
+    pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    // Resolve the table name from the parenthesized argument: `PRAGMA foreign_key_list(tbl)`.
+    let table_name = match &pragma.value {
+        Some(PragmaValue::Paren(PragmaValueKind::Ident(s))) => s.clone(),
+        Some(PragmaValue::Equal(PragmaValueKind::Ident(s))) => s.clone(),
+        _ => {
+            return Err(Error::msg(
+                "PRAGMA foreign_key_list: argument must be a table name",
+            ))
+        }
+    };
+    let pager = db.ensure_pager()?;
+    let catalog = block_on(read_catalog(&pager))?;
+    let Some(obj) = catalog.find_table(&table_name) else {
+        // Upstream silently returns no rows for a missing table (the `if( pTab && ... )`
+        // guard in `PragTyp_FOREIGN_KEY_LIST`).
+        return Ok(empty_static_stmt(sql, &[]));
+    };
+    let Some(sql_text) = obj.sql.as_deref() else {
+        return Ok(empty_static_stmt(sql, &[]));
+    };
+    let stmts = rustqlite_parser::parse(sql_text).map_err(|e| {
+        Error::msg(format!("cannot parse schema for \"{table_name}\": {e}"))
+    })?;
+    let ct = match stmts.into_iter().next() {
+        Some(rustqlite_parser::Stmt::CreateTable(ct)) => ct,
+        _ => return Ok(empty_static_stmt(sql, &[])),
+    };
+    let rows = foreign_key_list_rows(&ct);
+    let column_names = vec![
+        "id".to_string(),
+        "seq".to_string(),
+        "table".to_string(),
+        "from".to_string(),
+        "to".to_string(),
+        "on_update".to_string(),
+        "on_delete".to_string(),
+        "match".to_string(),
+    ];
+    Ok(Sqlite3Stmt {
+        sql: sql.to_string(),
+        program: Arc::new(Program::empty()),
+        column_names,
+        backing: Backing::Static {
+            rows,
+            cur: None,
+            pos: 0,
+        },
+        explain: 0,
+        counts: None,
+        last_error: None,
+    })
+}
+
+/// Build the `PRAGMA foreign_key_list` result rows from a parsed `CREATE TABLE`. Constraint
+/// order is column-level (in column order) then table-level (in declared order); within each
+/// constraint, column order is the declared order. The `to` column is the parent column name
+/// when the constraint names one, else NULL (the parent's PK — upstream emits NULL too).
+fn foreign_key_list_rows(ct: &CreateTable) -> Vec<Vec<Value>> {
+    fn action_name(a: Option<ReferenceAction>) -> &'static str {
+        match a {
+            None | Some(ReferenceAction::NoAction) => "NO ACTION",
+            Some(ReferenceAction::Restrict) => "RESTRICT",
+            Some(ReferenceAction::Cascade) => "CASCADE",
+            Some(ReferenceAction::SetNull) => "SET NULL",
+            Some(ReferenceAction::SetDefault) => "SET DEFAULT",
+        }
+    }
+
+    fn deferrable_name(d: Option<Deferrable>) -> &'static str {
+        // Upstream always reports "NONE" for the `match` column regardless of DEFERRABLE.
+        let _ = d;
+        "NONE"
+    }
+
+    // Upstream's `sqlite3AddForeignKey` (build.c) prepends each FK to `pTab->u.tab.pFKey`'s
+    // singly-linked list as it is reduced by the parser. Column-level REFERENCES clauses
+    // are reduced in column order; table-level FOREIGN KEY clauses are reduced afterwards
+    // in declared order. The resulting list (walked by `PragTyp_FOREIGN_KEY_LIST` via
+    // `pNextFrom`) is therefore in REVERSE of declaration order — the last-declared FK is
+    // at the head. We collect in declaration order then reverse, and assign `id` = 0-based
+    // position in the walked (reversed) list. `seq` is the column index within each FK
+    // (column-level FKs are single-column so seq is always 0; multi-column table-level FKs
+    // share one `id` across their columns, in declared column order).
+    #[derive(Clone)]
+    struct FkCol {
+        from: String,
+        to: Option<String>,
+    }
+    #[derive(Clone)]
+    struct FkRow {
+        parent_table: String,
+        cols: Vec<FkCol>,
+        on_update: Option<ReferenceAction>,
+        on_delete: Option<ReferenceAction>,
+        deferrable: Option<Deferrable>,
+    }
+    let mut fks: Vec<FkRow> = Vec::new();
+    // Column-level REFERENCES constraints, in column order (each is single-column).
+    for cd in &ct.columns {
+        for c in &cd.constraints {
+            if let ColumnConstraint::References(r) = c {
+                fks.push(FkRow {
+                    parent_table: r.parent_table.clone(),
+                    cols: vec![FkCol {
+                        from: cd.name.clone(),
+                        to: r.parent_columns.as_ref().and_then(|cs| cs.first()).cloned(),
+                    }],
+                    on_update: r.on_update,
+                    on_delete: r.on_delete,
+                    deferrable: r.deferrable,
+                });
+            }
+        }
+    }
+    // Table-level FOREIGN KEY constraints, in declared order.
+    for tc in &ct.constraints {
+        if let TableConstraintBody::ForeignKey { columns, references } = &tc.body {
+            let parent_cols: Vec<Option<String>> = match &references.parent_columns {
+                Some(cs) => cs.iter().cloned().map(Some).collect(),
+                None => std::iter::repeat(None).take(columns.len()).collect(),
+            };
+            let cols: Vec<FkCol> = columns
+                .iter()
+                .zip(parent_cols.iter())
+                .map(|(from, to)| FkCol {
+                    from: from.clone(),
+                    to: to.clone(),
+                })
+                .collect();
+            fks.push(FkRow {
+                parent_table: references.parent_table.clone(),
+                cols,
+                on_update: references.on_update,
+                on_delete: references.on_delete,
+                deferrable: references.deferrable,
+            });
+        }
+    }
+    // Walk in reverse (head of the linked list first).
+    let mut rows = Vec::new();
+    for (id, fk) in fks.iter().rev().enumerate() {
+        for (seq, col) in fk.cols.iter().enumerate() {
+            let to_val = match &col.to {
+                Some(s) => Value::Text(s.clone()),
+                None => Value::Null,
+            };
+            rows.push(vec![
+                Value::Int(id as i64),
+                Value::Int(seq as i64),
+                Value::Text(fk.parent_table.clone()),
+                Value::Text(col.from.clone()),
+                to_val,
+                Value::Text(action_name(fk.on_update).to_string()),
+                Value::Text(action_name(fk.on_delete).to_string()),
+                Value::Text(deferrable_name(fk.deferrable).to_string()),
+            ]);
+        }
+    }
+    rows
+}
+
+/// A `Static`-backed statement with no rows and the given column names (used for pragmas
+/// that return an empty result set on a missing/invalid argument).
+fn empty_static_stmt(sql: &str, column_names: &[&str]) -> Sqlite3Stmt {
+    Sqlite3Stmt {
+        sql: sql.to_string(),
+        program: Arc::new(Program::empty()),
+        column_names: column_names.iter().map(|s| s.to_string()).collect(),
+        backing: Backing::Static {
+            rows: Vec::new(),
+            cur: None,
+            pos: 0,
+        },
+        explain: 0,
+        counts: None,
+        last_error: None,
+    }
 }
 
 /// `PRAGMA auto_vacuum` — read returns the current mode (0/1/2); set writes the header flag.

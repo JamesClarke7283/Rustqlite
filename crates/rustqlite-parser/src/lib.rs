@@ -1897,6 +1897,8 @@ fn build_pragma_value_kind(pair: Pair<'_, Rule>) -> PragmaValueKind {
                 Rule::K_ON => PragmaValueKind::On,
                 Rule::K_DELETE => PragmaValueKind::Delete,
                 Rule::K_DEFAULT => PragmaValueKind::Default,
+                Rule::K_TRUE => PragmaValueKind::Ident("true".to_string()),
+                Rule::K_FALSE => PragmaValueKind::Ident("false".to_string()),
                 other => unreachable!("unexpected pragma_kw_value child {other:?}"),
             }
         }

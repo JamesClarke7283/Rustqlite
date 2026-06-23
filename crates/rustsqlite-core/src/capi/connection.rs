@@ -60,6 +60,13 @@ pub struct Sqlite3 {
     /// transaction; any other release/rollback just pops the stack. Shared by `Arc` with the
     /// in-flight VDBE so `OP_Savepoint` and `OP_AutoCommit` can consult/mutate it.
     is_transaction_savepoint: Arc<Mutex<bool>>,
+    /// `db->flags & SQLITE_ForeignKeys` from `main.c` — `true` when foreign-key constraint
+    /// enforcement is enabled via `PRAGMA foreign_keys = ON`. Default is OFF (matching upstream
+    /// unless `SQLITE_DEFAULT_FOREIGN_KEYS` is defined). The flag may only be toggled outside a
+    /// transaction (upstream's `PragTyp_FLAG` path masks `SQLITE_ForeignKeys` out when
+    /// `db->autoCommit == 0`). Enforcement itself is M17.6+; this flag is the read/write
+    /// surface for `PRAGMA foreign_keys`.
+    foreign_keys: Arc<Mutex<bool>>,
     last_error: Option<Error>,
 }
 
@@ -101,6 +108,7 @@ pub fn sqlite3_open_v2(filename: &str, flags: OpenFlags) -> Result<Sqlite3> {
             counts: Arc::new(Mutex::new(ChangeCounts::default())),
             autocommit: Arc::new(Mutex::new(true)),
             is_transaction_savepoint: Arc::new(Mutex::new(false)),
+            foreign_keys: Arc::new(Mutex::new(false)),
             last_error: None,
         })
     })
@@ -239,10 +247,23 @@ impl Sqlite3 {
     }
 
     /// A clone of the shared `is_transaction_savepoint` handle, for the in-flight VDBE so
-    /// `OP_Savepoint` and `OP_AutoCommit` can consult and mutate it. Engine-internal (used by
+    /// `OP_Savepoint` and `OP_AutoCommit` can consult/mutate it. Engine-internal (used by
     /// [`super::stmt`]). Mirrors `db->isTransactionSavepoint` in `main.c`.
     pub(crate) fn is_transaction_savepoint_handle(&self) -> Arc<Mutex<bool>> {
         self.is_transaction_savepoint.clone()
+    }
+
+    /// `PRAGMA foreign_keys` read — `true` when FK enforcement is enabled. Mirrors
+    /// `db->flags & SQLITE_ForeignKeys`. Default is OFF.
+    pub fn foreign_keys(&self) -> bool {
+        *self.foreign_keys.lock().unwrap()
+    }
+
+    /// `PRAGMA foreign_keys = ON/OFF` write — sets the FK enforcement flag. Mirrors the
+    /// `PragTyp_FLAG` path in `pragma.c`. Caller must reject the change inside a transaction
+    /// (upstream masks `SQLITE_ForeignKeys` out when `db->autoCommit == 0`).
+    pub(crate) fn set_foreign_keys(&self, on: bool) {
+        *self.foreign_keys.lock().unwrap() = on;
     }
 
     // ---- Interim engine read helpers (until the VDBE prepare/step path lands in M3) ----

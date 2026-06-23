@@ -836,3 +836,29 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   path uses direct `sqlite_schema` row manipulation). Differential-tested vs the C oracle
   (`create_trigger_*` / `drop_trigger_*` — schema row, IF NOT EXISTS, collision error,
   nonexistent-table error, DROP TRIGGER, IF EXISTS, nonexistent error).
+
+- **M17 — Foreign Keys** 🚧: **17.1–17.2** ✅ (parser shipped in M2.44 — column-level
+  `REFERENCES` and table-level `FOREIGN KEY (cols) REFERENCES` with `ON DELETE|UPDATE
+  action` and `DEFERRABLE`). **17.3 `PRAGMA foreign_keys`** ✅ / **17.4
+  `PRAGMA foreign_key_list(tbl)`** ✅: `PRAGMA foreign_keys` is a FLAG-pragma (mirrors
+  `PragTyp_FLAG` in `pragma.c` with the `SQLITE_ForeignKeys` mask) — read returns 0/1
+  (default OFF, matching upstream without `SQLITE_DEFAULT_FOREIGN_KEYS`); set parses the
+  value via `sqlite3GetBoolean` (`on`/`yes`/`true`/non-zero number → ON; `off`/`no`/
+  `false`/0 → OFF) and updates a per-connection `foreign_keys: Arc<Mutex<bool>>` flag
+  on `Sqlite3`. The toggle is silently dropped inside a transaction (upstream masks
+  `SQLITE_ForeignKeys` out of the FLAG-pragma mask when `db->autoCommit == 0`); we
+  mirror by checking `db.autocommit()`. The parser was extended to accept `TRUE`/`FALSE`
+  as `pragma_kw_value` (mapped to `Ident("true")`/`Ident("false")` so `sqlite3GetBoolean`'s
+  string match still applies). `PRAGMA foreign_key_list(tbl)` parses the table's stored
+  CREATE TABLE text, walks column-level `REFERENCES` and table-level `FOREIGN KEY`
+  constraints, and emits one row per (constraint, column) with 8 columns: `id`, `seq`,
+  `table`, `from`, `to`, `on_update`, `on_delete`, `match` (always "NONE" — upstream
+  accepts but ignores `MATCH`). The constraint order is REVERSE of declaration (upstream's
+  `sqlite3AddForeignKey` prepends each FK to `pTab->u.tab.pFKey`'s singly-linked list;
+  `PragTyp_FOREIGN_KEY_LIST` walks via `pNextFrom`); we collect in declaration order then
+  reverse and assign `id` = 0-based position in the walked list. `to` is NULL when the
+  constraint doesn't name a parent column (the parent's PK is referenced). Enforcement
+  itself (M17.6+) is deferred — this slice is the read/write flag and the introspection
+  pragma. Differential-tested vs the C oracle (`foreign_keys.rs`: default-off + toggle,
+  silent-no-op inside a transaction, `foreign_key_list` for column-level + table-level +
+  mixed + multi-column + no-FK + missing-table).
