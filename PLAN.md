@@ -374,7 +374,7 @@ list every granular item needed.
 - [x] **19.5** `RETURNING` clause on UPDATE
 - [x] **19.6** Conflict resolution enforcement for UPDATE (`OR ROLLBACK/ABORT/FAIL/IGNORE/REPLACE`)
 - [x] **19.7** `UPDATE` of `INTEGER PRIMARY KEY` (rowid-alias column) — must delete+reinsert to move the row
-- [ ] **19.8** `CHECK` constraint enforcement on INSERT/UPDATE
+- [x] **19.8** `CHECK` constraint enforcement on INSERT/UPDATE
 - [ ] **19.9** `NOT NULL` constraint enforcement on INSERT/UPDATE
 - [x] **19.10** `UNIQUE` constraint enforcement on INSERT/UPDATE (via unique indexes, already done — `emit_conflict_prechecks` + `IdxInsert P5_UNIQUE`)
 
@@ -866,7 +866,7 @@ list every granular item needed.
 
 ### M19 — DELETE/UPDATE Enhancements (Additional Items)
 
-- [ ] **19.8** `CHECK` constraint evaluation on INSERT/UPDATE
+- [x] **19.8** `CHECK` constraint evaluation on INSERT/UPDATE
 - [ ] **19.9** `NOT NULL` constraint enforcement on INSERT/UPDATE
 - [x] **19.10** `UNIQUE` constraint enforcement on INSERT/UPDATE (via unique indexes, already done — `emit_conflict_prechecks` + `IdxInsert P5_UNIQUE`)
 

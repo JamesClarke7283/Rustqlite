@@ -856,6 +856,21 @@ fn build_column_constraint(pair: Pair<'_, Rule>) -> ColumnConstraint {
                 stored,
             }
         }
+        Rule::c_check => {
+            let mut on_conflict = None;
+            let mut expr: Option<Expr> = None;
+            for part in inner.into_inner() {
+                match part.as_rule() {
+                    Rule::expr => expr = Some(expr::build_expr(part)),
+                    Rule::onconf => on_conflict = Some(build_onconf(part)),
+                    _ => {}
+                }
+            }
+            ColumnConstraint::Check {
+                expr: expr.expect("c_check has an expr"),
+                on_conflict,
+            }
+        }
         other => unreachable!("unexpected constraint {other:?}"),
     }
 }
@@ -2815,6 +2830,28 @@ mod tests {
         ));
         // Bad syntax: invalid conflict action.
         assert!(parse("CREATE TABLE t(a INTEGER PRIMARY KEY ON CONFLICT BOGUS);").is_err());
+    }
+
+    #[test]
+    fn column_constraint_check() {
+        use crate::{ConflictAction, ColumnConstraint};
+        // Column-level CHECK (expr) [ON CONFLICT <action>] (M19.8).
+        let Stmt::CreateTable(ct) = &parse(
+            "CREATE TABLE t(a INTEGER CHECK(a > 0), b TEXT CHECK(b IS NOT NULL) ON CONFLICT IGNORE);",
+        )
+        .unwrap()[0]
+        else {
+            panic!("expected CREATE TABLE")
+        };
+        assert_eq!(ct.columns.len(), 2);
+        assert!(matches!(
+            &ct.columns[0].constraints[0],
+            ColumnConstraint::Check { on_conflict: None, .. }
+        ));
+        assert!(matches!(
+            &ct.columns[1].constraints[0],
+            ColumnConstraint::Check { on_conflict: Some(ConflictAction::Ignore), .. }
+        ));
     }
 
     #[test]

@@ -83,7 +83,7 @@ pub fn compile_from_subquery(
             .collect(),
         rowid_alias: None,
         without_rowid: false,
-        pk_columns: Vec::new(), autoincrement: false,
+        pk_columns: Vec::new(), autoincrement: false, check_constraints: Vec::new(),
     };
 
     // 3. Expand the outer SELECT's projection against the synthesized table.

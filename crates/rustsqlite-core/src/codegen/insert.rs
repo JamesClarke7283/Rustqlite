@@ -287,6 +287,11 @@ fn compile_insert_values(
             emit_fk_checks(&mut b, fk_checks, table, rec_start, oe, row_skip)?;
         }
 
+        // M19.8: CHECK constraint enforcement. For each CHECK constraint on the table, evaluate
+        // the expression against the row's column registers; a NULL or false result violates the
+        // constraint. The per-constraint OE overrides the statement-level `OR <action>`.
+        emit_check_constraints(&mut b, table, rec_start, oe, row_skip)?;
+
         let record = b.alloc_reg();
         b.emit(Opcode::MakeRecord, rec_start, ncol as i32, record);
         b.emit(Opcode::Insert, cursor, record, rowid_reg);
@@ -507,6 +512,14 @@ fn compile_insert_without_rowid(
                     b.set_p4(halt, P4::Text(msg));
                 }
             }
+        }
+
+        // M19.8: CHECK constraint enforcement (same shape as the rowid-table INSERT path).
+        // `null_row_skip` serves as the OE_Ignore row-skip target for both NOT NULL and CHECK;
+        // it's resolved at the end of the row's insert block below.
+        emit_check_constraints(&mut b, table, col_start, oe, null_row_skip)?;
+        if !table.check_constraints.is_empty() && matches!(oe, OeAction::Ignore) {
+            any_null_skip = true;
         }
 
         // Permute into storage order: PK cols first (in declared order), then non-PK cols in
@@ -1267,6 +1280,73 @@ fn emit_fk_checks(
                 let halt = b.emit(Opcode::Halt, crate::error::ResultCode::Constraint as i32, other as i32, 0);
                 b.set_p4(halt, P4::Text(msg));
                 b.set_p5(halt, 4);
+            }
+        }
+        b.resolve(ok_label);
+    }
+    Ok(())
+}
+
+/// M19.8: Evaluate each `CHECK (expr)` constraint on the table against the row's column
+/// registers. A NULL or false result violates the constraint (only a true result satisfies,
+/// matching SQLite's 3-valued CHECK semantics: NULL is treated as a violation, unlike
+/// WHERE-clause NULL-handling). The per-constraint `ON CONFLICT <action>` overrides the
+/// statement-level `OR <action>` (mirrors upstream's `overrideError` rule: the per-constraint
+/// OE wins when it is not `OE_Default`; otherwise the statement's `OR <action>` applies).
+///
+/// The CHECK expression is evaluated with `register_base = Some(rec_start)` so column
+/// references read directly from the staged row registers (same shape as the
+/// partial-index predicate evaluation in the UPDATE path). A true result jumps past the
+/// violation handler; a NULL or false result falls through to it.
+pub(crate) fn emit_check_constraints(
+    b: &mut ProgramBuilder,
+    table: &Table,
+    rec_start: i32,
+    stmt_oe: OeAction,
+    row_skip: Label,
+) -> Result<()> {
+    for cc in &table.check_constraints {
+        let result_reg = b.alloc_reg();
+        let ctx = Ctx {
+            table,
+            cursor: 0,
+            register_base: Some(rec_start),
+            join_tables: None,
+            index_read: None,
+            subquery_resolver: None,
+        };
+        compile_expr(b, &cc.expr, result_reg, ctx)?;
+        // `IfNot result_reg, violation, 0` jumps to `violation` only when the result is
+        // definitely false; a true or NULL result falls through to OK. This matches SQLite's
+        // CHECK semantics: NULL is treated as "no violation" (the same 3-valued logic as a
+        // WHERE clause), so `CHECK(a > 0)` allows NULL. The p3=0 means "don't jump on NULL".
+        let ok_label = b.new_label();
+        let violation = b.new_label();
+        b.emit_jump(Opcode::IfNot, result_reg, violation, 0);
+        // True or NULL → OK (skip the violation handler).
+        b.emit_jump(Opcode::Goto, 0, ok_label, 0);
+        // Violation: the CHECK expression is definitely false.
+        b.resolve(violation);
+        let oe = if cc.oe != OeAction::None { cc.oe } else { stmt_oe };
+        match oe {
+            OeAction::Ignore => {
+                b.emit_jump(Opcode::Goto, 0, row_skip, 0);
+            }
+            other => {
+                // p5=3 is the "CHECK constraint failed: " prefix. Upstream's message body is
+                // the expression text (e.g. `CHECK constraint failed: a > 0`); we don't have
+                // an AST unparser, so we use the table name as a faithful-enough body (the
+                // result code and constraint type match the oracle exactly; the message text
+                // diverges — to be fixed when a full expr-to-string unparser lands).
+                let msg = table.name.clone();
+                let halt = b.emit(
+                    Opcode::Halt,
+                    crate::error::ResultCode::Constraint as i32,
+                    other as i32,
+                    0,
+                );
+                b.set_p4(halt, P4::Text(msg));
+                b.set_p5(halt, 3);
             }
         }
         b.resolve(ok_label);

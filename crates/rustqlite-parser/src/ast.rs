@@ -689,6 +689,12 @@ pub enum ColumnConstraint {
         /// `true` for STORED, `false` for VIRTUAL (the default when neither keyword is present).
         stored: bool,
     },
+    /// Column-level `CHECK (expr)` [ON CONFLICT <action>]. M19.8 parses this; enforcement is
+    /// M19.8. The `ON CONFLICT` clause is captured (it was parsed and discarded before).
+    Check {
+        expr: Expr,
+        on_conflict: Option<ConflictAction>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

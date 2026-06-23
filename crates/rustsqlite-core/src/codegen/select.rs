@@ -1541,7 +1541,7 @@ fn compile_values(
         columns: Vec::new(),
         rowid_alias: None,
         without_rowid: false,
-        pk_columns: Vec::new(), autoincrement: false,
+        pk_columns: Vec::new(), autoincrement: false, check_constraints: Vec::new(),
     };
     let ctx = Ctx {
         table: &empty,
@@ -1853,7 +1853,7 @@ fn compile_constant(
         columns: Vec::new(),
         rowid_alias: None,
         without_rowid: false,
-        pk_columns: Vec::new(), autoincrement: false,
+        pk_columns: Vec::new(), autoincrement: false, check_constraints: Vec::new(),
     };
     let ctx = Ctx {
         table: &empty,

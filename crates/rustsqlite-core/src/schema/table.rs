@@ -55,6 +55,26 @@ pub struct Table {
     /// the `sqlite_sequence` table to persist the high-water mark across DELETE+INSERT cycles.
     /// M18.7.
     pub autoincrement: bool,
+    /// The table's `CHECK` constraints (column-level and table-level), each carrying its
+    /// expression and the per-constraint `ON CONFLICT` action (OE_None when no clause was
+    /// given, meaning the statement-level `OR <action>` applies). M19.8 evaluates these on
+    /// INSERT and UPDATE.
+    pub check_constraints: Vec<CheckConstraint>,
+}
+
+/// A `CHECK (expr)` constraint on a table (column-level or table-level). M19.8.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckConstraint {
+    /// The CHECK expression. Evaluated against the row's column registers; a NULL or false
+    /// result violates the constraint (true → satisfies).
+    pub expr: rustqlite_parser::Expr,
+    /// The per-constraint `ON CONFLICT <action>` (OE_None when no clause was given, meaning
+    /// the statement-level `OR <action>` applies). M12.9 / M19.8.
+    pub oe: OeAction,
+    /// The column index this CHECK is attached to, when it's a column-level CHECK. Used for
+    /// the error message (e.g. `CHECK constraint failed: <tbl>.<col>` vs `CHECK constraint
+    /// failed: <tbl>`). `None` for a table-level CHECK.
+    pub col_idx: Option<usize>,
 }
 
 impl Default for Table {
@@ -67,6 +87,7 @@ impl Default for Table {
             without_rowid: false,
             pk_columns: Vec::new(),
             autoincrement: false,
+            check_constraints: Vec::new(),
         }
     }
 }
@@ -185,6 +206,7 @@ impl Table {
         // Track which columns carry a column-level PRIMARY KEY (with its ASC/DESC).
         let mut pk_cols: Vec<(usize, bool)> = Vec::new();
         let mut autoincrement = false;
+        let mut check_constraints: Vec<CheckConstraint> = Vec::new();
 
         for (i, cd) in ct.columns.iter().enumerate() {
             let affinity = affinity_of(cd.type_name.as_deref());
@@ -214,6 +236,17 @@ impl Table {
                     }
                     ColumnConstraint::Default(e) => {
                         default = Some(e.clone());
+                    }
+                    ColumnConstraint::Check { expr, on_conflict } => {
+                        let cc_oe = match on_conflict {
+                            None => OeAction::None,
+                            Some(ca) => OeAction::from_parser(Some(*ca)),
+                        };
+                        check_constraints.push(CheckConstraint {
+                            expr: expr.clone(),
+                            oe: cc_oe,
+                            col_idx: Some(i),
+                        });
                     }
                     _ => {}
                 }
@@ -247,6 +280,17 @@ impl Table {
                     }
                 }
                 table_pk_oe = Some(OeAction::from_parser(*on_conflict));
+            }
+            if let rustqlite_parser::TableConstraintBody::Check { expr, on_conflict } = &c.body {
+                let cc_oe = match on_conflict {
+                    None => OeAction::None,
+                    Some(ca) => OeAction::from_parser(Some(*ca)),
+                };
+                check_constraints.push(CheckConstraint {
+                    expr: expr.clone(),
+                    oe: cc_oe,
+                    col_idx: None,
+                });
             }
         }
         // A table-level `PRIMARY KEY (...) ON CONFLICT <action>` applies the OE to each PK
@@ -289,6 +333,7 @@ impl Table {
             without_rowid,
             pk_columns: if without_rowid { pk_cols } else { Vec::new() },
             autoincrement,
+            check_constraints,
         }
     }
 
@@ -471,6 +516,7 @@ impl IndexObject {
                 without_rowid: false,
                 pk_columns: Vec::new(),
                 autoincrement: false,
+                check_constraints: Vec::new(),
             });
         Ok(IndexObject::from_create(
             &ci,

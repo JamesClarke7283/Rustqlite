@@ -394,7 +394,7 @@ column_def = { ident ~ type_name? ~ column_constraint* }
 // "UNSIGNED BIG INT"), optionally with a size like VARCHAR(255). Using `ident` makes the
 // repetition stop naturally at a reserved constraint keyword (PRIMARY/NOT/UNIQUE/DEFAULT).
 type_name = { ident+ ~ ("(" ~ signed_number ~ ("," ~ signed_number)? ~ ")")? }
-column_constraint = { c_primary_key | c_not_null | c_unique | c_default | c_references | c_generated }
+column_constraint = { c_primary_key | c_not_null | c_unique | c_default | c_references | c_generated | c_check }
 c_primary_key = { K_PRIMARY ~ K_KEY ~ (K_ASC | K_DESC)? ~ K_AUTOINCREMENT? ~ onconf? }
 c_not_null = { K_NOT ~ K_NULL ~ onconf? }
 c_unique = { K_UNIQUE ~ onconf? }
@@ -405,6 +405,9 @@ c_references = { K_REFERENCES ~ ident ~ column_list? ~ refargs? ~ defer_subclaus
 // `GENERATED ALWAYS AS (expr) [STORED|VIRTUAL]` / `AS (expr) [STORED|VIRTUAL]`. M2.50.
 // The bare `AS (expr)` form (without `GENERATED ALWAYS`) is also accepted by upstream.
 c_generated = { (K_GENERATED ~ K_ALWAYS)? ~ K_AS ~ "(" ~ expr ~ ")" ~ (K_STORED | K_VIRTUAL)? }
+// Column-level `CHECK (expr)` [ON CONFLICT <action>] (M19.8). The `ON CONFLICT` clause is
+// parsed and carried on the constraint; enforcement is M19.8.
+c_check = { K_CHECK ~ "(" ~ expr ~ ")" ~ onconf? }
 signed_number = @{ ("+" | "-")? ~ (hex_int | float_or_int) }
 
 // ---- Table-level constraints (M2.44) ----

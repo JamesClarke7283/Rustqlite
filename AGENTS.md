@@ -971,3 +971,25 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   databases). Still M19+: 19.8 `CHECK` constraint evaluation, 19.9 `NOT NULL`
   enforcement. The `UPDATE ... FROM` path still rejects rowid-alias SET (staging the new
   rowid through the sorter's set-value columns is a follow-up).
+- **M19.8 `CHECK` constraint enforcement** ✅: column-level `CHECK (expr)` and table-level
+  `CHECK (expr)` constraints are now evaluated on INSERT and UPDATE. The parser gained a
+  `c_check` rule (column-level `CHECK (expr) [ON CONFLICT <action>]`) and a
+  `ColumnConstraint::Check { expr, on_conflict }` variant (table-level was already parsed
+  in M2.44). The `Table` struct carries `check_constraints: Vec<CheckConstraint>` (expr +
+  per-constraint OE + the column index for a column-level CHECK). The codegen's new
+  `emit_check_constraints` (mirrors `sqlite3GenerateConstraintChecks`'s CHECK block)
+  evaluates each CHECK expression against the row's column registers (`register_base =
+  Some(rec_start)`); a definite-false result violates the constraint (NULL and true pass,
+  matching SQLite's 3-valued CHECK semantics — `CHECK(a > 0)` allows NULL, unlike a NOT
+  NULL constraint). The per-constraint `ON CONFLICT <action>` overrides the statement-level
+  `OR <action>` (the per-constraint OE wins when it is not `OE_None`; the schema stores
+  `OeAction::None` when no `ON CONFLICT` clause was given, so the statement OE applies).
+  `OE_Ignore` skips the row (jumps to the row-skip label); ABORT/FAIL/ROLLBACK halt with a
+  `CHECK constraint failed: <tbl>` message (p5=3 prefix) before any writes for the row.
+  Wired into the rowid-table INSERT path, the WITHOUT ROWID INSERT path, the plain UPDATE
+  path, and the `UPDATE ... FROM` path. Differential-tested vs the C oracle
+  (`check_constraint_enforcement_matches_oracle`: column-level + table-level CHECK,
+  false/NULL/true, `OR IGNORE`, UPDATE violation, compound `AND` condition). Known
+  divergence: the message body is the table name, not the expression text (the oracle shows
+  `CHECK constraint failed: a > 0`; we show `CHECK constraint failed: t`) — to be fixed when
+  an AST-to-string unparser lands.

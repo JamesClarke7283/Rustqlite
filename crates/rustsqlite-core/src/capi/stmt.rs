@@ -822,7 +822,7 @@ fn resolve_sqlite_schema(pager: &Arc<Pager>) -> Result<Table> {
         ],
         rowid_alias: None,
         without_rowid: false,
-        pk_columns: Vec::new(), autoincrement: false,
+        pk_columns: Vec::new(), autoincrement: false, check_constraints: Vec::new(),
     })
 }
 

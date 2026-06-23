@@ -406,6 +406,12 @@ pub fn compile_update(
         b.set_p4(idx, P4::Symbol(aff_string));
     }
 
+    // (7b) M19.8: CHECK constraint enforcement. Evaluate each CHECK expression against the
+    // new row's column registers; a definite-false result violates the constraint (NULL and
+    // true pass, matching SQLite's CHECK semantics). The per-constraint OE overrides the
+    // statement-level `OR <action>`.
+    super::insert::emit_check_constraints(&mut b, table, reg_new, oe, sort_next)?;
+
     // (9) Make the record, delete the old row, re-insert at the same rowid. The Delete
     // and the Insert both carry `P5_ISUPDATE` so the change counters fire once.
     let reg_new_rec = b.alloc_reg();
@@ -1170,6 +1176,9 @@ fn compile_update_from(
         let idx = b.emit(Opcode::Affinity, reg_new, ncol as i32, 0);
         b.set_p4(idx, P4::Symbol(aff_string));
     }
+
+    // M19.8: CHECK constraint enforcement (same shape as the plain UPDATE path).
+    super::insert::emit_check_constraints(&mut b, table, reg_new, oe, sort_next)?;
 
     let reg_new_rec = b.alloc_reg();
     b.emit(Opcode::MakeRecord, reg_new, ncol as i32, reg_new_rec);
