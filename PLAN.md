@@ -467,7 +467,7 @@ list every granular item needed.
 ## M24 — JSON Functions
 
 - [x] **24.1** JSON parser (RFC 8259): parse JSON text into internal tree representation
-- [ ] **24.2** `json(X)` / `jsonb(X)` — validate and format JSON
+- [x] **24.2** `json(X)` / `jsonb(X)` — validate and format JSON
 - [ ] **24.3** `json_array(...)` — create JSON array from arguments
 - [ ] **24.4** `json_object(...)` — create JSON object from key-value pairs
 - [ ] **24.5** `json_extract(X, ...)` / `jsonb_extract(X, ...)` — extract value at path

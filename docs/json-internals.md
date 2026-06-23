@@ -89,3 +89,26 @@ surface (cache-friendly, in-place edits) that is not needed for correctness and 
 later. The parser runs on a 64 MiB-stack worker thread when the input's nesting depth exceeds
 200, so the `JSON_MAX_DEPTH=1000` recursion limit cannot overflow the default 2 MiB thread
 stack in debug builds (where Rust frames are large).
+
+## Known divergences from the C oracle (M24.1/M24.2 tree-parser approach)
+
+These all stem from upstream's JSONB form storing the **original text** of strings and
+numbers verbatim and re-rendering it on output, while our tree parser **decodes** during
+parsing and re-renders from the decoded value. They are not bugs — they are the cost of the
+tree approach, and will resolve when the JSONB form lands.
+
+1. **`\u` escapes preserved verbatim.** `json('"\u0041"')` returns `"\u0041"` upstream but
+   `"A"` with our parser. The JSONB blob stores the raw string bytes; we decode `\u0041` to
+   `A` during parsing and re-render `A`.
+2. **Number text preserved verbatim.** `json('1e10')` returns `1e10` upstream but
+   `10000000000.0` with our parser; `json('9223372036854775808')` returns the integer text
+   upstream but `9.2233720368547758e+18` with our parser (i64 overflow promotes to f64 and
+   re-renders via `fp_to_text`). Numbers that already match `fp_to_text`'s output (e.g.
+   `1.5`, `-1.5`) round-trip identically.
+3. **JSON5 extensions rejected.** Upstream accepts JSON5 by default (single-quoted strings,
+   unquoted keys, trailing commas, `Infinity`/`NaN`, hex literals, `+`-prefixed numbers,
+   leading-dot reals, comments). Our parser is strict RFC 8259 and rejects them. The
+   `hasNonstd` flag in upstream tracks JSON5 use; we don't accept it at all.
+
+The differential test `json_function` in `tests/diff.rs` skips the divergent cases with a
+comment pointing here.

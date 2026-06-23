@@ -11,6 +11,7 @@ use super::math;
 use super::scalar;
 use super::string;
 use super::string::TrimSide;
+use super::json;
 
 /// Call a scalar function by name (case-insensitive) over already-evaluated arguments.
 pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
@@ -92,6 +93,10 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         ("radians", 1) => Ok(math::radians(&args[0])),
         ("degrees", 1) => Ok(math::degrees(&args[0])),
 
+        // ---- JSON functions (M24) ----
+        ("json", 1) => json::json_fn(&args[0]),
+        ("jsonb", 1) => json::jsonb_fn(&args[0]),
+
         // Should not happen: codegen validates with `check` before emitting a Function opcode.
         _ => Err(no_such_function(name, args.len())),
     }
@@ -146,6 +151,9 @@ pub fn check(name: &str, n_arg: usize) -> Result<()> {
         "log" => Some(n_arg == 1 || n_arg == 2),
         "pow" | "power" | "mod" | "atan2" => Some(n_arg == 2),
         "pi" => Some(n_arg == 0),
+
+        // JSON functions (M24)
+        "json" | "jsonb" => Some(n_arg == 1),
 
         // volatile / connection-state functions (M3b): handled in the VDBE executor's Function
         // arm (they need runtime state), so `check` only learns their arities as the codegen
