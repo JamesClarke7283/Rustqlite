@@ -3327,6 +3327,7 @@ fn notnull_constraint_enforcement_matches_oracle() {
 #[test]
 fn pragma_table_info_matches_oracle() {
     // M20.2: PRAGMA table_info(tbl) returns (cid, name, type, notnull, dflt_value, pk).
+    // M20.3: PRAGMA table_xinfo(tbl) adds a `hidden` column.
     // Differential-tested vs the C oracle.
     skip_if_no_sqlite3!();
     let cases: &[&str] = &[
@@ -3338,20 +3339,22 @@ fn pragma_table_info_matches_oracle() {
         "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
     ];
     for create in cases {
-        let db = TempDb::new("pragma_ti_ours");
-        {
-            let mut conn = sqlite3_open(db.str()).expect("open");
-            exec(&mut conn, create);
-            let (mut s, _) = sqlite3_prepare_v2(&mut conn, "PRAGMA table_info(t);").unwrap();
-            let rows = collect(&mut s);
-            // Compare with the C oracle.
-            let ora = TempDb::new("pragma_ti_ora");
+        for pragma_sql in &["PRAGMA table_info(t);", "PRAGMA table_xinfo(t);"] {
+            let db = TempDb::new("pragma_ti_ours");
             {
-                let mut oconn = sqlite3_open(ora.str()).expect("open");
-                exec(&mut oconn, create);
-                let (mut os, _) = sqlite3_prepare_v2(&mut oconn, "PRAGMA table_info(t);").unwrap();
-                let oracle_rows = collect(&mut os);
-                assert_eq!(rows, oracle_rows, "PRAGMA table_info mismatch for `{create}`");
+                let mut conn = sqlite3_open(db.str()).expect("open");
+                exec(&mut conn, create);
+                let (mut s, _) = sqlite3_prepare_v2(&mut conn, pragma_sql).unwrap();
+                let rows = collect(&mut s);
+                // Compare with the C oracle.
+                let ora = TempDb::new("pragma_ti_ora");
+                {
+                    let mut oconn = sqlite3_open(ora.str()).expect("open");
+                    exec(&mut oconn, create);
+                    let (mut os, _) = sqlite3_prepare_v2(&mut oconn, pragma_sql).unwrap();
+                    let oracle_rows = collect(&mut os);
+                    assert_eq!(rows, oracle_rows, "PRAGMA mismatch for `{create}` `{pragma_sql}`");
+                }
             }
         }
     }

@@ -384,7 +384,7 @@ list every granular item needed.
 
 - [x] **20.1** PRAGMA framework: parse `PRAGMA [schema.]name [= value] | (value)`, dispatch to handler
 - [x] **20.2** `PRAGMA table_info(tbl)` — column info (cid, name, type, notnull, dflt_value, pk)
-- [ ] **20.3** `PRAGMA table_xinfo(tbl)` — like `table_info` plus hidden column flag
+- [x] **20.3** `PRAGMA table_xinfo(tbl)` — like `table_info` plus hidden column flag
 - [ ] **20.4** `PRAGMA table_list` — list all tables
 - [ ] **20.5** `PRAGMA index_list(tbl)` — list indexes on a table
 - [ ] **20.6** `PRAGMA index_info(idx)` — columns in an index

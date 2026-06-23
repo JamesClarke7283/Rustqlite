@@ -1708,7 +1708,8 @@ fn compile_pragma(db: &mut Sqlite3, sql: &str, pragma: &PragmaStmt) -> Result<Sq
         "foreign_keys" => compile_pragma_foreign_keys(db, sql, pragma),
         "foreign_key_list" => compile_pragma_foreign_key_list(db, sql, pragma),
         "foreign_key_check" => compile_pragma_foreign_key_check(db, sql, pragma),
-        "table_info" => compile_pragma_table_info(db, sql, pragma),
+        "table_info" => compile_pragma_table_info(db, sql, pragma, false),
+        "table_xinfo" => compile_pragma_table_info(db, sql, pragma, true),
         _ => Err(Error::msg(format!("PRAGMA {name} is not supported yet"))),
     }
 }
@@ -2231,10 +2232,15 @@ fn empty_static_stmt(sql: &str, column_names: &[&str]) -> Sqlite3Stmt {
 /// dflt_value, pk). The `pk` column is 0 for non-PK columns, 1 for a single-column PK,
 /// and the 1-based position within the PK for a composite PK (mirrors upstream's
 /// `PragTyp_TABLE_INFO`).
+///
+/// `PRAGMA table_xinfo(tbl)` — same as `table_info` plus a `hidden` column (0 for normal
+/// columns; non-zero for generated/virtual columns — M34 will populate this). The
+/// `with_hidden` flag selects the 7-column shape.
 fn compile_pragma_table_info(
     db: &mut Sqlite3,
     sql: &str,
     pragma: &PragmaStmt,
+    with_hidden: bool,
 ) -> Result<Sqlite3Stmt> {
     let table_name = match &pragma.value {
         Some(PragmaValue::Paren(PragmaValueKind::Ident(s))) => s.clone(),
@@ -2245,10 +2251,12 @@ fn compile_pragma_table_info(
     let catalog = block_on(read_catalog(&pager))?;
     let Some(obj) = catalog.find_table(&table_name) else {
         // Upstream silently returns no rows for a missing table.
-        return Ok(empty_static_stmt(
-            sql,
-            &["cid", "name", "type", "notnull", "dflt_value", "pk"],
-        ));
+        let cols: &[&str] = if with_hidden {
+            &["cid", "name", "type", "notnull", "dflt_value", "pk", "hidden"]
+        } else {
+            &["cid", "name", "type", "notnull", "dflt_value", "pk"]
+        };
+        return Ok(empty_static_stmt(sql, cols));
     };
     let table = Table::from_schema_object(obj)?;
     // Determine the PK position for each column (1-based for PK columns in a composite PK,
@@ -2258,26 +2266,36 @@ fn compile_pragma_table_info(
     for (ci, col) in table.columns.iter().enumerate() {
         let type_str = col.type_name_str();
         let dflt = format_default_expr(col.default.as_ref());
-        rows.push(vec![
+        let mut row = vec![
             Value::Int(ci as i64),
             Value::Text(col.name.clone()),
             Value::Text(type_str),
             Value::Int(i64::from(col.notnull)),
             dflt,
             Value::Int(pk_positions[ci] as i64),
-        ]);
+        ];
+        if with_hidden {
+            // The `hidden` column is 0 for normal columns; non-zero for generated/virtual
+            // columns (M34 will populate this). Today all columns are normal.
+            row.push(Value::Int(0));
+        }
+        rows.push(row);
+    }
+    let mut column_names = vec![
+        "cid".to_string(),
+        "name".to_string(),
+        "type".to_string(),
+        "notnull".to_string(),
+        "dflt_value".to_string(),
+        "pk".to_string(),
+    ];
+    if with_hidden {
+        column_names.push("hidden".to_string());
     }
     Ok(Sqlite3Stmt {
         sql: sql.to_string(),
         program: Arc::new(Program::empty()),
-        column_names: vec![
-            "cid".to_string(),
-            "name".to_string(),
-            "type".to_string(),
-            "notnull".to_string(),
-            "dflt_value".to_string(),
-            "pk".to_string(),
-        ],
+        column_names,
         backing: Backing::Static {
             rows,
             cur: None,
