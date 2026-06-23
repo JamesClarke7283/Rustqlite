@@ -395,26 +395,26 @@ list every granular item needed.
 - [x] **20.11** `PRAGMA page_size` — read; write only before first write
 - [x] **20.12** `PRAGMA page_count` — read total pages
 - [x] **20.13** `PRAGMA freelist_count` — read freelist page count
-- [ ] **20.14** `PRAGMA integrity_check` — b-tree walk + overflow chain + freelist verification
-- [ ] **20.15** `PRAGMA quick_check` — faster integrity check (skip overflow, freelist)
-- [ ] **20.16** `PRAGMA journal_mode` — read/set (delete, wal, memory, off, truncate, persist)
-- [ ] **20.17** `PRAGMA synchronous` — read/set (OFF, NORMAL, FULL, EXTRA)
-- [ ] **20.18** `PRAGMA cache_size` — read/set page cache size
-- [ ] **20.19** `PRAGMA foreign_keys` — read/set FK enforcement
-- [ ] **20.20** `PRAGMA encoding` — read/set text encoding (UTF-8 only for now)
+- [x] **20.14** `PRAGMA integrity_check` — b-tree walk + overflow chain + freelist verification
+- [x] **20.15** `PRAGMA quick_check` — faster integrity check (skip overflow, freelist)
+- [x] **20.16** `PRAGMA journal_mode` — read/set (delete, wal, memory, off, truncate, persist)
+- [x] **20.17** `PRAGMA synchronous` — read/set (OFF, NORMAL, FULL, EXTRA)
+- [x] **20.18** `PRAGMA cache_size` — read/set page cache size
+- [x] **20.19** `PRAGMA foreign_keys` — read/set FK enforcement
+- [x] **20.20** `PRAGMA encoding` — read/set text encoding (UTF-8 only for now)
 - [ ] **20.21** `PRAGMA compile_options` — list compile-time options
 - [ ] **20.22** `PRAGMA function_list` — list registered functions
-- [ ] **20.23** `PRAGMA collation_list` — list collations
+- [x] **20.23** `PRAGMA collation_list` — list collations
 - [ ] **20.24** `PRAGMA collist` — list columns
 - [ ] **20.25** `PRAGMA optimize` — trigger ANALYZE
-- [ ] **20.26** `PRAGMA wal_checkpoint` — checkpoint WAL
+- [x] **20.26** `PRAGMA wal_checkpoint` — checkpoint WAL
 - [ ] **20.27** `PRAGMA busy_timeout` — read/set busy timeout
 - [ ] **20.28** `PRAGMA case_sensitive_like` — toggle LIKE case sensitivity
 - [ ] **20.29** `PRAGMA recursive_triggers` — read/set trigger recursion
 - [ ] **20.30** `PRAGMA secure_delete` — read/set secure deletion (zero-fill deleted data)
 - [ ] **20.31** `PRAGMA locking_mode` — read/set (NORMAL, EXCLUSIVE)
-- [ ] **20.32** `PRAGMA auto_vacuum` — read/set (NONE, FULL, INCREMENTAL)
-- [ ] **20.33** `PRAGMA incremental_vacuum` — free freelist pages
+- [x] **20.32** `PRAGMA auto_vacuum` — read/set (NONE, FULL, INCREMENTAL)
+- [x] **20.33** `PRAGMA incremental_vacuum` — free freelist pages
 - [ ] **20.34** `PRAGMA defer_foreign_keys` — defer FK checking until COMMIT
 - [ ] **20.35** `PRAGMA writable_schema` — allow direct modification of `sqlite_schema`
 - [ ] **20.36** `PRAGMA stats` — report b-tree statistics (debug)

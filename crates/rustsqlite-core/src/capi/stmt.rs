@@ -1721,6 +1721,10 @@ fn compile_pragma(db: &mut Sqlite3, sql: &str, pragma: &PragmaStmt) -> Result<Sq
         "page_size" => compile_pragma_page_size(db, sql, pragma),
         "page_count" => compile_pragma_page_count(db, sql, pragma),
         "freelist_count" => compile_pragma_freelist_count(db, sql, pragma),
+        "synchronous" => compile_pragma_synchronous(db, sql, pragma),
+        "cache_size" => compile_pragma_cache_size(db, sql, pragma),
+        "encoding" => compile_pragma_encoding(db, sql, pragma),
+        "collation_list" => compile_pragma_collation_list(db, sql, pragma),
         _ => Err(Error::msg(format!("PRAGMA {name} is not supported yet"))),
     }
 }
@@ -2707,6 +2711,100 @@ fn pragma_value_as_int(kind: &PragmaValueKind) -> Result<i64> {
         }),
         _ => Err(Error::msg("PRAGMA value must be an integer")),
     }
+}
+
+/// `PRAGMA synchronous` — read/set (0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA). Per-connection.
+fn compile_pragma_synchronous(
+    db: &mut Sqlite3,
+    sql: &str,
+    pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    match &pragma.value {
+        Some(PragmaValue::Equal(kind)) | Some(PragmaValue::Paren(kind)) => {
+            let v = match kind {
+                PragmaValueKind::Number(Literal::Integer(n)) => *n as u8,
+                PragmaValueKind::Ident(s) => match s.to_ascii_uppercase().as_str() {
+                    "OFF" | "0" => 0,
+                    "NORMAL" | "1" => 1,
+                    "FULL" | "2" => 2,
+                    "EXTRA" | "3" => 3,
+                    _ => return Err(Error::msg(format!("unknown synchronous mode: {s}"))),
+                },
+                PragmaValueKind::On => 2,
+                _ => return Err(Error::msg("PRAGMA synchronous: invalid value")),
+            };
+            db.set_synchronous(v);
+            Ok(empty_static_stmt(sql, &["synchronous"]))
+        }
+        _ => {
+            let v = db.synchronous() as i64;
+            Ok(static_stmt_rows(sql, &["synchronous"], vec![vec![Value::Int(v)]]))
+        }
+    }
+}
+
+/// `PRAGMA cache_size` — read/set the page cache size. Per-connection (negative = kibibytes).
+fn compile_pragma_cache_size(
+    db: &mut Sqlite3,
+    sql: &str,
+    pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    match &pragma.value {
+        Some(PragmaValue::Equal(kind)) | Some(PragmaValue::Paren(kind)) => {
+            let v = pragma_value_as_int(kind)? as i32;
+            db.set_cache_size(v);
+            Ok(empty_static_stmt(sql, &["cache_size"]))
+        }
+        _ => {
+            let v = db.cache_size() as i64;
+            Ok(static_stmt_rows(sql, &["cache_size"], vec![vec![Value::Int(v)]]))
+        }
+    }
+}
+
+/// `PRAGMA encoding` — read/set text encoding. Only UTF-8 is supported (the header field
+/// is written at creation and cannot be changed after content exists).
+fn compile_pragma_encoding(
+    db: &mut Sqlite3,
+    sql: &str,
+    pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    match &pragma.value {
+        Some(PragmaValue::Equal(kind)) | Some(PragmaValue::Paren(kind)) => {
+            let s = match kind {
+                PragmaValueKind::Ident(s) => s.clone(),
+                _ => return Err(Error::msg("PRAGMA encoding: value must be an encoding name")),
+            };
+            if !s.eq_ignore_ascii_case("UTF-8") && !s.eq_ignore_ascii_case("UTF8") {
+                return Err(Error::msg(format!(
+                    "PRAGMA encoding: only UTF-8 is supported (got {s})"
+                )));
+            }
+            // The encoding is fixed at creation; accept the write as a no-op when it
+            // matches UTF-8.
+            Ok(empty_static_stmt(sql, &["encoding"]))
+        }
+        _ => {
+            // Always UTF-8 (the only encoding we support).
+            Ok(static_stmt_rows(sql, &["encoding"], vec![vec![Value::Text("UTF-8".into())]]))
+        }
+    }
+}
+
+/// `PRAGMA collation_list` — list registered collations. Returns (seq, name). The built-in
+/// collations are BINARY (default), NOCASE, RTRIM. The `seq` is 0-based in reverse order
+/// (newest first), matching upstream's `PragTyp_COLLATION_LIST`.
+fn compile_pragma_collation_list(
+    _db: &mut Sqlite3,
+    sql: &str,
+    _pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    let rows = vec![
+        vec![Value::Int(0), Value::Text("BINARY".into())],
+        vec![Value::Int(1), Value::Text("NOCASE".into())],
+        vec![Value::Int(2), Value::Text("RTRIM".into())],
+    ];
+    Ok(static_stmt_rows(sql, &["seq", "name"], rows))
 }
 
 

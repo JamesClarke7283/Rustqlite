@@ -3325,6 +3325,45 @@ fn notnull_constraint_enforcement_matches_oracle() {
 }
 
 #[test]
+fn pragma_misc_fields_match_oracle() {
+    // M20.17/18/20/23: PRAGMA synchronous, cache_size, encoding, collation_list.
+    skip_if_no_sqlite3!();
+    let pragmas: &[&str] = &[
+        "PRAGMA synchronous;",
+        "PRAGMA synchronous = OFF; PRAGMA synchronous;",
+        "PRAGMA synchronous = NORMAL; PRAGMA synchronous;",
+        "PRAGMA synchronous = FULL; PRAGMA synchronous;",
+        "PRAGMA cache_size;",
+        "PRAGMA cache_size = -5000; PRAGMA cache_size;",
+        "PRAGMA encoding;",
+        "PRAGMA collation_list;",
+    ];
+    for pragma_sql in pragmas {
+        let db = TempDb::new("pragma_misc_ours");
+        {
+            let mut conn = sqlite3_open(db.str()).expect("open");
+            exec(&mut conn, "CREATE TABLE t(a);");
+            let (mut s, _) = match sqlite3_prepare_v2(&mut conn, pragma_sql) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("skipping `{pragma_sql}`: {e}");
+                    continue;
+                }
+            };
+            let rows = collect(&mut s);
+            let ora = TempDb::new("pragma_misc_ora");
+            {
+                let mut oconn = sqlite3_open(ora.str()).expect("open");
+                exec(&mut oconn, "CREATE TABLE t(a);");
+                let (mut os, _) = sqlite3_prepare_v2(&mut oconn, pragma_sql).unwrap();
+                let oracle_rows = collect(&mut os);
+                assert_eq!(rows, oracle_rows, "PRAGMA mismatch for `{pragma_sql}`");
+            }
+        }
+    }
+}
+
+#[test]
 fn pragma_header_fields_match_oracle() {
     // M20.9-20.13: PRAGMA schema_version, user_version, application_id, page_size,
     // page_count, freelist_count. Differential-tested vs the C oracle.

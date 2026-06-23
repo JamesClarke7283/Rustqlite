@@ -67,6 +67,15 @@ pub struct Sqlite3 {
     /// `db->autoCommit == 0`). Enforcement itself is M17.6+; this flag is the read/write
     /// surface for `PRAGMA foreign_keys`.
     foreign_keys: Arc<Mutex<bool>>,
+    /// `PRAGMA synchronous` — 0=OFF, 1=NORMAL, 2=FULL (default), 3=EXTRA. Per-connection
+    /// (not persisted in the header). Currently informational — the pager always syncs on
+    /// commit.
+    synchronous: Arc<Mutex<u8>>,
+    /// `PRAGMA cache_size` — the page cache size in pages (negative = kibibytes, matching
+    /// the legacy `PRAGMA default_cache_size`). Per-connection (the header's
+    /// `default_cache_size` is the persistent default). Currently informational — the pager
+    /// does not enforce a page cache limit yet (M32.1).
+    cache_size: Arc<Mutex<i32>>,
     last_error: Option<Error>,
 }
 
@@ -109,6 +118,8 @@ pub fn sqlite3_open_v2(filename: &str, flags: OpenFlags) -> Result<Sqlite3> {
             autocommit: Arc::new(Mutex::new(true)),
             is_transaction_savepoint: Arc::new(Mutex::new(false)),
             foreign_keys: Arc::new(Mutex::new(false)),
+            synchronous: Arc::new(Mutex::new(2)),
+            cache_size: Arc::new(Mutex::new(-2000)),
             last_error: None,
         })
     })
@@ -264,6 +275,27 @@ impl Sqlite3 {
     /// (upstream masks `SQLITE_ForeignKeys` out when `db->autoCommit == 0`).
     pub(crate) fn set_foreign_keys(&self, on: bool) {
         *self.foreign_keys.lock().unwrap() = on;
+    }
+
+    /// `PRAGMA synchronous` read — 0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA. Per-connection.
+    pub fn synchronous(&self) -> u8 {
+        *self.synchronous.lock().unwrap()
+    }
+
+    /// `PRAGMA synchronous = N` write.
+    pub(crate) fn set_synchronous(&self, v: u8) {
+        *self.synchronous.lock().unwrap() = v;
+    }
+
+    /// `PRAGMA cache_size` read — the page cache size in pages (negative = kibibytes).
+    /// Per-connection; the header's `default_cache_size` is the persistent default.
+    pub fn cache_size(&self) -> i32 {
+        *self.cache_size.lock().unwrap()
+    }
+
+    /// `PRAGMA cache_size = N` write.
+    pub(crate) fn set_cache_size(&self, v: i32) {
+        *self.cache_size.lock().unwrap() = v;
     }
 
     // ---- Interim engine read helpers (until the VDBE prepare/step path lands in M3) ----
