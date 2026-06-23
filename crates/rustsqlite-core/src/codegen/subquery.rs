@@ -83,7 +83,7 @@ pub fn compile_from_subquery(
             .collect(),
         rowid_alias: None,
         without_rowid: false,
-        pk_columns: Vec::new(),
+        pk_columns: Vec::new(), autoincrement: false,
     };
 
     // 3. Expand the outer SELECT's projection against the synthesized table.
@@ -925,6 +925,10 @@ fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) 
         }
         AddImm => {
             r(&mut inst.p1);
+        }
+        MemMax => {
+            r(&mut inst.p1);
+            r(&mut inst.p2);
         }
         SeekRowid => {
             c(&mut inst.p1);

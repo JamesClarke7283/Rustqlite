@@ -1330,6 +1330,10 @@ fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) 
         AggValue => r(&mut inst.p3),
         HaltIfNull => r(&mut inst.p3),
         AddImm => r(&mut inst.p1),
+        MemMax => {
+            r(&mut inst.p1);
+            r(&mut inst.p2);
+        }
         SeekRowid => {
             c(&mut inst.p1);
             r(&mut inst.p3);

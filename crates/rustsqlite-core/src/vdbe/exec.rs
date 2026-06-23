@@ -788,6 +788,17 @@ impl Vdbe {
                     self.regs[p1 as usize] = Value::Int(v + p2 as i64);
                     self.pc += 1;
                 }
+                Opcode::MemMax => {
+                    // `MemMax p1 p2`: `r[p1] = max(r[p1], r[p2])`. Used by the AUTOINCREMENT
+                    // counter to track the maximum rowid across all inserted rows. Mirrors
+                    // `OP_MemMax` in `vdbe.c`.
+                    let a = self.regs[p1 as usize].as_i64();
+                    let b = self.regs[p2 as usize].as_i64();
+                    if b > a {
+                        self.regs[p1 as usize] = Value::Int(b);
+                    }
+                    self.pc += 1;
+                }
                 Opcode::SeekRowid => {
                     // `SeekRowid p1 p2 p3`: position cursor p1 at the row whose rowid is r[p3];
                     // jump to p2 if no such row exists. For ephemeral cursors our rowids are

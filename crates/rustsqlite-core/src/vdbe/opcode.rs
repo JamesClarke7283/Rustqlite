@@ -374,6 +374,9 @@ pub enum Opcode {
     /// `AddImm p1 p2`: `r[p1] += p2`. Mirrors `OP_AddImm` in `vdbe.c` — a short-form integer
     /// add used by the window-function sliding-frame counters.
     AddImm,
+    /// `MemMax p1 p2`: `r[p1] = max(r[p1], r[p2])`. Mirrors `OP_MemMax` in `vdbe.c` — used by
+    /// the AUTOINCREMENT counter to track the maximum rowid across all inserted rows.
+    MemMax,
     /// `SeekRowid p1 p2 p3`: position table cursor `p1` at the row whose rowid equals `r[p3]`;
     /// jump to `p2` if no such row exists. Mirrors `OP_SeekRowid` in `vdbe.c`. For ephemeral
     /// cursors, our rowids are sequential 1..=n, so this maps rowid → index.
@@ -514,6 +517,7 @@ impl Opcode {
             Opcode::AggValue => "AggValue",
             Opcode::HaltIfNull => "HaltIfNull",
             Opcode::AddImm => "AddImm",
+            Opcode::MemMax => "MemMax",
             Opcode::SeekRowid => "SeekRowid",
             Opcode::ResetSorter => "ResetSorter",
             Opcode::Last => "Last",

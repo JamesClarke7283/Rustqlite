@@ -359,7 +359,7 @@ list every granular item needed.
 - [x] **18.4** UPSERT: `ON CONFLICT` without column list — uses any unique index
 - [x] **18.5** VDBE: conflict resolution (`OR ROLLBACK`, `OR ABORT`, `OR FAIL`, `OR IGNORE`, `OR REPLACE`) enforcement for INSERT
 - [x] **18.6** `OR REPLACE` — delete conflicting row then insert new row
-- [ ] **18.7** `AUTOINCREMENT` enforcement: `sqlite_sequence` table for max rowid tracking
+- [ ] **18.7** `AUTOINCREMENT` enforcement: `sqlite_sequence` table for max rowid tracking [BLOCKED: scope — requires auto-creating the `sqlite_sequence(name,seq)` system table when a CREATE TABLE with AUTOINCREMENT is compiled, reading/writing it during INSERT (a new `MemMax` opcode to track the max rowid, a begin hook to read the current max, and an end hook to write the new max back), and modifying the `NewRowid` path for AUTOINCREMENT tables to use the persisted high-water mark rather than the current max. The `MemMax` opcode and the `Table::autoincrement` schema flag are already implemented (landed with this batch); the `sqlite_sequence` table creation + INSERT integration is the remaining work. Deferred to a dedicated session to avoid destabilizing the working INSERT path.]
 - [x] **18.8** `RETURNING` clause on INSERT — yield row values after insert
 - [x] **18.9** Multi-row `INSERT … VALUES` optimization (already works; ensure it handles `DEFAULT` keyword in value list)
 

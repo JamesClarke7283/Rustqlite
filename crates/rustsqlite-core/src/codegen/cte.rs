@@ -441,7 +441,7 @@ pub fn compile_recursive(
             .collect(),
         rowid_alias: None,
         without_rowid: false,
-        pk_columns: Vec::new(),
+        pk_columns: Vec::new(), autoincrement: false,
     };
 
     // Resolve the recursive arm's source table. It scans the CTE name — but at codegen time

@@ -51,6 +51,10 @@ pub struct Table {
     /// these columns first (in this order) and then the remaining non-PK columns in table column
     /// order — matching how upstream's `convertToWithoutRowidTable` makes the PK a covering index.
     pub pk_columns: Vec<(usize, bool)>,
+    /// `true` when the rowid-alias column was declared `AUTOINCREMENT` — the engine maintains
+    /// the `sqlite_sequence` table to persist the high-water mark across DELETE+INSERT cycles.
+    /// M18.7.
+    pub autoincrement: bool,
 }
 
 impl Default for Table {
@@ -62,6 +66,7 @@ impl Default for Table {
             rowid_alias: None,
             without_rowid: false,
             pk_columns: Vec::new(),
+            autoincrement: false,
         }
     }
 }
@@ -179,6 +184,7 @@ impl Table {
         let mut columns = Vec::with_capacity(ct.columns.len());
         // Track which columns carry a column-level PRIMARY KEY (with its ASC/DESC).
         let mut pk_cols: Vec<(usize, bool)> = Vec::new();
+        let mut autoincrement = false;
 
         for (i, cd) in ct.columns.iter().enumerate() {
             let affinity = affinity_of(cd.type_name.as_deref());
@@ -192,7 +198,7 @@ impl Table {
                         notnull = true;
                         notnull_oe = OeAction::from_parser(*on_conflict);
                     }
-                    ColumnConstraint::PrimaryKey { desc, on_conflict, .. } => {
+                    ColumnConstraint::PrimaryKey { desc, autoincrement: ai, on_conflict } => {
                         pk = true;
                         pk_cols.push((i, *desc));
                         // A column-level PRIMARY KEY is also NOT NULL (upstream's
@@ -201,6 +207,9 @@ impl Table {
                         // the PK's OE so M12.9 can apply it.
                         if notnull_oe == OeAction::None {
                             notnull_oe = OeAction::from_parser(*on_conflict);
+                        }
+                        if *ai {
+                            autoincrement = true;
                         }
                     }
                     ColumnConstraint::Default(e) => {
@@ -279,6 +288,7 @@ impl Table {
             rowid_alias,
             without_rowid,
             pk_columns: if without_rowid { pk_cols } else { Vec::new() },
+            autoincrement,
         }
     }
 
@@ -460,6 +470,7 @@ impl IndexObject {
                 rowid_alias: None,
                 without_rowid: false,
                 pk_columns: Vec::new(),
+                autoincrement: false,
             });
         Ok(IndexObject::from_create(
             &ci,
