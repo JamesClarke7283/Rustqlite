@@ -2581,3 +2581,88 @@ fn upsert_do_update_without_target_runs_on_first_conflict() {
     assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
     assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|x");
 }
+
+// ===== M19.1 DELETE ... ORDER BY ... LIMIT ... tests =====
+
+#[test]
+fn delete_with_limit_deletes_only_n_rows() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("delete_limit");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1), (2), (3), (4), (5);");
+        // DELETE with LIMIT 3 should delete only the first 3 rows.
+        exec(&mut conn, "DELETE FROM t LIMIT 3;");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        let values: Vec<Value> = rows.into_iter().map(|r| r[0].clone()).collect();
+        assert_eq!(values, vec![Value::Int(4), Value::Int(5)]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a FROM t ORDER BY a;"), "4\n5");
+}
+
+#[test]
+fn delete_with_order_by_and_limit() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("delete_order_limit");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'e'), (2, 'd'), (3, 'c'), (4, 'b'), (5, 'a');");
+        // Delete the 2 rows with the smallest `b` values (ORDER BY b ASC LIMIT 2).
+        exec(&mut conn, "DELETE FROM t ORDER BY b ASC LIMIT 2;");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY b;").unwrap();
+        let rows = collect(&mut stmt);
+        let values: Vec<(Value, Value)> = rows.into_iter().map(|r| (r[0].clone(), r[1].clone())).collect();
+        // 'a' (a=5) and 'b' (a=4) are deleted; remaining: 'c' (a=3), 'd' (a=2), 'e' (a=1).
+        assert_eq!(values, vec![
+            (Value::Int(3), Value::Text("c".into())),
+            (Value::Int(2), Value::Text("d".into())),
+            (Value::Int(1), Value::Text("e".into())),
+        ]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+}
+
+#[test]
+fn delete_with_where_and_limit() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("delete_where_limit");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1), (2), (3), (4), (5);");
+        // DELETE rows WHERE a > 1, limited to 2 rows.
+        exec(&mut conn, "DELETE FROM t WHERE a > 1 LIMIT 2;");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        let values: Vec<Value> = rows.into_iter().map(|r| r[0].clone()).collect();
+        // Rows with a > 1 are (2, 3, 4, 5); LIMIT 2 deletes (2, 3); remaining (1, 4, 5).
+        assert_eq!(values, vec![Value::Int(1), Value::Int(4), Value::Int(5)]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+}
+
+#[test]
+fn delete_order_by_without_limit_errors() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("delete_order_no_limit");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1), (2);");
+        let result = sqlite3_prepare_v2(&mut conn, "DELETE FROM t ORDER BY a;");
+        assert!(result.is_err(), "expected error for ORDER BY without LIMIT");
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("ORDER BY without LIMIT"), "got: {err}");
+    }
+}

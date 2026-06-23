@@ -367,7 +367,7 @@ list every granular item needed.
 
 ## M19 — DELETE / UPDATE Enhancements
 
-- [ ] **19.1** `DELETE … ORDER BY … LIMIT …`
+- [x] **19.1** `DELETE … ORDER BY … LIMIT …`
 - [ ] **19.2** `UPDATE … ORDER BY … LIMIT …`
 - [ ] **19.3** `UPDATE … FROM from_clause …` (SQLite 3.33+)
 - [ ] **19.4** `RETURNING` clause on DELETE
