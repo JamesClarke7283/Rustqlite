@@ -2531,3 +2531,79 @@ fn json_array_and_object() {
         }
     }
 }
+
+/// `json_extract(X, P, ...)` (M24.5), differential-tested against the system `sqlite3` oracle.
+/// Covers: object lookup, array index, nested paths, `$` root, `$[#]` last element, `$[#-N]`
+/// from-end, missing path → NULL, multiple paths → JSON array, scalar vs container return
+/// types, and the quoted-key form `$."key with spaces"`.
+#[test]
+fn json_extract() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    for q in [
+        // Object lookup.
+        "SELECT json_extract('{\"a\":1,\"b\":\"two\",\"c\":3.5,\"d\":null}','$.a');",
+        "SELECT json_extract('{\"a\":1,\"b\":\"two\",\"c\":3.5,\"d\":null}','$.b');",
+        "SELECT json_extract('{\"a\":1,\"b\":\"two\",\"c\":3.5,\"d\":null}','$.c');",
+        "SELECT json_extract('{\"a\":1,\"b\":\"two\",\"c\":3.5,\"d\":null}','$.d');",
+        // Missing key → NULL.
+        "SELECT json_extract('{\"a\":1}','$.b');",
+        // Array index.
+        "SELECT json_extract('[1,2,3]','$[0]');",
+        "SELECT json_extract('[1,2,3]','$[1]');",
+        "SELECT json_extract('[1,2,3]','$[2]');",
+        "SELECT json_extract('[1,2,3]','$[5]');", // out of range → NULL
+        // Last element.
+        "SELECT json_extract('[1,2,3]','$[#]');",
+        "SELECT json_extract('[1,2,3]','$[#-1]');",
+        "SELECT json_extract('[1,2,3]','$[#-2]');",
+        // Nested.
+        "SELECT json_extract('{\"x\":[1,{\"y\":[2,3]}]}','$.x[0]');",
+        "SELECT json_extract('{\"x\":[1,{\"y\":[2,3]}]}','$.x[1].y[0]');",
+        "SELECT json_extract('{\"x\":[1,{\"y\":[2,3]}]}','$.x[1].y[1]');",
+        // Root.
+        "SELECT json_extract('{\"a\":1}','$');",
+        "SELECT json_extract('[1,2,3]','$');",
+        "SELECT json_extract('\"hello\"','$');",
+        "SELECT json_extract('42','$');",
+        "SELECT json_extract('null','$');",
+        "SELECT json_extract('true','$');",
+        "SELECT json_extract('1.5','$');",
+        // Container result → JSON text.
+        "SELECT json_extract('{\"a\":[1,2]}','$.a');",
+        "SELECT json_extract('{\"a\":{\"b\":1}}','$.a');",
+        // Multiple paths → JSON array.
+        "SELECT json_extract('{\"a\":1,\"b\":2}','$.a','$.b');",
+        "SELECT json_extract('{\"a\":1}','$.a','$.missing');",
+        // Quoted key with spaces.
+        "SELECT json_extract('{\"a b\":1}','$.\"a b\"');",
+        // typeof — scalars return their SQL type.
+        "SELECT typeof(json_extract('{\"a\":1}','$.a'));",
+        "SELECT typeof(json_extract('{\"a\":\"x\"}','$.a'));",
+        "SELECT typeof(json_extract('{\"a\":1.5}','$.a'));",
+        "SELECT typeof(json_extract('{\"a\":null}','$.a'));",
+        "SELECT typeof(json_extract('{\"a\":[1]}','$.a'));",
+    ] {
+        assert_same(db.str(), q);
+    }
+    // Malformed JSON → error.
+    for q in [
+        "SELECT json_extract('hello','$');",
+        "SELECT json_extract('{','$');",
+    ] {
+        let oracle_err = std::process::Command::new("sqlite3")
+            .arg("-batch")
+            .arg(db.str())
+            .arg(q)
+            .output()
+            .expect("run sqlite3");
+        assert!(!oracle_err.status.success(), "oracle should error on: {q}");
+        match rustsqlite_rows(db.str(), q) {
+            Ok(rows) => panic!("rustsqlite should error on `{q}`, got: {rows:?}"),
+            Err(e) => assert!(e.contains("malformed JSON"), "wrong error for `{q}`: {e}"),
+        }
+    }
+}

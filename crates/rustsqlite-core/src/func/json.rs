@@ -673,6 +673,269 @@ pub fn json_object_fn(args: &[Value]) -> Result<Value> {
     Ok(Value::Text(out))
 }
 
+// ---- JSON path lookup (M24.5) ----
+//
+// Path syntax (a subset of upstream's `jsonLookupStep`, sufficient for json_extract):
+//   $             — the root.
+//   $.key         — object lookup by bare-key (alphanumerics + _).
+//   $."key"       — object lookup by quoted key (with JSON-string escapes).
+//   $['key']      — alternate quoted-key form (upstream uses $["key"]; we accept both
+//                   single and double quotes for ergonomics — upstream only accepts ").
+//   $[N]          — array index (0-based).
+//   $[#]          — last array element.
+//   $[#-N]        — N-th element from the end.
+//   $.a.b[2].c    — chained.
+//
+// Returns `Ok(Some(node))` on a hit, `Ok(None)` on a miss (matching upstream's
+// `JSON_LOOKUP_NOTFOUND` — json_extract returns NULL), and `Err` on a malformed path.
+
+/// Look up `path` against `root`. Returns `Ok(Some(&JsonNode))` on hit, `Ok(None)` on miss.
+pub fn lookup_path<'a>(root: &'a JsonNode, path: &str) -> Result<Option<&'a JsonNode>> {
+    if !path.starts_with('$') {
+        return Err(Error::msg("JSON path error near '")); // upstream: "bad JSON path"
+    }
+    let rest = &path[1..];
+    if rest.is_empty() {
+        return Ok(Some(root));
+    }
+    walk(root, rest.as_bytes(), 0)
+}
+
+fn walk<'a>(node: &'a JsonNode, path: &[u8], mut i: usize) -> Result<Option<&'a JsonNode>> {
+    if i >= path.len() {
+        return Ok(Some(node));
+    }
+    match path[i] {
+        b'.' => {
+            i += 1;
+            let (key, consumed) = parse_key_segment(path, i)?;
+            i = consumed;
+            match node {
+                JsonNode::Object(entries) => {
+                    // Last value wins (matching upstream).
+                    let hit = entries.iter().rev().find(|(k, _)| k == &key);
+                    match hit {
+                        Some((_, v)) => walk(v, path, i),
+                        None => Ok(None),
+                    }
+                }
+                _ => Ok(None), // not an object → NOTFOUND
+            }
+        }
+        b'[' => {
+            i += 1;
+            // Parse index: optional '#' then optional '-' then digits, then ']'.
+            let from_end = path.get(i).copied() == Some(b'#');
+            if from_end {
+                i += 1;
+            }
+            let negative = path.get(i).copied() == Some(b'-');
+            if negative {
+                i += 1;
+            }
+            let mut idx: u64 = 0;
+            let mut have_digit = false;
+            while i < path.len() && path[i].is_ascii_digit() {
+                idx = idx.saturating_mul(10).saturating_add((path[i] - b'0') as u64);
+                i += 1;
+                have_digit = true;
+            }
+            if i >= path.len() || path[i] != b']' {
+                return Err(Error::msg("bad JSON path"));
+            }
+            i += 1; // consume ']'
+            match node {
+                JsonNode::Array(items) => {
+                    let len = items.len() as u64;
+                    let target = if from_end {
+                        // `$[#]` = index `len` (out of range → NULL); `$[#-N]` = index `len - N`.
+                        // So `$[#-1]` = `len-1` = the last element; `$[#-0]` = `len` (out of range).
+                        if negative {
+                            len.checked_sub(idx)
+                        } else if !have_digit {
+                            // bare `$[#]` → index `len` (out of range)
+                            Some(len)
+                        } else {
+                            // `$[#N]` (no `-`) → index `len - N`
+                            len.checked_sub(idx)
+                        }
+                    } else {
+                        if negative {
+                            // `$[-N]` is non-standard; treat as from-end: index `len - N`.
+                            len.checked_sub(idx)
+                        } else if !have_digit {
+                            return Err(Error::msg("bad JSON path"));
+                        } else {
+                            Some(idx)
+                        }
+                    };
+                    match target {
+                        Some(t) if t < len => walk(&items[t as usize], path, i),
+                        _ => Ok(None),
+                    }
+                }
+                _ => Ok(None), // not an array → NOTFOUND
+            }
+        }
+        _ => Err(Error::msg("bad JSON path")),
+    }
+}
+
+fn parse_key_segment(path: &[u8], mut i: usize) -> Result<(String, usize)> {
+    if i >= path.len() {
+        return Err(Error::msg("bad JSON path"));
+    }
+    if path[i] == b'"' || path[i] == b'\'' {
+        let quote = path[i];
+        i += 1;
+        let start = i;
+        let mut key = String::new();
+        while i < path.len() && path[i] != quote {
+            if path[i] == b'\\' && i + 1 < path.len() {
+                let esc = path[i + 1];
+                match esc {
+                    b'"' => key.push('"'),
+                    b'\\' => key.push('\\'),
+                    b'/' => key.push('/'),
+                    b'b' => key.push('\u{0008}'),
+                    b'f' => key.push('\u{000C}'),
+                    b'n' => key.push('\n'),
+                    b'r' => key.push('\r'),
+                    b't' => key.push('\t'),
+                    b'u' => {
+                        // Parse 4 hex digits.
+                        if i + 6 > path.len() {
+                            return Err(Error::msg("bad JSON path"));
+                        }
+                        let hex = &path[i + 2..i + 6];
+                        let mut v = 0u32;
+                        for &b in hex {
+                            let d = match b {
+                                b'0'..=b'9' => (b - b'0') as u32,
+                                b'a'..=b'f' => (b - b'a' + 10) as u32,
+                                b'A'..=b'F' => (b - b'A' + 10) as u32,
+                                _ => return Err(Error::msg("bad JSON path")),
+                            };
+                            v = (v << 4) | d;
+                        }
+                        if let Some(c) = char::from_u32(v) {
+                            key.push(c);
+                        } else {
+                            return Err(Error::msg("bad JSON path"));
+                        }
+                        i += 4;
+                    }
+                    _ => return Err(Error::msg("bad JSON path")),
+                }
+                i += 2;
+            } else {
+                // Copy a UTF-8 character.
+                let len = utf8_len(path[i]);
+                if i + len > path.len() {
+                    return Err(Error::msg("bad JSON path"));
+                }
+                key.push_str(std::str::from_utf8(&path[i..i + len]).map_err(|_| Error::msg("bad JSON path"))?);
+                i += len;
+            }
+        }
+        if i >= path.len() || path[i] != quote {
+            return Err(Error::msg("bad JSON path"));
+        }
+        i += 1; // consume closing quote
+        let _ = start;
+        Ok((key, i))
+    } else {
+        // Bare key: read until '.', '[', or end.
+        let start = i;
+        while i < path.len() && path[i] != b'.' && path[i] != b'[' {
+            i += 1;
+        }
+        if i == start {
+            return Err(Error::msg("bad JSON path"));
+        }
+        let key = std::str::from_utf8(&path[start..i])
+            .map_err(|_| Error::msg("bad JSON path"))?
+            .to_string();
+        Ok((key, i))
+    }
+}
+
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        1 // invalid leading byte; take 1 to make progress
+    }
+}
+
+/// Convert a [`JsonNode`] to its SQL [`Value`] representation, the way `jsonReturnFromBlob`
+/// does for a non-array/non-object node: Null→Null, Bool→Int (1/0, SQLite has no bool),
+/// Int→Int, Real→Real, String→Text, Array/Object→Text (the canonical JSON rendering).
+pub fn json_node_to_sql_value(node: &JsonNode) -> Value {
+    match node {
+        JsonNode::Null => Value::Null,
+        JsonNode::Bool(b) => Value::Int(if *b { 1 } else { 0 }),
+        JsonNode::Int(i) => Value::Int(*i),
+        JsonNode::Real(r) => Value::Real(*r),
+        JsonNode::String(s) => Value::Text(s.clone()),
+        JsonNode::Array(_) | JsonNode::Object(_) => Value::Text(render(node)),
+    }
+}
+
+/// `json_extract(X, P1, P2, ...)` — extract the value at each path `Pi` from JSON `X`.
+///
+/// With one path: returns the SQL value at that path (NULL if the path is not found). A scalar
+/// (null/bool/int/real/string) is returned as its SQL equivalent; an array/object is returned
+/// as canonical JSON text.
+///
+/// With multiple paths: returns a JSON array containing the result of each path (each element
+/// rendered as JSON — arrays/objects stay JSON, scalars are JSON-encoded).
+pub fn json_extract_fn(args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(Error::msg("json_extract requires at least 2 arguments"));
+    }
+    let root = value_to_json(&args[0])?;
+    let paths = &args[1..];
+    if paths.len() == 1 {
+        let path = path_as_str(&paths[0])?;
+        match lookup_path(&root, &path)? {
+            Some(node) => Ok(json_node_to_sql_value(node)),
+            None => Ok(Value::Null),
+        }
+    } else {
+        let mut out = String::new();
+        out.push('[');
+        for (i, p) in paths.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let path = path_as_str(p)?;
+            match lookup_path(&root, &path)? {
+                Some(node) => render_into(node, &mut out),
+                None => out.push_str("null"),
+            }
+        }
+        out.push(']');
+        Ok(Value::Text(out))
+    }
+}
+
+fn path_as_str(v: &Value) -> Result<String> {
+    match v {
+        Value::Text(s) => Ok(s.clone()),
+        Value::Int(i) => Ok(i.to_string()),
+        Value::Real(r) => Ok(crate::util::fp::fp_to_text(*r)),
+        Value::Null => Err(Error::msg("json_extract() path cannot be NULL")),
+        Value::Blob(_) => Err(Error::msg("json_extract() path cannot be a BLOB")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -958,5 +1221,135 @@ mod tests {
         assert!(json_object_fn(&[Value::Null, Value::Int(1)]).is_err());
         // BLOB value.
         assert!(json_object_fn(&[t("a"), Value::Blob(vec![1])]).is_err());
+    }
+
+    // ---- M24.5 json_extract() / path lookup tests ----
+
+    #[test]
+    fn lookup_path_root() {
+        let n = p("{\"a\":1}");
+        assert_eq!(lookup_path(&n, "$").unwrap(), Some(&n));
+    }
+
+    #[test]
+    fn lookup_path_object() {
+        let n = p("{\"a\":1,\"b\":2}");
+        assert_eq!(
+            lookup_path(&n, "$.a").unwrap(),
+            Some(&JsonNode::Int(1)),
+        );
+        assert_eq!(
+            lookup_path(&n, "$.b").unwrap(),
+            Some(&JsonNode::Int(2)),
+        );
+        assert_eq!(lookup_path(&n, "$.c").unwrap(), None);
+    }
+
+    #[test]
+    fn lookup_path_array() {
+        let n = p("[1,2,3]");
+        assert_eq!(lookup_path(&n, "$[0]").unwrap(), Some(&JsonNode::Int(1)));
+        assert_eq!(lookup_path(&n, "$[2]").unwrap(), Some(&JsonNode::Int(3)));
+        assert_eq!(lookup_path(&n, "$[5]").unwrap(), None);
+        // From-end.
+        assert_eq!(lookup_path(&n, "$[#-1]").unwrap(), Some(&JsonNode::Int(3)));
+        assert_eq!(lookup_path(&n, "$[#-2]").unwrap(), Some(&JsonNode::Int(2)));
+        // $[#] is out of range (index = len).
+        assert_eq!(lookup_path(&n, "$[#]").unwrap(), None);
+    }
+
+    #[test]
+    fn lookup_path_nested() {
+        let n = p("{\"x\":[1,{\"y\":[2,3]}]}");
+        assert_eq!(
+            lookup_path(&n, "$.x[1].y[0]").unwrap(),
+            Some(&JsonNode::Int(2)),
+        );
+        assert_eq!(
+            lookup_path(&n, "$.x[0]").unwrap(),
+            Some(&JsonNode::Int(1)),
+        );
+    }
+
+    #[test]
+    fn lookup_path_quoted_key() {
+        let n = p("{\"a b\":1}");
+        assert_eq!(
+            lookup_path(&n, "$.\"a b\"").unwrap(),
+            Some(&JsonNode::Int(1)),
+        );
+    }
+
+    #[test]
+    fn lookup_path_object_on_array_is_notfound() {
+        let n = p("[1,2,3]");
+        assert_eq!(lookup_path(&n, "$.a").unwrap(), None);
+    }
+
+    #[test]
+    fn lookup_path_array_on_object_is_notfound() {
+        let n = p("{\"a\":1}");
+        assert_eq!(lookup_path(&n, "$[0]").unwrap(), None);
+    }
+
+    #[test]
+    fn lookup_path_bad_path() {
+        let n = p("{\"a\":1}");
+        assert!(lookup_path(&n, "a").is_err()); // missing leading $
+        assert!(lookup_path(&n, "$.").is_err()); // empty key
+        assert!(lookup_path(&n, "$[abc]").is_err()); // non-numeric index
+    }
+
+    #[test]
+    fn json_extract_fn_returns_sql_scalar() {
+        let j = t("{\"a\":1,\"b\":\"two\",\"c\":3.5,\"d\":null}");
+        assert_eq!(
+            json_extract_fn(&[j.clone(), t("$.a")]).unwrap(),
+            Value::Int(1),
+        );
+        assert_eq!(
+            json_extract_fn(&[j.clone(), t("$.b")]).unwrap(),
+            t("two"),
+        );
+        assert_eq!(
+            json_extract_fn(&[j.clone(), t("$.c")]).unwrap(),
+            Value::Real(3.5),
+        );
+        assert_eq!(
+            json_extract_fn(&[j.clone(), t("$.d")]).unwrap(),
+            Value::Null,
+        );
+        assert_eq!(
+            json_extract_fn(&[j, t("$.missing")]).unwrap(),
+            Value::Null,
+        );
+    }
+
+    #[test]
+    fn json_extract_fn_returns_json_text_for_container() {
+        let j = t("{\"a\":[1,2],\"b\":{\"x\":1}}");
+        assert_eq!(
+            json_extract_fn(&[j.clone(), t("$.a")]).unwrap(),
+            t("[1,2]"),
+        );
+        assert_eq!(
+            json_extract_fn(&[j, t("$.b")]).unwrap(),
+            t("{\"x\":1}"),
+        );
+    }
+
+    #[test]
+    fn json_extract_fn_multiple_paths() {
+        let j = t("{\"a\":1,\"b\":2}");
+        assert_eq!(
+            json_extract_fn(&[j, t("$.a"), t("$.b")]).unwrap(),
+            t("[1,2]"),
+        );
+        // Missing path → null in the array.
+        let j = t("{\"a\":1}");
+        assert_eq!(
+            json_extract_fn(&[j, t("$.a"), t("$.missing")]).unwrap(),
+            t("[1,null]"),
+        );
     }
 }
