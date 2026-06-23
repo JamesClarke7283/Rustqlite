@@ -1020,6 +1020,140 @@ pub fn json_array_length_fn(args: &[Value]) -> Result<Value> {
     }
 }
 
+/// `json_pretty(X [, Y])` — pretty-print X as indented JSON text. `Y` is the indent string
+/// (default four spaces). NULL input → NULL. Scalars are rendered without indentation
+/// (matching the oracle: `json_pretty('null')` → `null`, no trailing newline). Malformed
+/// JSON → error.
+pub fn json_pretty_fn(args: &[Value]) -> Result<Value> {
+    if args.is_empty() {
+        return Err(Error::msg("json_pretty requires at least 1 argument"));
+    }
+    if args[0].is_null() {
+        return Ok(Value::Null);
+    }
+    let root = value_to_json(&args[0])?;
+    let indent = if args.len() >= 2 {
+        match &args[1] {
+            Value::Text(s) if !s.is_empty() => s.clone(),
+            _ => "    ".to_string(),
+        }
+    } else {
+        "    ".to_string()
+    };
+    let mut out = String::new();
+    pretty_render(&root, &mut out, &indent, 0);
+    Ok(Value::Text(out))
+}
+
+fn pretty_render(node: &JsonNode, out: &mut String, indent: &str, depth: usize) {
+    match node {
+        JsonNode::Null => out.push_str("null"),
+        JsonNode::Bool(true) => out.push_str("true"),
+        JsonNode::Bool(false) => out.push_str("false"),
+        JsonNode::Int(i) => out.push_str(&i.to_string()),
+        JsonNode::Real(r) => out.push_str(&crate::util::fp::fp_to_text(*r)),
+        JsonNode::String(s) => render_string(s, out),
+        JsonNode::Array(items) => {
+            if items.is_empty() {
+                out.push_str("[]");
+                return;
+            }
+            out.push('[');
+            out.push('\n');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(",\n");
+                }
+                push_indent(out, indent, depth + 1);
+                pretty_render(item, out, indent, depth + 1);
+            }
+            out.push('\n');
+            push_indent(out, indent, depth);
+            out.push(']');
+        }
+        JsonNode::Object(entries) => {
+            if entries.is_empty() {
+                out.push_str("{}");
+                return;
+            }
+            out.push('{');
+            out.push('\n');
+            for (i, (k, v)) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(",\n");
+                }
+                push_indent(out, indent, depth + 1);
+                render_string(k, out);
+                out.push_str(": ");
+                pretty_render(v, out, indent, depth + 1);
+            }
+            out.push('\n');
+            push_indent(out, indent, depth);
+            out.push('}');
+        }
+    }
+}
+
+fn push_indent(out: &mut String, indent: &str, depth: usize) {
+    for _ in 0..depth {
+        out.push_str(indent);
+    }
+}
+
+/// `json_error_position(X)` — the 1-based character offset of the first syntax error in X,
+/// or 0 if X is valid JSON, or NULL if X is NULL. BLOBs are checked as JSONB (always invalid
+/// in our engine since we don't model JSONB → returns 1).
+pub fn json_error_position_fn(arg: &Value) -> Result<Value> {
+    match arg {
+        Value::Null => Ok(Value::Null),
+        Value::Int(_) | Value::Real(_) => Ok(Value::Int(0)), // numbers are valid JSON
+        Value::Text(s) => {
+            // Our parser reports a byte offset; convert to a 1-based character offset by
+            // counting UTF-8 char starts up to that byte.
+            match parse(s) {
+                Ok(_) => Ok(Value::Int(0)),
+                Err(e) => {
+                    // The error message carries "malformed JSON: <msg>"; the byte offset is
+                    // not currently exposed in the Error type. We re-parse to recover it.
+                    let byte_off = first_error_offset(s).unwrap_or(s.len());
+                    let char_off = s[..byte_off.min(s.len())].chars().count() + 1;
+                    let _ = e;
+                    Ok(Value::Int(char_off as i64))
+                }
+            }
+        }
+        Value::Blob(_) => Ok(Value::Int(1)), // not valid JSONB
+    }
+}
+
+/// A thin re-parse that returns the byte offset of the first error, mirroring upstream's
+/// `iErr`. Used by `json_error_position` since our [`Error`] type doesn't carry the offset.
+///
+/// **Quirk:** when the value parses but has trailing garbage, upstream resets `iErr` to 0
+/// (the parse is rolled back), so `json_error_position` returns 1. We mirror that here: a
+/// trailing-garbage error reports offset 0.
+fn first_error_offset(input: &str) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let mut p = Parser {
+        bytes,
+        pos: 0,
+        depth: 0,
+    };
+    p.skip_ws();
+    match p.parse_value() {
+        Ok(_) => {
+            p.skip_ws();
+            if p.pos != bytes.len() {
+                // Trailing garbage — upstream resets iErr to 0, so report offset 0.
+                Some(0)
+            } else {
+                None
+            }
+        }
+        Err(_) => Some(p.pos),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

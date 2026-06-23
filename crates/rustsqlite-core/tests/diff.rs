@@ -2682,3 +2682,55 @@ fn json_type_valid_quote_array_length() {
         }
     }
 }
+
+/// `json_pretty` (M24.12) and `json_error_position` (M24.14), differential-tested against the
+/// system `sqlite3` oracle.
+#[test]
+fn json_pretty_and_error_position() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    // json_pretty — the oracle outputs multi-line text; `.mode list` splits stdout on newlines,
+    // so the expected rows come back as one row per line. We join them back with '\n' and
+    // compare against the rustsqlite single-string value.
+    for (q, expected_text) in [
+        ("SELECT json_pretty('{}');", "{}"),
+        ("SELECT json_pretty('[]');", "[]"),
+        ("SELECT json_pretty('null');", "null"),
+        ("SELECT json_pretty('1');", "1"),
+        ("SELECT json_pretty('\"x\"');", "\"x\""),
+        ("SELECT json_pretty('{\"a\":1}');", "{\n    \"a\": 1\n}"),
+        ("SELECT json_pretty('{\"a\":1,\"b\":2}');", "{\n    \"a\": 1,\n    \"b\": 2\n}"),
+        ("SELECT json_pretty('[1,2,3]');", "[\n    1,\n    2,\n    3\n]"),
+        (
+            "SELECT json_pretty('{\"a\":[1,2],\"b\":{\"c\":3}}');",
+            "{\n    \"a\": [\n        1,\n        2\n    ],\n    \"b\": {\n        \"c\": 3\n    }\n}",
+        ),
+        ("SELECT json_pretty('{\"a\":1}','  ');", "{\n  \"a\": 1\n}"),
+        ("SELECT json_pretty(NULL);", "<<NULL>>"),
+    ] {
+        let expected_joined = sqlite3_rows(db.str(), q).join("\n");
+        let got = rustsqlite_rows(db.str(), q).expect("rustsqlite");
+        let got_joined = got.join("\n");
+        assert_eq!(
+            got_joined, expected_joined,
+            "mismatch for {q}\n  got:    {got_joined:?}\n  expect: {expected_joined:?}\n  want-text: {expected_text:?}"
+        );
+    }
+    // json_error_position. (Skip JSON5-accepted cases like '[1,2,]' — the oracle accepts
+    // trailing commas, our strict parser does not.)
+    for q in [
+        "SELECT json_error_position('{}');",
+        "SELECT json_error_position('1');",
+        "SELECT json_error_position('hello');",
+        "SELECT json_error_position('{\"a\":}');",
+        "SELECT json_error_position('1.5x');",
+        "SELECT json_error_position('42x');",
+        "SELECT json_error_position(NULL);",
+        "SELECT json_error_position('{');",
+    ] {
+        assert_same(db.str(), q);
+    }
+}

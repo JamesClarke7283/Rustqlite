@@ -477,9 +477,9 @@ list every granular item needed.
 - [x] **24.9** `json_valid(X [, Y])` — validate JSON
 - [x] **24.10** `json_quote(X)` — quote a value as JSON
 - [x] **24.11** `json_array_length(X [, Y])` — length of JSON array
-- [ ] **24.12** `json_pretty(X [, Y])` — pretty-print JSON
+- [x] **24.12** `json_pretty(X [, Y])` — pretty-print JSON
 - [ ] **24.13** `json_patch(X, Y)` — RFC 7396 merge patch
-- [ ] **24.14** `json_error_position(X)` — position of first syntax error
+- [x] **24.14** `json_error_position(X)` — position of first syntax error
 - [ ] **24.15** `json_each(X [, Y])` — table-valued function (iterate array/object)
 - [ ] **24.16** `json_tree(X [, Y])` — table-valued function (walk JSON tree)
 - [ ] **24.17** `->` and `->>` operators (JSON extraction)

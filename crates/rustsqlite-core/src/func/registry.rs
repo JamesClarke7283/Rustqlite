@@ -105,6 +105,8 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         ("json_array_length" | "jsonb_array_length", n) if n >= 1 && n <= 2 => {
             json::json_array_length_fn(args)
         }
+        ("json_pretty", n) if n >= 1 && n <= 2 => json::json_pretty_fn(args),
+        ("json_error_position", 1) => json::json_error_position_fn(&args[0]),
 
         // Should not happen: codegen validates with `check` before emitting a Function opcode.
         _ => Err(no_such_function(name, args.len())),
@@ -170,6 +172,8 @@ pub fn check(name: &str, n_arg: usize) -> Result<()> {
         "json_valid" => Some(n_arg == 1 || n_arg == 2),
         "json_quote" => Some(n_arg == 1),
         "json_array_length" | "jsonb_array_length" => Some(n_arg == 1 || n_arg == 2),
+        "json_pretty" => Some(n_arg == 1 || n_arg == 2),
+        "json_error_position" => Some(n_arg == 1),
 
         // volatile / connection-state functions (M3b): handled in the VDBE executor's Function
         // arm (they need runtime state), so `check` only learns their arities as the codegen
