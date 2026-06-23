@@ -1641,6 +1641,7 @@ fn compile_pragma(db: &mut Sqlite3, sql: &str, pragma: &PragmaStmt) -> Result<Sq
         "journal_mode" => compile_pragma_journal_mode(db, sql, pragma),
         "foreign_keys" => compile_pragma_foreign_keys(db, sql, pragma),
         "foreign_key_list" => compile_pragma_foreign_key_list(db, sql, pragma),
+        "foreign_key_check" => compile_pragma_foreign_key_check(db, sql, pragma),
         _ => Err(Error::msg(format!("PRAGMA {name} is not supported yet"))),
     }
 }
@@ -2077,6 +2078,68 @@ fn foreign_key_list_rows(ct: &CreateTable) -> Vec<Vec<Value>> {
         }
     }
     rows
+}
+
+/// `PRAGMA foreign_key_check` / `PRAGMA foreign_key_check(table-name)` — check the database
+/// (or the named table) for foreign-key constraint violations, returning one row per
+/// violation. Mirrors `PragTyp_FOREIGN_KEY_CHECK` in `pragma.c`.
+///
+/// The result has four columns: `table` (the child table containing the REFERENCES clause),
+/// `rowid` (the rowid of the violating child row, or NULL for a WITHOUT ROWID child),
+/// `parent` (the referenced parent table), and `fkid` (the 0-based index of the FK constraint
+/// on the child table). When no violations are found, zero rows are returned (matching
+/// upstream — `foreign_key_check` does NOT emit an "ok" row, unlike `integrity_check`).
+///
+/// With no value argument, every table in the schema is checked; with `= name` or
+/// `(name)`, only that table is checked. A missing named table raises "no such table: <name>"
+/// (matching upstream's `sqlite3LocateTable` error).
+fn compile_pragma_foreign_key_check(
+    db: &mut Sqlite3,
+    sql: &str,
+    pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    // The optional table-name argument: `PRAGMA foreign_key_check(tbl)` or `= tbl`. Upstream
+    // accepts both forms (the `zRight` token); with no value, the whole database is checked.
+    let table_filter = match &pragma.value {
+        Some(PragmaValue::Paren(PragmaValueKind::Ident(s))) => Some(s.clone()),
+        Some(PragmaValue::Equal(PragmaValueKind::Ident(s))) => Some(s.clone()),
+        _ => None,
+    };
+    // An empty database (no page 1 yet) has no tables to check — return empty (matching the
+    // oracle, which returns zero rows on a zero-byte file). `db.pager_arc()` fails on a fresh
+    // connection that has never written, so guard against that.
+    let pager = match db.pager_arc() {
+        Ok(p) => p,
+        Err(_) => {
+            return Ok(empty_static_stmt(
+                sql,
+                &["table", "rowid", "parent", "fkid"],
+            ));
+        }
+    };
+    let rows = block_on(crate::btree::foreign_key_check::foreign_key_check(
+        pager,
+        table_filter.as_deref(),
+    ))?;
+    let column_names = vec![
+        "table".to_string(),
+        "rowid".to_string(),
+        "parent".to_string(),
+        "fkid".to_string(),
+    ];
+    Ok(Sqlite3Stmt {
+        sql: sql.to_string(),
+        program: Arc::new(Program::empty()),
+        column_names,
+        backing: Backing::Static {
+            rows,
+            cur: None,
+            pos: 0,
+        },
+        explain: 0,
+        counts: None,
+        last_error: None,
+    })
 }
 
 /// A `Static`-backed statement with no rows and the given column names (used for pragmas

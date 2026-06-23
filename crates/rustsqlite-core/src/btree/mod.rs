@@ -15,6 +15,7 @@ pub mod cell;
 pub mod cursor;
 pub mod delete;
 pub mod destroy;
+pub mod foreign_key_check;
 pub mod index;
 pub mod index_cursor;
 pub mod index_delete;

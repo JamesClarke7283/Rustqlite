@@ -861,4 +861,25 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   itself (M17.6+) is deferred — this slice is the read/write flag and the introspection
   pragma. Differential-tested vs the C oracle (`foreign_keys.rs`: default-off + toggle,
   silent-no-op inside a transaction, `foreign_key_list` for column-level + table-level +
-  mixed + multi-column + no-FK + missing-table).
+  mixed + multi-column + no-FK + missing-table). **17.5 `PRAGMA foreign_key_check`** ✅:
+  `PRAGMA foreign_key_check` / `PRAGMA foreign_key_check(table-name)` checks the database (or
+  the named table) for FK violations, returning one row per violation with four columns
+  `table, rowid, parent, fkid` (mirrors `PragTyp_FOREIGN_KEY_CHECK` in `pragma.c`). The
+  backend (`btree/foreign_key_check.rs`) reads the catalog, parses each child table's CREATE
+  TABLE to extract `REFERENCES`/`FOREIGN KEY` constraints, and for each FK pre-resolves a
+  lookup strategy: `RowidSeek` (single-column FK referencing the parent's `INTEGER PRIMARY KEY`
+  rowid alias — probes via `TableCursor::seek_rowid`), `IndexSeek` (a covering index on the
+  parent — probes via `IndexCursor::seek(SeekOp::Ge)` + prefix equality), or `TableScan`
+  (no usable index — full parent-table scan). A child row with any NULL FK column is skipped
+  (NULL foreign keys never violate, matching upstream's `OP_IsNull → addrOk` early-out). A
+  dangling parent (the referenced table doesn't exist) reports every non-NULL child row as a
+  violation (matching upstream's second loop where `pParent == 0` leaves no `addrOk` jump).
+  The `fkid` is the 0-based FK index on the child table. WITHOUT ROWID child tables are
+  deferred (their rowid column would be NULL — the M5.3 WITHOUT ROWID write-path follow-up).
+  Differential-tested vs the C oracle (`foreign_keys.rs`: no-FK empty, satisfied empty,
+  rowid-FK violation, filtered-to-table, NULL child skipped, multi-column FK, dangling
+  parent reported, indexed parent, missing-table error, empty DB). Known gap: the
+  `TableScan` fallback uses BINARY collation for parent-column comparison rather than the
+  parent column's declared collation — correct for the common case (numeric/BINARY-text FKs)
+  but may diverge for `COLLATE NOCASE`/`RTRIM` parent columns; the `IndexSeek` path honors
+  per-column collation via the index's `KeyInfo`.
