@@ -3344,6 +3344,12 @@ fn pragma_flag_fields_match_oracle() {
         "PRAGMA secure_delete;",
         // compile_options: just check it returns rows (the set differs between builds).
         "PRAGMA compile_options;",
+        "PRAGMA locking_mode;",
+        "PRAGMA default_cache_size;",
+        "PRAGMA mmap_size;",
+        "PRAGMA temp_store;",
+        "PRAGMA max_page_count;",
+        "PRAGMA data_version;",
     ];
     for pragma_sql in pragmas {
         let db = TempDb::new("pragma_flag_ours");

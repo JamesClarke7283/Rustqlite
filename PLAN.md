@@ -412,12 +412,12 @@ list every granular item needed.
 - [x] **20.28** `PRAGMA case_sensitive_like` — toggle LIKE case sensitivity
 - [x] **20.29** `PRAGMA recursive_triggers` — read/set trigger recursion
 - [x] **20.30** `PRAGMA secure_delete` — read/set secure deletion (zero-fill deleted data)
-- [ ] **20.31** `PRAGMA locking_mode` — read/set (NORMAL, EXCLUSIVE)
+- [x] **20.31** `PRAGMA locking_mode` — read/set (NORMAL, EXCLUSIVE)
 - [x] **20.32** `PRAGMA auto_vacuum` — read/set (NONE, FULL, INCREMENTAL)
 - [x] **20.33** `PRAGMA incremental_vacuum` — free freelist pages
 - [x] **20.34** `PRAGMA defer_foreign_keys` — defer FK checking until COMMIT
 - [x] **20.35** `PRAGMA writable_schema` — allow direct modification of `sqlite_schema`
-- [ ] **20.36** `PRAGMA stats` — report b-tree statistics (debug)
+- [x] **20.36** `PRAGMA stats` — report b-tree statistics (debug)
 - [x] **20.37** `PRAGMA reverse_unordered_selects` — toggle optimization
 - [x] **20.38** `PRAGMA query_only` — prevent writes
 
@@ -876,11 +876,11 @@ list every granular item needed.
 - [ ] **20.40** `PRAGMA count_changes` — return rows-affected as query result
 - [ ] **20.41** `PRAGMA empty_result_callbacks` — callback on empty result sets
 - [ ] **20.42** `PRAGMA fullfsync` / `PRAGMA checkpoint_fullfsync` — full fsync control
-- [ ] **20.43** `PRAGMA data_version` — read data version (readonly)
-- [ ] **20.44** `PRAGMA default_cache_size` — legacy cache size setting
-- [ ] **20.45** `PRAGMA mmap_size` — read/set memory-mapped I/O limit
-- [ ] **20.46** `PRAGMA temp_store` — read/set (DEFAULT, FILE, MEMORY)
-- [ ] **20.47** `PRAGMA max_page_count` — read/set maximum pages
+- [x] **20.43** `PRAGMA data_version` — read data version (readonly)
+- [x] **20.44** `PRAGMA default_cache_size` — legacy cache size setting
+- [x] **20.45** `PRAGMA mmap_size` — read/set memory-mapped I/O limit
+- [x] **20.46** `PRAGMA temp_store` — read/set (DEFAULT, FILE, MEMORY)
+- [x] **20.47** `PRAGMA max_page_count` — read/set maximum pages
 - [ ] **20.48** `PRAGMA shrink_memory` — release unused memory
 - [ ] **20.49** `PRAGMA threads` — read/set worker thread count
 - [ ] **20.50** `PRAGMA soft_heap_limit` / `PRAGMA hard_heap_limit` — memory limits

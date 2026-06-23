@@ -1734,6 +1734,13 @@ fn compile_pragma(db: &mut Sqlite3, sql: &str, pragma: &PragmaStmt) -> Result<Sq
         "query_only" => compile_pragma_flag(db, sql, pragma, "query_only"),
         "case_sensitive_like" => compile_pragma_flag(db, sql, pragma, "case_sensitive_like"),
         "secure_delete" => compile_pragma_flag(db, sql, pragma, "secure_delete"),
+        "locking_mode" => compile_pragma_locking_mode(db, sql, pragma),
+        "default_cache_size" => compile_pragma_default_cache_size(db, sql, pragma),
+        "mmap_size" => compile_pragma_mmap_size(db, sql, pragma),
+        "temp_store" => compile_pragma_temp_store(db, sql, pragma),
+        "max_page_count" => compile_pragma_max_page_count(db, sql, pragma),
+        "data_version" => compile_pragma_data_version(db, sql, pragma),
+        "stats" => compile_pragma_stats(db, sql, pragma),
         _ => Err(Error::msg(format!("PRAGMA {name} is not supported yet"))),
     }
 }
@@ -2895,6 +2902,117 @@ fn pragma_value_as_bool(kind: &PragmaValueKind) -> Result<bool> {
         PragmaValueKind::On => Ok(true),
         _ => Err(Error::msg("PRAGMA value must be a boolean")),
     }
+}
+
+/// `PRAGMA locking_mode` — read/set (NORMAL, EXCLUSIVE). Per-connection. Currently
+/// informational (always NORMAL — the EXCLUSIVE optimization is not implemented).
+fn compile_pragma_locking_mode(
+    db: &mut Sqlite3,
+    sql: &str,
+    pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    match &pragma.value {
+        Some(PragmaValue::Equal(kind)) | Some(PragmaValue::Paren(kind)) => {
+            let s = match kind {
+                PragmaValueKind::Ident(s) => s.clone(),
+                _ => return Err(Error::msg("PRAGMA locking_mode: value must be NORMAL or EXCLUSIVE")),
+            };
+            if !s.eq_ignore_ascii_case("NORMAL") && !s.eq_ignore_ascii_case("EXCLUSIVE") {
+                return Err(Error::msg(format!("unknown locking mode: {s}")));
+            }
+            db.set_flag("locking_mode_exclusive", s.eq_ignore_ascii_case("EXCLUSIVE"));
+            Ok(empty_static_stmt(sql, &["locking_mode"]))
+        }
+        _ => {
+            let v = if db.flag("locking_mode_exclusive") { "exclusive" } else { "normal" };
+            Ok(static_stmt_rows(sql, &["locking_mode"], vec![vec![Value::Text(v.into())]]))
+        }
+    }
+}
+
+/// `PRAGMA default_cache_size` — read/write the header's persistent default cache size
+/// (bytes 48-51). The read returns the header value; the write updates the header.
+fn compile_pragma_default_cache_size(
+    db: &mut Sqlite3,
+    sql: &str,
+    pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    let pager = db.ensure_pager()?;
+    match &pragma.value {
+        Some(PragmaValue::Equal(kind)) | Some(PragmaValue::Paren(kind)) => {
+            let v = pragma_value_as_int(kind)? as i32;
+            pager.with_header_mut(|h| h.default_cache_size = v);
+            Ok(empty_static_stmt(sql, &["default_cache_size"]))
+        }
+        _ => {
+            let v = pager.header().default_cache_size as i64;
+            Ok(static_stmt_rows(sql, &["default_cache_size"], vec![vec![Value::Int(v)]]))
+        }
+    }
+}
+
+/// `PRAGMA mmap_size` — read/set the memory-mapped I/O limit. Per-connection. Currently
+/// informational (always 0 — mmap I/O is not implemented, M32.5).
+fn compile_pragma_mmap_size(
+    db: &mut Sqlite3,
+    sql: &str,
+    pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    match &pragma.value {
+        Some(PragmaValue::Equal(kind)) | Some(PragmaValue::Paren(kind)) => {
+            let _v = pragma_value_as_int(kind)?;
+            db.set_flag("mmap_size_set", true);
+            Ok(empty_static_stmt(sql, &["mmap_size"]))
+        }
+        _ => {
+            // Always 0 (mmap I/O not implemented).
+            Ok(static_stmt_rows(sql, &["mmap_size"], vec![vec![Value::Int(0)]]))
+        }
+    }
+}
+
+/// `PRAGMA temp_store` — read/set (0=DEFAULT, 1=FILE, 2=MEMORY). Per-connection. Currently
+/// informational (always DEFAULT).
+fn compile_pragma_temp_store(
+    _db: &mut Sqlite3,
+    sql: &str,
+    _pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    // Always 0 (DEFAULT) — temp table storage is not configurable yet.
+    Ok(static_stmt_rows(sql, &["temp_store"], vec![vec![Value::Int(0)]]))
+}
+
+/// `PRAGMA max_page_count` — read/set the maximum page count. The read returns the current
+/// limit (0 = unlimited); the write sets it. Currently informational (always 0).
+fn compile_pragma_max_page_count(
+    _db: &mut Sqlite3,
+    sql: &str,
+    _pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    // Always 0 (unlimited) — the page count limit is not enforced yet.
+    Ok(static_stmt_rows(sql, &["max_page_count"], vec![vec![Value::Int(0)]]))
+}
+
+/// `PRAGMA data_version` — read the data version (a counter that changes on every write).
+/// Returns the file change counter from the header.
+fn compile_pragma_data_version(
+    db: &mut Sqlite3,
+    sql: &str,
+    _pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    let pager = db.ensure_pager()?;
+    let v = pager.header().file_change_counter as i64;
+    Ok(static_stmt_rows(sql, &["data_version"], vec![vec![Value::Int(v)]]))
+}
+
+/// `PRAGMA stats` — report b-tree statistics (debug). Returns no rows (the debug stats are
+/// not collected). Mirrors upstream's `PragTyp_STATS` which is compiled out by default.
+fn compile_pragma_stats(
+    _db: &mut Sqlite3,
+    sql: &str,
+    _pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    Ok(empty_static_stmt(sql, &["table", "rowid", "height", "pgno", "nrow"]))
 }
 
 
