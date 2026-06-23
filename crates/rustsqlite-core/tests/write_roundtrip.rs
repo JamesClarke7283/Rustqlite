@@ -2356,3 +2356,207 @@ fn drop_trigger_nonexistent_errors() {
         let _ = conn;
     }
 }
+
+// ===== M18.3 UPSERT tests =====
+
+#[test]
+fn upsert_do_nothing_with_target_skips_conflicting_row() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("upsert_nothing");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_a ON t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        // ON CONFLICT (a) DO NOTHING skips the conflicting row and inserts the rest.
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x'), (2, 'y') ON CONFLICT (a) DO NOTHING;");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("a".into())],
+            vec![Value::Int(2), Value::Text("y".into())],
+        ]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|a\n2|y");
+}
+
+#[test]
+fn upsert_do_nothing_without_target_skips_on_any_unique() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("upsert_nothing_no_target");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_a ON t(a);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_b ON t(b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        // ON CONFLICT DO NOTHING (no target) — applies to any unique constraint.
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x') ON CONFLICT DO NOTHING;");
+        // Also a conflict on b: inserting (5, 'a') should skip due to idx_b.
+        exec(&mut conn, "INSERT INTO t VALUES (5, 'a') ON CONFLICT DO NOTHING;");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(1), Value::Text("a".into())]]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+}
+
+#[test]
+fn upsert_do_update_with_target_updates_conflicting_row() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("upsert_update");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_a ON t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        // ON CONFLICT (a) DO UPDATE SET b = excluded.b updates the conflicting row.
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x') ON CONFLICT (a) DO UPDATE SET b = excluded.b;");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(1), Value::Text("x".into())]]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|x");
+}
+
+#[test]
+fn upsert_do_update_with_where_clause() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("upsert_update_where");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_a ON t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        // The WHERE clause is false → no update happens, row unchanged.
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x') ON CONFLICT (a) DO UPDATE SET b = excluded.b WHERE b = 'nomatch';");
+        // The WHERE clause is true (existing b = 'a') → update happens.
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'y') ON CONFLICT (a) DO UPDATE SET b = excluded.b WHERE b = 'a';");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(1), Value::Text("y".into())]]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|y");
+}
+
+#[test]
+fn upsert_do_update_bare_column_resolves_to_existing_row() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("upsert_update_bare");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_a ON t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        // bare `b` resolves to the existing row's b ('a'); excluded.b is the new value ('x').
+        // SET b = b || excluded.b → 'a' || 'x' = 'ax'.
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x') ON CONFLICT (a) DO UPDATE SET b = b || excluded.b;");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(1), Value::Text("ax".into())]]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|ax");
+}
+
+#[test]
+fn upsert_do_update_with_secondary_index_maintenance() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("upsert_update_idx");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_a ON t(a);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_b ON t(b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        // Update b from 'a' to 'x'; idx_b must be maintained (delete 'a', insert 'x').
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x') ON CONFLICT (a) DO UPDATE SET b = excluded.b;");
+        // The secondary index idx_b should now have 'x' (not 'a').
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t WHERE b = 'x';").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(1), Value::Text("x".into())]]);
+        // Verify 'a' is no longer in idx_b.
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t WHERE b = 'a';").unwrap();
+        let rows = collect(&mut stmt);
+        assert!(rows.is_empty(), "old b value should be gone from idx_b: {rows:?}");
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+}
+
+#[test]
+fn upsert_do_nothing_with_unmatched_target_errors() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("upsert_unmatched");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        // No unique index on `a` → ON CONFLICT (a) should error.
+        let result = sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (1, 'x') ON CONFLICT (a) DO NOTHING;");
+        assert!(result.is_err(), "expected error for unmatched ON CONFLICT target");
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"), "got: {err}");
+    }
+}
+
+#[test]
+fn upsert_on_integer_primary_key_target() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("upsert_ipk");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(id INTEGER PRIMARY KEY, b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        // UPSERT on the INTEGER PRIMARY KEY column.
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET b = excluded.b;");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT id, b FROM t ORDER BY id;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(1), Value::Text("x".into())]]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT id, b FROM t ORDER BY id;"), "1|x");
+}
+
+#[test]
+fn upsert_do_update_multi_row_mixed_insert_and_update() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("upsert_mixed");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_a ON t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        // First row conflicts and updates; second row is a fresh insert.
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x'), (2, 'y') ON CONFLICT (a) DO UPDATE SET b = excluded.b;");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("x".into())],
+            vec![Value::Int(2), Value::Text("y".into())],
+        ]);
+        // Note: changes() over-counts when indexes are present (a pre-existing engine
+        // limitation — index IdxInsert carries P5_NCHANGE, bumping changes per index).
+        // We don't assert changes() here to avoid coupling to that behavior.
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|x\n2|y");
+}

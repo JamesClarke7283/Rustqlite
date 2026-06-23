@@ -28,6 +28,7 @@ pub mod subquery;
 pub mod transaction;
 pub mod trigger;
 pub mod update;
+pub mod upsert;
 pub mod view;
 pub mod window;
 

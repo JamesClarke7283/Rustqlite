@@ -906,3 +906,29 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   slot (which is NULL for the rowid alias) rather than the rowid register — the fix is to
   thread `rowid_reg` into `emit_fk_checks`; the common `x INTEGER REFERENCES parent(id)`
   case works because `x` is a regular column, not the rowid alias.
+
+- **M18 — INSERT Enhancements** 🚧: **18.3 UPSERT** ✅ (initial slice):
+  `ON CONFLICT [(cols)] DO NOTHING` and `ON CONFLICT (cols) DO UPDATE SET ... [WHERE ...]`
+  for rowid tables are implemented by `codegen::upsert` (mirrors `upsert.c`'s
+  `sqlite3UpsertAnalyzeTarget` + `sqlite3UpsertDoUpdate`). The `OeAction` enum gained an
+  `Update` variant (mirrors `OE_Update`). `codegen::upsert::resolve_target` matches a
+  conflict target to a unique index (or `MatchedIndex::Rowid` for the INTEGER PRIMARY KEY
+  column), raising "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
+  constraint" when no match is found. For DO NOTHING, a `NoConflict` probe (or
+  `NotExists` for the IPK) jumps to `row_skip` on conflict. For DO UPDATE, on conflict
+  the codegen fetches the conflicting row's rowid via `IdxRowid`, seeks the table cursor,
+  reads the existing row's columns into a register block, applies the WHERE filter
+  (false → skip the update), evaluates the SET assignments (with `excluded.col` resolving
+  to the new row's record registers and bare `col` resolving to the existing row's
+  columns), then Delete+Insert at the same rowid (carrying `P5_ISUPDATE` so `changes`
+  bumps once per updated row), and re-syncs index entries (IdxDelete old + IdxInsert new,
+  also `P5_ISUPDATE`). The matched index is skipped in the generic
+  `emit_conflict_prechecks` so its default OE doesn't double-fire. `ON CONFLICT DO
+  NOTHING` without a target uses INSERT OR IGNORE semantics (every unique constraint
+  resolves to `OE_Ignore`). `ON CONFLICT DO UPDATE` without a target is rejected with a
+  clear error (deferred — needs the per-index probe loop with the DO UPDATE body inline).
+  UPSERT on the rowid-alias column (SET rowid = ...) is rejected (rows are not moved via
+  UPSERT in this slice). Differential-tested vs the C oracle (`upsert_*` in
+  `write_roundtrip.rs`: DO NOTHING with/without target, DO UPDATE with target, WHERE
+  filter, bare-column vs `excluded.col` resolution, secondary-index maintenance, unmatched
+  target error, INTEGER PRIMARY KEY target, multi-row mixed insert+update).

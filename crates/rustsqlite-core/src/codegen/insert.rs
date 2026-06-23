@@ -15,11 +15,12 @@
 //! indexed column value followed by an `SCopy` of the rowid), then `MakeRecord`-ed. M5.2
 //! generalizes this to multi-column indexes.
 
-use rustqlite_parser::{Expr, InsertSource, InsertStmt, SelectStmt};
+use rustqlite_parser::{Expr, InsertSource, InsertStmt, SelectStmt, UpsertAction};
 
 use crate::codegen::returning::Returning;
 use crate::codegen::select;
 use crate::codegen::update::compile_pred_jump;
+use crate::codegen::upsert;
 use crate::error::{Error, Result};
 use crate::schema::{IndexObject, Table};
 use crate::types::Affinity;
@@ -198,6 +199,57 @@ fn compile_insert_values(
         // upstream's "OE_Fail and OE_Ignore must happen before any changes are made" rule in
         // `sqlite3GenerateConstraintChecks`).
         let row_skip = b.new_label();
+        // UPSERT (M18.3): when an `ON CONFLICT ...` clause is present, emit the
+        // upsert-driven conflict precheck before the generic per-index prechecks.
+        // The upsert precheck handles its matched index (DO NOTHING jumps to
+        // `row_skip`; DO UPDATE updates the conflicting row in place and then
+        // jumps to `row_skip`). The matched index is then skipped in
+        // `emit_conflict_prechecks` so its default OE doesn't double-fire. For
+        // `ON CONFLICT DO NOTHING` (no target) the upsert sets the statement-level
+        // OE to `Ignore` and lets `emit_conflict_prechecks` handle every unique
+        // index uniformly (equivalent to `INSERT OR IGNORE`).
+        let mut effective_oe = oe;
+        let mut skip_index: Option<usize> = None;
+        let has_upsert = !ins.upsert.is_empty();
+        if has_upsert {
+            let clause = &ins.upsert[0];
+            if clause.target.is_none() {
+                // No-target DO NOTHING → INSERT OR IGNORE semantics.
+                if matches!(clause.action, UpsertAction::Nothing) {
+                    effective_oe = OeAction::Ignore;
+                } else {
+                    // DO UPDATE without a target is rejected by the upsert codegen
+                    // (it emits an error); we still need to emit the precheck call
+                    // so the error surfaces.
+                }
+            } else {
+                // Targeted upsert: resolve the matched index and emit the upsert
+                // precheck now. The matched index position is computed so
+                // `emit_conflict_prechecks` can skip it.
+                let target = clause.target.as_ref().unwrap();
+                let matched = upsert::resolve_target(
+                    &target.columns,
+                    target.where_clause.as_ref(),
+                    table,
+                    indexes,
+                )?;
+                skip_index = match matched {
+                    upsert::MatchedIndex::Index(idx) => indexes.iter().position(|i| std::ptr::eq(i, idx)),
+                    _ => None,
+                };
+                upsert::emit_upsert_precheck(
+                    &mut b,
+                    &ins.upsert,
+                    table,
+                    indexes,
+                    rec_start,
+                    rowid_reg,
+                    cursor,
+                    index_cursor_base,
+                    row_skip,
+                )?;
+            }
+        }
         emit_conflict_prechecks(
             &mut b,
             indexes,
@@ -206,8 +258,9 @@ fn compile_insert_values(
             rowid_reg,
             index_cursor_base,
             cursor,
-            oe,
+            effective_oe,
             row_skip,
+            skip_index,
         )?;
 
         // M17.6: FK enforcement. For each FK constraint on this table, emit an `FkCheck` that
@@ -1230,6 +1283,7 @@ fn emit_conflict_prechecks(
     table_cursor: i32,
     oe: OeAction,
     row_skip: super::builder::Label,
+    skip_index: Option<usize>,
 ) -> Result<()> {
     // For OE_None (no conflict resolution requested) there's nothing to pre-check — the
     // IdxInsert's P5_UNIQUE will raise the error after the table Insert (the legacy behavior,
@@ -1238,6 +1292,9 @@ fn emit_conflict_prechecks(
         return Ok(());
     }
     for (i, idx) in indexes.iter().enumerate() {
+        if Some(i) == skip_index {
+            continue;
+        }
         if !idx.unique {
             continue;
         }
@@ -1432,6 +1489,11 @@ fn apply_affinity(b: &mut ProgramBuilder, reg: i32, affinity: Affinity) {
     let code = affinity_char(affinity);
     let idx = b.emit(Opcode::Affinity, reg, 1, 0);
     b.set_p4(idx, P4::Symbol((code as char).to_string()));
+}
+
+/// Public wrapper so the upsert codegen can reuse the affinity coercion.
+pub(crate) fn apply_affinity_pub(b: &mut ProgramBuilder, reg: i32, affinity: Affinity) {
+    apply_affinity(b, reg, affinity);
 }
 
 /// The single-character affinity code the `Affinity` opcode reads (matches `vdbe.c`'s

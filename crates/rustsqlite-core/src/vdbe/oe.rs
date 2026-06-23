@@ -12,6 +12,8 @@
 //!   rows from the same statement) in place.
 //! * `Ignore`  — skip the offending row and continue with the next one.
 //! * `Replace` — delete the conflicting row, then re-attempt the insert/update.
+//! * `Update`  — UPSERT `DO UPDATE`: run the user-supplied `SET` against the
+//!   conflicting row (distinct from `Replace`, which deletes+reinserts).
 //!
 //! The numeric values match upstream's `#define OE_*` so that `OP_Halt`'s `p2`
 //! operand (which carries the action) is byte-compatible.
@@ -25,6 +27,8 @@ pub enum OeAction {
     Fail = 3,
     Ignore = 4,
     Replace = 5,
+    /// UPSERT `DO UPDATE`. Mirrors upstream's `OE_Update`.
+    Update = 6,
 }
 
 impl OeAction {
@@ -39,6 +43,7 @@ impl OeAction {
             3 => OeAction::Fail,
             4 => OeAction::Ignore,
             5 => OeAction::Replace,
+            6 => OeAction::Update,
             _ => OeAction::Abort,
         }
     }

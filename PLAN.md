@@ -355,8 +355,8 @@ list every granular item needed.
 
 - [x] **18.1** `INSERT … SELECT` — materialize the SELECT, then insert rows from the result set
 - [x] **18.2** `INSERT … DEFAULT VALUES` — insert a row with all columns set to their default values
-- [ ] **18.3** UPSERT: `ON CONFLICT [(cols)] DO UPDATE SET … WHERE …` / `DO NOTHING`
-- [ ] **18.4** UPSERT: `ON CONFLICT` without column list — uses any unique index
+- [x] **18.3** UPSERT: `ON CONFLICT [(cols)] DO UPDATE SET … WHERE …` / `DO NOTHING`
+- [ ] **18.4** UPSERT: `ON CONFLICT` without column list — uses any unique index [PARTIAL: `ON CONFLICT DO NOTHING` (no target) is implemented as INSERT OR IGNORE semantics. `ON CONFLICT DO UPDATE` (no target) is rejected with an error — the faithful implementation needs to run the update body on the first unique constraint that conflicts, which requires running the per-index probe loop with the DO UPDATE body inline; deferred to a follow-up.]
 - [x] **18.5** VDBE: conflict resolution (`OR ROLLBACK`, `OR ABORT`, `OR FAIL`, `OR IGNORE`, `OR REPLACE`) enforcement for INSERT
 - [x] **18.6** `OR REPLACE` — delete conflicting row then insert new row
 - [ ] **18.7** `AUTOINCREMENT` enforcement: `sqlite_sequence` table for max rowid tracking
