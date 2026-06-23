@@ -925,10 +925,12 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   also `P5_ISUPDATE`). The matched index is skipped in the generic
   `emit_conflict_prechecks` so its default OE doesn't double-fire. `ON CONFLICT DO
   NOTHING` without a target uses INSERT OR IGNORE semantics (every unique constraint
-  resolves to `OE_Ignore`). `ON CONFLICT DO UPDATE` without a target is rejected with a
-  clear error (deferred — needs the per-index probe loop with the DO UPDATE body inline).
-  UPSERT on the rowid-alias column (SET rowid = ...) is rejected (rows are not moved via
-  UPSERT in this slice). Differential-tested vs the C oracle (`upsert_*` in
-  `write_roundtrip.rs`: DO NOTHING with/without target, DO UPDATE with target, WHERE
-  filter, bare-column vs `excluded.col` resolution, secondary-index maintenance, unmatched
-  target error, INTEGER PRIMARY KEY target, multi-row mixed insert+update).
+  resolves to `OE_Ignore`). `ON CONFLICT DO UPDATE` without a target probes the first
+  unique constraint (IPK if present, else the first unique index) and runs the DO UPDATE
+  body on conflict; all unique indexes are skipped in the generic prechecks so their
+  default OE doesn't double-fire. UPSERT on the rowid-alias column (SET rowid = ...) is
+  rejected (rows are not moved via UPSERT in this slice). Differential-tested vs the C
+  oracle (`upsert_*` in `write_roundtrip.rs`: DO NOTHING with/without target, DO UPDATE
+  with/without target, WHERE filter, bare-column vs `excluded.col` resolution,
+  secondary-index maintenance, unmatched target error, INTEGER PRIMARY KEY target,
+  multi-row mixed insert+update).

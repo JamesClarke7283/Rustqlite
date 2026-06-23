@@ -323,19 +323,16 @@ fn emit_do_update_for_target(
     assignments: &[Assignment],
     where_clause: Option<&Expr>,
 ) -> Result<()> {
-    // The conflict-block label is the entry point of the DO UPDATE body. We emit
-    // a `NoConflict` probe that jumps past the block on no-conflict; on conflict
-    // we fall through to the update body and at its end `Goto row_skip`.
+    // Emit the conflict probe that jumps to `no_conflict` when the target does
+    // not conflict; on conflict fall through to the update body.
     let no_conflict = b.new_label();
-    let (conflict_idx_pos, _nfield, _nkey, _key_start) = match matched {
+    let conflict_ic: Option<i32> = match matched {
         MatchedIndex::None => return Err(Error::msg(
             "ON CONFLICT DO UPDATE without a conflict target is not supported yet",
         )),
         MatchedIndex::Rowid => {
-            // Probe the table by rowid; on conflict fall through to the update body.
             b.emit_jump(Opcode::NotExists, cursor, no_conflict, rowid_reg);
-            // The "key" for the rowid path is just the rowid; nothing else to build.
-            (None, 0i32, 0i32, 0i32)
+            None
         }
         MatchedIndex::Index(target_idx) => {
             let ic_pos = indexes.iter().position(|i| std::ptr::eq(i, target_idx))
@@ -351,32 +348,111 @@ fn emit_do_update_for_target(
             b.emit(Opcode::SCopy, rowid_reg, key_start + nfield, 0);
             let nc = b.emit_jump(Opcode::NoConflict, ic, no_conflict, key_start);
             b.set_p4(nc, P4::Int(nfield as i64));
-            (Some(ic_pos), nfield, nkey, key_start)
+            Some(ic)
         }
     };
 
-    // === Conflict body begins here ===
-    // Position the table cursor on the conflicting row.
+    // === Conflict body ===
+    emit_do_update_body(
+        b, table, indexes, rec_start, rowid_reg, cursor, index_cursor_base,
+        conflict_ic, row_skip, assignments, where_clause,
+    )?;
+    // When WHERE filtered the update or the row was updated in place, skip past
+    // the table Insert (the row was not inserted).
+    b.emit_jump(Opcode::Goto, 0, row_skip, 0);
+    b.resolve(no_conflict);
+    Ok(())
+}
+
+/// Emit DO UPDATE for every unique constraint (no-target form). The C oracle probes
+/// the first unique constraint (IPK if present, else the first unique index) and on
+/// conflict runs the update body. We mirror this: pick the first unique constraint,
+/// emit a single probe, and on conflict run the shared update body. Other unique
+/// constraints are skipped in `emit_conflict_prechecks` (the caller does this via
+/// `skip_indexes`) so their default OE doesn't fire. If the update changes a column
+/// that is part of ANOTHER unique constraint, that constraint is not checked —
+/// matching upstream's behavior for the no-target form (the `overrideError = OE_Update`
+/// path only probes one index at a time in the C code; the actual `sqlite3Update`
+/// call inside `sqlite3UpsertDoUpdate` handles all index maintenance for the
+/// updated row).
+fn emit_do_update_for_all(
+    b: &mut ProgramBuilder,
+    table: &Table,
+    indexes: &[IndexObject],
+    rec_start: i32,
+    rowid_reg: i32,
+    cursor: i32,
+    index_cursor_base: i32,
+    row_skip: Label,
+    assignments: &[Assignment],
+    where_clause: Option<&Expr>,
+) -> Result<()> {
+    // Pick the first unique constraint to probe. Prefer the IPK, then the first
+    // unique index. If there are no unique constraints at all, the ON CONFLICT
+    // clause can never fire — fall through to the normal insert path.
+    let no_conflict = b.new_label();
+    let conflict_ic: Option<i32> = if table.rowid_alias.is_some() {
+        b.emit_jump(Opcode::NotExists, cursor, no_conflict, rowid_reg);
+        None
+    } else if let Some((i, first_idx)) = indexes
+        .iter()
+        .enumerate()
+        .find(|(_, idx)| idx.unique)
+    {
+        let ic = index_cursor_base + i as i32;
+        let indexed_cis = first_idx.table_column_indices(table)?;
+        let nfield = first_idx.nkey_fields() as i32;
+        let nkey = nfield + 1;
+        let key_start = b.alloc_regs(nkey);
+        for (j, col_idx) in indexed_cis.iter().enumerate() {
+            b.emit(Opcode::SCopy, rec_start + *col_idx as i32, key_start + j as i32, 0);
+        }
+        b.emit(Opcode::SCopy, rowid_reg, key_start + nfield, 0);
+        let nc = b.emit_jump(Opcode::NoConflict, ic, no_conflict, key_start);
+        b.set_p4(nc, P4::Int(nfield as i64));
+        Some(ic)
+    } else {
+        // No unique constraints at all — the ON CONFLICT can never fire.
+        return Ok(());
+    };
+
+    // === Conflict body ===
+    emit_do_update_body(
+        b, table, indexes, rec_start, rowid_reg, cursor, index_cursor_base,
+        conflict_ic, row_skip, assignments, where_clause,
+    )?;
+    b.emit_jump(Opcode::Goto, 0, row_skip, 0);
+    b.resolve(no_conflict);
+    Ok(())
+}
+
+/// The shared DO UPDATE body: seek the table to the conflicting row, read its
+/// columns, apply WHERE, evaluate SET, Delete+Insert, re-sync indexes. The
+/// `conflict_index_cursor` is `Some(ic)` when the conflict was on a unique index
+/// (so IdxRowid reads the rowid from that index cursor), or `None` when the
+/// conflict was on the IPK (the rowid is `rowid_reg`).
+fn emit_do_update_body(
+    b: &mut ProgramBuilder,
+    table: &Table,
+    indexes: &[IndexObject],
+    rec_start: i32,
+    rowid_reg: i32,
+    cursor: i32,
+    index_cursor_base: i32,
+    conflict_index_cursor: Option<i32>,
+    row_skip: Label,
+    assignments: &[Assignment],
+    where_clause: Option<&Expr>,
+) -> Result<()> {
     let conflict_rowid_reg = b.alloc_reg();
-    if let Some(ic_pos) = conflict_idx_pos {
-        let ic = index_cursor_base + ic_pos as i32;
+    if let Some(ic) = conflict_index_cursor {
         b.emit(Opcode::IdxRowid, ic, conflict_rowid_reg, 0);
-        // Seek the table cursor; if the rowid is gone (stale index), skip the update.
         b.emit_jump(Opcode::NotExists, cursor, row_skip, conflict_rowid_reg);
     } else {
-        // Rowid path: the rowid is the new row's rowid (the conflict is on the IPK).
         b.emit(Opcode::SCopy, rowid_reg, conflict_rowid_reg, 0);
-        // The table cursor was already probed by NotExists above; it's positioned.
-        // Re-seek to be safe (the NotExists above may have left it positioned; but
-        // the engine's NotExists semantics move the cursor, so we re-seek).
-        b.emit_jump(Opcode::NotExists, cursor, row_skip, conflict_rowid_reg);
     }
 
-    // Read the existing row's columns into a register block so SET expressions can
-    // reference bare `col` (resolves to the existing row). We use `register_base =
-    // Some(existing_row_start)` so `Expr::Column` reads from the block for non-alias
-    // columns. The rowid alias slot is filled with the rowid (so bare `rowid` and
-    // the alias column name both resolve to it).
+    // Read the existing row's columns.
     let ncol = table.columns.len();
     let existing_start = b.alloc_regs(ncol as i32);
     for ci in 0..ncol {
@@ -387,7 +463,7 @@ fn emit_do_update_for_target(
         }
     }
 
-    // Apply the WHERE filter (the existing row's columns are now in existing_start).
+    // Apply the WHERE filter.
     let update_done = b.new_label();
     if let Some(pred) = where_clause {
         let pred_ctx = Ctx {
@@ -398,7 +474,6 @@ fn emit_do_update_for_target(
             index_read: None,
             subquery_resolver: None,
         };
-        // compile_pred_jump jumps to `update_done` when the predicate is FALSE/NULL.
         compile_pred_jump(
             b,
             pred,
@@ -410,20 +485,12 @@ fn emit_do_update_for_target(
         )?;
     }
 
-    // Evaluate SET assignments. The LHS column becomes the table-column register
-    // at `rec_start + ci` (we overwrite the new row's value — the post-UPDATE row
-    // is a merge of the existing row + SET expressions). The RHS expression sees:
-    //   * bare `col` → the existing row's value (from existing_start)
-    //   * `excluded.col` → the new row's value (from rec_start)
-    // We compute each SET RHS into a temp register, then SCopy it into the LHS slot
-    // in rec_start (overwriting the inserted value), applying the column's affinity.
+    // Evaluate SET assignments.
     let excluded_ctx = ExcludedCtx { rec_start, table };
     for Assignment { column, value } in assignments {
         let ci = table.column_index(column).ok_or_else(|| {
             Error::msg(format!("table {} has no column named {column}", table.name))
         })?;
-        // Is the LHS the rowid alias? Reject for now (the first slice doesn't move
-        // rows via UPSERT).
         if table.rowid_alias == Some(ci) {
             return Err(Error::msg(format!(
                 "UPSERT of the INTEGER PRIMARY KEY column is not supported yet (column {})",
@@ -431,17 +498,11 @@ fn emit_do_update_for_target(
             )));
         }
         let target = rec_start + ci as i32;
-        // Compile the RHS with both the existing-row context (bare col) and the
-        // excluded context (excluded.col).
         compile_upsert_expr(b, value, target, table, cursor, existing_start, rec_start, Some(&excluded_ctx))?;
         crate::codegen::insert::apply_affinity_pub(b, target, table.columns[ci].affinity);
     }
 
-    // Rebuild the record from rec_start (the merged row) and Insert at the
-    // conflicting rowid. Upstream's UPSERT path runs the UPDATE via `sqlite3Update`
-    // which does Delete + Insert; we mirror that. The Delete carries P5_ISUPDATE
-    // (suppresses its own `changes` bump) and the Insert does NOT — so `changes`
-    // bumps exactly once per updated row, matching the UPDATE path's pattern.
+    // Delete + Insert at the same rowid.
     let del = b.emit(Opcode::Delete, cursor, 0, 0);
     b.set_p5(del, P5_ISUPDATE);
     let record = b.alloc_reg();
@@ -449,45 +510,14 @@ fn emit_do_update_for_target(
     let ins = b.emit(Opcode::Insert, cursor, record, conflict_rowid_reg);
     b.set_p5(ins, P5_ISUPDATE);
 
-    // Index maintenance: for every index, delete the OLD entry (built from
-    // existing_start) and insert the NEW entry (built from rec_start). The first
-    // slice does this unconditionally for every index — a future optimization will
-    // skip indexes whose key columns didn't change.
+    // Index maintenance.
     emit_upsert_index_maintenance(
         b, indexes, table, cursor, index_cursor_base,
         existing_start, conflict_rowid_reg, rec_start, conflict_rowid_reg,
     )?;
 
-    // Skip past the table Insert (the row was updated in place, not inserted).
-    b.emit_jump(Opcode::Goto, 0, row_skip, 0);
     b.resolve(update_done);
-    // When WHERE filtered the update: skip the in-place update but still skip the
-    // table Insert (upstream's DO UPDATE WHERE false → the row is not modified and
-    // not inserted; the conflict was resolved by "doing nothing" effectively).
-    b.emit_jump(Opcode::Goto, 0, row_skip, 0);
-    b.resolve(no_conflict);
     Ok(())
-}
-
-/// Emit DO UPDATE for every unique constraint (no-target form). The first slice
-/// rejects this with a clear error; a faithful implementation would run the update
-/// body on the first conflict, which is complex when multiple unique indexes
-/// could match. Defer to a follow-up.
-fn emit_do_update_for_all(
-    _b: &mut ProgramBuilder,
-    _table: &Table,
-    _indexes: &[IndexObject],
-    _rec_start: i32,
-    _rowid_reg: i32,
-    _cursor: i32,
-    _index_cursor_base: i32,
-    _row_skip: Label,
-    _assignments: &[Assignment],
-    _where_clause: Option<&Expr>,
-) -> Result<()> {
-    Err(Error::msg(
-        "ON CONFLICT DO UPDATE without a conflict target is not supported yet",
-    ))
 }
 
 /// Emit per-index delete-old + insert-new for the DO UPDATE path. `old_start`

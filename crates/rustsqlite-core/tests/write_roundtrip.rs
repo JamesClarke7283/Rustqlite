@@ -2560,3 +2560,24 @@ fn upsert_do_update_multi_row_mixed_insert_and_update() {
     assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
     assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|x\n2|y");
 }
+
+#[test]
+fn upsert_do_update_without_target_runs_on_first_conflict() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("upsert_no_target_update");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE UNIQUE INDEX idx_a ON t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'a');");
+        // ON CONFLICT DO UPDATE (no target) — matches any unique constraint.
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x') ON CONFLICT DO UPDATE SET b = excluded.b;");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![vec![Value::Int(1), Value::Text("x".into())]]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|x");
+}

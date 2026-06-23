@@ -207,9 +207,11 @@ fn compile_insert_values(
         // `emit_conflict_prechecks` so its default OE doesn't double-fire. For
         // `ON CONFLICT DO NOTHING` (no target) the upsert sets the statement-level
         // OE to `Ignore` and lets `emit_conflict_prechecks` handle every unique
-        // index uniformly (equivalent to `INSERT OR IGNORE`).
+        // index uniformly (equivalent to `INSERT OR IGNORE`). For `ON CONFLICT DO
+        // UPDATE` (no target) every unique constraint is handled by the upsert
+        // precheck, so all unique indexes are skipped in `emit_conflict_prechecks`.
         let mut effective_oe = oe;
-        let mut skip_index: Option<usize> = None;
+        let mut skip_indexes: Vec<usize> = Vec::new();
         let has_upsert = !ins.upsert.is_empty();
         if has_upsert {
             let clause = &ins.upsert[0];
@@ -218,14 +220,18 @@ fn compile_insert_values(
                 if matches!(clause.action, UpsertAction::Nothing) {
                     effective_oe = OeAction::Ignore;
                 } else {
-                    // DO UPDATE without a target is rejected by the upsert codegen
-                    // (it emits an error); we still need to emit the precheck call
-                    // so the error surfaces.
+                    // No-target DO UPDATE: the upsert precheck handles every unique
+                    // constraint; skip all unique indexes in the generic prechecks
+                    // so their default OE doesn't double-fire.
+                    for (i, idx) in indexes.iter().enumerate() {
+                        if idx.unique {
+                            skip_indexes.push(i);
+                        }
+                    }
                 }
             } else {
-                // Targeted upsert: resolve the matched index and emit the upsert
-                // precheck now. The matched index position is computed so
-                // `emit_conflict_prechecks` can skip it.
+                // Targeted upsert: resolve the matched index. The matched index
+                // position is computed so `emit_conflict_prechecks` can skip it.
                 let target = clause.target.as_ref().unwrap();
                 let matched = upsert::resolve_target(
                     &target.columns,
@@ -233,10 +239,18 @@ fn compile_insert_values(
                     table,
                     indexes,
                 )?;
-                skip_index = match matched {
-                    upsert::MatchedIndex::Index(idx) => indexes.iter().position(|i| std::ptr::eq(i, idx)),
-                    _ => None,
-                };
+                if let upsert::MatchedIndex::Index(idx) = matched {
+                    if let Some(pos) = indexes.iter().position(|i| std::ptr::eq(i, idx)) {
+                        skip_indexes.push(pos);
+                    }
+                }
+            }
+            // Emit the upsert precheck for both targeted and no-target forms.
+            // For no-target DO NOTHING, the precheck is skipped (effective_oe =
+            // Ignore handles it via emit_conflict_prechecks). For no-target DO
+            // UPDATE, the precheck probes the first unique constraint and runs
+            // the update body on conflict.
+            if !(clause.target.is_none() && matches!(clause.action, UpsertAction::Nothing)) {
                 upsert::emit_upsert_precheck(
                     &mut b,
                     &ins.upsert,
@@ -260,7 +274,7 @@ fn compile_insert_values(
             cursor,
             effective_oe,
             row_skip,
-            skip_index,
+            &skip_indexes,
         )?;
 
         // M17.6: FK enforcement. For each FK constraint on this table, emit an `FkCheck` that
@@ -1283,7 +1297,7 @@ fn emit_conflict_prechecks(
     table_cursor: i32,
     oe: OeAction,
     row_skip: super::builder::Label,
-    skip_index: Option<usize>,
+    skip_indexes: &[usize],
 ) -> Result<()> {
     // For OE_None (no conflict resolution requested) there's nothing to pre-check — the
     // IdxInsert's P5_UNIQUE will raise the error after the table Insert (the legacy behavior,
@@ -1292,7 +1306,7 @@ fn emit_conflict_prechecks(
         return Ok(());
     }
     for (i, idx) in indexes.iter().enumerate() {
-        if Some(i) == skip_index {
+        if skip_indexes.contains(&i) {
             continue;
         }
         if !idx.unique {
