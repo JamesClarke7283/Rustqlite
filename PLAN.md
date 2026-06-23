@@ -353,15 +353,15 @@ list every granular item needed.
 
 ## M18 — INSERT Enhancements
 
-- [ ] **18.1** `INSERT … SELECT` — materialize the SELECT, then insert rows from the result set
-- [ ] **18.2** `INSERT … DEFAULT VALUES` — insert a row with all columns set to their default values
+- [x] **18.1** `INSERT … SELECT` — materialize the SELECT, then insert rows from the result set
+- [x] **18.2** `INSERT … DEFAULT VALUES` — insert a row with all columns set to their default values
 - [ ] **18.3** UPSERT: `ON CONFLICT [(cols)] DO UPDATE SET … WHERE …` / `DO NOTHING`
 - [ ] **18.4** UPSERT: `ON CONFLICT` without column list — uses any unique index
-- [ ] **18.5** VDBE: conflict resolution (`OR ROLLBACK`, `OR ABORT`, `OR FAIL`, `OR IGNORE`, `OR REPLACE`) enforcement for INSERT
-- [ ] **18.6** `OR REPLACE` — delete conflicting row then insert new row
+- [x] **18.5** VDBE: conflict resolution (`OR ROLLBACK`, `OR ABORT`, `OR FAIL`, `OR IGNORE`, `OR REPLACE`) enforcement for INSERT
+- [x] **18.6** `OR REPLACE` — delete conflicting row then insert new row
 - [ ] **18.7** `AUTOINCREMENT` enforcement: `sqlite_sequence` table for max rowid tracking
-- [ ] **18.8** `RETURNING` clause on INSERT — yield row values after insert
-- [ ] **18.9** Multi-row `INSERT … VALUES` optimization (already works; ensure it handles `DEFAULT` keyword in value list)
+- [x] **18.8** `RETURNING` clause on INSERT — yield row values after insert
+- [x] **18.9** Multi-row `INSERT … VALUES` optimization (already works; ensure it handles `DEFAULT` keyword in value list)
 
 ---
 
