@@ -24,10 +24,10 @@ use crate::error::{Error, Result};
 use crate::schema::{IndexObject, Table};
 use crate::types::Affinity;
 use crate::vdbe::oe::OeAction;
-use crate::vdbe::program::{Program, P4, P5_NCHANGE, P5_UNIQUE};
+use crate::vdbe::program::{FkCheckP4, Program, P4, P5_NCHANGE, P5_UNIQUE};
 use crate::vdbe::Opcode;
 
-use super::builder::ProgramBuilder;
+use super::builder::{Label, ProgramBuilder};
 use super::expr::{compile_expr, Ctx};
 
 /// Compile an `INSERT INTO <table>` statement. `indexes` is the list of indexes attached to
@@ -37,22 +37,30 @@ use super::expr::{compile_expr, Ctx};
 /// For `INSERT ... SELECT`, `source_table` is the resolved source table (or `None` for a
 /// constant / `VALUES` source), and `source_indexes` are its indexes; these are passed to the
 /// SELECT compiler so column references resolve and indexed lookups work.
+///
+/// `fk_checks` carries the resolved FK constraints for M17.6 enforcement. When non-empty and
+/// the connection's `foreign_keys` flag is on, the program emits one `FkCheck` per FK per row
+/// before the table `Insert`; a missing parent row raises "FOREIGN KEY constraint failed".
+/// When empty (no FKs, or FK enforcement off), no FK opcodes are emitted.
 pub fn compile_insert(
     ins: &InsertStmt,
     table: &Table,
     indexes: &[IndexObject],
     source_table: Option<&Table>,
     source_indexes: &[IndexObject],
+    fk_checks: &[FkCheckP4],
 ) -> Result<Program> {
     if table.without_rowid {
         return compile_insert_without_rowid(ins, table, indexes);
     }
     match &ins.source {
-        InsertSource::Values(rows) => compile_insert_values(ins, table, indexes, rows),
+        InsertSource::Values(rows) => compile_insert_values(ins, table, indexes, rows, fk_checks),
         InsertSource::Select(sel) => {
-            compile_insert_select(ins, table, indexes, sel, source_table, source_indexes)
+            compile_insert_select(ins, table, indexes, sel, source_table, source_indexes, fk_checks)
         }
-        InsertSource::DefaultValues => compile_insert_default_values(ins, table, indexes),
+        InsertSource::DefaultValues => {
+            compile_insert_default_values(ins, table, indexes, fk_checks)
+        }
     }
 }
 
@@ -62,6 +70,7 @@ fn compile_insert_values(
     table: &Table,
     indexes: &[IndexObject],
     rows: &[Vec<Expr>],
+    fk_checks: &[FkCheckP4],
 ) -> Result<Program> {
     if rows.is_empty() {
         return Err(Error::msg("INSERT must supply at least one VALUES row"));
@@ -200,6 +209,16 @@ fn compile_insert_values(
             oe,
             row_skip,
         )?;
+
+        // M17.6: FK enforcement. For each FK constraint on this table, emit an `FkCheck` that
+        // verifies the child row's FK columns reference an existing parent row. NULL child keys
+        // skip the check (NULL foreign keys never violate). A missing parent jumps to the
+        // violation handler (a `Halt` with the "FOREIGN KEY constraint failed" prefix). The
+        // `foreign_keys` flag gates emission — when FK enforcement is off, no checks are emitted
+        // (matching upstream's `db->flags & SQLITE_ForeignKeys` guard in the codegen).
+        if !fk_checks.is_empty() {
+            emit_fk_checks(&mut b, fk_checks, table, rec_start, oe, row_skip)?;
+        }
 
         let record = b.alloc_reg();
         b.emit(Opcode::MakeRecord, rec_start, ncol as i32, record);
@@ -656,6 +675,7 @@ fn compile_insert_default_values(
     ins: &InsertStmt,
     table: &Table,
     indexes: &[IndexObject],
+    fk_checks: &[FkCheckP4],
 ) -> Result<Program> {
     // An explicit column list is not meaningful for DEFAULT VALUES, but SQLite accepts it as a
     // no-op (it still uses all defaults). We simply ignore `ins.columns`.
@@ -732,6 +752,17 @@ fn compile_insert_default_values(
         b.emit(Opcode::NewRowid, cursor, rowid_reg, 0);
     }
 
+    // M17.6: FK enforcement (only when the connection has FKs on).
+    if !fk_checks.is_empty() {
+        let row_skip = b.new_label();
+        let oe = OeAction::from_parser(ins.or_action);
+        emit_fk_checks(&mut b, fk_checks, table, rec_start, oe, row_skip)?;
+        // row_skip is only used by OE_Ignore; for the default ABORT path the violation Halt-s
+        // so this label is never branched to in the ABORT case. Resolve it to the post-insert
+        // point so a non-branching fall-through is correct.
+        b.resolve(row_skip);
+    }
+
     let record = b.alloc_reg();
     b.emit(Opcode::MakeRecord, rec_start, ncol as i32, record);
     b.emit(Opcode::Insert, cursor, record, rowid_reg);
@@ -774,6 +805,7 @@ fn compile_insert_select(
     sel: &SelectStmt,
     source_table: Option<&Table>,
     source_indexes: &[IndexObject],
+    fk_checks: &[FkCheckP4],
 ) -> Result<Program> {
     // Map each SELECT-result position to a table column index. With an explicit column list the
     // selected columns fill those columns; otherwise they are positional over all columns.
@@ -947,6 +979,14 @@ fn compile_insert_select(
         b.emit(Opcode::NewRowid, cursor, rowid_reg, 0);
     }
 
+    // M17.6: FK enforcement.
+    if !fk_checks.is_empty() {
+        let row_skip = b.new_label();
+        let oe = OeAction::from_parser(ins.or_action);
+        emit_fk_checks(&mut b, fk_checks, table, rec_start, oe, row_skip)?;
+        b.resolve(row_skip);
+    }
+
     let record = b.alloc_reg();
     b.emit(Opcode::MakeRecord, rec_start, ncol as i32, record);
     b.emit(Opcode::Insert, cursor, record, rowid_reg);
@@ -1103,7 +1143,76 @@ fn validate_indexes(table: &Table, indexes: &[IndexObject]) -> Result<()> {
 /// when no existing entry matches, and on conflict:
 ///
 /// * `OE_Ignore`: jump to `row_skip` (the caller resolves it past the table Insert + index
-///   inserts + RETURNING buffering, so the conflicting row is never written).
+/// Emit `FkCheck` opcodes for each FK constraint on `table`, after the row's column values are
+/// in `rec_start..rec_start+ncol` and before the table `Insert`. The violation handler emits a
+/// `Halt` with `p5 = 4` (the "FOREIGN KEY constraint failed" prefix) and the OE-appropriate `p2`.
+/// For `OE_Ignore`, the violation jumps to `row_skip` instead (the row is silently skipped,
+/// matching upstream's `if( pIdx==0 && ... ) goto ignore_dest` FK-ignore path).
+fn emit_fk_checks(
+    b: &mut ProgramBuilder,
+    fk_checks: &[FkCheckP4],
+    table: &Table,
+    rec_start: i32,
+    oe: OeAction,
+    row_skip: Label,
+) -> Result<()> {
+    for (fk_id, fk) in fk_checks.iter().enumerate() {
+        // Allocate a contiguous block of registers for the child key and SCopy each FK column
+        // from the row's record registers.
+        let n = fk.child_columns.len() as i32;
+        let key_start = b.alloc_regs(n);
+        for (i, col_name) in fk.child_columns.iter().enumerate() {
+            let target = key_start + i as i32;
+            let col_idx = table.column_index(col_name).ok_or_else(|| {
+                Error::msg(format!(
+                    "FK references unknown column {col_name} on table {}",
+                    table.name
+                ))
+            })?;
+            b.emit(Opcode::SCopy, rec_start + col_idx as i32, target, 0);
+        }
+        // Emit the FkCheck. p1 = key_start, p2 = violation label, p3 = fk_id. FkCheck jumps to
+        // p2 when the parent is missing; falls through when the parent exists (OK). The
+        // fall-through must skip over the violation handler (the Halt), so we emit a `Goto
+        // ok_label` after FkCheck, then the violation handler, then resolve ok_label.
+        let ok_label = b.new_label();
+        let violation = b.new_label();
+        let fc = b.emit_jump(Opcode::FkCheck, key_start, violation, fk_id as i32);
+        b.set_p4(fc, P4::FkCheck(fk.clone()));
+        // Fall-through = parent exists (OK) → skip the violation handler.
+        b.emit_jump(Opcode::Goto, 0, ok_label, 0);
+        // violation: the parent row is missing.
+        b.resolve(violation);
+        match oe {
+            OeAction::Ignore => {
+                b.emit_jump(Opcode::Goto, 0, row_skip, 0);
+            }
+            OeAction::None => {
+                // The p5=4 prefix "FOREIGN KEY constraint failed: " is added by the executor's
+                // Halt arm; the message body is just "child.col".
+                let msg = format!("{}.{}", fk.child_table, fk.child_columns.join(", "));
+                let halt = b.emit(Opcode::Halt, crate::error::ResultCode::Constraint as i32, OeAction::Abort as i32, 0);
+                b.set_p4(halt, P4::Text(msg));
+                b.set_p5(halt, 4);
+            }
+            other => {
+                let msg = format!("{}.{}", fk.child_table, fk.child_columns.join(", "));
+                let halt = b.emit(Opcode::Halt, crate::error::ResultCode::Constraint as i32, other as i32, 0);
+                b.set_p4(halt, P4::Text(msg));
+                b.set_p5(halt, 4);
+            }
+        }
+        b.resolve(ok_label);
+    }
+    Ok(())
+}
+
+/// Conflict-resolution pre-checks for UNIQUE constraints (mirrors the UNIQUE pre-check block in
+/// `sqlite3GenerateConstraintChecks`). For each unique index, emit a `NoConflict` seek; on
+/// conflict:
+///
+/// * `OE_Ignore`: jump to `row_skip` — BEFORE the table Insert — so the conflicting row is never
+///   written (the row is silently dropped, matching `INSERT OR IGNORE`).
 /// * `OE_Replace`: fetch the conflicting row's rowid via `IdxRowid`, seek the table cursor
 ///   to it, delete its entries from every index, delete the table row, then fall through
 ///   (the subsequent table Insert + IdxInserts will now succeed because the conflict is gone).

@@ -82,6 +82,10 @@ pub fn render_p4(p4: &P4) -> String {
             // instruction count and register count. We match that shape.
             format!("program({},{})", prog.instructions.len(), prog.num_registers)
         }
+        P4::FkCheck(fk) => {
+            // Render the FK constraint as "fk(child->parent)" so EXPLAIN is readable.
+            format!("fk({}.{}->{})", fk.child_table, fk.child_columns.join(","), fk.parent_table)
+        }
     }
 }
 

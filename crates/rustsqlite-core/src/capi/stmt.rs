@@ -179,6 +179,16 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             let (source_table, source_indexes) =
                 resolve_insert_source(&pager, &ins.source)?.unwrap_or_default();
             let source_table_ref = (!source_table.name.is_empty()).then_some(&source_table);
+            // M17.6: resolve FK constraints for enforcement when `PRAGMA foreign_keys = ON`.
+            // When the flag is off, no FK checks are emitted (matching upstream's
+            // `db->flags & SQLITE_ForeignKeys` guard in the codegen).
+            let fk_checks = if db.foreign_keys() {
+                block_on(crate::btree::foreign_key_check::resolve_fk_constraints(
+                    &pager, &table,
+                ))?
+            } else {
+                Vec::new()
+            };
             let column_names = ins
                 .returning
                 .as_deref()
@@ -192,6 +202,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 &indexes,
                 source_table_ref,
                 &source_indexes,
+                &fk_checks,
             )?);
             let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {

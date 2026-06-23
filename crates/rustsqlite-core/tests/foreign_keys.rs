@@ -531,3 +531,174 @@ fn foreign_key_check_indexed_parent_matches_oracle() {
     let theirs = db.oracle("PRAGMA foreign_key_check;");
     assert_eq!(ours, theirs, "foreign_key_check mismatch (indexed parent)");
 }
+
+// ---------------------------------------------------------------------------
+// M17.6: FK enforcement on INSERT
+// ---------------------------------------------------------------------------
+
+/// Helper: run a statement and return whether it succeeded (true) or failed (false),
+/// capturing the error message on failure.
+fn try_exec(conn: &mut Sqlite3, sql: &str) -> (bool, String) {
+    match sqlite3_prepare_v2(conn, sql) {
+        Ok((mut stmt, _)) => match stmt.step() {
+            ResultCode::Done => (true, String::new()),
+            ResultCode::Row => (true, "unexpected row".to_string()),
+            other => (false, format!("{other:?}: {}", stmt.errmsg())),
+        },
+        Err(e) => (false, e.to_string()),
+    }
+}
+
+/// With `PRAGMA foreign_keys = ON`, inserting a child row whose FK doesn't reference an
+/// existing parent row raises "FOREIGN KEY constraint failed". Matches the oracle.
+#[test]
+fn fk_enforcement_insert_violation_matches_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("fk_ins");
+
+    let mut conn = sqlite3_open(db.str()).expect("open");
+    exec(&mut conn, "CREATE TABLE parent(id INTEGER PRIMARY KEY);");
+    exec(&mut conn, "INSERT INTO parent VALUES(1),(2);");
+    exec(&mut conn, "CREATE TABLE child(x INTEGER REFERENCES parent(id));");
+    exec(&mut conn, "PRAGMA foreign_keys = ON;");
+
+    // Valid references succeed.
+    let (ok, msg) = try_exec(&mut conn, "INSERT INTO child VALUES(1);");
+    assert!(ok, "valid insert should succeed: {msg}");
+    let (ok, msg) = try_exec(&mut conn, "INSERT INTO child VALUES(2);");
+    assert!(ok, "valid insert should succeed: {msg}");
+
+    // Invalid reference fails with FK constraint error.
+    let (ok, msg) = try_exec(&mut conn, "INSERT INTO child VALUES(99);");
+    assert!(!ok, "invalid insert should fail");
+    assert!(
+        msg.contains("FOREIGN KEY constraint failed"),
+        "expected FK constraint error, got: {msg}"
+    );
+
+    // The oracle raises the same error.
+    let mut oracle_conn = sqlite3_open(db.str()).expect("open oracle");
+    exec(&mut oracle_conn, "PRAGMA foreign_keys = ON;");
+    let (ok, msg) = try_exec(&mut oracle_conn, "INSERT INTO child VALUES(99);");
+    assert!(!ok, "oracle should also fail");
+    assert!(
+        msg.contains("FOREIGN KEY constraint failed"),
+        "oracle FK error mismatch: {msg}"
+    );
+}
+
+/// With `PRAGMA foreign_keys = OFF` (the default), FK enforcement is skipped — invalid
+/// inserts succeed (matching the oracle).
+#[test]
+fn fk_enforcement_off_allows_violation() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("fk_off");
+
+    let mut conn = sqlite3_open(db.str()).expect("open");
+    exec(&mut conn, "CREATE TABLE parent(id INTEGER PRIMARY KEY);");
+    exec(&mut conn, "INSERT INTO parent VALUES(1);");
+    exec(&mut conn, "CREATE TABLE child(x INTEGER REFERENCES parent(id));");
+    // foreign_keys is OFF by default.
+    let (ok, msg) = try_exec(&mut conn, "INSERT INTO child VALUES(99);");
+    assert!(ok, "invalid insert should succeed when FK enforcement is off: {msg}");
+
+    // The oracle also allows it when the flag is off.
+    let mut oracle_conn = sqlite3_open(db.str()).expect("open oracle");
+    let (ok, msg) = try_exec(&mut oracle_conn, "INSERT INTO child VALUES(100);");
+    assert!(ok, "oracle should allow it too: {msg}");
+}
+
+/// A NULL child FK column is allowed (NULL foreign keys never violate), matching the oracle.
+#[test]
+fn fk_enforcement_null_child_allowed() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("fk_null");
+
+    let mut conn = sqlite3_open(db.str()).expect("open");
+    exec(&mut conn, "CREATE TABLE parent(id INTEGER PRIMARY KEY);");
+    exec(&mut conn, "INSERT INTO parent VALUES(1);");
+    exec(&mut conn, "CREATE TABLE child(x INTEGER REFERENCES parent(id));");
+    exec(&mut conn, "PRAGMA foreign_keys = ON;");
+    let (ok, msg) = try_exec(&mut conn, "INSERT INTO child VALUES(NULL);");
+    assert!(ok, "NULL child should be allowed: {msg}");
+
+    let mut oracle_conn = sqlite3_open(db.str()).expect("open oracle");
+    exec(&mut oracle_conn, "PRAGMA foreign_keys = ON;");
+    let (ok, msg) = try_exec(&mut oracle_conn, "INSERT INTO child VALUES(NULL);");
+    assert!(ok, "oracle should allow NULL child too: {msg}");
+}
+
+/// `INSERT OR IGNORE` with an FK violation skips the row (no error), matching the oracle.
+#[test]
+fn fk_enforcement_or_ignore_skips_row() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("fk_ignore");
+
+    let mut conn = sqlite3_open(db.str()).expect("open");
+    exec(&mut conn, "CREATE TABLE parent(id INTEGER PRIMARY KEY);");
+    exec(&mut conn, "INSERT INTO parent VALUES(1);");
+    exec(&mut conn, "CREATE TABLE child(x INTEGER REFERENCES parent(id));");
+    exec(&mut conn, "PRAGMA foreign_keys = ON;");
+    let (ok, msg) = try_exec(&mut conn, "INSERT OR IGNORE INTO child VALUES(99);");
+    assert!(ok, "OR IGNORE should skip the row (no error): {msg}");
+    // The violating row should NOT be in the table.
+    let rows = query_rows(&mut conn, "SELECT * FROM child;");
+    assert!(rows.is_empty(), "OR IGNORE should not insert the violating row");
+
+    let mut oracle_conn = sqlite3_open(db.str()).expect("open oracle");
+    exec(&mut oracle_conn, "PRAGMA foreign_keys = ON;");
+    let (ok, msg) = try_exec(&mut oracle_conn, "INSERT OR IGNORE INTO child VALUES(99);");
+    assert!(ok, "oracle OR IGNORE should skip: {msg}");
+    let rows = query_rows(&mut oracle_conn, "SELECT * FROM child;");
+    assert!(rows.is_empty(), "oracle should not insert either");
+}
+
+/// A multi-column FK is enforced correctly (both columns must match a parent row).
+#[test]
+fn fk_enforcement_multicolumn_matches_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("fk_multi");
+
+    // Build the schema with the oracle (so the implicit composite-PK index is populated
+    // correctly — our engine's composite-PK implicit-index population is a known M5.3+ gap).
+    let setup = [
+        "CREATE TABLE p(a INTEGER, b INTEGER, PRIMARY KEY(a,b));",
+        "INSERT INTO p VALUES(1,2),(3,4);",
+        "CREATE TABLE c(x INTEGER, y INTEGER, FOREIGN KEY(x,y) REFERENCES p(a,b));",
+    ];
+    for s in setup {
+        let out = Command::new("sqlite3")
+            .arg(db.str())
+            .arg(s)
+            .output()
+            .expect("run sqlite3");
+        assert!(out.status.success(), "sqlite3 setup failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    let mut conn = sqlite3_open(db.str()).expect("open");
+    exec(&mut conn, "PRAGMA foreign_keys = ON;");
+
+    // Valid: (1,2) and (3,4) exist.
+    let (ok, msg) = try_exec(&mut conn, "INSERT INTO c VALUES(1,2);");
+    assert!(ok, "valid multi-col insert should succeed: {msg}");
+    let (ok, msg) = try_exec(&mut conn, "INSERT INTO c VALUES(3,4);");
+    assert!(ok, "valid multi-col insert should succeed: {msg}");
+
+    // Invalid: (1,3) has no parent.
+    let (ok, msg) = try_exec(&mut conn, "INSERT INTO c VALUES(1,3);");
+    assert!(!ok, "invalid multi-col insert should fail");
+    assert!(
+        msg.contains("FOREIGN KEY constraint failed"),
+        "expected FK error, got: {msg}"
+    );
+
+    // The oracle raises the same error.
+    let mut oracle_conn = sqlite3_open(db.str()).expect("open oracle");
+    exec(&mut oracle_conn, "PRAGMA foreign_keys = ON;");
+    let (ok, msg) = try_exec(&mut oracle_conn, "INSERT INTO c VALUES(5,6);");
+    assert!(!ok, "oracle should fail too");
+    assert!(
+        msg.contains("FOREIGN KEY constraint failed"),
+        "oracle FK error mismatch: {msg}"
+    );
+}

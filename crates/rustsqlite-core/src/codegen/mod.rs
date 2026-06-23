@@ -120,8 +120,9 @@ pub fn compile_insert(
     indexes: &[IndexObject],
     source_table: Option<&Table>,
     source_indexes: &[IndexObject],
+    fk_checks: &[crate::vdbe::FkCheckP4],
 ) -> Result<Program> {
-    insert::compile_insert(ins, table, indexes, source_table, source_indexes)
+    insert::compile_insert(ins, table, indexes, source_table, source_indexes, fk_checks)
 }
 
 /// Compile a `DELETE FROM <table> [WHERE <expr>]` into a VDBE write program against the

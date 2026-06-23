@@ -57,6 +57,54 @@ pub enum P4 {
     /// parent's until a `Halt` pops the frame (or a `Return` from a `Gosub`-shaped sub-program
     /// returns to the parent).
     SubProgram(Arc<Program>),
+    /// Foreign-key check info for `OP_FkCheck` (M17.6). Carries the resolved parent lookup
+    /// strategy so the executor can verify a child row's FK without re-parsing the schema per
+    /// row.
+    FkCheck(FkCheckP4),
+}
+
+/// The resolved FK constraint info carried by `OP_FkCheck`'s `P4`. The codegen resolves the
+/// parent table and its covering index (or rowid-alias path) once at prepare time and stores
+/// the lookup strategy here; the executor replays it per child row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FkCheckP4 {
+    /// The child table name (for the error message: "FOREIGN KEY constraint failed: child.col").
+    pub child_table: String,
+    /// The child column names (parallel to the child-key registers).
+    pub child_columns: Vec<String>,
+    /// The parent table name (for the error message).
+    pub parent_table: String,
+    /// The lookup strategy.
+    pub lookup: FkLookup,
+}
+
+/// The parent-lookup strategy for one FK constraint.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FkLookup {
+    /// Single-column FK referencing the parent's `INTEGER PRIMARY KEY` rowid alias. Probe via
+    /// `TableCursor::seek_rowid` on the parent table b-tree rooted at `root`.
+    RowidSeek { root: u32 },
+    /// An index on the parent table covers the referenced columns. Probe via
+    /// `IndexCursor::seek(SeekOp::Ge)` + prefix equality on the index rooted at `root`, using
+    /// the per-column `key_info` for comparison.
+    IndexSeek {
+        root: u32,
+        key_info: Vec<KeyField>,
+    },
+    /// No usable index — full parent-table scan comparing the referenced columns (BINARY
+    /// collation fallback). Correct but O(n) per child row.
+    TableScan {
+        root: u32,
+        /// The table-column index of each referenced parent column (parallel to the child-key
+        /// registers), with the parent `Table` for rowid-alias substitution.
+        parent_col_indices: Vec<usize>,
+        /// The parent table's rowid-alias column index (if any) for value substitution.
+        parent_rowid_alias: Option<usize>,
+    },
+    /// The parent table doesn't exist (a dangling FK). Upstream reports every non-NULL child
+    /// row as a violation in this case (the `PragTyp_FOREIGN_KEY_CHECK` second loop leaves no
+    /// `addrOk` jump when `pParent == 0`).
+    ParentMissing,
 }
 
 /// A single VDBE instruction.

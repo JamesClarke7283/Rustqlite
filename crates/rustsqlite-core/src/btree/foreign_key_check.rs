@@ -48,7 +48,7 @@ use crate::schema::catalog::{read_catalog, Catalog};
 use crate::schema::table::{IndexObject, Table};
 use crate::schema::SchemaObject;
 use crate::types::{Collation, Value};
-use crate::vdbe::KeyField;
+use crate::vdbe::{FkCheckP4, FkLookup, KeyField};
 
 /// One FK constraint extracted from a `CREATE TABLE` statement.
 struct FkConstraint {
@@ -324,6 +324,66 @@ async fn plan_fk(catalog: &Catalog, fk: &FkConstraint) -> Result<FkPlan> {
         parent_table,
         parent_col_indices,
     })
+}
+
+/// Resolve every FK constraint on `child_table` into a [`FkCheckP4`] for the INSERT/UPDATE
+/// codegen (M17.6 enforcement). Returns an empty vec when the table has no FKs. The
+/// `child_table_name` is the stored name (may be quoted); `child_columns` is parallel to the
+/// FK's child-column-index list so the codegen can emit `SCopy` from the right row registers.
+///
+/// This is the prepare-time resolution: the catalog is read once, each FK's parent table is
+/// found, and the lookup strategy (rowid seek, index seek, or table scan) is captured. At
+/// runtime, `OP_FkCheck` replays the strategy per child row.
+pub async fn resolve_fk_constraints(
+    pager: &Pager,
+    child_table: &Table,
+) -> Result<Vec<FkCheckP4>> {
+    // Re-parse the child's CREATE TABLE to extract the FK constraints (the Table struct itself
+    // doesn't carry FK info — it's parsed on demand, matching the `foreign_key_list` pattern).
+    let catalog = read_catalog(pager).await?;
+    let child_obj = catalog
+        .find_table(&child_table.name)
+        .ok_or_else(|| crate::error::Error::msg(format!("no such table: {}", child_table.name)))?;
+    let Some(sql_text) = child_obj.sql.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let stmts = rustqlite_parser::parse(sql_text).map_err(|e| {
+        crate::error::Error::msg(format!("cannot parse schema for \"{}\": {e}", child_table.name))
+    })?;
+    let ct = match stmts.into_iter().next() {
+        Some(Stmt::CreateTable(ct)) => ct,
+        _ => return Ok(Vec::new()),
+    };
+    let fks = extract_fks(&ct, child_table);
+    let mut out = Vec::with_capacity(fks.len());
+    for fk in &fks {
+        let plan = plan_fk(&catalog, fk).await?;
+        let child_columns: Vec<String> = fk
+            .cols
+            .iter()
+            .map(|(idx, _)| child_table.columns.get(*idx).map(|c| c.name.clone()).unwrap_or_default())
+            .collect();
+        let lookup = match plan {
+            FkPlan::RowidSeek { parent_root } => FkLookup::RowidSeek { root: parent_root },
+            FkPlan::IndexSeek { index, key_info, .. } => FkLookup::IndexSeek {
+                root: index.rootpage as u32,
+                key_info,
+            },
+            FkPlan::TableScan { parent_table, parent_col_indices } => FkLookup::TableScan {
+                root: parent_table.rootpage as u32,
+                parent_col_indices,
+                parent_rowid_alias: parent_table.rowid_alias,
+            },
+            FkPlan::ParentMissing => FkLookup::ParentMissing,
+        };
+        out.push(FkCheckP4 {
+            child_table: child_table.name.clone(),
+            child_columns,
+            parent_table: fk.parent_table.clone(),
+            lookup,
+        });
+    }
+    Ok(out)
 }
 
 /// Find an index on `table_name` whose indexed columns (in order) match `cols` (case-

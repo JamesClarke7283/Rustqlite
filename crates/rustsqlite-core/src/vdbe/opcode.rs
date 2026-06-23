@@ -394,6 +394,17 @@ pub enum Opcode {
     /// `r[p3..p3+3]`: `r[p3]=0` on success or `1` if busy, `r[p3+1]=` number of frames in the WAL,
     /// `r[p3+2]=` number of frames checkpointed. Mirrors `OP_Checkpoint` in `vdbe.c`.
     Checkpoint,
+    /// `FkCheck p1 p2 p3 P4=FkCheck`: verify a single foreign-key constraint for the row whose
+    /// child-key columns live in registers `r[p1..p1+n]` (where `n` is the FK's column count,
+    /// carried in `P4::FkCheck`). If any child-key column is NULL, the check is skipped (NULL
+    /// foreign keys never violate — mirrors upstream's `OP_IsNull → addrOk` early-out). When
+    /// the parent row matching the child key is found, execution falls through; when the
+    /// parent row is missing, execution jumps to `p2` (the constraint-violation handler, which
+    /// typically emits a `Halt` with `p5 = 4` for the "FOREIGN KEY constraint failed" prefix).
+    /// `p3` carries the FK constraint's 0-based index (for the error message). This is the
+    /// runtime side of M17.6 FK enforcement; the lookup strategy (rowid seek, index seek, or
+    /// full parent scan) is resolved at codegen time and carried in `P4::FkCheck`.
+    FkCheck,
 }
 
 impl Opcode {
@@ -508,6 +519,7 @@ impl Opcode {
             Opcode::Last => "Last",
             Opcode::Prev => "Prev",
             Opcode::Checkpoint => "Checkpoint",
+            Opcode::FkCheck => "FkCheck",
         }
     }
 }

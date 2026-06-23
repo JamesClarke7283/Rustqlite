@@ -882,4 +882,27 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   `TableScan` fallback uses BINARY collation for parent-column comparison rather than the
   parent column's declared collation — correct for the common case (numeric/BINARY-text FKs)
   but may diverge for `COLLATE NOCASE`/`RTRIM` parent columns; the `IndexSeek` path honors
-  per-column collation via the index's `KeyInfo`.
+  per-column collation via the index's `KeyInfo`. **17.6 FK enforcement on INSERT** ✅:
+  `INSERT INTO child ...` with `PRAGMA foreign_keys = ON` verifies each FK constraint before
+  the table `Insert`. The prepare path (`capi::stmt`) calls
+  `btree::foreign_key_check::resolve_fk_constraints` to parse the child's CREATE TABLE,
+  extract each `REFERENCES`/`FOREIGN KEY` constraint, resolve the parent table + covering
+  index (or rowid-alias path), and build a `Vec<FkCheckP4>` threaded into `compile_insert`.
+  The codegen emits a new `OP_FkCheck p1 p2 p3 P4=FkCheck` per FK per row (after
+  `emit_conflict_prechecks`, before `MakeRecord`): `p1` is the child-key start register,
+  `p2` is the violation label, `p3` is the 0-based FK index. The executor (`vdbe::exec`)
+  reads the child-key registers, skips when any is NULL (NULL foreign keys never violate),
+  and calls `fk_parent_exists` which replays the `FkLookup` strategy (RowidSeek /
+  IndexSeek / TableScan / ParentMissing — the same strategies as `foreign_key_check`). When
+  the parent is missing, the codegen's violation handler emits a `Halt` with
+  `p1=Constraint`, `p2=oe`, `p4="child.col"`, `p5=4` (the "FOREIGN KEY constraint failed"
+  prefix, already wired in the `Halt` arm). `OE_Ignore` jumps to `row_skip` instead (the
+  row is silently dropped, matching `INSERT OR IGNORE`). When `PRAGMA foreign_keys = OFF`
+  (the default), no FK checks are emitted (matching upstream's `db->flags &
+  SQLITE_ForeignKeys` guard). Differential-tested vs the C oracle (`foreign_keys.rs`:
+  valid insert succeeds, invalid insert fails with FK constraint error, NULL child
+  allowed, `OR IGNORE` skips the row, multi-column FK enforced). Known limitation: an FK
+  on the rowid-alias column (`x INTEGER PRIMARY KEY REFERENCES parent`) copies the record
+  slot (which is NULL for the rowid alias) rather than the rowid register — the fix is to
+  thread `rowid_reg` into `emit_fk_checks`; the common `x INTEGER REFERENCES parent(id)`
+  case works because `x` is a regular column, not the rowid alias.

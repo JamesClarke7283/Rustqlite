@@ -23,5 +23,5 @@ pub use exec::{StepResult, Vdbe};
 pub use mem::Mem;
 pub use oe::OeAction;
 pub use opcode::Opcode;
-pub use program::{Instruction, KeyField, Program, P4};
+pub use program::{FkCheckP4, FkLookup, Instruction, KeyField, Program, P4};
 pub use sorter::Sorter;

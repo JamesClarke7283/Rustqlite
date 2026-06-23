@@ -424,7 +424,7 @@ fn is_absolute_jump(inst: &Instruction) -> bool {
         Goto | Init | Gosub | If | IfNot | IsNull | NotNull | IfPos | DecrJumpZero | Eq | Ne | Lt
             | Le | Gt | Ge | Rewind | Next | NotExists | SeekGE | SeekGT | SeekLE | SeekLT
             | IdxGE | IdxGT | IdxLE | IdxLT | Found | NotFound | NoConflict | SorterSort
-            | SorterNext
+            | SorterNext | FkCheck
     )
 }
 
@@ -954,6 +954,11 @@ fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) 
             // p2 is a register in the sub-program's own frame; rebase it. p1 is an offset from
             // the parent's base, not a register, so leave it alone.
             r(&mut inst.p2);
+        }
+        FkCheck => {
+            // p1 is the child-key start register; rebase it. p2 is a jump target (handled by
+            // the caller's address-map patch); p3 is the FK index (not a register).
+            r(&mut inst.p1);
         }
     }
 }

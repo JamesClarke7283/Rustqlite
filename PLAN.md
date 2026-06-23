@@ -342,7 +342,7 @@ list every granular item needed.
 - [x] **17.3** `PRAGMA foreign_keys` — enable/disable FK enforcement
 - [x] **17.4** `PRAGMA foreign_key_list(tbl)` — list FK constraints on a table
 - [x] **17.5** `PRAGMA foreign_key_check` — verify all FK constraints
-- [ ] **17.6** FK enforcement on INSERT: child row must reference an existing parent row (or be NULL)
+- [x] **17.6** FK enforcement on INSERT: child row must reference an existing parent row (or be NULL)
 - [ ] **17.7** FK enforcement on DELETE from parent: cascade action (SET NULL, SET DEFAULT, CASCADE, RESTRICT, NO ACTION)
 - [ ] **17.8** FK enforcement on UPDATE of parent key: cascade action
 - [ ] **17.9** VDBE: `FkCheck` / `FkCounter` / `FkIfZero` opcodes

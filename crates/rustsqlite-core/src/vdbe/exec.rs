@@ -26,7 +26,7 @@ use super::cursor::{PseudoCursor, VdbeCursor};
 use super::ephemeral::Ephemeral;
 use super::opcode::Opcode;
 use super::program::{
-    p5_to_aff, Instruction, Program, P4, P5_ISUPDATE, P5_JUMPIFNULL, P5_NCHANGE, P5_NULLEQ,
+    p5_to_aff, FkLookup, Instruction, Program, P4, P5_ISUPDATE, P5_JUMPIFNULL, P5_NCHANGE, P5_NULLEQ,
     P5_STOREP2, P5_UNIQUE,
 };
 use super::sorter::Sorter;
@@ -1116,6 +1116,36 @@ impl Vdbe {
                         }
                     }
                     self.pc += 1;
+                }
+
+                Opcode::FkCheck => {
+                    // `OP_FkCheck p1 p2 p3 P4=FkCheck`: verify a single FK constraint for the
+                    // child row whose key columns are in `r[p1..p1+n]`. When any key column is
+                    // NULL, skip (no violation). When the parent row is missing, jump to `p2`
+                    // (the violation handler). Otherwise fall through. `p3` carries the FK's
+                    // 0-based index for the error message; the lookup strategy is in `P4`.
+                    let fk = match &inst.p4 {
+                        P4::FkCheck(fk) => fk.clone(),
+                        _ => return Err(Error::msg("OP_FkCheck: missing P4::FkCheck")),
+                    };
+                    let n = fk.child_columns.len();
+                    let start = p1 as usize;
+                    let key: Vec<Value> = self.regs[start..start + n].to_vec();
+                    // NULL foreign keys never violate (upstream's `OP_IsNull → addrOk`).
+                    if key.iter().any(|v| matches!(v, Value::Null)) {
+                        self.pc += 1;
+                        continue;
+                    }
+                    let pager = self
+                        .pager
+                        .clone()
+                        .ok_or_else(|| Error::msg("no database is open"))?;
+                    let found = fk_parent_exists(&pager, &fk.lookup, &key).await?;
+                    if found {
+                        self.pc += 1;
+                    } else {
+                        self.pc = p2 as usize;
+                    }
                 }
 
                 Opcode::OpenRead => {
@@ -2505,6 +2535,58 @@ fn compare_prefix(prefix: &[Value], key: &[Value], key_info: &[KeyField]) -> Ord
         }
     }
     prefix.len().cmp(&key.len())
+}
+
+/// `OP_FkCheck` runtime: look up the parent row matching `child_key` using the resolved
+/// `FkLookup` strategy. Returns `true` when a matching parent row exists (FK satisfied),
+/// `false` when missing (FK violated). Mirrors the `foreign_key_check.rs` lookup paths.
+async fn fk_parent_exists(pager: &Arc<Pager>, lookup: &FkLookup, child_key: &[Value]) -> Result<bool> {
+    use crate::btree::cursor::TableCursor;
+    use crate::btree::index_cursor::{IndexCursor, SeekOp};
+    use crate::format::decode_record;
+    match lookup {
+        FkLookup::RowidSeek { root } => {
+            let rowid = child_key[0].as_i64();
+            let mut cur = TableCursor::new(pager.clone(), *root);
+            cur.seek_rowid(rowid).await
+        }
+        FkLookup::IndexSeek { root, key_info } => {
+            let mut cur = IndexCursor::new(pager.clone(), *root, key_info.clone());
+            let positioned = cur.seek(SeekOp::Ge, child_key).await?;
+            if !positioned {
+                return Ok(false);
+            }
+            let payload = cur.payload().to_vec();
+            let entry = decode_record(&payload, pager.text_encoding())?;
+            let prefix_len = entry.len().saturating_sub(1).min(child_key.len());
+            let prefix = &entry[..prefix_len];
+            Ok(compare_prefix(prefix, child_key, key_info) == Ordering::Equal)
+        }
+        FkLookup::TableScan { root, parent_col_indices, parent_rowid_alias } => {
+            let rows = crate::btree::scan_table(pager, *root).await?;
+            let encoding = pager.text_encoding();
+            for (rowid, payload) in rows {
+                let pvalues = decode_record(&payload, encoding)?;
+                let mut matched = true;
+                for (i, &parent_col_idx) in parent_col_indices.iter().enumerate() {
+                    let pv = if Some(parent_col_idx) == *parent_rowid_alias {
+                        Value::Int(rowid)
+                    } else {
+                        pvalues.get(parent_col_idx).cloned().unwrap_or(Value::Null)
+                    };
+                    if mem_compare(&pv, &child_key[i], Collation::Binary) != Ordering::Equal {
+                        matched = false;
+                        break;
+                    }
+                }
+                if matched {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        FkLookup::ParentMissing => Ok(false),
+    }
 }
 
 fn char_to_aff(ch: u8) -> Affinity {

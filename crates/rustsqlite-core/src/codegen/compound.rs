@@ -1348,6 +1348,7 @@ fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) 
         Yield => r(&mut inst.p1),
         Program => {}
         Param => r(&mut inst.p2),
+        FkCheck => r(&mut inst.p1),
     }
 }
 
@@ -1359,7 +1360,7 @@ fn is_absolute_jump(inst: &Instruction) -> bool {
         Goto | Init | Gosub | If | IfNot | IsNull | NotNull | IfPos | DecrJumpZero | Eq | Ne | Lt
             | Le | Gt | Ge | Rewind | Next | NotExists | SeekGE | SeekGT | SeekLE | SeekLT
             | IdxGE | IdxGT | IdxLE | IdxLT | Found | NotFound | NoConflict | SorterSort
-            | SorterNext | Yield | Jump | InitCoroutine | SeekRowid | Last | Prev
+            | SorterNext | Yield | Jump | InitCoroutine | SeekRowid | Last | Prev | FkCheck
     )
 }
 
