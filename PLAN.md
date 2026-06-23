@@ -402,24 +402,24 @@ list every granular item needed.
 - [x] **20.18** `PRAGMA cache_size` — read/set page cache size
 - [x] **20.19** `PRAGMA foreign_keys` — read/set FK enforcement
 - [x] **20.20** `PRAGMA encoding` — read/set text encoding (UTF-8 only for now)
-- [ ] **20.21** `PRAGMA compile_options` — list compile-time options
+- [x] **20.21** `PRAGMA compile_options` — list compile-time options
 - [ ] **20.22** `PRAGMA function_list` — list registered functions
 - [x] **20.23** `PRAGMA collation_list` — list collations
 - [ ] **20.24** `PRAGMA collist` — list columns
 - [ ] **20.25** `PRAGMA optimize` — trigger ANALYZE
 - [x] **20.26** `PRAGMA wal_checkpoint` — checkpoint WAL
-- [ ] **20.27** `PRAGMA busy_timeout` — read/set busy timeout
-- [ ] **20.28** `PRAGMA case_sensitive_like` — toggle LIKE case sensitivity
-- [ ] **20.29** `PRAGMA recursive_triggers` — read/set trigger recursion
-- [ ] **20.30** `PRAGMA secure_delete` — read/set secure deletion (zero-fill deleted data)
+- [x] **20.27** `PRAGMA busy_timeout` — read/set busy timeout
+- [x] **20.28** `PRAGMA case_sensitive_like` — toggle LIKE case sensitivity
+- [x] **20.29** `PRAGMA recursive_triggers` — read/set trigger recursion
+- [x] **20.30** `PRAGMA secure_delete` — read/set secure deletion (zero-fill deleted data)
 - [ ] **20.31** `PRAGMA locking_mode` — read/set (NORMAL, EXCLUSIVE)
 - [x] **20.32** `PRAGMA auto_vacuum` — read/set (NONE, FULL, INCREMENTAL)
 - [x] **20.33** `PRAGMA incremental_vacuum` — free freelist pages
-- [ ] **20.34** `PRAGMA defer_foreign_keys` — defer FK checking until COMMIT
-- [ ] **20.35** `PRAGMA writable_schema` — allow direct modification of `sqlite_schema`
+- [x] **20.34** `PRAGMA defer_foreign_keys` — defer FK checking until COMMIT
+- [x] **20.35** `PRAGMA writable_schema` — allow direct modification of `sqlite_schema`
 - [ ] **20.36** `PRAGMA stats` — report b-tree statistics (debug)
-- [ ] **20.37** `PRAGMA reverse_unordered_selects` — toggle optimization
-- [ ] **20.38** `PRAGMA query_only` — prevent writes
+- [x] **20.37** `PRAGMA reverse_unordered_selects` — toggle optimization
+- [x] **20.38** `PRAGMA query_only` — prevent writes
 
 ---
 

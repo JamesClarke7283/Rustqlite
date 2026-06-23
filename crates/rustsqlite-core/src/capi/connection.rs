@@ -76,6 +76,23 @@ pub struct Sqlite3 {
     /// `default_cache_size` is the persistent default). Currently informational — the pager
     /// does not enforce a page cache limit yet (M32.1).
     cache_size: Arc<Mutex<i32>>,
+    /// Per-connection flag pragmas (mirrors `db->flags` in `main.c`).
+    /// `defer_foreign_keys` — defer FK checking until COMMIT.
+    defer_foreign_keys: Arc<Mutex<bool>>,
+    /// `writable_schema` — allow direct modification of `sqlite_schema`.
+    writable_schema: Arc<Mutex<bool>>,
+    /// `reverse_unordered_selects` — reverse the order of unordered SELECTs (debug).
+    reverse_unordered_selects: Arc<Mutex<bool>>,
+    /// `query_only` — prevent writes.
+    query_only: Arc<Mutex<bool>>,
+    /// `case_sensitive_like` — LIKE is case-sensitive (default OFF).
+    case_sensitive_like: Arc<Mutex<bool>>,
+    /// `secure_delete` — zero-fill deleted data (default OFF).
+    secure_delete: Arc<Mutex<bool>>,
+    /// `recursive_triggers` — allow recursive trigger firing (default OFF).
+    recursive_triggers: Arc<Mutex<bool>>,
+    /// `busy_timeout` — the busy timeout in milliseconds (default 0).
+    busy_timeout: Arc<Mutex<i32>>,
     last_error: Option<Error>,
 }
 
@@ -120,6 +137,14 @@ pub fn sqlite3_open_v2(filename: &str, flags: OpenFlags) -> Result<Sqlite3> {
             foreign_keys: Arc::new(Mutex::new(false)),
             synchronous: Arc::new(Mutex::new(2)),
             cache_size: Arc::new(Mutex::new(-2000)),
+            defer_foreign_keys: Arc::new(Mutex::new(false)),
+            writable_schema: Arc::new(Mutex::new(false)),
+            reverse_unordered_selects: Arc::new(Mutex::new(false)),
+            query_only: Arc::new(Mutex::new(false)),
+            case_sensitive_like: Arc::new(Mutex::new(false)),
+            secure_delete: Arc::new(Mutex::new(false)),
+            recursive_triggers: Arc::new(Mutex::new(false)),
+            busy_timeout: Arc::new(Mutex::new(0)),
             last_error: None,
         })
     })
@@ -296,6 +321,46 @@ impl Sqlite3 {
     /// `PRAGMA cache_size = N` write.
     pub(crate) fn set_cache_size(&self, v: i32) {
         *self.cache_size.lock().unwrap() = v;
+    }
+
+    /// Read a per-connection boolean flag by name. Returns `false` for unknown flags.
+    pub fn flag(&self, name: &str) -> bool {
+        match name {
+            "foreign_keys" => *self.foreign_keys.lock().unwrap(),
+            "defer_foreign_keys" => *self.defer_foreign_keys.lock().unwrap(),
+            "writable_schema" => *self.writable_schema.lock().unwrap(),
+            "reverse_unordered_selects" => *self.reverse_unordered_selects.lock().unwrap(),
+            "query_only" => *self.query_only.lock().unwrap(),
+            "case_sensitive_like" => *self.case_sensitive_like.lock().unwrap(),
+            "secure_delete" => *self.secure_delete.lock().unwrap(),
+            "recursive_triggers" => *self.recursive_triggers.lock().unwrap(),
+            _ => false,
+        }
+    }
+
+    /// Set a per-connection boolean flag by name. No-op for unknown flags.
+    pub(crate) fn set_flag(&self, name: &str, v: bool) {
+        match name {
+            "foreign_keys" => *self.foreign_keys.lock().unwrap() = v,
+            "defer_foreign_keys" => *self.defer_foreign_keys.lock().unwrap() = v,
+            "writable_schema" => *self.writable_schema.lock().unwrap() = v,
+            "reverse_unordered_selects" => *self.reverse_unordered_selects.lock().unwrap() = v,
+            "query_only" => *self.query_only.lock().unwrap() = v,
+            "case_sensitive_like" => *self.case_sensitive_like.lock().unwrap() = v,
+            "secure_delete" => *self.secure_delete.lock().unwrap() = v,
+            "recursive_triggers" => *self.recursive_triggers.lock().unwrap() = v,
+            _ => {}
+        }
+    }
+
+    /// `PRAGMA busy_timeout` read — the busy timeout in milliseconds.
+    pub fn busy_timeout(&self) -> i32 {
+        *self.busy_timeout.lock().unwrap()
+    }
+
+    /// `PRAGMA busy_timeout = N` write.
+    pub(crate) fn set_busy_timeout(&self, v: i32) {
+        *self.busy_timeout.lock().unwrap() = v;
     }
 
     // ---- Interim engine read helpers (until the VDBE prepare/step path lands in M3) ----

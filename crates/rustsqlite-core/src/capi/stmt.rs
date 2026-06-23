@@ -1725,6 +1725,15 @@ fn compile_pragma(db: &mut Sqlite3, sql: &str, pragma: &PragmaStmt) -> Result<Sq
         "cache_size" => compile_pragma_cache_size(db, sql, pragma),
         "encoding" => compile_pragma_encoding(db, sql, pragma),
         "collation_list" => compile_pragma_collation_list(db, sql, pragma),
+        "compile_options" => compile_pragma_compile_options(db, sql, pragma),
+        "busy_timeout" => compile_pragma_busy_timeout(db, sql, pragma),
+        "recursive_triggers" => compile_pragma_flag(db, sql, pragma, "recursive_triggers"),
+        "defer_foreign_keys" => compile_pragma_flag(db, sql, pragma, "defer_foreign_keys"),
+        "writable_schema" => compile_pragma_flag(db, sql, pragma, "writable_schema"),
+        "reverse_unordered_selects" => compile_pragma_flag(db, sql, pragma, "reverse_unordered_selects"),
+        "query_only" => compile_pragma_flag(db, sql, pragma, "query_only"),
+        "case_sensitive_like" => compile_pragma_flag(db, sql, pragma, "case_sensitive_like"),
+        "secure_delete" => compile_pragma_flag(db, sql, pragma, "secure_delete"),
         _ => Err(Error::msg(format!("PRAGMA {name} is not supported yet"))),
     }
 }
@@ -2805,6 +2814,87 @@ fn compile_pragma_collation_list(
         vec![Value::Int(2), Value::Text("RTRIM".into())],
     ];
     Ok(static_stmt_rows(sql, &["seq", "name"], rows))
+}
+
+/// `PRAGMA compile_options` — list compile-time options. Returns one row per option. The
+/// set reflects our engine's defaults (a subset of upstream's — we don't have all the
+/// options, but the common ones are present for introspection parity).
+fn compile_pragma_compile_options(
+    _db: &mut Sqlite3,
+    sql: &str,
+    _pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    let options = [
+        "DEFAULT_CACHE_SIZE=-2000",
+        "DEFAULT_PAGE_SIZE=4096",
+        "DEFAULT_SYNCHRONOUS=2",
+        "DEFAULT_WAL_SYNCHRONOUS=2",
+        "ENABLE_FTS5",
+        "ENABLE_JSON1",
+        "ENABLE_MATH_FUNCTIONS",
+        "ENABLE_STAT4",
+        "ENABLE_UPDATE_DELETE_LIMIT",
+        "LIKE_DOESNT_MATCH_BLOBS",
+        "OMIT_DEPRECATED",
+        "THREADSAFE=1",
+    ];
+    let rows = options.iter().map(|o| vec![Value::Text((*o).into())]).collect();
+    Ok(static_stmt_rows(sql, &["compile_options"], rows))
+}
+
+/// `PRAGMA busy_timeout` — read/set the busy timeout in milliseconds. Per-connection.
+fn compile_pragma_busy_timeout(
+    db: &mut Sqlite3,
+    sql: &str,
+    pragma: &PragmaStmt,
+) -> Result<Sqlite3Stmt> {
+    match &pragma.value {
+        Some(PragmaValue::Equal(kind)) | Some(PragmaValue::Paren(kind)) => {
+            let v = pragma_value_as_int(kind)? as i32;
+            db.set_busy_timeout(v);
+            Ok(empty_static_stmt(sql, &["busy_timeout"]))
+        }
+        _ => {
+            let v = db.busy_timeout() as i64;
+            Ok(static_stmt_rows(sql, &["busy_timeout"], vec![vec![Value::Int(v)]]))
+        }
+    }
+}
+
+/// Generic read/write handler for a per-connection boolean flag pragma. Read returns 0/1;
+/// write accepts a boolean-ish value (ON/OFF, 0/1, TRUE/FALSE, YES/NO).
+fn compile_pragma_flag(
+    db: &mut Sqlite3,
+    sql: &str,
+    pragma: &PragmaStmt,
+    flag_name: &str,
+) -> Result<Sqlite3Stmt> {
+    match &pragma.value {
+        Some(PragmaValue::Equal(kind)) | Some(PragmaValue::Paren(kind)) => {
+            let on = pragma_value_as_bool(kind)?;
+            db.set_flag(flag_name, on);
+            Ok(empty_static_stmt(sql, &[flag_name]))
+        }
+        _ => {
+            let v = i64::from(db.flag(flag_name));
+            Ok(static_stmt_rows(sql, &[flag_name], vec![vec![Value::Int(v)]]))
+        }
+    }
+}
+
+/// Parse a `PragmaValueKind` as a boolean (for `PRAGMA name = ON/OFF`).
+fn pragma_value_as_bool(kind: &PragmaValueKind) -> Result<bool> {
+    match kind {
+        PragmaValueKind::Number(Literal::Integer(n)) => Ok(*n != 0),
+        PragmaValueKind::Number(Literal::Real(r)) => Ok(*r != 0.0),
+        PragmaValueKind::Ident(s) => match s.to_ascii_uppercase().as_str() {
+            "ON" | "TRUE" | "YES" | "1" => Ok(true),
+            "OFF" | "FALSE" | "NO" | "0" => Ok(false),
+            _ => Err(Error::msg(format!("PRAGMA value must be a boolean, got `{s}`"))),
+        },
+        PragmaValueKind::On => Ok(true),
+        _ => Err(Error::msg("PRAGMA value must be a boolean")),
+    }
 }
 
 

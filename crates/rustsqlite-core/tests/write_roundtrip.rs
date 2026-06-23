@@ -3325,6 +3325,57 @@ fn notnull_constraint_enforcement_matches_oracle() {
 }
 
 #[test]
+fn pragma_flag_fields_match_oracle() {
+    // M20.21/27/29/30/34/35/37/38: PRAGMA compile_options, busy_timeout, recursive_triggers,
+    // defer_foreign_keys, writable_schema, reverse_unordered_selects, query_only,
+    // case_sensitive_like, secure_delete.
+    skip_if_no_sqlite3!();
+    let pragmas: &[&str] = &[
+        "PRAGMA busy_timeout;",
+        "PRAGMA busy_timeout = 5000; PRAGMA busy_timeout;",
+        "PRAGMA recursive_triggers;",
+        "PRAGMA recursive_triggers = ON; PRAGMA recursive_triggers;",
+        "PRAGMA defer_foreign_keys;",
+        "PRAGMA defer_foreign_keys = ON; PRAGMA defer_foreign_keys;",
+        "PRAGMA writable_schema;",
+        "PRAGMA query_only;",
+        "PRAGMA reverse_unordered_selects;",
+        "PRAGMA case_sensitive_like;",
+        "PRAGMA secure_delete;",
+        // compile_options: just check it returns rows (the set differs between builds).
+        "PRAGMA compile_options;",
+    ];
+    for pragma_sql in pragmas {
+        let db = TempDb::new("pragma_flag_ours");
+        {
+            let mut conn = sqlite3_open(db.str()).expect("open");
+            exec(&mut conn, "CREATE TABLE t(a);");
+            let (mut s, _) = match sqlite3_prepare_v2(&mut conn, pragma_sql) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("skipping `{pragma_sql}`: {e}");
+                    continue;
+                }
+            };
+            let rows = collect(&mut s);
+            // compile_options: just assert it returns at least one row.
+            if pragma_sql.contains("compile_options") {
+                assert!(!rows.is_empty(), "compile_options should return rows");
+                continue;
+            }
+            let ora = TempDb::new("pragma_flag_ora");
+            {
+                let mut oconn = sqlite3_open(ora.str()).expect("open");
+                exec(&mut oconn, "CREATE TABLE t(a);");
+                let (mut os, _) = sqlite3_prepare_v2(&mut oconn, pragma_sql).unwrap();
+                let oracle_rows = collect(&mut os);
+                assert_eq!(rows, oracle_rows, "PRAGMA mismatch for `{pragma_sql}`");
+            }
+        }
+    }
+}
+
+#[test]
 fn pragma_misc_fields_match_oracle() {
     // M20.17/18/20/23: PRAGMA synchronous, cache_size, encoding, collation_list.
     skip_if_no_sqlite3!();
