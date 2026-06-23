@@ -2607,3 +2607,78 @@ fn json_extract() {
         }
     }
 }
+
+/// `json_type`, `json_valid`, `json_quote`, `json_array_length` (M24.8–M24.11),
+/// differential-tested against the system `sqlite3` oracle.
+#[test]
+fn json_type_valid_quote_array_length() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    for q in [
+        // json_type — each JSON kind.
+        "SELECT json_type('{}');",
+        "SELECT json_type('[]');",
+        "SELECT json_type('1');",
+        "SELECT json_type('1.5');",
+        "SELECT json_type('\"x\"');",
+        "SELECT json_type('null');",
+        "SELECT json_type('true');",
+        "SELECT json_type('false');",
+        // json_type with path.
+        "SELECT json_type('{\"a\":1}','$.a');",
+        "SELECT json_type('{\"a\":[1,2]}','$.a');",
+        "SELECT json_type('{\"a\":1}','$.missing');",
+        // json_type(NULL) → NULL.
+        "SELECT json_type(NULL);",
+        // json_valid.
+        "SELECT json_valid('{}');",
+        "SELECT json_valid('[]');",
+        "SELECT json_valid('1');",
+        "SELECT json_valid('1.5');",
+        "SELECT json_valid('\"x\"');",
+        "SELECT json_valid('null');",
+        "SELECT json_valid('true');",
+        "SELECT json_valid('hello');",
+        "SELECT json_valid('{');",
+        "SELECT json_valid(NULL);",
+        // json_quote.
+        "SELECT json_quote('hello');",
+        "SELECT json_quote(123);",
+        "SELECT json_quote(1.5);",
+        "SELECT json_quote(NULL);",
+        "SELECT json_quote('a\"b');",
+        "SELECT json_quote('a\nb');",
+        "SELECT json_quote('{\"a\":1}');",
+        // json_array_length.
+        "SELECT json_array_length('[1,2,3]');",
+        "SELECT json_array_length('[]');",
+        "SELECT json_array_length('{}');",
+        "SELECT json_array_length('1');",
+        "SELECT json_array_length('{\"a\":[1,2,3]}','$.a');",
+        "SELECT json_array_length('[1,2,3]','$');",
+        "SELECT json_array_length('{\"a\":[1,2]}','$.missing');",
+        "SELECT json_array_length(NULL);",
+    ] {
+        assert_same(db.str(), q);
+    }
+    // Malformed JSON → error (json_type, json_array_length).
+    for q in [
+        "SELECT json_type('hello');",
+        "SELECT json_array_length('hello');",
+    ] {
+        let oracle_err = std::process::Command::new("sqlite3")
+            .arg("-batch")
+            .arg(db.str())
+            .arg(q)
+            .output()
+            .expect("run sqlite3");
+        assert!(!oracle_err.status.success(), "oracle should error on: {q}");
+        match rustsqlite_rows(db.str(), q) {
+            Ok(rows) => panic!("rustsqlite should error on `{q}`, got: {rows:?}"),
+            Err(e) => assert!(e.contains("malformed JSON"), "wrong error for `{q}`: {e}"),
+        }
+    }
+}

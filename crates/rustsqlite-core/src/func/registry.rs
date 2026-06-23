@@ -99,6 +99,12 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         ("json_array", _) => json::json_array_fn(args),
         ("json_object", _) => json::json_object_fn(args),
         ("json_extract" | "jsonb_extract", n) if n >= 2 => json::json_extract_fn(args),
+        ("json_type", n) if n >= 1 && n <= 2 => json::json_type_fn(args),
+        ("json_valid", n) if n >= 1 && n <= 2 => json::json_valid_fn(args),
+        ("json_quote", 1) => json::json_quote_fn(&args[0]),
+        ("json_array_length" | "jsonb_array_length", n) if n >= 1 && n <= 2 => {
+            json::json_array_length_fn(args)
+        }
 
         // Should not happen: codegen validates with `check` before emitting a Function opcode.
         _ => Err(no_such_function(name, args.len())),
@@ -160,6 +166,10 @@ pub fn check(name: &str, n_arg: usize) -> Result<()> {
         "json_array" => Some(true), // any arity including zero
         "json_object" => Some(n_arg % 2 == 0),
         "json_extract" | "jsonb_extract" => Some(n_arg >= 2),
+        "json_type" => Some(n_arg == 1 || n_arg == 2),
+        "json_valid" => Some(n_arg == 1 || n_arg == 2),
+        "json_quote" => Some(n_arg == 1),
+        "json_array_length" | "jsonb_array_length" => Some(n_arg == 1 || n_arg == 2),
 
         // volatile / connection-state functions (M3b): handled in the VDBE executor's Function
         // arm (they need runtime state), so `check` only learns their arities as the codegen

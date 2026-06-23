@@ -936,6 +936,90 @@ fn path_as_str(v: &Value) -> Result<String> {
     }
 }
 
+/// `json_type(X)` / `json_type(X, P)` — the type label of X (or of the value at path P within
+/// X). Returns `"null"`/`"true"`/`"false"`/`"integer"`/`"real"`/`"text"`/`"array"`/`"object"`.
+/// NULL input → NULL. A missing path → NULL. Malformed JSON → error.
+pub fn json_type_fn(args: &[Value]) -> Result<Value> {
+    if args.is_empty() {
+        return Err(Error::msg("json_type requires at least 1 argument"));
+    }
+    if args[0].is_null() {
+        return Ok(Value::Null);
+    }
+    let root = value_to_json(&args[0])?;
+    let node = if args.len() >= 2 {
+        let path = path_as_str(&args[1])?;
+        match lookup_path(&root, &path)? {
+            Some(n) => n,
+            None => return Ok(Value::Null),
+        }
+    } else {
+        &root
+    };
+    Ok(Value::Text(node.type_label().to_string()))
+}
+
+/// `json_valid(X)` / `json_valid(X, F)` — 1 if X is well-formed JSON, 0 otherwise. NULL → NULL.
+/// The flags argument F (1–15) is accepted but only the default mode (1 = strict RFC 8259) is
+/// honored; JSON5 modes (2, 4, 8) report 0 since we don't accept JSON5 extensions.
+pub fn json_valid_fn(args: &[Value]) -> Result<Value> {
+    if args.is_empty() {
+        return Err(Error::msg("json_valid requires at least 1 argument"));
+    }
+    if args[0].is_null() {
+        return Ok(Value::Null);
+    }
+    // The flags argument is accepted but only mode 1 (strict) is implemented.
+    let ok = match &args[0] {
+        Value::Text(s) => parse(s).is_ok(),
+        Value::Int(_) | Value::Real(_) => true, // numbers are valid JSON
+        Value::Null => true,
+        Value::Blob(_) => false, // a bare BLOB is never valid JSON
+    };
+    Ok(Value::Int(if ok { 1 } else { 0 }))
+}
+
+/// `json_quote(X)` — render X as a JSON value: NULL → `null`, INTEGER/REAL → number text,
+/// TEXT → a quoted JSON string (escaped per RFC 8259). BLOB → error. Unlike `json(X)`, this
+/// always quotes a TEXT argument as a string (it does not parse it as JSON).
+pub fn json_quote_fn(arg: &Value) -> Result<Value> {
+    let mut out = String::new();
+    match arg {
+        Value::Null => out.push_str("null"),
+        Value::Int(i) => out.push_str(&i.to_string()),
+        Value::Real(r) => out.push_str(&crate::util::fp::fp_to_text(*r)),
+        Value::Text(s) => render_string(s, &mut out),
+        Value::Blob(_) => return Err(Error::msg("JSON cannot hold BLOB values")),
+    }
+    Ok(Value::Text(out))
+}
+
+/// `json_array_length(X)` / `json_array_length(X, P)` — the number of elements in the array
+/// at path P (or the root). Returns 0 if the target is not an array (matching upstream's
+/// "not an array → 0" behavior). NULL input → NULL. Malformed JSON → error.
+pub fn json_array_length_fn(args: &[Value]) -> Result<Value> {
+    if args.is_empty() {
+        return Err(Error::msg("json_array_length requires at least 1 argument"));
+    }
+    if args[0].is_null() {
+        return Ok(Value::Null);
+    }
+    let root = value_to_json(&args[0])?;
+    let node = if args.len() >= 2 {
+        let path = path_as_str(&args[1])?;
+        match lookup_path(&root, &path)? {
+            Some(n) => n,
+            None => return Ok(Value::Null),
+        }
+    } else {
+        &root
+    };
+    match node {
+        JsonNode::Array(items) => Ok(Value::Int(items.len() as i64)),
+        _ => Ok(Value::Int(0)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
