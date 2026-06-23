@@ -473,6 +473,7 @@ fn emit_do_update_body(
             join_tables: None,
             index_read: None,
             subquery_resolver: None,
+            outer: None,
         };
         compile_pred_jump(
             b,
@@ -687,6 +688,7 @@ fn compile_upsert_expr(
                 join_tables: None,
                 index_read: None,
                 subquery_resolver: None,
+                outer: None,
             };
             compile_expr(b, expr, target, ctx)
         }

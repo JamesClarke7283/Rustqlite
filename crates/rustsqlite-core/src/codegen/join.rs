@@ -78,6 +78,7 @@ pub fn compile_cross_join(
         index_read: None,
         join_tables: Some(&join_tables),
         subquery_resolver: None,
+        outer: None,
     };
 
     let mut b = ProgramBuilder::new();

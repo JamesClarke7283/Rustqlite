@@ -272,6 +272,7 @@ fn compile_window_scan(
         join_tables: None,
         index_read: None,
         subquery_resolver,
+        outer: None,
     };
     let mut b = ProgramBuilder::new();
 
@@ -435,6 +436,7 @@ fn compile_window_scan(
             rowid_position,
         }),
         subquery_resolver: None,
+        outer: None,
     };
 
     // i_part_prev / i_peer_prev registers (compared against the current row's keys).
@@ -1307,6 +1309,7 @@ fn emit_partition_sliding(
             rowid_position: cache_rowid_position,
         }),
         subquery_resolver: None,
+        outer: None,
     };
     for (wi, call) in win_calls.iter().enumerate() {
         let kind = kinds[wi];
@@ -1370,6 +1373,7 @@ fn emit_partition_sliding(
             rowid_position: emit_rowid_position,
         }),
         subquery_resolver: None,
+        outer: None,
     };
     let emit_block = b.alloc_regs(ncol);
     for (j, (expr, _)) in rewritten_outputs.iter().enumerate() {

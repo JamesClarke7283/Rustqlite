@@ -20,7 +20,7 @@ use crate::vdbe::program::{Program, P4};
 use crate::vdbe::{KeyField, Opcode};
 
 use super::builder::{Label, ProgramBuilder};
-use super::expr::{compile_expr, compile_jump, Ctx, SubqueryResolver};
+use super::expr::{compile_expr, compile_jump, Ctx, OuterScope, SubqueryResolver};
 use super::index_planner::{pick_index, IndexPlan};
 
 /// Compile a single-table (or constant) `SELECT`, returning the program and the result column
@@ -36,6 +36,21 @@ pub fn compile(
     table: Option<&Table>,
     indexes: &[IndexObject],
     subquery_resolver: Option<&dyn SubqueryResolver>,
+) -> Result<(Program, Vec<String>)> {
+    compile_with_outer(select, table, indexes, subquery_resolver, None)
+}
+
+/// Like [`compile`] but additionally accepts an outer-query scope for correlated subquery
+/// column resolution. The `outer` scope is threaded into the `Ctx` used by the scan's
+/// expression evaluation, so a correlated column reference that does not resolve against
+/// the local FROM table falls through to the outer scope (mirrors `NameContext.pNext` in
+/// `resolve.c`). At the outermost query `outer` is `None`.
+pub fn compile_with_outer(
+    select: &SelectStmt,
+    table: Option<&Table>,
+    indexes: &[IndexObject],
+    subquery_resolver: Option<&dyn SubqueryResolver>,
+    outer: Option<&OuterScope<'_>>,
 ) -> Result<(Program, Vec<String>)> {
     // A compound SELECT (UNION/UNION ALL/INTERSECT/EXCEPT) is lowered by the dedicated
     // `codegen::compound` module, which mirrors `multiSelect`/`multiSelectByMerge` in
@@ -87,19 +102,19 @@ pub fn compile(
     let (limit, offset) = eval_limit_offset(select)?;
 
     let program = if !select.values.is_empty() {
-        compile_values(select, &outputs, limit, offset, subquery_resolver)?
+        compile_values(select, &outputs, limit, offset, subquery_resolver, outer)?
     } else {
         match table {
             Some(t) => {
                 if is_aggregate_query(select, &outputs) {
-                    compile_aggregate(select, t, &outputs, limit, offset, subquery_resolver)?
+                    compile_aggregate(select, t, &outputs, limit, offset, subquery_resolver, outer)?
                 } else if let Some(plan) = pick_index(select, t, indexes) {
-                    compile_indexed_select(select, t, &plan, &outputs, limit, offset, subquery_resolver)?
+                    compile_indexed_select(select, t, &plan, &outputs, limit, offset, subquery_resolver, outer)?
                 } else {
-                    compile_scan(select, t, &outputs, limit, offset, subquery_resolver)?
+                    compile_scan(select, t, &outputs, limit, offset, subquery_resolver, outer)?
                 }
             }
-            None => compile_constant(select, &outputs, limit, offset, subquery_resolver)?,
+            None => compile_constant(select, &outputs, limit, offset, subquery_resolver, outer)?,
         }
     };
     Ok((program, names))
@@ -129,6 +144,7 @@ fn compile_aggregate(
     limit: Option<i64>,
     offset: i64,
     subquery_resolver: Option<&dyn SubqueryResolver>,
+    outer: Option<&OuterScope<'_>>,
 ) -> Result<Program> {
     // (A) Collect every aggregate call from the projection list and the HAVING clause. Both
     // sites share one set of accumulator registers (matching upstream's `AggInfo` which walks
@@ -173,6 +189,7 @@ fn compile_aggregate(
         register_base: None, join_tables: None,
         index_read: None,
         subquery_resolver,
+        outer: None,
     };
     let mut b = ProgramBuilder::new();
 
@@ -875,6 +892,7 @@ fn compile_indexed_select(
     limit: Option<i64>,
     offset: i64,
     subquery_resolver: Option<&dyn SubqueryResolver>,
+    outer: Option<&OuterScope<'_>>,
 ) -> Result<Program> {
     let idx_cursor = 0i32;
     let table_cursor = 1i32;
@@ -900,6 +918,7 @@ fn compile_indexed_select(
         register_base: None, join_tables: None,
         index_read,
         subquery_resolver,
+        outer,
     };
     let mut b = ProgramBuilder::new();
 
@@ -1680,6 +1699,7 @@ fn compile_values(
     limit: Option<i64>,
     offset: i64,
     subquery_resolver: Option<&dyn SubqueryResolver>,
+    outer: Option<&OuterScope<'_>>,
 ) -> Result<Program> {
     // Validate arity: every row must have the same number of columns as the expansion result set.
     let ncol = outputs.len();
@@ -1707,6 +1727,7 @@ fn compile_values(
         register_base: None, join_tables: None,
         index_read: None,
         subquery_resolver,
+        outer: None,
     };
     let ncol_i32 = ncol as i32;
     let mut b = ProgramBuilder::new();
@@ -1811,6 +1832,7 @@ fn compile_scan(
     limit: Option<i64>,
     offset: i64,
     subquery_resolver: Option<&dyn SubqueryResolver>,
+    outer: Option<&OuterScope<'_>>,
 ) -> Result<Program> {
     let cursor = 0i32;
     let ncol = outputs.len() as i32;
@@ -1820,6 +1842,7 @@ fn compile_scan(
         register_base: None, join_tables: None,
         index_read: None,
         subquery_resolver,
+        outer,
     };
     let mut b = ProgramBuilder::new();
 
@@ -2003,6 +2026,7 @@ fn compile_constant(
     limit: Option<i64>,
     offset: i64,
     subquery_resolver: Option<&dyn SubqueryResolver>,
+    outer: Option<&OuterScope<'_>>,
 ) -> Result<Program> {
     // No table: column references resolve against an empty table and therefore error.
     let empty = Table {
@@ -2019,6 +2043,7 @@ fn compile_constant(
         register_base: None, join_tables: None,
         index_read: None,
         subquery_resolver,
+        outer,
     };
     let ncol = outputs.len() as i32;
     let mut b = ProgramBuilder::new();

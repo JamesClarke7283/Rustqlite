@@ -16,6 +16,7 @@
 //! shapes land with later milestones.
 
 use rustqlite_parser::{Expr, SelectStmt, TableOrJoin};
+use rustqlite_parser::walker::{walk_select_expr, Visitor, WalkControl};
 
 use crate::error::{Error, Result};
 use crate::schema::{Column, IndexObject, Table};
@@ -24,7 +25,7 @@ use crate::vdbe::program::{Instruction, Program, P4};
 use crate::vdbe::Opcode;
 
 use super::builder::{Label, ProgramBuilder};
-use super::expr::{compile_expr, compile_jump, Ctx};
+use super::expr::{compile_expr, compile_jump, Ctx, OuterScope, OuterTable, OUTER_CURSOR_BASE};
 use super::select::{
     self, eval_limit_offset, expand_columns, resolve_order_term, emit_int,
 };
@@ -105,6 +106,7 @@ pub fn compile_from_subquery(
         index_read: None,
         join_tables: None,
         subquery_resolver: None,
+        outer: None,
     };
     let mut b = ProgramBuilder::new();
 
@@ -429,6 +431,153 @@ fn is_absolute_jump(inst: &Instruction) -> bool {
     )
 }
 
+/// Detect whether `subquery` references any column of `outer` — i.e. whether the subquery is
+/// **correlated**. Mirrors upstream's `EP_VarSelect` determination (set by `lookupName` in
+/// `resolve.c` when a column reference resolves in an enclosing `NameContext` rather than the
+/// subquery's own FROM). A correlated subquery must be re-evaluated on every outer row, so
+/// the caller drops the `OP_Once` wrapper.
+///
+/// Walks the subquery's expressions (result columns, WHERE, GROUP BY, HAVING, ORDER BY,
+/// LIMIT, OFFSET, VALUES rows) — NOT the FROM clause's own subquery bodies (those have their
+/// own, independent scopes). For each `Expr::Column`, checks whether it resolves against the
+/// subquery's own `sub_tables` first (a local match is not correlation), then against `outer`
+/// (a match there is correlation). Prunes subqueries with their own FROM (they have their own
+/// scope; a doubly-nested correlated reference is handled by the inner subquery's own
+/// correlation detection).
+fn is_correlated(
+    subquery: &SelectStmt,
+    sub_tables: &[(&Table, &str)],
+    outer: Option<&OuterScope<'_>>,
+) -> bool {
+    let Some(outer) = outer else { return false };
+    let mut det = CorrelationDetector {
+        sub_tables,
+        outer,
+        found: false,
+    };
+    let _ = walk_select_expr(&mut det, subquery);
+    det.found
+}
+
+struct CorrelationDetector<'a, 'o> {
+    sub_tables: &'a [(&'a Table, &'a str)],
+    outer: &'o OuterScope<'o>,
+    found: bool,
+}
+
+impl<'a, 'o> Visitor for CorrelationDetector<'a, 'o> {
+    type Break = ();
+    fn visit_expr(&mut self, e: &Expr) -> WalkControl<()> {
+        match e {
+            Expr::Column { schema: _, table, name } => {
+                // First check whether the reference resolves against the subquery's own FROM.
+                // A local match is not correlation. Mirrors `lookupName`'s inner-then-outer
+                // order: the innermost scope wins.
+                let mut local_cnt = 0;
+                let mut qualifier_matched_local = false;
+                for (t, tname) in self.sub_tables {
+                    if let Some(q) = table.as_deref() {
+                        if !tname.eq_ignore_ascii_case(q) {
+                            continue;
+                        }
+                        qualifier_matched_local = true;
+                        if t.resolve_column(name).is_some() {
+                            local_cnt += 1;
+                        }
+                    } else if t.resolve_column(name).is_some() {
+                        local_cnt += 1;
+                    }
+                }
+                if local_cnt > 0 {
+                    return WalkControl::Continue;
+                }
+                // A qualified ref whose qualifier matched a local table but had no column:
+                // "no such column" — not correlation.
+                if table.is_some() && qualifier_matched_local {
+                    return WalkControl::Continue;
+                }
+                // A qualified ref whose qualifier didn't match any local table: could be an
+                // outer-table alias. Check the outer scope.
+                if super::expr::lookup_outer(self.outer, table.as_deref(), name).is_some() {
+                    self.found = true;
+                    return WalkControl::Abort(());
+                }
+                WalkControl::Continue
+            }
+            // Subqueries with their own FROM have their own scope; a doubly-nested correlated
+            // reference is handled by the inner subquery's correlation detection when IT is
+            // compiled. Prune to avoid false positives.
+            Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => WalkControl::Prune,
+            _ => WalkControl::Continue,
+        }
+    }
+
+    fn visit_select(&mut self, select: &SelectStmt) -> WalkControl<()> {
+        // Prune subqueries with their own FROM (independent scope). A FROM-less / VALUES-only
+        // subquery is walked normally so its bare column refs are checked against the outer
+        // scope (correlation through a FROM-less inner subquery).
+        if !select.from.is_empty() && select.values.is_empty() {
+            WalkControl::Prune
+        } else {
+            WalkControl::Continue
+        }
+    }
+}
+
+/// Build an [`OuterScope`] for the outer query, assigning each outer table a unique sentinel
+/// cursor number (`OUTER_CURSOR_BASE + i`). The caller passes the outer query's `Ctx` (whose
+/// `join_tables` or single `table`/`cursor` describe the outer FROM) and receives a
+/// `Vec<OuterTable>` plus the [`OuterScope`] referencing it. The `outer_tables` Vec must
+/// outlive the scope.
+fn build_outer_scope<'a>(
+    outer_tables: &'a [OuterTable<'a>],
+    parent: Option<&'a OuterScope<'a>>,
+) -> OuterScope<'a> {
+    OuterScope {
+        tables: outer_tables,
+        parent,
+    }
+}
+
+/// Collect the outer query's FROM tables from a [`Ctx`]. Handles both the single-table case
+/// (`table`/`cursor`) and the join case (`join_tables`). Returns a `Vec<OuterTable>` with
+/// sentinel cursors assigned; the caller owns the Vec and passes `&OuterScope` into
+/// `select::compile_with_outer`. When `ctx.outer` is set, its scope becomes the parent.
+fn collect_outer_tables(ctx: Ctx<'_>) -> Vec<OuterTable<'_>> {
+    let mut v: Vec<OuterTable<'_>> = Vec::new();
+    if let Some(jt) = ctx.join_tables {
+        for (i, t) in jt.iter().enumerate() {
+            v.push(OuterTable {
+                table: t.table,
+                cursor: OUTER_CURSOR_BASE + i as i32,
+                name: t.name,
+            });
+        }
+    } else {
+        v.push(OuterTable {
+            table: ctx.table,
+            cursor: OUTER_CURSOR_BASE,
+            name: "", // bare single-table: no alias needed for bare-column resolution
+        });
+    }
+    v
+}
+
+/// The real outer-program cursor numbers corresponding to the sentinel cursors assigned in
+/// [`collect_outer_tables`]. Built in lockstep with that function's Vec; passed to
+/// [`rebase_operands`] so the inliner can rewrite sentinel cursors to the real outer cursors.
+fn collect_outer_real_cursors(ctx: Ctx<'_>) -> Vec<i32> {
+    let mut v: Vec<i32> = Vec::new();
+    if let Some(jt) = ctx.join_tables {
+        for t in jt {
+            v.push(t.cursor);
+        }
+    } else {
+        v.push(ctx.cursor);
+    }
+    v
+}
+
 /// Compile a scalar subquery `(SELECT …)` used as an expression, returning the register that
 /// holds the scalar result (the first column of the first row, or NULL if no rows). Mirrors
 /// `sqlite3CodeSubselect` in `expr.c` for the `TK_SELECT` case: the subquery body is compiled
@@ -449,11 +598,18 @@ fn is_absolute_jump(inst: &Instruction) -> bool {
 ///
 /// `subquery_table`/`subquery_indexes` describe the subquery's own FROM table (or `None` for
 /// a constant / `VALUES` subquery), resolved by the caller via a [`super::expr::SubqueryResolver`].
+///
+/// `outer_ctx` is the enclosing query's [`Ctx`], used to build the [`OuterScope`] for correlated
+/// column resolution. When `Some` and the subquery references an outer column (correlation),
+/// the `OP_Once` wrapper is dropped so the subroutine re-runs on every outer row (mirrors
+/// upstream's `EP_VarSelect` guard in `sqlite3CodeSubselect`). When `None`, the subquery is
+/// assumed non-correlated and `OP_Once` caches the result.
 pub fn compile_scalar_subquery(
     b: &mut ProgramBuilder,
     subquery: &SelectStmt,
     subquery_table: Option<&Table>,
     subquery_indexes: &[IndexObject],
+    outer_ctx: Option<Ctx<'_>>,
 ) -> Result<i32> {
     // A scalar subquery must produce exactly one column. Upstream raises
     // "sub-select returns more than one column" for multi-column scalar subqueries; we surface
@@ -466,17 +622,47 @@ pub fn compile_scalar_subquery(
         )));
     }
 
+    // Build the outer scope for correlated column resolution. The outer tables get sentinel
+    // cursor numbers (OUTER_CURSOR_BASE + i); the inliner's `rebase_operands` rewrites those
+    // to the real outer-program cursors via `outer_cursor_map`. The `outer_tables` Vec and
+    // `outer_scope` must outlive the `select::compile_with_outer` call below — they're owned
+    // here on the stack.
+    let outer_tables: Vec<OuterTable<'_>> = outer_ctx
+        .map(|ctx| collect_outer_tables(ctx))
+        .unwrap_or_default();
+    let outer_real_cursors: Vec<i32> = outer_ctx
+        .map(|ctx| collect_outer_real_cursors(ctx))
+        .unwrap_or_default();
+    let outer_scope: OuterScope<'_> = build_outer_scope(&outer_tables, outer_ctx.and_then(|c| c.outer));
+    let outer_for_compile: Option<&OuterScope<'_>> = (!outer_tables.is_empty()).then_some(&outer_scope);
+    let sub_tables: Vec<(&Table, &str)> = subquery_table
+        .map(|t| vec![(t, t.name.as_str())])
+        .unwrap_or_default();
+    let correlated = is_correlated(subquery, &sub_tables, outer_for_compile);
+    // The outer-cursor map for `rebase_operands`: sentinel -> real outer cursor.
+    let outer_cursor_map: Vec<(i32, i32)> = outer_tables
+        .iter()
+        .zip(outer_real_cursors.iter())
+        .map(|(ot, &real)| (ot.cursor, real))
+        .collect();
+
     // Compile the subquery body first so we know its register count. The inlined body uses
     // registers 1..N (its own `ProgramBuilder` allocation); our `result_reg`/`return_reg` must
     // live ABOVE that range to avoid being clobbered by the subquery's `Column`/`Integer`/
     // comparison-register writes. We compile into a throwaway builder, extract the program,
     // then allocate our registers in the OUTER builder past the subquery's high-water mark.
-    let (sub_program, _sub_names) = select::compile(subquery, subquery_table, subquery_indexes, None)?;
+    let (sub_program, _sub_names) = select::compile_with_outer(
+        subquery,
+        subquery_table,
+        subquery_indexes,
+        None,
+        outer_for_compile,
+    )?;
     let sub_num_regs = sub_program.num_registers as i32;
 
     // Cursor offset: the subquery's `select::compile` hardcodes cursor 0 for its table scan
     // (and 1 for a sorter, 2 for DISTINCT dedup). The outer program may already be using
-    // those cursor numbers for its own scan. Offset the subquery's cursor numbers by the
+    // those cursor numbers for its own scan. Offset that subquery's cursor numbers by the
     // outer builder's `next_cursor()` so they land in a free range.
     let cursor_offset = b.next_cursor();
 
@@ -496,9 +682,13 @@ pub fn compile_scalar_subquery(
 
     // `OP_Once` wraps the subroutine call so a non-correlated subquery runs only once. On a
     // repeat encounter, `Once` jumps past the subroutine body to the caller's continuation
-    // (bound to `after_sub` below), so the cached `result_reg` is reused.
+    // (bound to `after_sub` below), so the cached `result_reg` is reused. A **correlated**
+    // subquery must re-run on every outer row, so the `Once` is skipped (mirrors upstream's
+    // `EP_VarSelect` guard in `sqlite3CodeSubselect`).
     let after_sub = b.new_label();
-    b.emit_jump(Opcode::Once, 0, after_sub, 0);
+    if !correlated {
+        b.emit_jump(Opcode::Once, 0, after_sub, 0);
+    }
 
     // Pre-fill the result with NULL (the no-rows case). The subroutine body will overwrite
     // this on the first yielded row.
@@ -566,7 +756,7 @@ pub fn compile_scalar_subquery(
                 // handles them via the address map). Per-opcode rules mirror the VDBE's
                 // operand-type conventions.
                 let mut new_inst = inst.clone();
-                rebase_operands(&mut new_inst, reg_offset, cursor_offset);
+                rebase_operands(&mut new_inst, reg_offset, cursor_offset, &outer_cursor_map);
                 b.append(new_inst);
             }
         }
@@ -622,21 +812,46 @@ pub fn compile_scalar_subquery(
 /// and the subroutine returns immediately (the equivalent of upstream's `LIMIT 1` injection).
 /// The body's `Halt` (the scan-end label) is rewritten to the subroutine's `Return`.
 ///
-/// Like [`compile_scalar_subquery`], the M8.8 first slice assumes the subquery is
+/// Like [`compile_scalar_subquery`], the M8.8 first slice assumed the subquery was
 /// **non-correlated** — it must not reference outer-query columns. The `OP_Once` wrapping
 /// caches the result across all encounters; a correlated subquery would need to re-run on
-/// each outer row (M8.11 `Param` + M8.13 re-materialization).
+/// each outer row (M8.11 `Param` + M8.13 re-materialization). As of M8.13 correlated
+/// `EXISTS` is supported via `outer_ctx`: when the subquery references an outer column, the
+/// `OP_Once` is dropped and the subroutine re-runs on every outer row.
 pub fn compile_exists_subquery(
     b: &mut ProgramBuilder,
     subquery: &SelectStmt,
     subquery_table: Option<&Table>,
     subquery_indexes: &[IndexObject],
+    outer_ctx: Option<Ctx<'_>>,
 ) -> Result<i32> {
+    // Build the outer scope for correlated column resolution (same shape as
+    // `compile_scalar_subquery`). The `outer_tables` Vec and `outer_scope` outlive the
+    // `select::compile_with_outer` call below — they're owned here on the stack.
+    let outer_tables: Vec<OuterTable<'_>> = outer_ctx
+        .map(|ctx| collect_outer_tables(ctx))
+        .unwrap_or_default();
+    let outer_real_cursors: Vec<i32> = outer_ctx
+        .map(|ctx| collect_outer_real_cursors(ctx))
+        .unwrap_or_default();
+    let outer_scope: OuterScope<'_> = build_outer_scope(&outer_tables, outer_ctx.and_then(|c| c.outer));
+    let outer_for_compile: Option<&OuterScope<'_>> = (!outer_tables.is_empty()).then_some(&outer_scope);
+    let sub_tables: Vec<(&Table, &str)> = subquery_table
+        .map(|t| vec![(t, t.name.as_str())])
+        .unwrap_or_default();
+    let correlated = is_correlated(subquery, &sub_tables, outer_for_compile);
+    let outer_cursor_map: Vec<(i32, i32)> = outer_tables
+        .iter()
+        .zip(outer_real_cursors.iter())
+        .map(|(ot, &real)| (ot.cursor, real))
+        .collect();
+
     // Compile the subquery body first so we know its register count. The inlined body uses
     // registers 1..N (its own `ProgramBuilder` allocation); our `result_reg`/`return_reg`
     // must live ABOVE that range to avoid being clobbered by the subquery's `Column`/`Integer`/
     // comparison-register writes.
-    let (sub_program, _sub_names) = select::compile(subquery, subquery_table, subquery_indexes, None)?;
+    let (sub_program, _sub_names) =
+        select::compile_with_outer(subquery, subquery_table, subquery_indexes, None, outer_for_compile)?;
     let sub_num_regs = sub_program.num_registers as i32;
 
     // Cursor offset: the subquery's `select::compile` hardcodes cursor 0 for its table scan
@@ -653,9 +868,12 @@ pub fn compile_exists_subquery(
     let result_reg = b.alloc_reg();
     let return_reg = b.alloc_reg();
 
-    // `OP_Once` wraps the subroutine call so a non-correlated subquery runs only once.
+    // `OP_Once` wraps the subroutine call so a non-correlated subquery runs only once. A
+    // correlated subquery drops `Once` so it re-runs on every outer row.
     let after_sub = b.new_label();
-    b.emit_jump(Opcode::Once, 0, after_sub, 0);
+    if !correlated {
+        b.emit_jump(Opcode::Once, 0, after_sub, 0);
+    }
 
     // Pre-fill the result with 0 (the no-rows case).
     b.emit(Opcode::Integer, 0, result_reg, 0);
@@ -694,7 +912,7 @@ pub fn compile_exists_subquery(
             }
             _ => {
                 let mut new_inst = inst.clone();
-                rebase_operands(&mut new_inst, reg_offset, cursor_offset);
+                rebase_operands(&mut new_inst, reg_offset, cursor_offset, &outer_cursor_map);
                 b.append(new_inst);
             }
         }
@@ -735,12 +953,35 @@ pub fn compile_exists_subquery(
 /// vs. cursor numbers vs. integer immediates vs. jump targets. Jump targets (`p2` of
 /// `Goto`/`If`/`Rewind`/`Next`/...) are NOT rebased here; the caller's jump-patch loop
 /// handles them via the address map.
-fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) {
+///
+/// **Sentinel outer cursors**: a correlated subquery references outer-query columns via
+/// sentinel cursor numbers `>= OUTER_CURSOR_BASE` (assigned by [`collect_outer_tables`]).
+/// `outer_cursor_map` carries `(sentinel, real_cursor)` pairs; the `c` closure rewrites a
+/// sentinel to its real outer-program cursor instead of applying `cursor_offset`. This
+/// preserves the outer-program cursor that was already opened by the enclosing scan (it is
+/// NOT a subquery cursor that needs offsetting).
+fn rebase_operands(
+    inst: &mut Instruction,
+    reg_offset: i32,
+    cursor_offset: i32,
+    outer_cursor_map: &[(i32, i32)],
+) {
     use Opcode::*;
     // Helper: rebase a register operand.
     let r = |x: &mut i32| *x += reg_offset;
-    // Helper: rebase a cursor operand.
-    let c = |x: &mut i32| *x += cursor_offset;
+    // Helper: rebase a cursor operand. A sentinel (>= OUTER_CURSOR_BASE) is rewritten to its
+    // real outer-program cursor via the map; a regular subquery cursor gets `+ cursor_offset`.
+    let c = |x: &mut i32| {
+        if *x >= OUTER_CURSOR_BASE {
+            if let Some(&(_, real)) = outer_cursor_map.iter().find(|(s, _)| *s == *x) {
+                *x = real;
+            } else {
+                // Unknown sentinel — leave as-is defensively (would be a codegen bug).
+            }
+        } else {
+            *x += cursor_offset;
+        }
+    };
     match inst.opcode {
         // Control flow — p2 is a jump target (NOT rebased here). p1/p3 are registers where
         // applicable.
@@ -1020,11 +1261,29 @@ pub fn compile_in_subquery(
         )));
     }
 
+    // Build the outer scope for correlated column resolution (same shape as
+    // `compile_scalar_subquery`). `ctx` is the outer query's expression context; its `outer`
+    // chain becomes the parent scope so doubly-nested correlation works.
+    let outer_tables: Vec<OuterTable<'_>> = collect_outer_tables(ctx);
+    let outer_real_cursors: Vec<i32> = collect_outer_real_cursors(ctx);
+    let outer_scope: OuterScope<'_> = build_outer_scope(&outer_tables, ctx.outer);
+    let outer_for_compile: Option<&OuterScope<'_>> = (!outer_tables.is_empty()).then_some(&outer_scope);
+    let sub_tables: Vec<(&Table, &str)> = subquery_table
+        .map(|t| vec![(t, t.name.as_str())])
+        .unwrap_or_default();
+    let correlated = is_correlated(subquery, &sub_tables, outer_for_compile);
+    let outer_cursor_map: Vec<(i32, i32)> = outer_tables
+        .iter()
+        .zip(outer_real_cursors.iter())
+        .map(|(ot, &real)| (ot.cursor, real))
+        .collect();
+
     // 1. Compile the subquery body first so we know its register/cursor high-water mark. The
     //    inlined body uses registers 1..N (its own `ProgramBuilder` allocation) and cursors
     //    0/1/2 (table/sorter/distinct). Our ephemeral index cursor must live ABOVE that range,
     //    and our result registers must live ABOVE the subquery's register range.
-    let (sub_program, _sub_names) = select::compile(subquery, subquery_table, subquery_indexes, None)?;
+    let (sub_program, _sub_names) =
+        select::compile_with_outer(subquery, subquery_table, subquery_indexes, None, outer_for_compile)?;
     let sub_num_regs = sub_program.num_registers as i32;
 
     // Cursor offset for the inlined subquery body. The subquery's `select::compile` hardcodes
@@ -1046,9 +1305,12 @@ pub fn compile_in_subquery(
     let return_reg = b.alloc_reg();
 
     // `OP_Once` wraps the materialization so a non-correlated subquery runs only once. On a
-    // repeat encounter, `Once` jumps past the subroutine to the membership test.
+    // repeat encounter, `Once` jumps past the subroutine to the membership test. A correlated
+    // subquery drops `Once` so the ephemeral is re-materialized on every outer row.
     let after_sub = b.new_label();
-    b.emit_jump(Opcode::Once, 0, after_sub, 0);
+    if !correlated {
+        b.emit_jump(Opcode::Once, 0, after_sub, 0);
+    }
 
     // Open the ephemeral index: single-column key, BINARY collation (the LHS/RHS comparison in
     // `OP_Found`/`OP_NotFound` on an ephemeral uses BINARY collation with NULL-equality, matching
@@ -1063,6 +1325,14 @@ pub fn compile_in_subquery(
     // (Vec-backed, not a b-tree), so we cannot use upstream's "first row only" optimization;
     // the per-row NULL check is O(n) per materialization, same asymptotic as the materialization.
     b.emit(Opcode::Integer, 0, rhs_has_null_reg, 0);
+
+    // When correlated, re-initialize the ephemeral before each re-materialization: a `Clear`
+    // drops the prior outer row's rows so the new materialization starts fresh. The first
+    // encounter (no prior rows) is a no-op clear. This mirrors upstream's re-materialization
+    // (the subroutine body is re-run, repopulating the ephemeral from scratch).
+    if correlated {
+        b.emit(Opcode::Clear, eph_cursor, 0, 0);
+    }
 
     // Call the materialization subroutine.
     let subroutine_start = b.new_label();
@@ -1123,7 +1393,7 @@ pub fn compile_in_subquery(
             }
             _ => {
                 let mut new_inst = inst.clone();
-                rebase_operands(&mut new_inst, reg_offset, cursor_offset);
+                rebase_operands(&mut new_inst, reg_offset, cursor_offset, &outer_cursor_map);
                 b.append(new_inst);
             }
         }
@@ -1421,7 +1691,7 @@ mod tests {
         let setup = b.new_label();
         b.emit_jump(Opcode::Init, 0, setup, 0);
         let after_init = b.cur_addr();
-        let result_reg = compile_scalar_subquery(&mut b, &s, None, &[]).unwrap();
+        let result_reg = compile_scalar_subquery(&mut b, &s, None, &[], None).unwrap();
         let target = b.alloc_reg();
         b.emit(Opcode::SCopy, result_reg, target, 0);
         b.emit(Opcode::ResultRow, target, 1, 0);
@@ -1478,7 +1748,7 @@ mod tests {
         let setup = b.new_label();
         b.emit_jump(Opcode::Init, 0, setup, 0);
         let after_init = b.cur_addr();
-        let result_reg = compile_exists_subquery(&mut b, &s, None, &[]).unwrap();
+        let result_reg = compile_exists_subquery(&mut b, &s, None, &[], None).unwrap();
         let target = b.alloc_reg();
         b.emit(Opcode::SCopy, result_reg, target, 0);
         b.emit(Opcode::ResultRow, target, 1, 0);

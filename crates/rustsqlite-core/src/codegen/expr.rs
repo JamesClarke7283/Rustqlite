@@ -57,7 +57,41 @@ pub struct Ctx<'a> {
     /// [`compile_expr`] compile their body against the catalog via this resolver. When `None`,
     /// those expression kinds raise an "unsupported" error (matching the pre-M8.7 behavior).
     pub subquery_resolver: Option<&'a dyn SubqueryResolver>,
+    /// The enclosing query's scope, for correlated subquery column resolution. When a column
+    /// reference does not resolve against the local `table`/`join_tables`, [`compile_column`]
+    /// walks this scope chain and, on a match, emits a `Column`/`Rowid` against the outer
+    /// table's **sentinel** cursor number (assigned by the subquery codegen, see
+    /// [`OuterTable::cursor`]). The subquery inliner's [`rebase_operands`] rewrites those
+    /// sentinel cursors back to the real outer-program cursor numbers. `None` at the outermost
+    /// query (no enclosing scope).
+    pub outer: Option<&'a OuterScope<'a>>,
 }
+
+/// The enclosing query's table scope for correlated subquery resolution — the Rust analogue
+/// of upstream's `NameContext.pNext` chain. Carries the outer query's FROM tables (each with
+/// a sentinel cursor number) and a link to the next enclosing scope.
+pub struct OuterScope<'a> {
+    pub tables: &'a [OuterTable<'a>],
+    pub parent: Option<&'a OuterScope<'a>>,
+}
+
+/// One table in an enclosing query's scope. `cursor` is a **sentinel** cursor number unique
+/// within the subquery's compile (assigned by the subquery codegen from
+/// [`OUTER_CURSOR_BASE`]); the inliner's [`rebase_operands`] rewrites it to the real
+/// outer-program cursor number. `name` is the alias if present, else the table name — the form
+/// a `alias.col` or `table.col` reference matches against.
+#[derive(Clone, Copy)]
+pub struct OuterTable<'a> {
+    pub table: &'a Table,
+    pub cursor: i32,
+    pub name: &'a str,
+}
+
+/// Sentinel cursor numbers for outer-scope tables start here, well clear of any real cursor
+/// number a subquery body opens (0, 1, 2 — offset to `cursor_offset..cursor_offset+3` during
+/// inlining). [`rebase_operands`] treats any cursor operand `>= OUTER_CURSOR_BASE` as a
+/// sentinel and rewrites it via the outer-cursor map.
+pub const OUTER_CURSOR_BASE: i32 = 10_000;
 
 /// One table in a join: the resolved `Table`, the cursor number it's open on, and the name
 /// used to reference it (the table name or its alias). Used by [`Ctx::join_tables`] for
@@ -192,6 +226,7 @@ pub fn compile_expr(b: &mut ProgramBuilder, e: &Expr, target: i32, ctx: Ctx) -> 
                 s,
                 sub_table.as_ref(),
                 &sub_indexes,
+                Some(ctx),
             )?;
             b.emit(Opcode::SCopy, result_reg, target, 0);
         }
@@ -216,6 +251,7 @@ pub fn compile_expr(b: &mut ProgramBuilder, e: &Expr, target: i32, ctx: Ctx) -> 
                 s,
                 sub_table.as_ref(),
                 &sub_indexes,
+                Some(ctx),
             )?;
             // Move the scalar result into the caller's target register.
             b.emit(Opcode::SCopy, result_reg, target, 0);
@@ -310,6 +346,7 @@ fn compile_column(
                     index_read: None,
                     join_tables: None,
                     subquery_resolver: ctx.subquery_resolver,
+                    outer: ctx.outer,
                 };
                 (sub, t.name)
             })
@@ -327,6 +364,7 @@ fn compile_column(
                     index_read: None,
                     join_tables: None,
                     subquery_resolver: ctx.subquery_resolver,
+                    outer: ctx.outer,
                 };
                 (sub, t.name)
             })
@@ -352,6 +390,13 @@ fn compile_column(
             0
         };
         if idx == 0 {
+            // Not a `columnN` reference — try the enclosing scope (correlated subquery
+            // inside a VALUES-derived outer scope). If no outer match, raise "no such column".
+            if let Some(outer) = ctx.outer {
+                if let Some((ot, col_ref)) = lookup_outer(outer, qualifier, name) {
+                    return emit_outer_column(b, ot, col_ref, target);
+                }
+            }
             return Err(Error::msg(format!("no such column: {col_name}")));
         }
         let reg = ctx.register_base.unwrap_or(0) + idx as i32 - 1;
@@ -416,11 +461,99 @@ fn compile_column(
             }
         }
         None => {
+            // No match against the local table. Try the enclosing scope (correlated
+            // subquery). When the outer scope matches, emit a `Column`/`Rowid` against
+            // the outer table's sentinel cursor; the subquery inliner's `rebase_operands`
+            // rewrites the sentinel back to the real outer-program cursor number.
+            if let Some(outer) = ctx.outer {
+                if let Some((ot, col_ref)) = lookup_outer(outer, qualifier, name) {
+                    return emit_outer_column(b, ot, col_ref, target);
+                }
+            }
             let disp = match qualifier {
                 Some(q) => format!("{q}.{name}"),
                 None => name.to_string(),
             };
             return Err(Error::msg(format!("no such column: {disp}")));
+        }
+    }
+    Ok(())
+}
+
+/// Walk the [`OuterScope`] chain looking for a column match, mirroring the
+/// `do { … } while (pNC = pNC->pNext)` loop in `lookupName` (`resolve.c:341`). On a match
+/// returns the outer table and the `ColumnRef` within it. A qualified ref pins the scope:
+/// if the qualifier matches a table here but not the column, returns `None` (no outward
+/// fallthrough). A bare ref with no local match falls through to the parent scope.
+pub(crate) fn lookup_outer<'a>(
+    scope: &'a OuterScope<'a>,
+    qualifier: Option<&str>,
+    name: &str,
+) -> Option<(&'a OuterTable<'a>, ColumnRef)> {
+    let mut local_cnt = 0;
+    let mut matched: Option<(&OuterTable, ColumnRef)> = None;
+    let mut qualifier_matched_a_table = false;
+    for t in scope.tables {
+        if let Some(q) = qualifier {
+            if !t.name.eq_ignore_ascii_case(q) {
+                continue;
+            }
+            qualifier_matched_a_table = true;
+            if let Some(cr) = t.table.resolve_column(name) {
+                local_cnt += 1;
+                matched = Some((t, cr));
+            }
+        } else if let Some(cr) = t.table.resolve_column(name) {
+            local_cnt += 1;
+            matched = Some((t, cr));
+        }
+    }
+    if local_cnt > 1 {
+        // Ambiguous in this scope — upstream raises "ambiguous column name"; the resolve
+        // pass (M2.74) catches it first. Return the first match defensively.
+        return matched;
+    }
+    if local_cnt == 1 {
+        return matched;
+    }
+    // No local match. A qualified ref whose qualifier matched a table here but had no
+    // column: pin the scope (no outward fallthrough).
+    if qualifier.is_some() && qualifier_matched_a_table {
+        return None;
+    }
+    // A qualified ref whose qualifier didn't match any table here: upstream returns "no
+    // such column" without falling outward. Match that.
+    if qualifier.is_some() && !qualifier_matched_a_table {
+        return None;
+    }
+    // Bare ref, no local match: fall through to the parent scope.
+    scope.parent.and_then(|p| lookup_outer(p, qualifier, name))
+}
+
+/// Emit a `Column`/`Rowid` against an outer table's sentinel cursor. The sentinel is
+/// rewritten to the real outer-program cursor by `rebase_operands` during subquery inlining.
+fn emit_outer_column(
+    b: &mut ProgramBuilder,
+    ot: &OuterTable,
+    col_ref: ColumnRef,
+    target: i32,
+) -> Result<()> {
+    match col_ref {
+        ColumnRef::Rowid => {
+            b.emit(Opcode::Rowid, ot.cursor, target, 0);
+        }
+        ColumnRef::Index(i) => {
+            let col_pos = if ot.table.without_rowid {
+                ot.table
+                    .without_rowid_storage_index(i)
+                    .expect("column exists on WITHOUT ROWID table") as i32
+            } else {
+                i as i32
+            };
+            b.emit(Opcode::Column, ot.cursor, col_pos, target);
+            if ot.table.columns[i].affinity == Affinity::Real {
+                b.emit(Opcode::RealAffinity, target, 0, 0);
+            }
         }
     }
     Ok(())

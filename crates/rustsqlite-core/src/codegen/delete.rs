@@ -51,7 +51,7 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
         return compile_delete_ordered_limited(del, table, indexes);
     }
     let cursor = 0i32;
-    let ctx = Ctx { table, cursor, register_base: None, join_tables: None, index_read: None, subquery_resolver: None };
+    let ctx = Ctx { table, cursor, register_base: None, join_tables: None, index_read: None, subquery_resolver: None, outer: None };
     let ncol = table.columns.len();
     let mut b = ProgramBuilder::new();
 
@@ -176,6 +176,7 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
                         register_base: None, join_tables: None,
                         index_read: None,
                         subquery_resolver: None,
+                        outer: None,
                     };
                     compile_expr(&mut b, expr, target, expr_ctx)?;
                 } else {
@@ -233,6 +234,7 @@ pub fn compile_delete(del: &DeleteStmt, table: &Table, indexes: &[IndexObject]) 
                         register_base: None, join_tables: None,
                         index_read: None,
                         subquery_resolver: None,
+                        outer: None,
                     };
                     compile_expr(&mut b, expr, target, expr_ctx)?;
                 } else {
@@ -284,7 +286,7 @@ fn compile_delete_ordered_limited(
 ) -> Result<Program> {
     let cursor = 0i32;
     let sorter = 1i32;
-    let ctx = Ctx { table, cursor, register_base: None, join_tables: None, index_read: None, subquery_resolver: None };
+    let ctx = Ctx { table, cursor, register_base: None, join_tables: None, index_read: None, subquery_resolver: None, outer: None };
     let ncol = table.columns.len();
     let mut b = ProgramBuilder::new();
 
@@ -468,6 +470,7 @@ fn compile_delete_ordered_limited(
                     register_base: None, join_tables: None,
                     index_read: None,
                     subquery_resolver: None,
+                    outer: None,
                 };
                 compile_expr(&mut b, expr, target, expr_ctx)?;
             } else {

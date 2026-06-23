@@ -174,7 +174,7 @@ pub fn compile_update(
 
     let cursor = 0i32;
     let sorter = 1i32;
-    let ctx = Ctx { table, cursor, register_base: None, join_tables: None, index_read: None, subquery_resolver: None };
+    let ctx = Ctx { table, cursor, register_base: None, join_tables: None, index_read: None, subquery_resolver: None, outer: None };
     let mut b = ProgramBuilder::new();
     b.set_default_oe(oe as u8);
 
@@ -495,6 +495,7 @@ pub fn compile_update(
                                 register_base: Some(conflict_row_start), join_tables: None,
                                 index_read: None,
                                 subquery_resolver: None,
+                                outer: None,
                             };
                             compile_expr(&mut b, expr, target, expr_ctx)?;
                         } else {
@@ -560,7 +561,7 @@ pub fn compile_update(
         let skip_delete_label = if let Some(pred) = &idx.where_clause {
             validate_partial_pred_on_update(pred, table, &target_col)?;
             let skip = b.new_label();
-            let pred_ctx = Ctx { table, cursor, register_base: None, join_tables: None, index_read: None, subquery_resolver: None };
+            let pred_ctx = Ctx { table, cursor, register_base: None, join_tables: None, index_read: None, subquery_resolver: None, outer: None };
             compile_pred_jump(&mut b, pred, skip, table, reg_new, indexed_cis.as_slice(), pred_ctx)?;
             Some(skip)
         } else {
@@ -578,6 +579,7 @@ pub fn compile_update(
                     register_base: Some(reg_old), join_tables: None,
                     index_read: None,
                     subquery_resolver: None,
+                    outer: None,
                 };
                 compile_expr(&mut b, expr, target, expr_ctx)?;
             } else {
@@ -629,7 +631,7 @@ pub fn compile_update(
         let skip_insert_label = if let Some(pred) = &idx.where_clause {
             validate_partial_pred_on_update(pred, table, &target_col)?;
             let skip = b.new_label();
-            let pred_ctx = Ctx { table, cursor, register_base: None, join_tables: None, index_read: None, subquery_resolver: None };
+            let pred_ctx = Ctx { table, cursor, register_base: None, join_tables: None, index_read: None, subquery_resolver: None, outer: None };
             compile_pred_jump(&mut b, pred, skip, table, reg_new, indexed_cis.as_slice(), pred_ctx)?;
             Some(skip)
         } else {
@@ -648,6 +650,7 @@ pub fn compile_update(
                     register_base: Some(reg_new), join_tables: None,
                     index_read: None,
                     subquery_resolver: None,
+                    outer: None,
                 };
                 compile_expr(&mut b, expr, target, expr_ctx)?;
             } else {
@@ -1022,6 +1025,7 @@ fn compile_update_from(
         index_read: None,
         join_tables: Some(jt_slice),
         subquery_resolver: None,
+        outer: None,
     };
 
     // ON predicates per join level (only INNER/CROSS have them; comma joins have none).
@@ -1224,7 +1228,7 @@ fn compile_update_from(
         let skip_delete_label = if let Some(pred) = &idx.where_clause {
             validate_partial_pred_on_update(pred, table, &target_col)?;
             let skip = b.new_label();
-            let pred_ctx = Ctx { table, cursor: target_cursor, register_base: None, join_tables: None, index_read: None, subquery_resolver: None };
+            let pred_ctx = Ctx { table, cursor: target_cursor, register_base: None, join_tables: None, index_read: None, subquery_resolver: None, outer: None };
             compile_pred_jump(&mut b, pred, skip, table, reg_new, indexed_cis.as_slice(), pred_ctx)?;
             Some(skip)
         } else {
@@ -1241,6 +1245,7 @@ fn compile_update_from(
                     register_base: Some(reg_old), join_tables: None,
                     index_read: None,
                     subquery_resolver: None,
+                    outer: None,
                 };
                 compile_expr(&mut b, expr, target, expr_ctx)?;
             } else {
@@ -1278,7 +1283,7 @@ fn compile_update_from(
         let skip_insert_label = if let Some(pred) = &idx.where_clause {
             validate_partial_pred_on_update(pred, table, &target_col)?;
             let skip = b.new_label();
-            let pred_ctx = Ctx { table, cursor: target_cursor, register_base: None, join_tables: None, index_read: None, subquery_resolver: None };
+            let pred_ctx = Ctx { table, cursor: target_cursor, register_base: None, join_tables: None, index_read: None, subquery_resolver: None, outer: None };
             compile_pred_jump(&mut b, pred, skip, table, reg_new, indexed_cis.as_slice(), pred_ctx)?;
             Some(skip)
         } else {
@@ -1296,6 +1301,7 @@ fn compile_update_from(
                     register_base: Some(reg_new), join_tables: None,
                     index_read: None,
                     subquery_resolver: None,
+                    outer: None,
                 };
                 compile_expr(&mut b, expr, target, expr_ctx)?;
             } else {
