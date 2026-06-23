@@ -2666,3 +2666,97 @@ fn delete_order_by_without_limit_errors() {
         assert!(err.to_string().contains("ORDER BY without LIMIT"), "got: {err}");
     }
 }
+
+// ===== M19.2 UPDATE ... ORDER BY ... LIMIT ... tests =====
+
+#[test]
+fn update_with_limit_updates_only_n_rows() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("update_limit");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);");
+        // UPDATE with LIMIT 3: update only the first 3 rows (by insertion order).
+        exec(&mut conn, "UPDATE t SET b = 0 LIMIT 3;");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Int(0)],
+            vec![Value::Int(2), Value::Int(0)],
+            vec![Value::Int(3), Value::Int(0)],
+            vec![Value::Int(4), Value::Int(40)],
+            vec![Value::Int(5), Value::Int(50)],
+        ]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+}
+
+#[test]
+fn update_with_order_by_and_limit() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("update_order_limit");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);");
+        // Update the 2 rows with the largest `b` values (ORDER BY b DESC LIMIT 2).
+        exec(&mut conn, "UPDATE t SET b = 0 ORDER BY b DESC LIMIT 2;");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(20)],
+            vec![Value::Int(3), Value::Int(30)],
+            vec![Value::Int(4), Value::Int(0)],
+            vec![Value::Int(5), Value::Int(0)],
+        ]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+}
+
+#[test]
+fn update_with_where_and_limit() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("update_where_limit");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);");
+        // Update rows WHERE a > 1, limited to 2 rows.
+        exec(&mut conn, "UPDATE t SET b = 0 WHERE a > 1 LIMIT 2;");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        // Rows with a > 1 are (2, 3, 4, 5); LIMIT 2 updates (2, 3); remaining (1, 4, 5) unchanged.
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(0)],
+            vec![Value::Int(3), Value::Int(0)],
+            vec![Value::Int(4), Value::Int(40)],
+            vec![Value::Int(5), Value::Int(50)],
+        ]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+}
+
+#[test]
+fn update_order_by_without_limit_errors() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("update_order_no_limit");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a);");
+        exec(&mut conn, "INSERT INTO t VALUES (1), (2);");
+        let result = sqlite3_prepare_v2(&mut conn, "UPDATE t SET a = 0 ORDER BY a;");
+        assert!(result.is_err(), "expected error for ORDER BY without LIMIT");
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("ORDER BY without LIMIT"), "got: {err}");
+    }
+}

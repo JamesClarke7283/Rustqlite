@@ -134,6 +134,11 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
         }
     }
 
+    // ORDER BY without LIMIT is an error (mirrors upstream).
+    if !upd.order_by.is_empty() && upd.limit.is_none() {
+        return Err(Error::msg("ORDER BY without LIMIT on UPDATE"));
+    }
+
     let cursor = 0i32;
     let sorter = 1i32;
     let ctx = Ctx { table, cursor, register_base: None, join_tables: None, index_read: None, subquery_resolver: None };
@@ -154,9 +159,24 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
     // (1) Write transaction.
     b.emit(Opcode::Transaction, 0, 1, 0);
 
-    // (2) Open the rowid-set sorter with one key field (the rowid, ASC, BINARY).
-    let so = b.emit(Opcode::SorterOpen, sorter, 1, 0);
-    b.set_p4(so, P4::KeyInfo(vec![crate::vdbe::KeyField::asc_binary()]));
+    // (2) Open the rowid-set sorter. When ORDER BY is present, the sorter key is
+    // [order_by_values..., rowid]; otherwise it's just [rowid]. The sorter orders
+    // by the ORDER BY columns; the rowid is the trailing payload used to re-seek.
+    let _n_order = upd.order_by.len() as i32;
+    let sorter_fields: Vec<crate::vdbe::KeyField> = if upd.order_by.is_empty() {
+        vec![crate::vdbe::KeyField::asc_binary()]
+    } else {
+        upd.order_by
+            .iter()
+            .map(|ot| crate::vdbe::KeyField {
+                desc: ot.desc,
+                collation: crate::types::Collation::Binary,
+            })
+            .collect()
+    };
+    let n_sorter_keys = sorter_fields.len() as i32;
+    let so = b.emit(Opcode::SorterOpen, sorter, n_sorter_keys, 0);
+    b.set_p4(so, P4::KeyInfo(sorter_fields));
 
     // RETURNING ephemeral cursor sits above the index cursors (allocated later). For now pick a
     // high cursor number; we open it after index cursors are emitted.
@@ -201,9 +221,19 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
         compile_jump(&mut b, w, scan_next, false, true, ctx)?;
     }
     let reg_old_rowid = b.alloc_reg();
-    let reg_rowid_rec = b.alloc_reg();
     b.emit(Opcode::Rowid, cursor, reg_old_rowid, 0);
-    b.emit(Opcode::MakeRecord, reg_old_rowid, 1, reg_rowid_rec);
+    // Build the sorter record: [order_by_values..., rowid].
+    let rec_start = b.alloc_regs(n_sorter_keys + 1);
+    for (j, ot) in upd.order_by.iter().enumerate() {
+        compile_expr(&mut b, &ot.expr, rec_start + j as i32, ctx)?;
+    }
+    if upd.order_by.is_empty() {
+        // No ORDER BY: single dummy key field (preserves insertion order).
+        b.emit(Opcode::Integer, 0, rec_start, 0);
+    }
+    b.emit(Opcode::SCopy, reg_old_rowid, rec_start + n_sorter_keys, 0);
+    let reg_rowid_rec = b.alloc_reg();
+    b.emit(Opcode::MakeRecord, rec_start, n_sorter_keys + 1, reg_rowid_rec);
     b.emit(Opcode::SorterInsert, sorter, reg_rowid_rec, 0);
 
     b.resolve(scan_next);
@@ -214,6 +244,22 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
     // delete + re-insert. `changes()` and `total_changes()` count once per row updated
     // because the Delete carries `P5_ISUPDATE` (suppresses its own counter; the Insert
     // bumps once). `last_insert_rowid()` is left untouched (matches upstream).
+
+    // Initialize OFFSET and LIMIT counters BEFORE the sort loop so they persist
+    // across iterations.
+    let offset_reg = b.alloc_reg();
+    if let Some(offset_expr) = &upd.offset {
+        compile_expr(&mut b, offset_expr, offset_reg, ctx)?;
+    } else {
+        b.emit(Opcode::Integer, 0, offset_reg, 0);
+    }
+    let limit_reg = b.alloc_reg();
+    if let Some(limit_expr) = &upd.limit {
+        compile_expr(&mut b, limit_expr, limit_reg, ctx)?;
+    } else {
+        b.emit(Opcode::Integer, -1, limit_reg, 0);
+    }
+
     let end_update = b.new_label();
     b.emit_jump(Opcode::SorterSort, sorter, end_update, 0);
     let update_top = b.new_label();
@@ -221,9 +267,30 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
     b.resolve(update_top);
 
     b.emit(Opcode::SorterData, sorter, 0, 0);
-    // Pull the captured rowid back out of the sorter record.
+
+    // OFFSET: skip the first OFFSET rows.
+    if upd.offset.is_some() {
+        let skip_offset = b.new_label();
+        let after_offset = b.new_label();
+        b.emit_jump(Opcode::IfPos, offset_reg, skip_offset, 1);
+        b.emit_jump(Opcode::Goto, 0, after_offset, 0);
+        b.resolve(skip_offset);
+        b.emit_jump(Opcode::SorterNext, sorter, update_top, 0);
+        b.emit_jump(Opcode::Goto, 0, end_update, 0);
+        b.resolve(after_offset);
+    }
+
+    // LIMIT: stop after LIMIT rows.
+    if upd.limit.is_some() {
+        let do_update = b.new_label();
+        b.emit_jump(Opcode::IfPos, limit_reg, do_update, 1);
+        b.emit_jump(Opcode::Goto, 0, end_update, 0);
+        b.resolve(do_update);
+    }
+
+    // Pull the captured rowid back out of the sorter record (at column n_sorter_keys).
     let reg_old_rowid2 = b.alloc_reg();
-    b.emit(Opcode::Column, sorter, 0, reg_old_rowid2);
+    b.emit(Opcode::Column, sorter, n_sorter_keys, reg_old_rowid2);
     // Re-seek the table cursor; if the row is gone (concurrent delete), skip.
     b.emit_jump(Opcode::NotExists, cursor, sort_next, reg_old_rowid2);
 
