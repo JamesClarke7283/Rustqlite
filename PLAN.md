@@ -425,11 +425,11 @@ list every granular item needed.
 
 ## M21 — ATTACH / DETACH
 
-- [ ] **21.1** Parser: `ATTACH [DATABASE] expr AS expr [KEY expr]`
-- [ ] **21.2** Parser: `DETACH [DATABASE] expr`
+- [x] **21.1** Parser: `ATTACH [DATABASE] expr AS expr [KEY expr]` (shipped in M2.38)
+- [x] **21.2** Parser: `DETACH [DATABASE] expr` (shipped in M2.39)
 - [ ] **21.3** Multi-database pager: `main`, `temp`, and user-attached schemas in a connection
 - [ ] **21.4** Schema-qualified table references: `schema.table` in FROM, INSERT, UPDATE, DELETE
-- [ ] **21.5** `PRAGMA database_list` — list all attached databases
+- [x] **21.5** `PRAGMA database_list` — list all attached databases (shipped with M20.8)
 - [ ] **21.6** VFS: open additional database files for ATTACH
 - [ ] **21.7** VDBE: schema switching for cross-database references
 - [ ] **21.8** DETACH: close file, remove schema entry
