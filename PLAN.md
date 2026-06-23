@@ -343,11 +343,11 @@ list every granular item needed.
 - [x] **17.4** `PRAGMA foreign_key_list(tbl)` — list FK constraints on a table
 - [x] **17.5** `PRAGMA foreign_key_check` — verify all FK constraints
 - [x] **17.6** FK enforcement on INSERT: child row must reference an existing parent row (or be NULL)
-- [ ] **17.7** FK enforcement on DELETE from parent: cascade action (SET NULL, SET DEFAULT, CASCADE, RESTRICT, NO ACTION)
-- [ ] **17.8** FK enforcement on UPDATE of parent key: cascade action
-- [ ] **17.9** VDBE: `FkCheck` / `FkCounter` / `FkIfZero` opcodes
-- [ ] **17.10** Deferred FK constraints (check at COMMIT time, not at statement time)
-- [ ] **17.11** `sqlite_foreign_keys_list` system table / introspection
+- [ ] **17.7** FK enforcement on DELETE from parent: cascade action (SET NULL, SET DEFAULT, CASCADE, RESTRICT, NO ACTION) [BLOCKED: scope — requires a parent→children reverse-FK resolver, a child-locator opcode (the inverse of FkLookup), a recursive cascade driver for CASCADE/SET NULL/SET DEFAULT, and the FkConstraint extension to carry on_delete. The infrastructure (catalog, extract_fks, plan_fk, FkLookup, OP_FkCheck executor, the per-row hook slot in compile_delete) is reusable, but the net-new codegen + executor work is substantial. Deferred to a dedicated session.]
+- [ ] **17.8** FK enforcement on UPDATE of parent key: cascade action [BLOCKED: scope — same as 17.7, plus the UPDATE codegen path. Deferred.]
+- [ ] **17.9** VDBE: `FkCheck` / `FkCounter` / `FkIfZero` opcodes [BLOCKED: scope — FkCheck is implemented (M17.6); FkCounter/FkIfZero are for deferred-FK bookkeeping (M17.10) and the cascade counter (M17.7). Deferred with 17.7/17.10.]
+- [ ] **17.10** Deferred FK constraints (check at COMMIT time, not at statement time) [BLOCKED: scope — requires FkCounter/FkIfZero (17.9) and the deferred-constraint queue. Deferred with 17.7/17.9.]
+- [ ] **17.11** `sqlite_foreign_keys_list` system table / introspection [BLOCKED: not an upstream SQLite feature — `sqlite_foreign_keys_list` does not exist in SQLite 3.53.1; this was a planning error. The FK introspection surface is `PRAGMA foreign_key_list` (M17.4) and `PRAGMA foreign_key_check` (M17.5), both implemented.]
 
 ---
 
