@@ -53,7 +53,7 @@
 //! (`SET <IPK col> = …`) is also rejected at codegen time. NOT NULL enforcement is not yet
 //! modeled (the INSERT path has the same gap); it arrives with the constraint-checks slice.
 
-use rustqlite_parser::{Assignment, UpdateStmt};
+use rustqlite_parser::{Assignment, Expr, JoinOp, TableOrJoin, UpdateStmt};
 
 use crate::codegen::builder::Label;
 use crate::codegen::returning::Returning;
@@ -66,12 +66,30 @@ use crate::vdbe::program::{Program, P4, P5_ISUPDATE, P5_UNIQUE};
 use crate::vdbe::{KeyField, Opcode};
 
 use super::builder::ProgramBuilder;
-use super::expr::{compile_expr, compile_jump, Ctx};
+use super::expr::{compile_expr, compile_jump, Ctx, JoinTable};
 
-/// Compile `UPDATE [OR action] tbl SET col = expr [, …] [WHERE expr]`. `indexes` is the list
-/// of indexes attached to `table`; the codegen emits per-row `IdxDelete` + `IdxInsert`
-/// maintenance for each index, now including multi-column composite keys (M5.2).
-pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) -> Result<Program> {
+/// A resolved table attached to an `UPDATE ... FROM` clause: the table object, the name used
+/// to qualify its columns (alias if present, else the table name), and its indexes. The
+/// `UPDATE` target table is NOT in this list — it is passed as the `table` argument to
+/// [`compile_update`].
+#[derive(Clone, Copy)]
+pub struct FromTable<'a> {
+    pub table: &'a Table,
+    pub name: &'a str,
+    pub indexes: &'a [IndexObject],
+}
+
+/// Compile `UPDATE [OR action] tbl SET col = expr [, …] [WHERE expr] [FROM from_clause]`.
+/// `indexes` is the list of indexes attached to `table`; the codegen emits per-row
+/// `IdxDelete` + `IdxInsert` maintenance for each index, now including multi-column composite
+/// keys (M5.2). `from_tables` carries the resolved tables of the optional `FROM` clause
+/// (M19.3); empty means no `FROM` clause and the original two-pass shape is used.
+pub fn compile_update(
+    upd: &UpdateStmt,
+    table: &Table,
+    indexes: &[IndexObject],
+    from_tables: &[FromTable<'_>],
+) -> Result<Program> {
     if upd.schema.is_some() {
         return Err(Error::msg("schema-qualified UPDATE is not yet supported"));
     }
@@ -108,10 +126,30 @@ pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) 
         )));
     }
 
+    // An `UPDATE ... FROM` clause present but no resolved FROM tables supplied is a caller
+    // bug; a non-empty `from_tables` without a `FROM` clause on the statement is also invalid.
+    if !upd.from.is_empty() && from_tables.is_empty() {
+        return Err(Error::msg(
+            "UPDATE ... FROM present but no FROM tables were resolved by the caller",
+        ));
+    }
+    if upd.from.is_empty() && !from_tables.is_empty() {
+        return Err(Error::msg(
+            "from_tables supplied but the UPDATE statement has no FROM clause",
+        ));
+    }
+
+    // Route to the FROM-clause variant when present. M19.3 first slice: a comma/cross/inner
+    // join of plain tables (no subqueries, no outer joins — SQLite forbids OUTER JOIN in
+    // UPDATE FROM anyway).
+    if !from_tables.is_empty() {
+        return compile_update_from(upd, table, indexes, from_tables, oe);
+    }
+
     // Resolve the assignments: for each, the table column index and the value expression.
     // Last-write-wins on duplicate columns (matches upstream `sqlite3Update`).
     let ncol = table.columns.len();
-    let mut target_col: Vec<Option<(usize, &rustqlite_parser::Expr)>> = vec![None; ncol];
+    let mut target_col: Vec<Option<(usize, &Expr)>> = vec![None; ncol];
     for Assignment { column, value } in &upd.assignments {
         let ci = table.column_index(column).ok_or_else(|| {
             Error::msg(format!("table {} has no column named {column}", table.name))
@@ -631,6 +669,493 @@ fn validate_partial_pred_on_update(
     Ok(())
 }
 
+/// Compile `UPDATE [OR action] tbl SET col = expr [, …] [WHERE expr] FROM from_clause` —
+/// the SQLite-3.33+ `UPDATE ... FROM` form. Mirrors `updateFromSelect` in `update.c`:
+/// conceptually `SELECT <rowid>, <set-exprs...> FROM tbl, from_tables WHERE <where>` is run
+/// into a sorter, then for each sorter row the target table is seeked by rowid and the SET
+/// values (read from the sorter columns) are applied.
+///
+/// This first slice supports the common shape: a comma / CROSS / INNER join of plain tables
+/// (no subqueries, no OUTER JOIN — SQLite forbids OUTER JOIN in `UPDATE FROM` anyway). The
+/// SET expressions and the WHERE clause may reference columns from any of the joined tables.
+/// The target table's rowid is captured per matched row; the SET expressions are evaluated
+/// against the joined row and staged in the sorter alongside the rowid, so the second pass
+/// does not need to re-evaluate them (mirrors upstream's `nChangeFrom > 0` path where the
+/// change expressions are read back from the ephemeral columns).
+///
+/// `from_tables` is in declared FROM order. The target table is the outer (left) loop; each
+/// FROM table is an inner loop. No join-order selection is performed (matches the simplest
+/// path; the planner-based reorder lands with M22).
+fn compile_update_from(
+    upd: &UpdateStmt,
+    table: &Table,
+    indexes: &[IndexObject],
+    from_tables: &[FromTable<'_>],
+    oe: OeAction,
+) -> Result<Program> {
+    // Validate the FROM clause shape: only plain-table cross/inner joins. A subquery in the
+    // UPDATE FROM would need the M8.6 subquery materialization infrastructure threaded here;
+    // OUTER JOINs are rejected by SQLite itself in this position.
+    for entry in &upd.from {
+        match entry {
+            TableOrJoin::Table(_) => {}
+            TableOrJoin::Subquery { .. } => {
+                return Err(Error::msg(
+                    "subquery in UPDATE ... FROM is not yet supported (only plain tables)",
+                ));
+            }
+            TableOrJoin::Join(j) => {
+                match j.op {
+                    JoinOp::Cross | JoinOp::Inner | JoinOp::Natural => {}
+                    _ => {
+                        return Err(Error::msg(
+                            "OUTER JOIN in UPDATE ... FROM is not allowed (use a subquery)",
+                        ));
+                    }
+                }
+                // The nested-left side must also be plain-table only.
+                if !matches!(&*j.left, TableOrJoin::Table(_)) {
+                    return Err(Error::msg(
+                        "nested subquery/join in UPDATE ... FROM is not yet supported",
+                    ));
+                }
+            }
+        }
+    }
+    if from_tables.len() > 8 {
+        return Err(Error::msg("UPDATE ... FROM supports at most 8 joined tables in this slice"));
+    }
+
+    // Reject ORDER BY / LIMIT / OFFSET on UPDATE ... FROM for the first slice. SQLite does
+    // support these (when compiled with SQLITE_ENABLE_UPDATE_DELETE_LIMIT), but the
+    // row-set + nested-loop shape here doesn't carry the rowid through the order cleanly.
+    // The plain UPDATE path keeps ORDER BY / LIMIT / OFFSET support.
+    if !upd.order_by.is_empty() || upd.limit.is_some() || upd.offset.is_some() {
+        return Err(Error::msg(
+            "ORDER BY / LIMIT / OFFSET on UPDATE ... FROM is not yet supported",
+        ));
+    }
+
+    let ncol = table.columns.len();
+
+    // Resolve assignments: column-index -> SET value expression.
+    let mut target_col: Vec<Option<(usize, &Expr)>> = vec![None; ncol];
+    for Assignment { column, value } in &upd.assignments {
+        let ci = table.column_index(column).ok_or_else(|| {
+            Error::msg(format!("table {} has no column named {column}", table.name))
+        })?;
+        target_col[ci] = Some((ci, value));
+    }
+    // Updating the rowid-alias column is rejected (same guard as the plain UPDATE path).
+    for (ci, slot) in target_col.iter().enumerate() {
+        if slot.is_some() && table.rowid_alias == Some(ci) {
+            return Err(Error::msg(format!(
+                "UPDATE of the INTEGER PRIMARY KEY column is not yet supported (table {}, column {})",
+                table.name, table.columns[ci].name
+            )));
+        }
+    }
+
+    // The SET expressions staged in the sorter, in column order. The sorter record layout is:
+    //   [rowid, set_value_for_lowest_assigned_col, set_value_for_next_assigned_col, ...]
+    // We collect the (col_idx, value_expr) pairs in column order so the second pass can read
+    // them back at known offsets.
+    let mut set_pairs: Vec<(usize, &Expr)> = Vec::new();
+    for (ci, slot) in target_col.iter().enumerate() {
+        if let Some((_, value)) = slot {
+            set_pairs.push((ci, *value));
+        }
+    }
+    let n_set = set_pairs.len() as i32;
+
+    let mut b = ProgramBuilder::new();
+    b.set_default_oe(oe as u8);
+
+    let returning = upd
+        .returning
+        .as_deref()
+        .map(|r| Returning::new(r, table))
+        .transpose()?;
+
+    let setup = b.new_label();
+    let after_init = b.new_label();
+    b.emit_jump(Opcode::Init, 0, setup, 0);
+    b.resolve(after_init);
+
+    // (1) Write transaction.
+    b.emit(Opcode::Transaction, 0, 1, 0);
+
+    // (2) Sorter holds [rowid, set_value_1, ..., set_value_n]. Single key (rowid asc).
+    let sorter = 1i32;
+    let sorter_fields = vec![KeyField::asc_binary()];
+    let so = b.emit(Opcode::SorterOpen, sorter, 1, 0);
+    b.set_p4(so, P4::KeyInfo(sorter_fields));
+
+    // Cursor layout:
+    //   0           -> target table (write)
+    //   2..(2+nidx) -> target table indexes (write)
+    //   20..        -> FROM tables (read), high numbers to avoid collisions.
+    let target_cursor = 0i32;
+    let index_cursor_base = 2i32;
+    let from_cursor_base = 20i32;
+
+    // RETURNING ephemeral at an even higher number.
+    let returning_cursor = 40i32;
+    let mut returning = returning;
+    if let Some(ref mut ret) = returning {
+        ret.emit_open(&mut b, returning_cursor);
+    }
+
+    // (3) Open the target table for write.
+    let open = b.emit(Opcode::OpenWrite, target_cursor, table.rootpage as i32, 0);
+    b.set_p4(open, P4::Int(ncol as i64));
+
+    // (3b) Open the target's indexes for write (IdxDelete/IdxInsert maintenance).
+    for (i, idx) in indexes.iter().enumerate() {
+        let _ = idx.table_column_indices(table)?;
+        let ic = index_cursor_base + i as i32;
+        let open = b.emit(Opcode::OpenWrite, ic, idx.rootpage as i32, 0);
+        let key_info: Vec<KeyField> = idx
+            .columns
+            .iter()
+            .map(|ic| KeyField {
+                desc: ic.desc,
+                collation: ic.collation,
+            })
+            .collect();
+        b.set_p4(open, P4::KeyInfo(key_info));
+    }
+
+    // (3c) Open each FROM table for read.
+    for (i, ft) in from_tables.iter().enumerate() {
+        let fc = from_cursor_base + i as i32;
+        let open = b.emit(Opcode::OpenRead, fc, ft.table.rootpage as i32, 0);
+        if ft.table.without_rowid {
+            b.set_p4(open, P4::KeyInfo(ft.table.without_rowid_key_info()));
+        } else {
+            b.set_p4(open, P4::Int(ft.table.columns.len() as i64));
+        }
+        b.note_cursor(fc);
+    }
+
+    // (4) First pass: nested loop. Target table is the outer (left) loop; each FROM table is
+    //     an inner loop. For each row combination that passes the WHERE filter, capture the
+    //     target rowid + each SET expression value into the sorter.
+    let join_tables: Vec<JoinTable<'_>> = {
+        let mut v: Vec<JoinTable<'_>> = Vec::with_capacity(1 + from_tables.len());
+        v.push(JoinTable {
+            table,
+            cursor: target_cursor,
+            name: &upd.table,
+        });
+        for (i, ft) in from_tables.iter().enumerate() {
+            v.push(JoinTable {
+                table: ft.table,
+                cursor: from_cursor_base + i as i32,
+                name: ft.name,
+            });
+        }
+        v
+    };
+    let jt_slice: &[JoinTable<'_>] = &join_tables;
+    let scan_ctx = Ctx {
+        table,
+        cursor: target_cursor,
+        register_base: None,
+        index_read: None,
+        join_tables: Some(jt_slice),
+        subquery_resolver: None,
+    };
+
+    // ON predicates per join level (only INNER/CROSS have them; comma joins have none).
+    // `flatten_cross_join` walks ONLY the FROM clause (not the target table), so its entries
+    // map 1:1 to `from_tables` in declared order. Each entry's constraint is the ON predicate
+    // (None for a comma join).
+    let flat = super::join::flatten_cross_join(&upd.from)
+        .ok_or_else(|| Error::msg("UPDATE ... FROM expects a plain table list"))?;
+    if flat.len() != from_tables.len() {
+        return Err(Error::msg(
+            "UPDATE ... FROM FROM-clause shape mismatch (subqueries or nested joins not supported)",
+        ));
+    }
+    let on_preds: Vec<Option<&Expr>> = flat
+        .iter()
+        .map(|(_, c)| super::join::on_predicate(*c))
+        .collect();
+
+    // Outermost loop: target table.
+    let end_scan = b.new_label();
+    b.emit_jump(Opcode::Rewind, target_cursor, end_scan, 0);
+    let target_loop = b.new_label();
+    b.resolve(target_loop);
+
+    // Inner loops: each FROM table. Build them as a ladder of Rewind/Next pairs. The
+    // innermost body runs the WHERE filter, captures the rowid, evaluates SET expressions,
+    // and inserts into the sorter.
+    //
+    // Nested loop layout for `from_tables = [a, b, c]`:
+    //   target_loop:
+    //     Rewind a, end_target_iter      ; on_empty = end_target_iter (skip everything)
+    //     from_loops[0]:
+    //       ON[0]? jump from_nexts[0]
+    //       Rewind b, from_nexts[0]      ; on_empty = from_nexts[i-1] = from_nexts[0]
+    //       from_loops[1]:
+    //         ON[1]? jump from_nexts[1]
+    //         Rewind c, from_nexts[1]    ; on_empty = from_nexts[i-1] = from_nexts[1]
+    //         from_loops[2]:
+    //           ON[2]? jump from_nexts[2]
+    //           WHERE? jump from_nexts[2]
+    //           <body: capture rowid + SET values, SorterInsert>
+    //         from_nexts[2]:
+    //           Next c, from_loops[2]
+    //       from_nexts[1]:
+    //         Next b, from_loops[1]
+    //     from_nexts[0]:
+    //       Next a, from_loops[0]
+    //   end_target_iter:
+    //     Next target, target_loop
+    //   end_scan:
+    //
+    // For a single from table [a]: on_empty of Rewind a = end_target_iter.
+    // For zero from tables: there are no inner loops; the body runs directly under target_loop,
+    //   and the WHERE-false jump goes to end_target_iter (so the target's Next runs).
+    let n_from = from_tables.len();
+    let from_loops: Vec<Label> = (0..n_from).map(|_| b.new_label()).collect();
+    let from_nexts: Vec<Label> = (0..n_from).map(|_| b.new_label()).collect();
+    let end_target_iter = b.new_label();
+
+    // The label that the WHERE-false jump targets: the innermost from_next (continue the
+    // innermost loop), or end_target_iter when there are no FROM tables.
+    let body_skip = if n_from == 0 {
+        end_target_iter
+    } else {
+        from_nexts[n_from - 1]
+    };
+
+    // Emit the Rewind + ON predicate for each FROM table in order.
+    for i in 0..n_from {
+        let fc = from_cursor_base + i as i32;
+        let on_empty = if i == 0 {
+            end_target_iter
+        } else {
+            from_nexts[i - 1]
+        };
+        b.emit_jump(Opcode::Rewind, fc, on_empty, 0);
+        b.resolve(from_loops[i]);
+        if let Some(on) = on_preds.get(i).copied().flatten() {
+            compile_jump(&mut b, on, from_nexts[i], false, true, scan_ctx)?;
+        }
+    }
+
+    // Innermost body: WHERE filter, then capture rowid + SET values into the sorter.
+    if let Some(w) = &upd.where_clause {
+        compile_jump(&mut b, w, body_skip, false, true, scan_ctx)?;
+    }
+
+    let reg_rowid = b.alloc_reg();
+    b.emit(Opcode::Rowid, target_cursor, reg_rowid, 0);
+
+    let rec_start = b.alloc_regs(1 + n_set);
+    b.emit(Opcode::SCopy, reg_rowid, rec_start, 0);
+    for (k, (_, value)) in set_pairs.iter().enumerate() {
+        compile_expr(&mut b, value, rec_start + 1 + k as i32, scan_ctx)?;
+    }
+    let reg_rec = b.alloc_reg();
+    b.emit(Opcode::MakeRecord, rec_start, 1 + n_set, reg_rec);
+    b.emit(Opcode::SorterInsert, sorter, reg_rec, 0);
+
+    // Close out the inner loops in reverse order (innermost first).
+    for i in (0..n_from).rev() {
+        b.resolve(from_nexts[i]);
+        let fc = from_cursor_base + i as i32;
+        b.emit_jump(Opcode::Next, fc, from_loops[i], 0);
+    }
+    b.resolve(end_target_iter);
+    b.emit_jump(Opcode::Next, target_cursor, target_loop, 0);
+    b.resolve(end_scan);
+
+    // (5) Second pass: iterate the sorter, re-seek the target by rowid, build the new record
+    //     from the existing row + staged SET values, do delete + insert + index maintenance.
+    let end_update = b.new_label();
+    b.emit_jump(Opcode::SorterSort, sorter, end_update, 0);
+    let update_top = b.new_label();
+    let sort_next = b.new_label();
+    b.resolve(update_top);
+
+    b.emit(Opcode::SorterData, sorter, 0, 0);
+
+    // Pull the captured rowid back out of the sorter record (column 0).
+    let reg_old_rowid = b.alloc_reg();
+    b.emit(Opcode::Column, sorter, 0, reg_old_rowid);
+    b.emit_jump(Opcode::NotExists, target_cursor, sort_next, reg_old_rowid);
+
+    // Build the new record: copy each table column from the current row, then override the
+    // assigned columns with the staged SET values read from the sorter columns 1..1+n_set.
+    let reg_new = b.alloc_regs(ncol as i32);
+    for ci in 0..ncol {
+        b.emit(Opcode::Column, target_cursor, ci as i32, reg_new + ci as i32);
+    }
+    for ci in 0..ncol {
+        if table.columns[ci].affinity == Affinity::Real {
+            b.emit(Opcode::RealAffinity, reg_new + ci as i32, 0, 0);
+        }
+    }
+
+    // Snapshot the OLD row for index key computation (same as the plain UPDATE path).
+    let reg_old = b.alloc_regs(ncol as i32);
+    for ci in 0..ncol {
+        b.emit(Opcode::SCopy, reg_new + ci as i32, reg_old + ci as i32, 0);
+    }
+    if table.rowid_alias.is_none() {
+        let _placeholder = b.alloc_reg();
+    }
+
+    // Override assigned columns from the sorter. The SET values sit at sorter columns 1..1+n_set
+    // in the same order as `set_pairs`.
+    for (k, (ci, _)) in set_pairs.iter().enumerate() {
+        b.emit(Opcode::Column, sorter, 1 + k as i32, reg_new + *ci as i32);
+    }
+
+    // Apply column affinities.
+    let mut aff_string = String::with_capacity(ncol);
+    for col in &table.columns {
+        aff_string.push(affinity_char(col.affinity) as char);
+    }
+    if !aff_string.is_empty() {
+        let idx = b.emit(Opcode::Affinity, reg_new, ncol as i32, 0);
+        b.set_p4(idx, P4::Symbol(aff_string));
+    }
+
+    let reg_new_rec = b.alloc_reg();
+    b.emit(Opcode::MakeRecord, reg_new, ncol as i32, reg_new_rec);
+
+    // Index maintenance: OLD-key IdxDelete, table Delete+Insert, NEW-key IdxInsert. This
+    // mirrors the plain UPDATE path; the OLD keys are evaluated against `reg_old` and the
+    // NEW keys against `reg_new`. Partial-index predicates are supported the same way.
+    for (i, idx) in indexes.iter().enumerate() {
+        let ic = index_cursor_base + i as i32;
+        let indexed_cis = idx.table_column_indices(table).expect("validated earlier");
+        let nkey = idx.nkey_fields() as i32 + 1;
+
+        let skip_delete_label = if let Some(pred) = &idx.where_clause {
+            validate_partial_pred_on_update(pred, table, &target_col)?;
+            let skip = b.new_label();
+            let pred_ctx = Ctx { table, cursor: target_cursor, register_base: None, join_tables: None, index_read: None, subquery_resolver: None };
+            compile_pred_jump(&mut b, pred, skip, table, reg_new, indexed_cis.as_slice(), pred_ctx)?;
+            Some(skip)
+        } else {
+            None
+        };
+
+        let old_key = b.alloc_regs(nkey);
+        for (j, icol) in idx.columns.iter().enumerate() {
+            let target = old_key + j as i32;
+            if let Some(expr) = &icol.expr {
+                let expr_ctx = Ctx {
+                    table,
+                    cursor: target_cursor,
+                    register_base: Some(reg_old), join_tables: None,
+                    index_read: None,
+                    subquery_resolver: None,
+                };
+                compile_expr(&mut b, expr, target, expr_ctx)?;
+            } else {
+                let col_idx = table
+                    .column_index(&icol.name)
+                    .expect("validated earlier");
+                b.emit(Opcode::SCopy, reg_old + col_idx as i32, target, 0);
+            }
+        }
+        b.emit(Opcode::SCopy, reg_old_rowid, old_key + idx.nkey_fields() as i32, 0);
+        b.emit(Opcode::IdxDelete, ic, old_key, nkey);
+
+        if let Some(skip) = skip_delete_label {
+            b.resolve(skip);
+        }
+    }
+
+    let del_idx = b.emit(Opcode::Delete, target_cursor, 0, 0);
+    b.set_p5(del_idx, P5_ISUPDATE);
+    let ins_idx = b.emit(Opcode::Insert, target_cursor, reg_new_rec, reg_old_rowid);
+    b.set_p5(ins_idx, P5_ISUPDATE);
+
+    if let Some(ref ret) = returning {
+        if let Some(alias_idx) = table.rowid_alias {
+            b.emit(Opcode::SCopy, reg_old_rowid, reg_new + alias_idx as i32, 0);
+        }
+        ret.emit_buffer_row(&mut b, table, target_cursor, reg_new)?;
+    }
+
+    for (i, idx) in indexes.iter().enumerate() {
+        let ic = index_cursor_base + i as i32;
+        let indexed_cis = idx.table_column_indices(table).expect("validated earlier");
+        let nkey = idx.nkey_fields() as i32 + 1;
+
+        let skip_insert_label = if let Some(pred) = &idx.where_clause {
+            validate_partial_pred_on_update(pred, table, &target_col)?;
+            let skip = b.new_label();
+            let pred_ctx = Ctx { table, cursor: target_cursor, register_base: None, join_tables: None, index_read: None, subquery_resolver: None };
+            compile_pred_jump(&mut b, pred, skip, table, reg_new, indexed_cis.as_slice(), pred_ctx)?;
+            Some(skip)
+        } else {
+            None
+        };
+
+        let new_key = b.alloc_regs(nkey);
+        let mut plain_iter = indexed_cis.iter();
+        for (j, icol) in idx.columns.iter().enumerate() {
+            let target = new_key + j as i32;
+            if let Some(expr) = &icol.expr {
+                let expr_ctx = Ctx {
+                    table,
+                    cursor: target_cursor,
+                    register_base: Some(reg_new), join_tables: None,
+                    index_read: None,
+                    subquery_resolver: None,
+                };
+                compile_expr(&mut b, expr, target, expr_ctx)?;
+            } else {
+                let col_idx = *plain_iter.next().expect("plain column aligned with indexed_cis");
+                b.emit(Opcode::SCopy, reg_new + col_idx as i32, target, 0);
+            }
+        }
+        b.emit(Opcode::SCopy, reg_old_rowid, new_key + idx.nkey_fields() as i32, 0);
+        let new_key_rec = b.alloc_reg();
+        b.emit(Opcode::MakeRecord, new_key, nkey, new_key_rec);
+        let idx_ins = b.emit(Opcode::IdxInsert, ic, new_key_rec, 0);
+        let mut p5 = P5_ISUPDATE;
+        if idx.unique {
+            p5 |= P5_UNIQUE;
+            if let Some(msg) = idx.unique_constraint_message(table) {
+                b.set_p4(idx_ins, P4::Text(msg));
+            } else {
+                b.set_p4(idx_ins, P4::Int(0));
+            }
+        } else {
+            b.set_p4(idx_ins, P4::Int(0));
+        }
+        b.set_p5(idx_ins, p5);
+
+        if let Some(skip) = skip_insert_label {
+            b.resolve(skip);
+        }
+    }
+
+    b.resolve(sort_next);
+    b.emit_jump(Opcode::SorterNext, sorter, update_top, 0);
+    b.resolve(end_update);
+
+    if let Some(ref ret) = returning {
+        ret.emit_output_loop(&mut b);
+    }
+
+    b.emit(Opcode::Halt, 0, 0, 0);
+
+    b.resolve(setup);
+    b.emit_jump(Opcode::Goto, 0, after_init, 0);
+    Ok(b.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -660,10 +1185,10 @@ mod tests {
     fn rejects_or_ignore_or_replace() {
         let t = table_of("CREATE TABLE t(a, b)");
         let u = update_of("UPDATE OR REPLACE t SET a = 1;");
-        let err = compile_update(&u, &t, &[]).unwrap_err();
+        let err = compile_update(&u, &t, &[], &[]).unwrap_err();
         assert!(err.to_string().contains("OR IGNORE / OR REPLACE"));
         let u = update_of("UPDATE OR IGNORE t SET a = 1;");
-        let err = compile_update(&u, &t, &[]).unwrap_err();
+        let err = compile_update(&u, &t, &[], &[]).unwrap_err();
         assert!(err.to_string().contains("OR IGNORE / OR REPLACE"));
     }
 
@@ -671,13 +1196,13 @@ mod tests {
     fn accepts_or_rollback_abort_fail() {
         let t = table_of("CREATE TABLE t(a, b)");
         let u = update_of("UPDATE OR ROLLBACK t SET a = 1;");
-        let prog = compile_update(&u, &t, &[]).unwrap();
+        let prog = compile_update(&u, &t, &[], &[]).unwrap();
         assert_eq!(prog.default_oe, OeAction::Rollback as u8);
         let u = update_of("UPDATE OR FAIL t SET a = 1;");
-        let prog = compile_update(&u, &t, &[]).unwrap();
+        let prog = compile_update(&u, &t, &[], &[]).unwrap();
         assert_eq!(prog.default_oe, OeAction::Fail as u8);
         let u = update_of("UPDATE OR ABORT t SET a = 1;");
-        let prog = compile_update(&u, &t, &[]).unwrap();
+        let prog = compile_update(&u, &t, &[], &[]).unwrap();
         assert_eq!(prog.default_oe, OeAction::Abort as u8);
     }
 
@@ -685,7 +1210,7 @@ mod tests {
     fn rejects_unknown_column() {
         let t = table_of("CREATE TABLE t(a, b)");
         let u = update_of("UPDATE t SET nope = 1;");
-        let err = compile_update(&u, &t, &[]).unwrap_err();
+        let err = compile_update(&u, &t, &[], &[]).unwrap_err();
         assert!(err.to_string().contains("no column named nope"));
     }
 
@@ -693,7 +1218,7 @@ mod tests {
     fn rejects_rowid_alias_set() {
         let t = table_of("CREATE TABLE t(id INTEGER PRIMARY KEY, v)");
         let u = update_of("UPDATE t SET id = 5;");
-        let err = compile_update(&u, &t, &[]).unwrap_err();
+        let err = compile_update(&u, &t, &[], &[]).unwrap_err();
         assert!(err.to_string().contains("INTEGER PRIMARY KEY"));
     }
 
@@ -701,7 +1226,7 @@ mod tests {
     fn golden_opcode_shape() {
         let t = table_of("CREATE TABLE t(a, b)");
         let u = update_of("UPDATE t SET a = 1 WHERE b > 0;");
-        let prog = compile_update(&u, &t, &[]).unwrap();
+        let prog = compile_update(&u, &t, &[], &[]).unwrap();
         let names: Vec<&str> = prog.instructions.iter().map(|i| i.opcode.name()).collect();
         // Two-pass shape, in this order.
         assert!(names.contains(&"Transaction"));

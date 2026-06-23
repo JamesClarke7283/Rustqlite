@@ -263,7 +263,10 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             // UPDATE: resolve the target table from the catalog and compile the two-pass
             // (sorter-as-rowset) write program. The codegen rejects OR actions other than
             // ABORT, schema-qualified names, unknown columns, and (defensively) updates of
-            // the rowid-alias column.
+            // the rowid-alias column. M19.3: when the statement has a `FROM` clause, each
+            // FROM table is resolved from the catalog (plain tables only — subqueries and
+            // outer joins are rejected at codegen time) and passed to the codegen so the
+            // SET expressions and WHERE can reference the joined tables.
             let pager = db.pager_arc()?;
             let (table, indexes) = resolve_table_and_indexes(&pager, &upd.table)?;
             let column_names = upd
@@ -273,7 +276,54 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 .transpose()?
                 .map(|ret| ret.column_names())
                 .unwrap_or_default();
-            let program = Arc::new(codegen::compile_update(&upd, &table, &indexes)?);
+            // Resolve FROM tables (M19.3). The FROM clause's first entry IS the target table
+            // (already resolved above); subsequent entries are the joined tables. We use
+            // `flatten_cross_join` to walk the FROM clause in declared order, then skip the
+            // first entry (the target).
+            let from_tables_owned: Vec<(Table, String, Vec<IndexObject>)>;
+            let from_tables: Vec<codegen::update::FromTable<'_>>;
+            if !upd.from.is_empty() {
+                let catalog = block_on(read_catalog(&pager))?;
+                let flat = codegen::join::flatten_cross_join(&upd.from)
+                    .ok_or_else(|| Error::msg("UPDATE ... FROM expects a plain table list"))?;
+                // The first flat entry is the target table; the rest are FROM tables.
+                let mut owned = Vec::new();
+                for (tref, _constraint) in flat.iter() {
+                    let obj = catalog
+                        .find_table(&tref.name)
+                        .ok_or_else(|| Error::msg(format!("no such table: {}", tref.name)))?;
+                    let t = Table::from_schema_object(obj)?;
+                    let name = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
+                    let mut idxs = Vec::new();
+                    for obj in catalog.indexes() {
+                        if obj.tbl_name.eq_ignore_ascii_case(&tref.name) {
+                            idxs.push(IndexObject::from_schema_object(obj)?);
+                        }
+                    }
+                    owned.push((t, name, idxs));
+                }
+                from_tables_owned = owned;
+                from_tables = from_tables_owned
+                    .iter()
+                    .map(|(t, n, idxs)| codegen::update::FromTable {
+                        table: t,
+                        name: n.as_str(),
+                        indexes: idxs.as_slice(),
+                    })
+                    .collect();
+            } else {
+                from_tables_owned = Vec::new();
+                from_tables = Vec::new();
+            }
+            // Keep `from_tables_owned` alive past the `from_tables` borrow so its tables/
+            // indexes aren't dropped before the codegen reads them.
+            let _keep = &from_tables_owned;
+            let program = Arc::new(codegen::compile_update(
+                &upd,
+                &table,
+                &indexes,
+                &from_tables,
+            )?);
             let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),

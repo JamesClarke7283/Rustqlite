@@ -166,8 +166,13 @@ pub fn compile_drop_index(
 /// program against the resolved `table`. The first M5.0 slice: single-table, no triggers /
 /// FK / `OR action` other than ABORT (errors at codegen time). M5.1: `indexes` drives per-row
 /// `IdxDelete` + `IdxInsert` maintenance for each single-column index on the table.
-pub fn compile_update(upd: &UpdateStmt, table: &Table, indexes: &[IndexObject]) -> Result<Program> {
-    update::compile_update(upd, table, indexes)
+pub fn compile_update(
+    upd: &UpdateStmt,
+    table: &Table,
+    indexes: &[IndexObject],
+    from_tables: &[update::FromTable<'_>],
+) -> Result<Program> {
+    update::compile_update(upd, table, indexes, from_tables)
 }
 
 /// Compile a `SELECT ... FROM (subquery) AS alias [...]` by materializing the subquery into an

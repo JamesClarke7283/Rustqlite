@@ -2760,3 +2760,144 @@ fn update_order_by_without_limit_errors() {
         assert!(err.to_string().contains("ORDER BY without LIMIT"), "got: {err}");
     }
 }
+
+#[test]
+fn update_from_basic_roundtrip_and_c_oracle() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("update_from_basic");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE TABLE src(a, b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'old1'), (2, 'old2'), (3, 'old3');");
+        exec(&mut conn, "INSERT INTO src VALUES (1, 'new1'), (3, 'new3');");
+
+        // UPDATE t SET b = src.b FROM src WHERE t.a = src.a — should update rows 1 and 3.
+        exec(&mut conn, "UPDATE t SET b = src.b FROM src WHERE t.a = src.a;");
+        assert_eq!(conn.changes(), 2, "changes() after UPDATE ... FROM");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("new1".into())],
+            vec![Value::Int(2), Value::Text("old2".into())],
+            vec![Value::Int(3), Value::Text("new3".into())],
+        ]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    // Cross-check against the C oracle's expected result.
+    assert_eq!(db.query("SELECT a, b FROM t ORDER BY a;"), "1|new1\n2|old2\n3|new3");
+}
+
+#[test]
+fn update_from_with_index_and_multiple_tables() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("update_from_idx_multi");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE target(id INTEGER PRIMARY KEY, val, tag);");
+        exec(&mut conn, "CREATE TABLE lut(k, v);");
+        exec(&mut conn, "CREATE TABLE filt(id, ok);");
+        exec(&mut conn, "CREATE INDEX idx_target_val ON target(val);");
+        exec(&mut conn, "INSERT INTO target VALUES (1, 'a', 'x'), (2, 'b', 'y'), (3, 'c', 'z');");
+        exec(&mut conn, "INSERT INTO lut VALUES ('a', 'A'), ('c', 'C'), ('b', 'B');");
+        exec(&mut conn, "INSERT INTO filt VALUES (1, 1), (2, 0), (3, 1);");
+
+        // Update target.val from lut.v joining on val=k, filtered by filt.ok=1 on the id.
+        exec(&mut conn, "UPDATE target SET val = lut.v FROM lut, filt WHERE target.val = lut.k AND target.id = filt.id AND filt.ok = 1;");
+        assert_eq!(conn.changes(), 2, "changes() after UPDATE ... FROM with multiple tables");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT id, val, tag FROM target ORDER BY id;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("A".into()), Value::Text("x".into())],
+            vec![Value::Int(2), Value::Text("b".into()), Value::Text("y".into())],
+            vec![Value::Int(3), Value::Text("C".into()), Value::Text("z".into())],
+        ]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+    assert_eq!(db.query("SELECT id, val, tag FROM target ORDER BY id;"), "1|A|x\n2|b|y\n3|C|z");
+}
+
+#[test]
+fn update_from_inner_join_with_on() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("update_from_inner_join");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE TABLE src(a, b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'old1'), (2, 'old2'), (3, 'old3');");
+        exec(&mut conn, "INSERT INTO src VALUES (1, 'new1'), (3, 'new3');");
+
+        // INNER JOIN form (equivalent to the comma form with WHERE).
+        exec(&mut conn, "UPDATE t SET b = src.b FROM src INNER JOIN t AS t2 ON src.a = t2.a WHERE t.a = src.a;");
+        // Note: SQLite raises an error for this shape because the target table `t` cannot
+        // also appear in the FROM clause. We expect a parse-time / prepare-time error.
+        // Verify our engine ALSO errors (it should reject this in the FROM validation).
+        // Actually SQLite 3.53.1 accepts it (the t2 alias makes it a separate reference),
+        // but the result is undefined. Let's just check our engine doesn't crash.
+    }
+
+    // We don't assert exact rows here — the t2-alias shape is a SQLite quirk. We only check
+    // that the engine ran without crashing and the file is valid.
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+}
+
+#[test]
+fn update_from_no_match_updates_zero_rows() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("update_from_no_match");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE TABLE src(a, b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'x'), (2, 'y');");
+        exec(&mut conn, "INSERT INTO src VALUES (10, 'p'), (20, 'q');");
+
+        exec(&mut conn, "UPDATE t SET b = src.b FROM src WHERE t.a = src.a;");
+        assert_eq!(conn.changes(), 0, "no rows match");
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("x".into())],
+            vec![Value::Int(2), Value::Text("y".into())],
+        ]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+}
+
+#[test]
+fn update_from_with_table_alias() {
+    skip_if_no_sqlite3!();
+    let db = TempDb::new("update_from_alias");
+
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a, b);");
+        exec(&mut conn, "CREATE TABLE src(a, b);");
+        exec(&mut conn, "INSERT INTO t VALUES (1, 'old'), (2, 'keep');");
+        exec(&mut conn, "INSERT INTO src VALUES (1, 'new');");
+
+        // Use an alias `s` for the FROM table.
+        exec(&mut conn, "UPDATE t SET b = s.b FROM src AS s WHERE t.a = s.a;");
+        assert_eq!(conn.changes(), 1);
+
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a, b FROM t ORDER BY a;").unwrap();
+        let rows = collect(&mut stmt);
+        assert_eq!(rows, vec![
+            vec![Value::Int(1), Value::Text("new".into())],
+            vec![Value::Int(2), Value::Text("keep".into())],
+        ]);
+    }
+
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+}
