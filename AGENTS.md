@@ -934,3 +934,40 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   with/without target, WHERE filter, bare-column vs `excluded.col` resolution,
   secondary-index maintenance, unmatched target error, INTEGER PRIMARY KEY target,
   multi-row mixed insert+update).
+
+- **M19 — DELETE / UPDATE Enhancements** 🚧: **19.1** `DELETE … ORDER BY … LIMIT …` ✅,
+  **19.2** `UPDATE … ORDER BY … LIMIT …` ✅, **19.3** `UPDATE … FROM from_clause` ✅
+  (SQLite 3.33+), **19.4** `RETURNING` on DELETE ✅, **19.5** `RETURNING` on UPDATE ✅,
+  **19.6** `OR IGNORE`/`OR REPLACE`/`OR ROLLBACK`/`OR ABORT`/`OR FAIL` on UPDATE ✅,
+  **19.10** `UNIQUE` on UPDATE ✅. **19.7 `UPDATE` of `INTEGER PRIMARY KEY`** ✅: the
+  rowid-alias column (`SET <ipk-col> = <expr>`) is now supported. The codegen detects
+  `chng_rowid` (the SET list targets the `rowid_alias` column index) and, in the second
+  pass (the sorter-as-rowset update loop), evaluates the SET expression into a dedicated
+  `reg_new_rowid` register with INTEGER affinity + the new `OP_MustBeInt` opcode (a faithful
+  port of `OP_MustBeInt` in `vdbe.c`: applies NUMERIC affinity, then raises `SQLITE_MISMATCH`
+  when the value isn't an integer — a NULL value raises MISMATCH, matching the oracle's
+  `UPDATE t SET id = NULL` → "datatype mismatch", unlike `INSERT INTO t VALUES (NULL,…)`
+  which auto-assigns; a non-numeric string or a real with a fraction also raises MISMATCH).
+  The rowid-alias slot in the stored record is set to NULL (the rowid is carried in the
+  register, same as INSERT). A uniqueness pre-check on the new rowid uses `OP_NotExists`:
+  when the new rowid equals the old rowid (an `OP_Eq` guard), the check is skipped (a
+  self-assign like `UPDATE t SET id = 1 WHERE v='a'` on a row whose id is already 1 is a
+  no-op for the rowid — the row doesn't move and there's no conflict); otherwise, a found
+  row with the new rowid is a UNIQUE constraint violation on the IPK (`UNIQUE constraint
+  failed: <tbl>.<ipk-col>`) handled per the statement-level `OR <action>`: IGNORE jumps to
+  `sort_next`, REPLACE deletes the conflicting row + its index entries then falls through,
+  ABORT/FAIL/ROLLBACK halt before any writes. The table `Insert` and the NEW index keys use
+  `reg_new_rowid` as the rowid (instead of `reg_old_rowid2`), so the row moves within the
+  b-tree and the index entries point to the new rowid. `char_to_aff` was fixed to recognize
+  the canonical `SQLITE_AFF_*` letters (`A`=BLOB, `B`=TEXT, `C`=NUMERIC, `D`=INTEGER,
+  `E`=REAL) — the `Affinity` opcode's INTEGER coercion ('D') was previously a no-op
+  (mapped to BLOB), which is why the INSERT path's `apply_affinity(.., Integer)` appeared
+  to work despite never coercing (MustBeInt isn't used on the INSERT rowid-alias path;
+  `NewRowid` handles NULL there). Differential-tested vs the C oracle
+  (`update_rowid_alias_matches_oracle` in `write_roundtrip.rs`: move to a new rowid, id
+  arithmetic, self-assign, negative rowid, multi-column SET with the rowid-alias, NULL /
+  non-numeric / real-with-fraction / duplicate-rowid error cases — all match the oracle's
+  result code and message, and `PRAGMA integrity_check` passes on Rustqlite-written
+  databases). Still M19+: 19.8 `CHECK` constraint evaluation, 19.9 `NOT NULL`
+  enforcement. The `UPDATE ... FROM` path still rejects rowid-alias SET (staging the new
+  rowid through the sorter's set-value columns is a follow-up).

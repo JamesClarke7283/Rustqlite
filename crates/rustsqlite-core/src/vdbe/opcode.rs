@@ -302,6 +302,11 @@ pub enum Opcode {
     // --- coercion / functions ---
     /// `Affinity p1 p2 p4=Symbol(affs)`: apply the affinity chars in `affs` to `r[p1 .. p1+p2]`.
     Affinity,
+    /// `MustBeInt p1 p2`: force `r[p1]` to be an integer. If the value is not an integer and
+    /// cannot be converted to one without loss, jump to `p2` when `p2 != 0`, else raise
+    /// `SQLITE_MISMATCH`. Mirrors `OP_MustBeInt` in `vdbe.c`. Used by UPDATE of the INTEGER
+    /// PRIMARY KEY column to coerce the SET expression's result to an integer rowid.
+    MustBeInt,
     /// `RealAffinity p1`: if `r[p1]` holds an integer, convert it to a real. Emitted after
     /// reading a REAL-affinity column, whose integer-valued rows are stored as integers on disk
     /// for space but should read back as REAL.
@@ -524,6 +529,7 @@ impl Opcode {
             Opcode::Prev => "Prev",
             Opcode::Checkpoint => "Checkpoint",
             Opcode::FkCheck => "FkCheck",
+            Opcode::MustBeInt => "MustBeInt",
         }
     }
 }

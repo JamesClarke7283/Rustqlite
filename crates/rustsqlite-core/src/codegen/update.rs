@@ -49,9 +49,11 @@
 //! ```
 //!
 //! Scope: `OR action` other than the default ABORT is parsed but errors with a precise
-//! "ON CONFLICT <action> is not yet supported" message; updating the rowid-alias column
-//! (`SET <IPK col> = …`) is also rejected at codegen time. NOT NULL enforcement is not yet
-//! modeled (the INSERT path has the same gap); it arrives with the constraint-checks slice.
+//! "ON CONFLICT <action> is not yet supported" message. M19.7 adds support for updating the
+//! rowid-alias column (`SET <IPK col> = …`): the row is deleted and re-inserted at the new
+//! rowid, with INTEGER-affinity coercion (`MustBeInt`) and a uniqueness pre-check on the new
+//! rowid. NOT NULL enforcement is not yet modeled (the INSERT path has the same gap); it
+//! arrives with the constraint-checks slice.
 
 use rustqlite_parser::{Assignment, Expr, JoinOp, TableOrJoin, UpdateStmt};
 
@@ -152,20 +154,18 @@ pub fn compile_update(
         target_col[ci] = Some((ci, value));
     }
 
-    // The first M5.0 slice cannot change the rowid. Reject the case where the SET list
-    // includes the rowid-alias column (an explicit `SET rowid = …` would compile as
-    // `resolve_column("rowid") → Rowid`, but column resolution via `column_index` would fail
-    // because the rowid alias has no stored column index, so this branch is unreachable
-    // through the current parser — kept for clarity and as a guard for a future rowid-set
-    // path).
-    for (ci, slot) in target_col.iter().enumerate() {
-        if slot.is_some() && table.rowid_alias == Some(ci) {
-            return Err(Error::msg(format!(
-                "UPDATE of the INTEGER PRIMARY KEY column is not yet supported (table {}, column {})",
-                table.name, table.columns[ci].name
-            )));
-        }
-    }
+    // M19.7: detect `UPDATE ... SET <ipk-col> = <expr>` — the rowid-alias column is being
+    // changed. Upstream calls this `chngRowid`; the row must be deleted and re-inserted
+    // at the new rowid (it may move within the b-tree). The SET expression is evaluated
+    // with INTEGER affinity and `MustBeInt` coercion (a non-integer/NULL value raises
+    // SQLITE_MISMATCH, matching the oracle — `UPDATE t SET id = NULL` is an error, unlike
+    // `INSERT` where NULL auto-assigns). The rowid-alias slot in the stored record is set
+    // to NULL (the rowid is carried in a separate register, not in the record). Uniqueness
+    // of the new rowid is enforced by a `NotExists` pre-check against the table cursor.
+    let chng_rowid = target_col.iter().enumerate().any(|(ci, slot)| {
+        slot.is_some() && table.rowid_alias == Some(ci)
+    });
+    let rowid_alias_idx = table.rowid_alias;
 
     // ORDER BY without LIMIT is an error (mirrors upstream).
     if !upd.order_by.is_empty() && upd.limit.is_none() {
@@ -357,9 +357,42 @@ pub fn compile_update(
         let _placeholder = b.alloc_reg();
     }
 
+    // M19.7: when the rowid-alias column is being updated, the new rowid is staged in this
+    // register (evaluated from the SET expression with INTEGER affinity + MustBeInt). When
+    // the rowid is not being changed, this stays None and the old rowid register is used.
+    let mut reg_new_rowid_opt: Option<i32> = None;
+
     for (ci, slot) in target_col.iter().enumerate() {
         if let Some((_, value)) = slot {
+            // When the rowid-alias column is being updated, evaluate the SET expression into
+            // a dedicated rowid register (with INTEGER affinity + `MustBeInt` coercion) rather
+            // than into the record slot. The record slot is set to NULL below (the rowid is
+            // carried in the register, not in the record — same shape as INSERT).
+            if chng_rowid && Some(ci) == rowid_alias_idx {
+                reg_new_rowid_opt = Some(b.alloc_reg());
+                let rrid = reg_new_rowid_opt.unwrap();
+                compile_expr(&mut b, value, rrid, ctx)?;
+                // INTEGER affinity + MustBeInt: a non-integer-coercible value (including a
+                // non-numeric string or a real with a fractional part) raises MISMATCH;
+                // a NULL value also raises MISMATCH (MustBeInt leaves NULL but the subsequent
+                // NotNull check rejects it — `UPDATE t SET id = NULL` is an error, unlike
+                // INSERT where NULL auto-assigns). Mirrors upstream's `OP_MustBeInt` after
+                // `sqlite3ExprCode(pParse, pRowidExpr, regNewRowid)`.
+                let aff_idx = b.emit(Opcode::Affinity, rrid, 1, 0);
+                b.set_p4(aff_idx, P4::Symbol("D".into()));
+                b.emit(Opcode::MustBeInt, rrid, 0, 0);
+                continue;
+            }
             compile_expr(&mut b, value, reg_new + ci as i32, ctx)?;
+        }
+    }
+
+    // When the rowid is being changed, the record slot for the alias column is NULL (the
+    // rowid is in `reg_new_rowid`). Set it after the SET loop so a later affinity pass does
+    // not try to coerce it.
+    if chng_rowid {
+        if let Some(alias_idx) = rowid_alias_idx {
+            b.emit(Opcode::Null, 0, reg_new + alias_idx as i32, 0);
         }
     }
 
@@ -398,6 +431,95 @@ pub fn compile_update(
         sort_next,
         &[],
     )?;
+
+    // (8b-rowid) M19.7: when the rowid-alias column is being changed, the new rowid must be
+    // unique. The table b-tree's rowid IS the IPK, so a duplicate is a UNIQUE constraint
+    // violation on the IPK (`UNIQUE constraint failed: <tbl>.<ipk-col>`). Probe with
+    // `NotExists`: if a row with the new rowid already exists (and it's not the current row,
+    // which was already seeked above), handle per the OE. This mirrors upstream's IPK
+    // uniqueness check via the implicit unique index on `INTEGER PRIMARY KEY`.
+    let effective_rowid_reg = reg_new_rowid_opt.unwrap_or(reg_old_rowid2);
+    if chng_rowid {
+        let new_rowid = reg_new_rowid_opt.unwrap();
+        // Skip the uniqueness check when the new rowid equals the old rowid (a self-assign
+        // like `UPDATE t SET id = 1 WHERE v = 'a'` on a row whose id is already 1 is a no-op
+        // for the rowid — the row doesn't move and there's no conflict). Compare the two
+        // registers; if equal, jump past the uniqueness check.
+        let skip_unique = b.new_label();
+        // `Eq p1=new_rowid p3=reg_old_rowid2` jumps to p2 (skip_unique) when the two are equal.
+        // The `Ne`/`Eq` opcodes compare `r[p3] OP r[p1]`; `Eq` jumps when `r[reg_old_rowid2] ==
+        // r[new_rowid]`. When the new rowid equals the old, the row doesn't move and there's no
+        // uniqueness conflict (the row's own rowid is the only one at that value).
+        b.emit_jump(Opcode::Eq, new_rowid, skip_unique, reg_old_rowid2);
+        // Seek the table cursor to the new rowid; if found, it's a conflict. The current
+        // row (at `reg_old_rowid2`) was excluded by the equality check above, so a found
+        // row is a different row.
+        let no_conflict_label = b.new_label();
+        b.emit_jump(Opcode::NotExists, cursor, no_conflict_label, new_rowid);
+        // Fall-through: a row with the new rowid exists → conflict.
+        match oe {
+            OeAction::Ignore => {
+                b.emit_jump(Opcode::Goto, 0, sort_next, 0);
+            }
+            OeAction::Replace => {
+                // Delete the conflicting row (the one at the new rowid). It's already
+                // seeked above; delete it and its index entries, then fall through.
+                let conflict_row_start = b.alloc_regs(ncol as i32);
+                for ci in 0..ncol {
+                    b.emit(Opcode::Column, cursor, ci as i32, conflict_row_start + ci as i32);
+                }
+                for (i, idx) in indexes.iter().enumerate() {
+                    let ic = index_cursor_base + i as i32;
+                    let indexed_cis = idx.table_column_indices(table).expect("validated earlier");
+                    let nkey = idx.nkey_fields() as i32 + 1;
+                    let old_key = b.alloc_regs(nkey);
+                    let mut plain_iter = indexed_cis.iter();
+                    for (j, icol) in idx.columns.iter().enumerate() {
+                        let target = old_key + j as i32;
+                        if let Some(expr) = &icol.expr {
+                            let expr_ctx = Ctx {
+                                table,
+                                cursor,
+                                register_base: Some(conflict_row_start), join_tables: None,
+                                index_read: None,
+                                subquery_resolver: None,
+                            };
+                            compile_expr(&mut b, expr, target, expr_ctx)?;
+                        } else {
+                            let col_idx = *plain_iter.next().expect("plain column aligned");
+                            b.emit(Opcode::SCopy, conflict_row_start + col_idx as i32, target, 0);
+                        }
+                    }
+                    b.emit(Opcode::SCopy, new_rowid, old_key + idx.nkey_fields() as i32, 0);
+                    b.emit(Opcode::IdxDelete, ic, old_key, nkey);
+                }
+                b.emit(Opcode::Delete, cursor, 0, 0);
+                // Re-seek the cursor back to the current row (the one we're updating).
+                b.emit_jump(Opcode::NotExists, cursor, sort_next, reg_old_rowid2);
+            }
+            _ => {
+                // ABORT/FAIL/ROLLBACK: halt with the UNIQUE constraint message before any
+                // writes for this row (the OLD-key IdxDelete + Delete below never run).
+                let col_name = rowid_alias_idx
+                    .map(|i| table.columns[i].name.as_str())
+                    .unwrap_or("rowid");
+                let msg = format!("{}.{}", table.name, col_name);
+                let halt_idx = b.emit(
+                    Opcode::Halt,
+                    crate::error::ResultCode::Constraint as i32,
+                    oe as i32,
+                    0,
+                );
+                b.set_p4(halt_idx, P4::Text(msg));
+                b.set_p5(halt_idx, 2); // UNIQUE constraint prefix
+            }
+        }
+        b.resolve(no_conflict_label);
+        b.resolve(skip_unique);
+        // Re-seek the cursor back to the current row (NotExists above moved it to the new
+        // rowid's position, or didn't move it if not found — but to be safe, re-seek).
+        b.emit_jump(Opcode::NotExists, cursor, sort_next, reg_old_rowid2);
+    }
 
     // (8c) After the REPLACE pre-check may have moved the table cursor to the conflicting
     // (now-deleted) row, re-seek it back to the current row so the OLD-key IdxDelete pass
@@ -472,14 +594,14 @@ pub fn compile_update(
 
     let del_idx = b.emit(Opcode::Delete, cursor, 0, 0);
     b.set_p5(del_idx, P5_ISUPDATE);
-    let ins_idx = b.emit(Opcode::Insert, cursor, reg_new_rec, reg_old_rowid2);
+    let ins_idx = b.emit(Opcode::Insert, cursor, reg_new_rec, effective_rowid_reg);
     b.set_p5(ins_idx, P5_ISUPDATE);
 
     if let Some(ref ret) = returning {
         // The rowid-alias slot in the stored record is NULL, but RETURNING needs the logical
         // column value (the rowid). Patch it into the staged register block before evaluating.
         if let Some(alias_idx) = table.rowid_alias {
-            b.emit(Opcode::SCopy, reg_old_rowid2, reg_new + alias_idx as i32, 0);
+            b.emit(Opcode::SCopy, effective_rowid_reg, reg_new + alias_idx as i32, 0);
         }
         ret.emit_buffer_row(&mut b, table, cursor, reg_new)?;
     }
@@ -528,7 +650,7 @@ pub fn compile_update(
         }
         b.emit(
             Opcode::SCopy,
-            reg_old_rowid2,
+            effective_rowid_reg,
             new_key + idx.nkey_fields() as i32,
             0,
         );
@@ -1263,11 +1385,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_rowid_alias_set() {
+    fn accepts_rowid_alias_set() {
+        // M19.7: UPDATE of the INTEGER PRIMARY KEY column is now supported (the row is
+        // deleted and re-inserted at the new rowid). The codegen accepts it and compiles a
+        // program that evaluates the SET expression with INTEGER affinity + MustBeInt.
         let t = table_of("CREATE TABLE t(id INTEGER PRIMARY KEY, v)");
         let u = update_of("UPDATE t SET id = 5;");
-        let err = compile_update(&u, &t, &[], &[]).unwrap_err();
-        assert!(err.to_string().contains("INTEGER PRIMARY KEY"));
+        let prog = compile_update(&u, &t, &[], &[]).unwrap();
+        let names: Vec<&str> = prog.instructions.iter().map(|i| i.opcode.name()).collect();
+        assert!(names.contains(&"MustBeInt"), "MustBeInt emitted for IPK SET");
     }
 
     #[test]

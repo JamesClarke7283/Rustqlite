@@ -900,6 +900,9 @@ fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) 
         RealAffinity => {
             r(&mut inst.p1);
         }
+        MustBeInt => {
+            r(&mut inst.p1);
+        }
         // Function — p2 = first arg register, p3 = result register.
         Function => {
             r(&mut inst.p2);

@@ -1314,6 +1314,7 @@ fn rebase_operands(inst: &mut Instruction, reg_offset: i32, cursor_offset: i32) 
         }
         Affinity => r(&mut inst.p1),
         RealAffinity => r(&mut inst.p1),
+        MustBeInt => r(&mut inst.p1),
         Function => {
             r(&mut inst.p2);
             r(&mut inst.p3);

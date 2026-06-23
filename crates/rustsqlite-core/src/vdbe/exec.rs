@@ -1789,6 +1789,34 @@ impl Vdbe {
                     }
                     self.pc += 1;
                 }
+                Opcode::MustBeInt => {
+                    // Force `r[p1]` to be an integer. Apply NUMERIC affinity first (coerces a
+                    // numeric-looking text value to Int/Real); if the result is not an Int,
+                    // jump to `p2` when `p2 != 0`, else raise SQLITE_MISMATCH. A NULL value is
+                    // NOT an integer and raises MISMATCH (mirrors the C source: NULL has no
+                    // MEM_Int flag, NUMERIC affinity leaves it NULL, and the second check
+                    // fails). This is why `UPDATE t SET id = NULL` on an IPK column raises
+                    // MISMATCH while `INSERT INTO t VALUES (NULL, ...)` auto-assigns.
+                    let v = std::mem::replace(&mut self.regs[p1 as usize], Value::Null);
+                    let v = apply_affinity(v, Affinity::Numeric);
+                    match v {
+                        Value::Int(_) => {
+                            self.regs[p1 as usize] = v;
+                            self.pc += 1;
+                        }
+                        other => {
+                            if p2 != 0 {
+                                self.regs[p1 as usize] = other;
+                                self.pc = p2 as usize;
+                            } else {
+                                return Err(Error::new(
+                                    crate::error::ResultCode::Mismatch,
+                                    "datatype mismatch",
+                                ));
+                            }
+                        }
+                    }
+                }
 
                 Opcode::Function => {
                     let name = as_p4_text(&inst.p4);
@@ -2601,7 +2629,19 @@ async fn fk_parent_exists(pager: &Arc<Pager>, lookup: &FkLookup, child_key: &[Va
 }
 
 fn char_to_aff(ch: u8) -> Affinity {
+    // SQLite's `SQLITE_AFF_*` letters: BLOB='A', TEXT='B', NUMERIC='C', INTEGER='D', REAL='E'.
+    // The numeric affinities are also accepted in any case (upstream's `sqlite3AffinityType`
+    // uppercases first). `Affinity::Integer` and `Affinity::Numeric` both coerce via
+    // `to_numeric_affinity`; `Affinity::Integer` is a label distinction only (the canonical
+    // INTEGER PRIMARY KEY coercion), so 'D' and 'C' map to the same behavior.
     match ch.to_ascii_uppercase() {
+        b'A' => Affinity::Blob,
+        b'B' => Affinity::Text,
+        b'C' => Affinity::Numeric,
+        b'D' => Affinity::Integer,
+        b'E' => Affinity::Real,
+        // Backwards-compat aliases used by some call sites before the canonical letters
+        // were standardized.
         b'T' => Affinity::Text,
         b'N' => Affinity::Numeric,
         b'I' => Affinity::Integer,

@@ -3054,3 +3054,118 @@ fn update_or_rollback_in_transaction() {
     assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
     assert_eq!(db.query("SELECT id, v FROM t ORDER BY id;"), "1|a\n2|b\n3|c");
 }
+
+#[test]
+fn update_rowid_alias_matches_oracle() {
+    // M19.7: UPDATE of the INTEGER PRIMARY KEY (rowid-alias) column — the row moves within
+    // the b-tree. Differential-tested vs the C oracle: each case runs the UPDATE on a copy
+    // of the fixture with the system `sqlite3` and with rustqlite, then compares the result
+    // rows and `PRAGMA integrity_check`.
+    skip_if_no_sqlite3!();
+    let setups: &[(&str, &str)] = &[
+        ("CREATE TABLE t(id INTEGER PRIMARY KEY, v); INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c');", "SELECT id, v FROM t ORDER BY id;"),
+        ("CREATE TABLE t(id INTEGER PRIMARY KEY, v); INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c');", "SELECT rowid, id, v FROM t ORDER BY id;"),
+    ];
+    let cases: &[&str] = &[
+        "UPDATE t SET id = 10 WHERE v = 'b';",
+        "UPDATE t SET id = id + 100;",
+        "UPDATE t SET id = 5 WHERE v = 'a';",
+        "UPDATE t SET id = 1 WHERE v = 'a';",
+        "UPDATE t SET id = -7 WHERE v = 'c';",
+        "UPDATE t SET v = 'x', id = 50 WHERE v = 'b';",
+    ];
+    for (setup, check) in setups {
+        for upd in cases {
+            update_rowid_alias_case(setup, check, upd);
+        }
+    }
+    // Error cases: NULL value, non-numeric text, real with fraction, duplicate rowid.
+    let err_cases: &[(&str, &str, &str, i32)] = &[
+        ("CREATE TABLE t(id INTEGER PRIMARY KEY, v); INSERT INTO t VALUES (1,'a');",
+         "UPDATE t SET id = NULL WHERE v = 'a';", "datatype mismatch", 20),
+        ("CREATE TABLE t(id INTEGER PRIMARY KEY, v); INSERT INTO t VALUES (1,'a');",
+         "UPDATE t SET id = 'foo' WHERE v = 'a';", "datatype mismatch", 20),
+        ("CREATE TABLE t(id INTEGER PRIMARY KEY, v); INSERT INTO t VALUES (1,'a');",
+         "UPDATE t SET id = 5.7 WHERE v = 'a';", "datatype mismatch", 20),
+        ("CREATE TABLE t(id INTEGER PRIMARY KEY, v); INSERT INTO t VALUES (1,'a'),(2,'b');",
+         "UPDATE t SET id = 2 WHERE v = 'a';", "UNIQUE constraint failed", 19),
+    ];
+    for (setup, upd, want_msg, want_code) in err_cases {
+        let setup_stmts: Vec<&str> = setup.split(';').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let db = TempDb::new("ipk_err");
+        {
+            let mut conn = sqlite3_open(db.str()).expect("open");
+            for s in &setup_stmts {
+                exec(&mut conn, s);
+            }
+            let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, upd).unwrap();
+            let res = stmt.step();
+            let msg = stmt.errmsg();
+            assert_eq!(
+                res as i32, *want_code,
+                "wrong code for `{upd}`: got {res:?} ({msg}), want code {want_code}"
+            );
+            assert!(
+                msg.contains(want_msg),
+                "wrong message for `{upd}`: got `{msg}`, want substring `{want_msg}`"
+            );
+        }
+        // The C oracle should produce the same error on the same fixture + UPDATE.
+        let ora = TempDb::new("ipk_err_ora");
+        {
+            let mut conn = sqlite3_open(ora.str()).expect("open");
+            for s in &setup_stmts {
+                exec(&mut conn, s);
+            }
+            let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, upd).unwrap();
+            let res = stmt.step();
+            let msg = stmt.errmsg();
+            assert_eq!(res as i32, *want_code, "oracle code mismatch for `{upd}`: {res:?} ({msg})");
+            assert!(msg.contains(want_msg), "oracle msg mismatch for `{upd}`: `{msg}`");
+        }
+    }
+}
+
+fn update_rowid_alias_case(setup: &str, check: &str, upd: &str) {
+    // Run the fixture + UPDATE + check on both the C oracle and rustqlite, compare rows.
+    // `setup` may contain multiple statements separated by `;` — `exec` only runs the first,
+    // so split and run each.
+    let setup_stmts: Vec<&str> = setup.split(';').map(str::trim).filter(|s| !s.is_empty()).collect();
+
+    let ora = TempDb::new("ipk_ora");
+    {
+        let mut conn = sqlite3_open(ora.str()).expect("open");
+        for s in &setup_stmts {
+            exec(&mut conn, s);
+        }
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, upd).unwrap();
+        loop {
+            match stmt.step() {
+                ResultCode::Done => break,
+                ResultCode::Row => {}
+                other => panic!("oracle `{upd}` failed: {other:?}: {}", stmt.errmsg()),
+            }
+        }
+    }
+    let expected = ora.query(check);
+    assert_eq!(ora.query("PRAGMA integrity_check;"), "ok", "oracle integrity: `{upd}`");
+
+    let ours = TempDb::new("ipk_ours");
+    {
+        let mut conn = sqlite3_open(ours.str()).expect("open");
+        for s in &setup_stmts {
+            exec(&mut conn, s);
+        }
+        exec(&mut conn, upd);
+    }
+    let got = ours.query(check);
+    assert_eq!(
+        got, expected,
+        "row mismatch for `{upd}`:\n  got:  {got}\n  want: {expected}"
+    );
+    assert_eq!(
+        ours.query("PRAGMA integrity_check;"),
+        "ok",
+        "rustqlite integrity: `{upd}`"
+    );
+}
