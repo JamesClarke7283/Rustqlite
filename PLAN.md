@@ -838,8 +838,8 @@ list every granular item needed.
 
 ### M6 — Aggregates (Additional Items)
 
-- [ ] **6.10** `FILTER (WHERE expr)` on aggregate calls: `count(*) FILTER (WHERE type='user')`
-- [ ] **6.11** `string_agg(X, Y)` — alias for `group_concat`
+- [x] **6.10** `FILTER (WHERE expr)` on aggregate calls: `count(*) FILTER (WHERE type='user')`
+- [x] **6.11** `string_agg(X, Y)` — alias for `group_concat`
 
 ### M8 — Subqueries (Additional Items)
 

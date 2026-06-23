@@ -867,6 +867,123 @@ fn aggregate_queries() {
     }
 }
 
+/// `FILTER (WHERE expr)` on aggregate function calls (M6.10). The filter expression is
+/// evaluated per-row; the aggregate accumulates only rows where the filter is true (NULL/false
+/// are skipped). Covers: no-GROUP-BY, GROUP BY, multiple aggregates with different filters,
+/// dedup of identical (name+args+filter) calls, NULL handling in the filter, all built-in
+/// aggregates, GROUP BY + HAVING + FILTER, and `string_agg` alias.
+#[test]
+fn aggregate_filter_clause() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup(
+        "CREATE TABLE t(a INT, b INT);\
+         INSERT INTO t VALUES\
+            (1,10),(2,20),(3,NULL),(4,40),(NULL,50);",
+    );
+    for q in [
+        // No GROUP BY — single filtered aggregate.
+        "SELECT sum(a) FILTER (WHERE a > 2) FROM t;",
+        "SELECT sum(a) FILTER (WHERE b > 15) FROM t;",
+        "SELECT count(*) FILTER (WHERE a IS NULL) FROM t;",
+        "SELECT count(*) FILTER (WHERE b IS NOT NULL) FROM t;",
+        "SELECT count(a) FILTER (WHERE a IS NOT NULL) FROM t;",
+        "SELECT min(a) FILTER (WHERE b > 25) FROM t;",
+        "SELECT max(a) FILTER (WHERE b < 25) FROM t;",
+        "SELECT avg(a) FILTER (WHERE a > 2) FROM t;",
+        "SELECT total(a) FILTER (WHERE a > 2) FROM t;",
+        "SELECT group_concat(a) FILTER (WHERE a > 2) FROM t;",
+        "SELECT group_concat(a, ',') FILTER (WHERE a % 2 = 0) FROM t;",
+        "SELECT string_agg(a, ',') FILTER (WHERE a > 2) FROM t;",
+        "SELECT sum(DISTINCT a) FILTER (WHERE a > 1) FROM t;",
+        // Empty filter result → NULL for sum/min/max/avg, 0 for count/total.
+        "SELECT sum(a) FILTER (WHERE a > 100) FROM t;",
+        "SELECT count(*) FILTER (WHERE a > 100) FROM t;",
+        "SELECT total(a) FILTER (WHERE a > 100) FROM t;",
+        "SELECT min(a) FILTER (WHERE a > 100) FROM t;",
+        "SELECT max(a) FILTER (WHERE a > 100) FROM t;",
+        "SELECT avg(a) FILTER (WHERE a > 100) FROM t;",
+        "SELECT group_concat(a) FILTER (WHERE a > 100) FROM t;",
+        // Multiple aggregates with different filters in one query.
+        "SELECT sum(a) FILTER (WHERE a > 1), sum(a) FILTER (WHERE a > 2), sum(a) FILTER (WHERE a > 3) FROM t;",
+        "SELECT count(*) FILTER (WHERE a > 2), count(*) FILTER (WHERE b IS NULL) FROM t;",
+        // Same aggregate twice with the SAME filter → dedup (one accumulator).
+        "SELECT sum(a) FILTER (WHERE a > 2), sum(a) FILTER (WHERE a > 2) FROM t;",
+        // GROUP BY with FILTER.
+        "SELECT a, sum(b) FILTER (WHERE b > 15) FROM t GROUP BY a ORDER BY a;",
+        "SELECT a, count(*) FILTER (WHERE b IS NULL) FROM t GROUP BY a ORDER BY a;",
+        "SELECT a, count(*) FILTER (WHERE b > 20) FROM t GROUP BY a ORDER BY a;",
+        // FILTER referencing a column not in GROUP BY (but in the table).
+        "SELECT a, sum(b) FILTER (WHERE a > 2) FROM t GROUP BY a ORDER BY a;",
+        // GROUP BY + HAVING + FILTER.
+        "SELECT a, sum(b) FILTER (WHERE b > 15) FROM t GROUP BY a HAVING sum(b) FILTER (WHERE b > 15) > 20 ORDER BY a;",
+        // FILTER with NULL filter result (NULL → skip).
+        "SELECT sum(a) FILTER (WHERE b > 100) FROM t;",
+        // FILTER combined with WHERE.
+        "SELECT sum(a) FILTER (WHERE a > 2) FROM t WHERE b IS NOT NULL;",
+        "SELECT a, sum(b) FILTER (WHERE b > 20) FROM t WHERE a IS NOT NULL GROUP BY a ORDER BY a;",
+        // FILTER with LIMIT.
+        "SELECT a, count(*) FILTER (WHERE b > 15) FROM t GROUP BY a ORDER BY a LIMIT 2;",
+    ] {
+        assert_same(db.str(), q);
+    }
+}
+
+/// `FILTER (WHERE expr)` error parity: SQLite rejects FILTER on non-aggregate functions with
+/// "FILTER may not be used with non-aggregate <name>()". We match.
+#[test]
+fn aggregate_filter_errors() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup("CREATE TABLE t(a); INSERT INTO t VALUES (1),(2);");
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "SELECT upper(a) FILTER (WHERE a = 1) FROM t;",
+            "FILTER may not be used with non-aggregate upper()",
+            "FILTER may not be used with non-aggregate upper()",
+        ),
+        (
+            "SELECT length(a) FILTER (WHERE a = 1) FROM t;",
+            "FILTER may not be used with non-aggregate length()",
+            "FILTER may not be used with non-aggregate length()",
+        ),
+        (
+            "SELECT abs(a) FILTER (WHERE a = 1) FROM t;",
+            "FILTER may not be used with non-aggregate abs()",
+            "FILTER may not be used with non-aggregate abs()",
+        ),
+    ];
+    for (q, oracle_sub, our_sub) in cases {
+        let oracle_out = std::process::Command::new("sqlite3")
+            .arg("-batch")
+            .arg(db.str())
+            .arg(q)
+            .output()
+            .expect("run sqlite3");
+        let oracle_err = String::from_utf8_lossy(&oracle_out.stderr);
+        assert!(
+            oracle_err.contains(oracle_sub),
+            "oracle did not error as expected for {q}: {oracle_err}"
+        );
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        match sqlite3_prepare_v2(&mut conn, q) {
+            Ok(_) => panic!("expected error for: {q}"),
+            Err(e) => assert!(
+                e.message.contains(our_sub),
+                "error mismatch for {q}: got {:?}, expected substring {:?}",
+                e.message,
+                our_sub
+            ),
+        }
+    }
+}
+
 /// `GROUP BY` + `ORDER BY` with varying group sizes — exercises the actual sort (the
 /// `standard_fixture` has all groups of size 1, so `ORDER BY count(*)` is a no-op sort whose
 /// tiebreak order differs between our stable sorter and SQLite's b-tree-backed ORDER BY).

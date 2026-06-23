@@ -226,6 +226,18 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   Known divergence: the tiebreak order for equal ORDER BY keys is unspecified in SQL; our stable
   sorter preserves GROUP BY insertion order while SQLite's b-tree-backed ORDER BY reverses it
   for DESC — both are correct, test cases with ties use a secondary ORDER BY key for determinism.
+  **6.10 `FILTER (WHERE expr)` on aggregate calls** ✅: `AggCall` carries an optional `filter`
+  expression; the no-GROUP-BY path evaluates the filter at scan time and jumps past `AggStep`
+  when false/NULL (`sqlite3ExprIfFalse(..., SQLITE_JUMPIFNULL)`); the GROUP BY path evaluates
+  the filter at scan time and stores a 0/1 flag column per aggregate-with-filter in the sorter,
+  then the step block reads the flag and jumps past `AggStep` when 0/NULL. Dedup keys on
+  (name, args, filter) so the same call with the same filter shares one accumulator, while a
+  different filter makes a distinct accumulator. `check_filter_only_on_aggregates` raises
+  "FILTER may not be used with non-aggregate <name>()" (matching `resolve.c:1300`), walking
+  outputs / WHERE / HAVING / ORDER BY / GROUP BY. `expr_to_text` renders the FILTER clause in
+  the column name (`sum(a) FILTER (WHERE a > 2)`). Differential-tested vs the C oracle
+  (`aggregate_filter_clause`, `aggregate_filter_errors`). **6.11 `string_agg`** was already
+  wired as a `group_concat` alias in `AggregateKind::from_name`.
 - **M7 — Joins** 🚧: **7.1–7.3** ✅ (parser, `OpenEphemeral`, `Found`/`NotFound` already shipped
   in M2/M6). **7.4–7.5 cross / inner joins** ✅: two-table `FROM t1, t2` / `CROSS JOIN` /
   `INNER JOIN ... ON` compile as a nested loop (outer `Rewind`/`Next` over the left table,

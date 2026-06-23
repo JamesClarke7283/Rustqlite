@@ -68,6 +68,20 @@ pub fn compile(
     // scalar codegen path.
     for (e, _) in &outputs {
         check_no_window_only_without_over(e)?;
+        check_filter_only_on_aggregates(e)?;
+    }
+    // FILTER misuse may also appear in WHERE / HAVING / ORDER BY / GROUP BY.
+    if let Some(w) = &select.where_clause {
+        check_filter_only_on_aggregates(w)?;
+    }
+    if let Some(h) = &select.having {
+        check_filter_only_on_aggregates(h)?;
+    }
+    for t in &select.order_by {
+        check_filter_only_on_aggregates(&t.expr)?;
+    }
+    for g in &select.group_by {
+        check_filter_only_on_aggregates(g)?;
     }
     let names: Vec<String> = outputs.iter().map(|(_, n)| n.clone()).collect();
     let (limit, offset) = eval_limit_offset(select)?;
@@ -292,7 +306,9 @@ fn compile_aggregate(
         if let Some(w) = &select.where_clause {
             compile_jump(&mut b, w, scan_next, false, true, ctx)?;
         }
-        // Evaluate each aggregate's arguments and `AggStep` it.
+        // Evaluate each aggregate's arguments and `AggStep` it. A `FILTER (WHERE expr)`
+        // clause (upstream's `TK_FILTER` shape) jumps past the `AggStep` when the filter is
+        // false or NULL — `sqlite3ExprIfFalse(pParse, pFilter, addrNext, SQLITE_JUMPIFNULL)`.
         for (i, call) in agg_calls.iter().enumerate() {
             let kind = kinds[i];
             let n_arg = match &call.args {
@@ -309,9 +325,16 @@ fn compile_aggregate(
                     r
                 }
             };
+            let agg_skip = call.filter.as_ref().map(|_| b.new_label());
+            if let Some(f) = &call.filter {
+                compile_jump(&mut b, f, agg_skip.unwrap(), false, true, ctx)?;
+            }
             let idx = b.emit(Opcode::AggStep, 0, arg_base, agg_reg_base + i as i32);
             b.set_p4(idx, P4::FuncDef(kind));
             b.set_p5(idx, n_arg);
+            if let Some(lbl) = agg_skip {
+                b.resolve(lbl);
+            }
         }
         b.resolve(scan_next);
         b.emit_jump(Opcode::Next, cursor, scan_top, 0);
@@ -394,7 +417,13 @@ fn compile_aggregate(
         })
         .collect();
     let total_agg_args: i32 = agg_arg_counts.iter().sum();
-    let n_sorter_fields = nkey + total_agg_args;
+    // Each aggregate with a FILTER clause gets an extra sorter column holding the filter's
+    // boolean result (1 = step this row, 0/NULL = skip). The filter is evaluated in the scan
+    // loop (where the table cursor is active) and read back in the step block — avoiding the
+    // need to re-resolve the filter's column references against the sorter.
+    let agg_has_filter: Vec<bool> = agg_calls.iter().map(|c| c.filter.is_some()).collect();
+    let n_filter_cols: i32 = agg_has_filter.iter().filter(|&&x| x).count() as i32;
+    let n_sorter_fields = nkey + total_agg_args + n_filter_cols;
 
     // KeyInfo for the sorter: the GROUP BY keys, ASC BINARY (matches SQLite's default group
     // ordering; a future task threads through explicit COLLATE / DESC).
@@ -434,6 +463,27 @@ fn compile_aggregate(
             }
         }
         arg_offset += agg_arg_counts[i];
+    }
+    // Then each aggregate's FILTER result (1/0) — evaluated against the live table row.
+    // A NULL filter result (e.g. `FILTER (WHERE col > 1)` with col NULL) is stored as 0 so the
+    // step block's `If` check skips it, matching `SQLITE_JUMPIFNULL` semantics.
+    let mut filter_offset = nkey + total_agg_args;
+    let mut filter_col_for: Vec<Option<i32>> = Vec::with_capacity(agg_calls.len());
+    for (i, call) in agg_calls.iter().enumerate() {
+        if let Some(f) = &call.filter {
+            let pass_label = b.new_label();
+            let store_reg = block + filter_offset;
+            // Default to 0 (skip). If the filter is true, set to 1.
+            b.emit(Opcode::Integer, 0, store_reg, 0);
+            compile_jump(&mut b, f, pass_label, false, true, ctx)?;
+            b.emit(Opcode::Integer, 1, store_reg, 0);
+            b.resolve(pass_label);
+            filter_col_for.push(Some(filter_offset));
+            filter_offset += 1;
+        } else {
+            filter_col_for.push(None);
+        }
+        let _ = i;
     }
     let rec = b.alloc_reg();
     b.emit(Opcode::MakeRecord, block, n_sorter_fields, rec);
@@ -551,9 +601,23 @@ fn compile_aggregate(
                 }
             }
         }
+        // FILTER (WHERE expr): skip the AggStep when the per-row filter flag column is 0/NULL.
+        // Mirrors upstream's `sqlite3ExprIfFalse(pParse, pFilter, addrNext, SQLITE_JUMPIFNULL)`.
+        let agg_step_end = if let Some(fcol) = filter_col_for[i] {
+            let skip = b.new_label();
+            let flag_reg = b.alloc_reg();
+            b.emit(Opcode::Column, sorter, fcol, flag_reg);
+            b.emit_jump(Opcode::IfNot, flag_reg, skip, 1);
+            Some(skip)
+        } else {
+            None
+        };
         let idx = b.emit(Opcode::AggStep, 0, agg_arg_base, agg_reg_base + i as i32);
         b.set_p4(idx, P4::FuncDef(kind));
         b.set_p5(idx, n_arg);
+        if let Some(skip) = agg_step_end {
+            b.resolve(skip);
+        }
     }
     // Mark that we've seen at least one row in this group.
     b.emit(Opcode::Integer, 1, i_use_flag, 0);
@@ -700,11 +764,12 @@ fn emit_sort_tail(
     let _ = end_label;
 }
 
-/// `true` if two aggregate calls are syntactically identical (same name, same args). Used to
-/// deduplicate the same aggregate call appearing twice in the projection list so both sites
-/// share one accumulator register — matching upstream's `AggInfo` deduplication.
+/// `true` if two aggregate calls are syntactically identical (same name, same args, same
+/// FILTER). Used to deduplicate the same call appearing twice so both sites share one
+/// accumulator register — matching upstream's `AggInfo` deduplication. A different FILTER
+/// makes a distinct accumulator even with identical name+args.
 fn agg_call_eq(a: &AggCall, b: &AggCall) -> bool {
-    a.name.eq_ignore_ascii_case(&b.name) && a.args == b.args
+    a.name.eq_ignore_ascii_case(&b.name) && a.args == b.args && a.filter == b.filter
 }
 
 /// Rewrite a projection expression for the GROUP BY output pass. This combines two
@@ -741,7 +806,7 @@ fn rewrite_aggregates_with_group_keys(
         return Expr::AggRef(reg);
     }
     match e {
-        Expr::Function { name, args, over, .. }
+        Expr::Function { name, args, filter, over, .. }
             if over.is_none()
                 && is_aggregate_call(
                     name,
@@ -754,6 +819,7 @@ fn rewrite_aggregates_with_group_keys(
             let call = AggCall {
                 name: name.clone(),
                 args: args.clone(),
+                filter: filter.clone(),
             };
             match reg_of(&call) {
                 Some(reg) => Expr::AggRef(reg),
@@ -1122,6 +1188,94 @@ fn check_no_window_only_without_over(e: &Expr) -> Result<()> {
     Ok(())
 }
 
+/// Recursively check that `FILTER (WHERE …)` is only used with aggregate function calls.
+/// Upstream raises "FILTER may not be used with non-aggregate <name>()" (resolve.c:1300) when
+/// a non-aggregate function carries a FILTER clause. A function with `OVER (...)` is a window
+/// call (aggregates-as-windows are allowed FILTER); a bare non-aggregate with FILTER is the
+/// error. We also walk WHERE / HAVING / ORDER BY / GROUP BY since FILTER can appear there.
+fn check_filter_only_on_aggregates(e: &Expr) -> Result<()> {
+    match e {
+        Expr::Function { name, args, distinct: _, filter, over } => {
+            let n_arg = match args {
+                FunctionArgs::Star => 0,
+                FunctionArgs::List(v) => v.len(),
+            };
+            // FILTER on a non-aggregate, non-window function is an error. A function with an
+            // OVER clause is a window call; aggregate-as-window may use FILTER, and window-only
+            // functions are rejected elsewhere ("FILTER clause may only be used with aggregate
+            // window functions" — that's the window codegen path's responsibility).
+            if filter.is_some() && over.is_none() && !is_aggregate_call(name, n_arg) {
+                // Avoid double-reporting for window-only names (those get "misuse of window
+                // function" from `check_no_window_only_without_over`).
+                if !crate::func::aggregate::is_window_only_name(name) {
+                    return Err(Error::msg(format!(
+                        "FILTER may not be used with non-aggregate {name}()"
+                    )));
+                }
+            }
+            if let FunctionArgs::List(v) = args {
+                for a in v {
+                    check_filter_only_on_aggregates(a)?;
+                }
+            }
+            // The FILTER expression itself may contain function calls; walk it too.
+            if let Some(f) = filter {
+                check_filter_only_on_aggregates(f)?;
+            }
+        }
+        Expr::Unary { expr, .. } => check_filter_only_on_aggregates(expr)?,
+        Expr::Binary { left, right, .. } => {
+            check_filter_only_on_aggregates(left)?;
+            check_filter_only_on_aggregates(right)?;
+        }
+        Expr::Between { expr, low, high, .. } => {
+            check_filter_only_on_aggregates(expr)?;
+            check_filter_only_on_aggregates(low)?;
+            check_filter_only_on_aggregates(high)?;
+        }
+        Expr::In { expr, values, .. } => {
+            check_filter_only_on_aggregates(expr)?;
+            for v in values {
+                check_filter_only_on_aggregates(v)?;
+            }
+        }
+        Expr::InSubquery { expr, .. } => check_filter_only_on_aggregates(expr)?,
+        Expr::Cast { expr, .. } => check_filter_only_on_aggregates(expr)?,
+        Expr::Case {
+            base,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(b) = base {
+                check_filter_only_on_aggregates(b)?;
+            }
+            for (w, t) in when_then {
+                check_filter_only_on_aggregates(w)?;
+                check_filter_only_on_aggregates(t)?;
+            }
+            if let Some(e) = else_expr {
+                check_filter_only_on_aggregates(e)?;
+            }
+        }
+        Expr::Collate { expr, .. } => check_filter_only_on_aggregates(expr)?,
+        Expr::IsDistinctFrom { left, right, .. } => {
+            check_filter_only_on_aggregates(left)?;
+            check_filter_only_on_aggregates(right)?;
+        }
+        Expr::Row(es) => {
+            for e in es {
+                check_filter_only_on_aggregates(e)?;
+            }
+        }
+        Expr::Coalesce2 { left, right } => {
+            check_filter_only_on_aggregates(left)?;
+            check_filter_only_on_aggregates(right)?;
+        }
+        Expr::Literal(_) | Expr::Column { .. } | Expr::BindParam(_)
+        | Expr::Exists(_) | Expr::Subquery(_) | Expr::AggRef(_) => {}
+    }
+    Ok(())
+}
 /// `true` if `e` contains an aggregate function call (recursing through the operator tree).
 /// Mirrors the analysis walk upstream does in `sqlite3ExprAnalyzeAggregates`. A function name
 /// that is also an aggregate name (e.g. `max`) only counts as an aggregate when its argument
@@ -1343,11 +1497,13 @@ fn has_window_function_query(select: &SelectStmt, outputs: &[(Expr, String)]) ->
 }
 
 /// A located aggregate call discovered during analysis: the function name, its argument list
-/// (or `Star`), and a stable identity used to deduplicate the same call appearing twice.
+/// (or `Star`), an optional `FILTER (WHERE expr)` clause, and a stable identity used to
+/// deduplicate the same call appearing twice.
 #[derive(Clone, Debug)]
 struct AggCall {
     name: String,
     args: FunctionArgs,
+    filter: Option<Box<Expr>>,
 }
 
 /// Walk an expression, collecting every plain-aggregate function call in evaluation order
@@ -1359,7 +1515,7 @@ struct AggCall {
 /// Window calls are collected separately by [`collect_window_functions`].
 fn collect_aggregates(e: &Expr, out: &mut Vec<AggCall>) {
     match e {
-        Expr::Function { name, args, over, .. }
+        Expr::Function { name, args, filter, over, .. }
             if over.is_none()
                 && is_aggregate_call(
                     name,
@@ -1374,6 +1530,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggCall>) {
             out.push(AggCall {
                 name: name.clone(),
                 args: args.clone(),
+                filter: filter.clone(),
             });
         }
         Expr::Function { args, .. } => {
@@ -1443,7 +1600,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggCall>) {
 /// separately.
 fn rewrite_aggregates(e: &Expr, reg_of: &impl Fn(&AggCall) -> Option<i32>) -> Expr {
     match e {
-        Expr::Function { name, args, over, .. }
+        Expr::Function { name, args, filter, over, .. }
             if over.is_none()
                 && is_aggregate_call(
                     name,
@@ -1456,6 +1613,7 @@ fn rewrite_aggregates(e: &Expr, reg_of: &impl Fn(&AggCall) -> Option<i32>) -> Ex
             let call = AggCall {
                 name: name.clone(),
                 args: args.clone(),
+                filter: filter.clone(),
             };
             match reg_of(&call) {
                 Some(reg) => Expr::AggRef(reg),
@@ -2090,12 +2248,24 @@ pub fn expr_to_text(e: &Expr) -> String {
             let sym = binary_symbol(*op);
             format!("{}{}{}", expr_to_text(left), sym, expr_to_text(right))
         }
-        Expr::Function { name, args, .. } => {
+        Expr::Function { name, args, distinct, filter, over } => {
             let inner = match args {
                 FunctionArgs::Star => "*".to_string(),
-                FunctionArgs::List(v) => v.iter().map(expr_to_text).collect::<Vec<_>>().join(", "),
+                FunctionArgs::List(v) => {
+                    let prefix = if *distinct { "DISTINCT " } else { "" };
+                    format!("{prefix}{}", v.iter().map(expr_to_text).collect::<Vec<_>>().join(", "))
+                }
             };
-            format!("{name}({inner})")
+            let mut s = format!("{name}({inner})");
+            if let Some(f) = filter {
+                s.push_str(&format!(" FILTER (WHERE {})", expr_to_text(f)));
+            }
+            if over.is_some() {
+                // Window column-name text rendering is not exercised through `expr_to_text`
+                // (window queries go through the window codegen path, not `default_col_name`).
+                s.push_str(" OVER (...)");
+            }
+            s
         }
         Expr::BindParam(s) => s.clone(),
         Expr::Between { .. } => "between".to_string(),
