@@ -1475,7 +1475,7 @@ mod tests {
     fn positional_insert_uses_newrowid() {
         let t = table_of("CREATE TABLE t(a, b)");
         let ins = insert_of("INSERT INTO t VALUES (1, 'x'), (2, 'y');");
-        let prog = compile_insert(&ins, &t, &[], None, &[]).unwrap();
+        let prog = compile_insert(&ins, &t, &[], None, &[], &[]).unwrap();
         let names: Vec<&str> = prog.instructions.iter().map(|i| i.opcode.name()).collect();
         assert!(names.contains(&"OpenWrite"));
         // Two rows → two NewRowid + two Insert (no rowid alias).
@@ -1494,7 +1494,7 @@ mod tests {
     fn rowid_alias_guards_newrowid_with_notnull() {
         let t = table_of("CREATE TABLE t(id INTEGER PRIMARY KEY, v)");
         let ins = insert_of("INSERT INTO t VALUES (5, 'x');");
-        let prog = compile_insert(&ins, &t, &[], None, &[]).unwrap();
+        let prog = compile_insert(&ins, &t, &[], None, &[], &[]).unwrap();
         let names: Vec<&str> = prog.instructions.iter().map(|i| i.opcode.name()).collect();
         // The alias value becomes the rowid; NewRowid is emitted but guarded by NotNull so it only
         // runs when the supplied value is NULL (auto-assign).
@@ -1507,7 +1507,7 @@ mod tests {
     fn explicit_column_list_maps_values() {
         let t = table_of("CREATE TABLE t(a, b, c)");
         let ins = insert_of("INSERT INTO t (b, a) VALUES (10, 20);");
-        let prog = compile_insert(&ins, &t, &[], None, &[]).unwrap();
+        let prog = compile_insert(&ins, &t, &[], None, &[], &[]).unwrap();
         // 3 record slots are allocated per row; the unlisted column c is NULL.
         let null_count = prog
             .instructions
@@ -1521,7 +1521,7 @@ mod tests {
     fn default_values_uses_column_defaults() {
         let t = table_of("CREATE TABLE t(a INT DEFAULT 42, b TEXT DEFAULT 'hi', c)");
         let ins = insert_of("INSERT INTO t DEFAULT VALUES;");
-        let prog = compile_insert(&ins, &t, &[], None, &[]).unwrap();
+        let prog = compile_insert(&ins, &t, &[], None, &[], &[]).unwrap();
         let names: Vec<&str> = prog.instructions.iter().map(|i| i.opcode.name()).collect();
         assert!(names.contains(&"OpenWrite"));
         assert_eq!(names.iter().filter(|n| **n == "NewRowid").count(), 1);
@@ -1541,7 +1541,7 @@ mod tests {
     fn default_values_rowid_alias_auto_assigns() {
         let t = table_of("CREATE TABLE t(id INTEGER PRIMARY KEY, v INT DEFAULT 7)");
         let ins = insert_of("INSERT INTO t DEFAULT VALUES;");
-        let prog = compile_insert(&ins, &t, &[], None, &[]).unwrap();
+        let prog = compile_insert(&ins, &t, &[], None, &[], &[]).unwrap();
         let names: Vec<&str> = prog.instructions.iter().map(|i| i.opcode.name()).collect();
         // The rowid alias has no explicit default, so NewRowid is guarded by NotNull.
         assert!(names.contains(&"NotNull"));
