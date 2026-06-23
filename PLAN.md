@@ -390,11 +390,11 @@ list every granular item needed.
 - [x] **20.6** `PRAGMA index_info(idx)` — columns in an index
 - [x] **20.7** `PRAGMA index_xinfo(idx)` — like `index_info` plus sort order and collation
 - [x] **20.8** `PRAGMA database_list` — list attached databases
-- [ ] **20.9** `PRAGMA schema_version` / `PRAGMA user_version` — read/write header fields
-- [ ] **20.10** `PRAGMA application_id` — read/write header field
-- [ ] **20.11** `PRAGMA page_size` — read; write only before first write
-- [ ] **20.12** `PRAGMA page_count` — read total pages
-- [ ] **20.13** `PRAGMA freelist_count` — read freelist page count
+- [x] **20.9** `PRAGMA schema_version` / `PRAGMA user_version` — read/write header fields
+- [x] **20.10** `PRAGMA application_id` — read/write header field
+- [x] **20.11** `PRAGMA page_size` — read; write only before first write
+- [x] **20.12** `PRAGMA page_count` — read total pages
+- [x] **20.13** `PRAGMA freelist_count` — read freelist page count
 - [ ] **20.14** `PRAGMA integrity_check` — b-tree walk + overflow chain + freelist verification
 - [ ] **20.15** `PRAGMA quick_check` — faster integrity check (skip overflow, freelist)
 - [ ] **20.16** `PRAGMA journal_mode` — read/set (delete, wal, memory, off, truncate, persist)

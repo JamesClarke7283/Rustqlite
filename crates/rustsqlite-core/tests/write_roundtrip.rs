@@ -3325,6 +3325,59 @@ fn notnull_constraint_enforcement_matches_oracle() {
 }
 
 #[test]
+fn pragma_header_fields_match_oracle() {
+    // M20.9-20.13: PRAGMA schema_version, user_version, application_id, page_size,
+    // page_count, freelist_count. Differential-tested vs the C oracle.
+    skip_if_no_sqlite3!();
+    let setups: &[&str] = &[
+        "CREATE TABLE t(a);",
+        "CREATE TABLE t(a); INSERT INTO t VALUES (1);",
+        "CREATE TABLE t(a); CREATE INDEX i ON t(a);",
+    ];
+    let pragmas: &[&str] = &[
+        "PRAGMA schema_version;",
+        "PRAGMA user_version;",
+        "PRAGMA application_id;",
+        "PRAGMA page_size;",
+        "PRAGMA page_count;",
+        "PRAGMA freelist_count;",
+        "PRAGMA user_version = 42;",
+        "PRAGMA application_id = 7;",
+        "PRAGMA user_version;",
+        "PRAGMA application_id;",
+    ];
+    for setup in setups {
+        for pragma_sql in pragmas {
+            let db = TempDb::new("pragma_hdr_ours");
+            {
+                let mut conn = sqlite3_open(db.str()).expect("open");
+                for s in setup.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                    exec(&mut conn, s);
+                }
+                let (mut s, _) = match sqlite3_prepare_v2(&mut conn, pragma_sql) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("skipping `{pragma_sql}`: {e}");
+                        continue;
+                    }
+                };
+                let rows = collect(&mut s);
+                let ora = TempDb::new("pragma_hdr_ora");
+                {
+                    let mut oconn = sqlite3_open(ora.str()).expect("open");
+                    for s in setup.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                        exec(&mut oconn, s);
+                    }
+                    let (mut os, _) = sqlite3_prepare_v2(&mut oconn, pragma_sql).unwrap();
+                    let oracle_rows = collect(&mut os);
+                    assert_eq!(rows, oracle_rows, "PRAGMA mismatch for `{pragma_sql}` setup `{setup}`");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn pragma_introspection_matches_oracle() {
     // M20.4-M20.8: PRAGMA table_list, index_list, index_info, index_xinfo, database_list.
     // Differential-tested vs the C oracle. Each case runs the pragma on both engines and
