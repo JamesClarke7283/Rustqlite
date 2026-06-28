@@ -1109,3 +1109,26 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   (table-valued functions — need virtual-table infrastructure M31), 24.17 `->`/`->>`
   operators (need parser + codegen), 24.18/24.19 `json_group_array`/`json_group_object`
   (aggregates), 24.20 subtype support (`SetSubtype`/`GetSubtype`/`ClrSubtype` opcodes).
+- **M25 — Remaining Scalar & Utility Functions** ✅: `printf`/`format`
+  (`crates/rustsqlite-core/src/func/printf.rs`, mirrors `printf.c`) ports the SQL-level
+  `sqlite3_str_printf` machinery: the full conversion set (`d i o u x X c s f F e E g G
+  q Q w n p %`), flags (`-+0 #`), width/precision (literal or `*`), and positional
+  arguments (`%N$spec`). Subtle oracle-pinned behaviors: `%c` renders the argument as
+  text and emits the first character (NOT a codepoint — `printf('%c', 72)` → `'7'`);
+  `%w` doubles `"` (Windows path quoting) and a NULL `%w` argument yields the literal
+  string `(NULL)` (not a NULL result); `%Q` of NULL yields the literal `NULL`; `%f`
+  rounds half away from zero (C printf, not Rust's banker's rounding — reproduced via
+  `f64::round` on the scaled value); `printf()` with no args returns NULL. `soundex`
+  (`crates/rustsqlite-core/src/func/soundex.rs`, mirrors `soundexFunc` in `func.c`)
+  implements American Soundex WITHOUT the H/W adjacency rule (H/W reset the "previous
+  code" like vowels — `Ashcraft` → `A226`, not `A261`); NULL/empty/non-alphabetic →
+  `?000`. `load_extension` is a stub that errors ("extension loading is disabled"),
+  matching the oracle's error parity. `sqlite_compileoption_get(N)` returns NULL and
+  `sqlite_compileoption_used(X)` returns 0 (Rustqlite has no C compile options — the
+  names are accepted so introspection queries don't fail). `sqlite_source_id()`
+  (alias `sqlite_sourceid`) returns the pinned `SQLITE_SOURCE_ID`. `unistr(X)` interprets
+  `\uXXXX` and `\UXXXXXXXX` escapes (added in SQLite 3.45; not in the local 3.46.1
+  oracle, so unit-tested in `func::registry::tests`). `sqlite_log(E, M)` returns NULL
+  (logging side-effect is a no-op). `string_agg(X, Y)` was already wired as a
+  `group_concat` alias. Differential-tested vs the C oracle
+  (`printf_and_utility_functions` in `diff.rs` — 45+ queries).

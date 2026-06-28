@@ -491,14 +491,14 @@ list every granular item needed.
 
 ## M25 — Remaining Scalar & Utility Functions
 
-- [ ] **25.1** `printf(format, ...)` / `format(format, ...)` — printf-style string formatting
-- [ ] **25.2** `soundex(X)` — SOUNDEX encoding (ifdef SQLITE_SOUNDEX)
-- [ ] **25.3** `load_extension(X [, Y])` — stub (return error; extensions not supported)
-- [ ] **25.4** `sqlite_compileoption_get(N)` / `sqlite_compileoption_used(X)` — compile option introspection
-- [ ] **25.5** `sqlite_source_id()` — return source ID string
-- [ ] **25.6** `unistr(X)` — Unicode escape sequence function
-- [ ] **25.7** `sqlite_log(E, M)` — log to error log
-- [ ] **25.8** Aggregate functions: `string_agg(X, Y)` (alias for `group_concat`)
+- [x] **25.1** `printf(format, ...)` / `format(format, ...)` — printf-style string formatting
+- [x] **25.2** `soundex(X)` — SOUNDEX encoding (ifdef SQLITE_SOUNDEX)
+- [x] **25.3** `load_extension(X [, Y])` — stub (return error; extensions not supported)
+- [x] **25.4** `sqlite_compileoption_get(N)` / `sqlite_compileoption_used(X)` — compile option introspection
+- [x] **25.5** `sqlite_source_id()` — return source ID string
+- [x] **25.6** `unistr(X)` — Unicode escape sequence function
+- [x] **25.7** `sqlite_log(E, M)` — log to error log
+- [x] **25.8** Aggregate functions: `string_agg(X, Y)` (alias for `group_concat`)
 
 ---
 

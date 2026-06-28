@@ -10,8 +10,10 @@ pub mod date;
 pub mod json;
 pub mod like;
 pub mod math;
+pub mod printf;
 pub mod registry;
 pub mod scalar;
+pub mod soundex;
 pub mod string;
 
 pub use aggregate::{is_aggregate_name, Accumulator, AggregateKind};

@@ -2915,3 +2915,110 @@ fn json_group_aggregates() {
         assert_same(db.str(), q);
     }
 }
+
+/// `printf`/`format` (M25.1) and related scalar/utility functions (M25.2–M25.8) —
+/// differential-tested against the system `sqlite3` oracle. Covers printf conversions
+/// (`%d`/`%s`/`%f`/`%e`/`%g`/`%x`/`%o`/`%c`/`%q`/`%Q`/`%w`/`%%`), flags (`-+0 #`),
+/// width/precision (literal and `*`), positional arguments (`%N$`), NULL handling,
+/// `soundex`, `sqlite_source_id`, `sqlite_compileoption_*`, `sqlite_log`, and
+/// `load_extension` (error parity). `unistr` is not in the local oracle (3.46.1), so
+/// it is unit-tested in `func::registry::tests` instead.
+#[test]
+fn printf_and_utility_functions() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = standard_fixture();
+    for q in [
+        // ---- printf / format ----
+        "SELECT printf('%d %s %f', 1, 'hi', 3.5);",
+        "SELECT printf('%5.2f', 3.14159);",
+        "SELECT printf('%0*d', 6, 42);",
+        "SELECT printf('%.*f', 2, 3.14159);",
+        "SELECT printf('%x %X %o', 255, 255, 255);",
+        "SELECT printf('%c', 65);",
+        "SELECT printf('100%%');",
+        "SELECT printf('%q', 'it''s');",
+        "SELECT printf('%Q', 'it''s');",
+        "SELECT printf('%w', 'a''b\"c');",
+        "SELECT printf('%5d|%-5d|', 42, 42);",
+        "SELECT printf('%+d %+d', 5, -5);",
+        "SELECT printf('%05d', -3);",
+        "SELECT printf('%#x', 255);",
+        "SELECT printf('%#o', 255);",
+        "SELECT printf('%e', 123456.789);",
+        "SELECT printf('%.0f', 0.5);",
+        "SELECT printf('%.0f', 1.5);",
+        "SELECT printf('%.0f', 2.5);",
+        "SELECT printf('%g', 0.0001);",
+        "SELECT printf('%g', 0.00001);",
+        "SELECT printf('%g', 100000.0);",
+        "SELECT printf('%g', 1000000.0);",
+        "SELECT printf('%g', 10000000.0);",
+        "SELECT printf('hello %s', NULL);",
+        "SELECT printf('%d', NULL);",
+        "SELECT printf('%f', NULL);",
+        "SELECT printf('%Q', NULL);",
+        "SELECT printf('%w', NULL);",
+        "SELECT printf('%c', NULL);",
+        "SELECT printf('%%d', 5);",
+        "SELECT printf('%5.3s', 'abcdef');",
+        "SELECT printf('%.3s', 'abcdef');",
+        "SELECT printf('%lld', 9223372036854775807);",
+        "SELECT printf('%x', -1);",
+        "SELECT printf(NULL);",
+        "SELECT printf();",
+        "SELECT printf('hello');",
+        "SELECT printf('%s %s', 'a', 'b');",
+        "SELECT format('%s %s', 'a', 'b');",
+        "SELECT printf('%d %d %d', 1, 2);",
+        // ---- soundex ----
+        "SELECT soundex('Robert');",
+        "SELECT soundex('Rupert');",
+        "SELECT soundex('Ashcraft');",
+        "SELECT soundex('Tymczak');",
+        "SELECT soundex('Pfister');",
+        "SELECT soundex('Honeyman');",
+        "SELECT soundex('Smith');",
+        "SELECT soundex('Schmidt');",
+        "SELECT soundex('Washington');",
+        "SELECT soundex('Lee');",
+        "SELECT soundex('Gutierrez');",
+        "SELECT soundex('');",
+        "SELECT soundex(NULL);",
+        "SELECT soundex(123);",
+        // ---- sqlite_log ----
+        "SELECT sqlite_log(1, 'hi');",
+    ] {
+        assert_same(db.str(), q);
+    }
+
+    // `sqlite_source_id` differs per build — verify shape only.
+    let our_src = rustsqlite_rows(":memory:", "SELECT sqlite_source_id();")
+        .expect("source_id query");
+    let oracle_src = sqlite3_rows(":memory:", "SELECT sqlite_source_id();");
+    assert_eq!(our_src.len(), 1);
+    assert_eq!(oracle_src.len(), 1);
+    assert!(our_src[0].len() > 20, "our source_id: {}", our_src[0]);
+    assert!(oracle_src[0].len() > 20, "oracle source_id: {}", oracle_src[0]);
+
+    // `sqlite_compileoption_used` is inherently engine-specific (the oracle's compile
+    // options differ from ours). Verify the function exists and returns 0/1, not parity.
+    let our_opt = rustsqlite_rows(":memory:", "SELECT sqlite_compileoption_used('FOO_BAR');")
+        .expect("compileoption_used query");
+    assert_eq!(our_opt, vec!["0".to_string()]);
+
+    // `load_extension` errors in both engines.
+    let our_err = rustsqlite_rows(":memory:", "SELECT load_extension('x');");
+    assert!(our_err.is_err(), "load_extension should error");
+    let oracle_err_out = std::process::Command::new("sqlite3")
+        .arg(":memory:")
+        .arg("SELECT load_extension('x');")
+        .output()
+        .expect("run sqlite3");
+    assert!(
+        !oracle_err_out.status.success(),
+        "oracle should also error on load_extension"
+    );
+}

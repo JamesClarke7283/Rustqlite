@@ -8,7 +8,9 @@ use crate::types::Value;
 
 use super::like;
 use super::math;
+use super::printf;
 use super::scalar;
+use super::soundex;
 use super::string;
 use super::string::TrimSide;
 use super::json;
@@ -129,6 +131,43 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         ("_json_arrow", 2) => json::json_arrow_fn(args, true),
         ("_json_arrow_text", 2) => json::json_arrow_fn(args, false),
 
+        // ---- printf / format (M25.1) ----
+        ("printf" | "format", _) => printf::printf_fn(args),
+
+        // ---- soundex (M25.2) ----
+        ("soundex", 1) => Ok(soundex::soundex(&args[0])),
+
+        // ---- load_extension stub (M25.3) ----
+        // Extensions are not supported; the stub returns an error matching the oracle's
+        // "extension loading is disabled" / shared-object-open failure shape.
+        ("load_extension", _) => Err(Error::msg(
+            "extension loading is disabled",
+        )),
+
+        // ---- compile-option introspection (M25.4) ----
+        // Rustqlite is not a compiled C build, so it has no traditional compile options.
+        // `sqlite_compileoption_get(N)` returns NULL for any N (no options registered).
+        // `sqlite_compileoption_used(X)` returns 0 (no option is "used").
+        // The names are still accepted (no "no such function" error) so introspection
+        // queries don't fail.
+        ("sqlite_compileoption_get", 1) => Ok(Value::Null),
+        ("sqlite_compileoption_used", 1) => Ok(Value::Int(0)),
+
+        // ---- source id (M25.5) ----
+        ("sqlite_source_id" | "sqlite_sourceid", 0) => {
+            Ok(Value::Text(crate::SQLITE_SOURCE_ID.to_string()))
+        }
+
+        // ---- unistr (M25.6) ----
+        // `unistr(X)` interprets `\uXXXX` (4 hex) and `\UXXXXXXXX` (8 hex) escape sequences
+        // in X, converting them to the corresponding Unicode characters. Other text is
+        // passed through unchanged. NULL → NULL. Added in SQLite 3.45.
+        ("unistr", 1) => unistr(&args[0]),
+
+        // ---- sqlite_log (M25.7) ----
+        // Returns NULL; the side-effect (logging) is a no-op in this build.
+        ("sqlite_log", _) => Ok(Value::Null),
+
         // Should not happen: codegen validates with `check` before emitting a Function opcode.
         _ => Err(no_such_function(name, args.len())),
     }
@@ -217,6 +256,32 @@ pub fn check(name: &str, n_arg: usize) -> Result<()> {
         "timediff" => Some(n_arg == 2),
         "current_date" | "current_time" | "current_timestamp" => Some(n_arg == 0),
 
+        // printf / format (M25.1) — variadic, ≥0 args (printf() returns "").
+        "printf" | "format" => Some(true),
+
+        // soundex (M25.2) — 1 arg.
+        "soundex" => Some(n_arg == 1),
+
+        // load_extension (M25.3) — 1 or 2 args (stub, always errors).
+        "load_extension" => Some(n_arg == 1 || n_arg == 2),
+
+        // compile-option introspection (M25.4).
+        "sqlite_compileoption_get" => Some(n_arg == 1),
+        "sqlite_compileoption_used" => Some(n_arg == 1),
+
+        // source id (M25.5).
+        "sqlite_source_id" | "sqlite_sourceid" => Some(n_arg == 0),
+
+        // unistr (M25.6).
+        "unistr" => Some(n_arg == 1),
+
+        // sqlite_log (M25.7) — 0, 1, or 2 args.
+        "sqlite_log" => Some(n_arg <= 2),
+
+        // string_agg (M25.8) — 2-arg aggregate, alias for group_concat. Accepted by
+        // `check` here; the aggregate codegen resolves it via `AggregateKind::from_name`.
+        "string_agg" => Some(n_arg == 2),
+
         _ => None,
     };
     match arity_ok {
@@ -230,6 +295,71 @@ pub fn check(name: &str, n_arg: usize) -> Result<()> {
 
 fn no_such_function(name: &str, _n: usize) -> Error {
     Error::msg(format!("no such function: {name}"))
+}
+
+/// `unistr(X)` — interpret `\uXXXX` and `\UXXXXXXXX` escape sequences in X.
+fn unistr(v: &Value) -> Result<Value> {
+    if v.is_null() {
+        return Ok(Value::Null);
+    }
+    let s = v.to_text().unwrap_or_default();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            let (kind, n_hex) = match bytes[i + 1] {
+                b'u' => ('u', 4usize),
+                b'U' => ('U', 8usize),
+                _ => {
+                    out.push('\\');
+                    i += 1;
+                    continue;
+                }
+            };
+            if i + 1 + n_hex <= bytes.len() {
+                let hex = &s[i + 2..i + 2 + n_hex];
+                if hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    if let Ok(code) = u32::from_str_radix(hex, 16) {
+                        if let Some(ch) = char::from_u32(code) {
+                            out.push(ch);
+                            i += 2 + n_hex;
+                            continue;
+                        }
+                    }
+                }
+                // Invalid escape: pass the backslash through, continue from next char.
+                out.push('\\');
+                i += 1;
+                let _ = kind;
+                continue;
+            } else {
+                out.push('\\');
+                i += 1;
+                continue;
+            }
+        }
+        // Copy one UTF-8 character.
+        let ch_start = i;
+        let len = utf8_len(bytes[i]);
+        i += len;
+        out.push_str(&s[ch_start..ch_start + len.min(bytes.len() - ch_start)]);
+    }
+    Ok(Value::Text(out))
+}
+
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
 }
 
 #[cfg(test)]
