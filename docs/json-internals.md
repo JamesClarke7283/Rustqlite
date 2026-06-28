@@ -112,3 +112,37 @@ tree approach, and will resolve when the JSONB form lands.
 
 The differential test `json_function` in `tests/diff.rs` skips the divergent cases with a
 comment pointing here.
+## Value-argument semantics (M24.6/M24.7/M24.13)
+
+The JSON1 docs (§3.4) distinguish **JSON arguments** (parsed as JSON) from **VALUE arguments**
+(quoted as JSON strings). `json_insert`/`json_replace`/`json_set`/`json_array`/`json_object`
+take VALUE arguments: a TEXT value is inserted as a JSON **string**, not parsed as JSON.
+
+```
+json_set('{"a":2,"c":4}', '$.c', '[97,96]') → '{"a":2,"c":"[97,96]"}'   -- TEXT → string
+json_set('{"a":2,"c":4}', '$.c', json('[97,96]')) → '{"a":2,"c":[97,96]}' -- JSON fn → JSON
+```
+
+The exception is the **JSON-subtype rule**: if a VALUE argument is the *direct result* of
+another JSON function (or the `->` operator, but not `->>`), it is treated as JSON and its
+substructure is preserved. SQLite tracks this via the `Mem.eSubtype = JSON_SUBTYPE` flag set
+on the result of every `json_*` function. **Rustqlite does not yet model the JSON subtype**
+(M24.20 — `SetSubtype`/`GetSubtype`/`ClrSubtype` opcodes), so a TEXT value is ALWAYS a quoted
+JSON string in our implementation, even when it came from `json()`. This is the documented
+divergence in `tests/diff.rs::json_array_and_object` and the reason `json_set(...,
+json('[1,2]'))` produces `"[1,2]"` (string) instead of `[1,2]` (array) in our engine.
+
+### `json_patch` NULL-target quirk
+
+`json_patch(NULL, P)` returns **NULL** (not the patch), regardless of `P`. This matches
+upstream's `sqlite3_value_type(argv[0])==SQLITE_NULL → return NULL` early-out. The RFC 7396
+spec says a null target should take the patch, but SQLite's implementation diverges from the
+spec here; we match SQLite (the spec is the spec, but the oracle is the spec for this
+project).
+
+### Path auto-vivify
+
+`json_insert`/`json_set` auto-vivify intermediate **object** keys along the path (a missing
+`$.b.c` on `{"a":2}` creates `{"a":2,"b":{"c":5}}`). **Array** slots are NOT auto-vivified —
+an out-of-range array index is a silent no-op (the path doesn't exist). `$[#]` appends to an
+array; `$[#-N]` addresses the N-th-from-end element.

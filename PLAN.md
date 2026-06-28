@@ -471,14 +471,14 @@ list every granular item needed.
 - [x] **24.3** `json_array(...)` — create JSON array from arguments
 - [x] **24.4** `json_object(...)` — create JSON object from key-value pairs
 - [x] **24.5** `json_extract(X, ...)` / `jsonb_extract(X, ...)` — extract value at path
-- [ ] **24.6** `json_insert(X, ...)` / `json_replace(X, ...)` / `json_set(X, ...)` — modify JSON
-- [ ] **24.7** `json_remove(X, ...)` — remove element at path
+- [x] **24.6** `json_insert(X, ...)` / `json_replace(X, ...)` / `json_set(X, ...)` — modify JSON
+- [x] **24.7** `json_remove(X, ...)` — remove element at path
 - [x] **24.8** `json_type(X [, Y])` — type of element
 - [x] **24.9** `json_valid(X [, Y])` — validate JSON
 - [x] **24.10** `json_quote(X)` — quote a value as JSON
 - [x] **24.11** `json_array_length(X [, Y])` — length of JSON array
 - [x] **24.12** `json_pretty(X [, Y])` — pretty-print JSON
-- [ ] **24.13** `json_patch(X, Y)` — RFC 7396 merge patch
+- [x] **24.13** `json_patch(X, Y)` — RFC 7396 merge patch
 - [x] **24.14** `json_error_position(X)` — position of first syntax error
 - [ ] **24.15** `json_each(X [, Y])` — table-valued function (iterate array/object)
 - [ ] **24.16** `json_tree(X [, Y])` — table-valued function (walk JSON tree)
@@ -844,8 +844,8 @@ list every granular item needed.
 ### M8 — Subqueries (Additional Items)
 
 - [x] **8.12** Subquery flattening optimization: merge `FROM (SELECT …)` into outer query when safe
-- [ ] **8.13** Correlated subquery re-materialization when outer row changes
-- [ ] **8.14** Automatic index creation for correlated subqueries (autoindex)
+- [x] **8.13** Correlated subquery re-materialization when outer row changes
+- [ ] **8.14** Automatic index creation for correlated subqueries (autoindex) [BLOCKED: scope — a query-planner optimization (duplicates M27.7). Requires (1) detecting the `WHERE inner_col = outer_col` equality pattern in a correlated subquery, (2) hoisting an ephemeral-index build before the outer scan via `OP_Once` (the subquery is compiled inside the outer scan's expression loop, so the build must be hoisted across the `Rewind` boundary), (3) rewriting the inlined subquery scan to `SeekGE`/`IdxGT` probe the autoindex instead of full-scanning the inner table, and (4) a new `OpenAutoindex` opcode (or `OpenEphemeral`+`KeyInfo` reuse). Correlated subqueries produce correct results today (M8.13 re-materializes per outer row); the autoindex is a performance optimization, not a correctness fix. Deferred to a dedicated query-planner session alongside M27.]
 
 ### M12 — Transactions (Additional Items)
 

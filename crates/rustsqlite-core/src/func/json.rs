@@ -1154,6 +1154,446 @@ fn first_error_offset(input: &str) -> Option<usize> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// M24.6 / M24.7 / M24.13 — json_insert / json_replace / json_set / json_remove / json_patch
+// ---------------------------------------------------------------------------
+
+/// A parsed path segment: object key or array index (with the `#` semantics resolved at apply
+/// time, since the absolute index depends on the runtime array length).
+#[derive(Clone, Debug)]
+enum PathSeg {
+    /// `.<key>` — object lookup.
+    Key(String),
+    /// `[N]` — absolute array index N.
+    Index(u64),
+    /// `[#]` — the array length (one past the last element; used to append).
+    Append,
+    /// `[#-N]` — index `len - N` (the N-th from the end; `[#-0]` ≡ `[#]` ≡ append).
+    FromEnd(u64),
+}
+
+/// Parse a JSON path (after the leading `$`) into a sequence of [`PathSeg`]s. Mirrors the
+/// segment parsing in `walk` but produces a structured form for the mutation functions to
+/// consume in two passes (resolve-then-apply). A bare `$` yields an empty segment list (the
+/// root). Returns `Err` on a malformed path.
+fn parse_path_segments(path: &[u8]) -> Result<Vec<PathSeg>> {
+    let mut segs = Vec::new();
+    let mut i = 0;
+    while i < path.len() {
+        match path[i] {
+            b'.' => {
+                i += 1;
+                let (key, consumed) = parse_key_segment(path, i)?;
+                i = consumed;
+                segs.push(PathSeg::Key(key));
+            }
+            b'[' => {
+                i += 1;
+                let from_end = path.get(i).copied() == Some(b'#');
+                if from_end {
+                    i += 1;
+                }
+                let negative = path.get(i).copied() == Some(b'-');
+                if negative {
+                    i += 1;
+                }
+                let mut idx: u64 = 0;
+                let mut have_digit = false;
+                while i < path.len() && path[i].is_ascii_digit() {
+                    idx = idx.saturating_mul(10).saturating_add((path[i] - b'0') as u64);
+                    i += 1;
+                    have_digit = true;
+                }
+                if i >= path.len() || path[i] != b']' {
+                    return Err(Error::msg("bad JSON path"));
+                }
+                i += 1; // consume ']'
+                if from_end {
+                    if !have_digit && !negative {
+                        segs.push(PathSeg::Append);
+                    } else if negative {
+                        segs.push(PathSeg::FromEnd(idx));
+                    } else {
+                        // `[#N]` (no `-`) → index `len - N` (same as FromEnd).
+                        segs.push(PathSeg::FromEnd(idx));
+                    }
+                } else if negative {
+                    // `[-N]` — non-standard; treat as from-end (matches `walk`).
+                    segs.push(PathSeg::FromEnd(idx));
+                } else if !have_digit {
+                    return Err(Error::msg("bad JSON path"));
+                } else {
+                    segs.push(PathSeg::Index(idx));
+                }
+            }
+            _ => return Err(Error::msg("bad JSON path")),
+        }
+    }
+    Ok(segs)
+}
+
+/// Resolve a [`PathSeg`] to an absolute array index given the current array length. Mirrors
+/// `walk`'s index resolution: `Append` → `len` (one-past-end), `FromEnd(N)` → `len - N`,
+/// `Index(N)` → `N`. Returns `None` for an out-of-range index (the path does not exist).
+fn resolve_index(seg: &PathSeg, len: usize) -> Option<usize> {
+    let len64 = len as u64;
+    let idx = match seg {
+        PathSeg::Index(n) => *n,
+        PathSeg::Append => len64,
+        PathSeg::FromEnd(n) => len64.checked_sub(*n).unwrap_or(len64 + 1), // overflow → out of range
+        PathSeg::Key(_) => return None,
+    };
+    if idx <= len64 {
+        Some(idx as usize)
+    } else {
+        None
+    }
+}
+
+/// Whether a path's final segment points at an existing location in `root`. Used by
+/// `json_replace` (skip if not exists) and `json_insert` (skip if exists).
+fn path_exists(root: &JsonNode, segs: &[PathSeg]) -> bool {
+    let mut cur = root;
+    for s in segs {
+        match (s, cur) {
+            (PathSeg::Key(k), JsonNode::Object(entries)) => {
+                match entries.iter().rev().find(|(ek, _)| ek == k) {
+                    Some((_, v)) => cur = v,
+                    None => return false,
+                }
+            }
+            (PathSeg::Key(_), _) => return false,
+            (seg, JsonNode::Array(items)) => {
+                match resolve_index(seg, items.len()) {
+                    Some(i) if i < items.len() => cur = &items[i],
+                    _ => return false,
+                }
+            }
+            (_, _) => return false,
+        }
+    }
+    true
+}
+
+/// Navigate to the parent of the path's final segment, auto-vivifying intermediate object keys
+/// (a non-existent object key creates an empty object; mirrors upstream's `jsonSetBoolean`/
+/// `jsonLookupStep` auto-vivify). Array indices that are out of range are *not* auto-vivified
+/// (the path does not exist; `json_insert`/`json_set` only auto-creates object keys, not array
+/// slots — matching upstream). Returns `Ok(Some(parent_node))` if the parent was reached,
+/// `Ok(None)` if an intermediate segment did not match (the parent path does not exist and
+/// cannot be auto-vivified), or `Err` on a malformed path.
+fn navigate_to_parent_mut<'a>(
+    root: &'a mut JsonNode,
+    segs: &[PathSeg],
+) -> Result<Option<&'a mut JsonNode>> {
+    let mut cur = root;
+    // All but the last segment — auto-vivify object keys along the way.
+    for s in &segs[..segs.len().saturating_sub(1)] {
+        match (s, cur) {
+            (PathSeg::Key(k), JsonNode::Object(entries)) => {
+                // Last-wins lookup: find the last entry with this key, or auto-vivify.
+                let idx = entries.iter().rposition(|(ek, _)| ek == k);
+                let idx = match idx {
+                    Some(i) => i,
+                    None => {
+                        entries.push((k.clone(), JsonNode::Object(Vec::new())));
+                        entries.len() - 1
+                    }
+                };
+                cur = &mut entries[idx].1;
+            }
+            (PathSeg::Key(_), _) => return Ok(None),
+            (seg, JsonNode::Array(items)) => match resolve_index(seg, items.len()) {
+                Some(i) if i < items.len() => cur = &mut items[i],
+                _ => return Ok(None),
+            },
+            (_, _) => return Ok(None),
+        }
+    }
+    Ok(Some(cur))
+}
+
+/// Apply one (path, value) update to `root` in the given mode. Mirrors the per-path step of
+/// `jsonInsertStep`/`jsonReplaceStep`/`jsonSetStep` in `json.c`. The three modes share the
+/// navigation logic; only the "should I write?" decision differs:
+/// * `Insert` — write only if the path does NOT already exist.
+/// * `Replace` — write only if the path DOES already exist.
+/// * `Set` — always write (auto-vivify object keys).
+fn apply_path_update(
+    root: &mut JsonNode,
+    segs: &[PathSeg],
+    value: &Value,
+    mode: UpdateMode,
+) -> Result<()> {
+    if segs.is_empty() {
+        // `$` — the root. Only `json_set`/`json_replace` overwrite the root; `json_insert`
+        // never overwrites an existing root. (Upstream: `json_set('x', '$', ...)` replaces
+        // the entire value.)
+        match mode {
+            UpdateMode::Insert => {
+                // json_insert('x', '$', v) → no-op (root always exists).
+            }
+            UpdateMode::Replace | UpdateMode::Set => {
+                *root = value_arg_to_json(value)?;
+            }
+        }
+        return Ok(());
+    }
+    let exists = path_exists(root, segs);
+    let should_write = match mode {
+        UpdateMode::Insert => !exists,
+        UpdateMode::Replace => exists,
+        UpdateMode::Set => true,
+    };
+    if !should_write {
+        return Ok(());
+    }
+    let parent = match navigate_to_parent_mut(root, segs)? {
+        Some(p) => p,
+        None => return Ok(()), // parent path not reachable / not auto-vivifiable → no-op
+    };
+    let last = &segs[segs.len() - 1];
+    match (last, parent) {
+        (PathSeg::Key(k), JsonNode::Object(entries)) => {
+            // For Set/Insert on a missing key, append. For Replace on an existing key,
+            // overwrite the last entry's value (preserve duplicate-key semantics? upstream
+            // overwrites the last occurrence).
+            let idx = entries.iter().rposition(|(ek, _)| ek == k);
+            let new_node = value_arg_to_json(value)?;
+            match idx {
+                Some(i) => entries[i].1 = new_node,
+                None => entries.push((k.clone(), new_node)),
+            }
+        }
+        (PathSeg::Key(_), _) => {
+            // Parent is not an object — can't set a key. No-op (matches upstream's
+            // silent-skip when the path's container type doesn't match).
+        }
+        (seg, JsonNode::Array(items)) => {
+            let new_node = value_arg_to_json(value)?;
+            let idx = resolve_index(seg, items.len());
+            match idx {
+                Some(i) if i < items.len() => {
+                    // In-range: overwrite (Replace/Set).
+                    items[i] = new_node;
+                }
+                Some(i) if i == items.len() => {
+                    // Append (`[#]` or `[#-0]`): Insert/Set appends.
+                    items.push(new_node);
+                }
+                _ => {
+                    // Out of range: no-op for Insert/Set beyond the append slot. (Upstream
+                    // silently skips a write past the end+1 position.)
+                }
+            }
+        }
+        (_, _) => {
+            // Parent is a scalar — can't index into it. No-op.
+        }
+    }
+    Ok(())
+}
+
+/// The update mode for [`apply_path_update`], mirroring the three JSON-edit functions.
+#[derive(Clone, Copy, Debug)]
+pub enum UpdateMode {
+    Insert,
+    Replace,
+    Set,
+}
+
+/// Convert an SQL [`Value`] to a [`JsonNode`] using the "value argument" semantics of
+/// `json_insert`/`json_replace`/`json_set`/`json_array`/`json_object` (per the JSON1 docs §3.4):
+/// NULL → `null`, INTEGER → number, REAL → number, TEXT → a JSON **string** (NOT parsed as
+/// JSON), BLOB → error. The "value is JSON if it came from a JSON function" rule (JSON subtype)
+/// is not yet modeled — M24.20; a TEXT value is always a quoted string here, matching the
+/// common case (`json_set('{"a":2}', '$.c', '[97,96]')` → `'{"a":2,"c":"[97,96]"}'`).
+fn value_arg_to_json(arg: &Value) -> Result<JsonNode> {
+    match arg {
+        Value::Null => Ok(JsonNode::Null),
+        Value::Int(i) => Ok(JsonNode::Int(*i)),
+        Value::Real(r) => Ok(JsonNode::Real(*r)),
+        Value::Text(s) => Ok(JsonNode::String(s.clone())),
+        Value::Blob(_) => Err(Error::msg("JSON cannot hold BLOB values")),
+    }
+}
+
+/// `json_insert(X, P, V, ...)` / `json_replace(X, P, V, ...)` / `json_set(X, P, V, ...)` —
+/// modify JSON `X` by applying each `(P, V)` pair in sequence. Edits accumulate left-to-right
+/// (a prior edit changes the value a later path resolves against, matching upstream).
+///
+/// * `json_insert` — writes `V` at `P` only if `P` does NOT already exist in `X`.
+/// * `json_replace` — writes `V` at `P` only if `P` DOES already exist in `X`.
+/// * `json_set` — writes `V` at `P` unconditionally (auto-vivifying object keys).
+///
+/// The first argument must be valid JSON (or NULL → NULL). Each path must be well-formed. The
+/// value is rendered per [`value_to_json`] (TEXT → JSON string; the JSON-subtype-aware "value
+/// is JSON if it came from a JSON function" rule is not yet modeled — M24.20).
+pub fn json_edit_fn(args: &[Value], mode: UpdateMode) -> Result<Value> {
+    if args.is_empty() {
+        return Err(Error::msg("json function requires at least 1 argument"));
+    }
+    // Odd arg count: 1 (root) + 2*N (path,value pairs). Even → error.
+    if args.len() % 2 == 0 {
+        let name = match mode {
+            UpdateMode::Insert => "json_insert",
+            UpdateMode::Replace => "json_replace",
+            UpdateMode::Set => "json_set",
+        };
+        return Err(Error::msg(format!(
+            "wrong number of arguments to function {name}()"
+        )));
+    }
+    // NULL root → NULL (matches upstream).
+    if args[0].is_null() {
+        return Ok(Value::Null);
+    }
+    let mut root = value_to_json(&args[0])?;
+    // Apply each (path, value) pair in order.
+    let mut i = 1;
+    while i + 1 < args.len() {
+        let path = path_as_str(&args[i])?;
+        if !path.starts_with('$') {
+            return Err(Error::msg("JSON path error near '"));
+        }
+        let segs = parse_path_segments(path[1..].as_bytes())?;
+        apply_path_update(&mut root, &segs, &args[i + 1], mode)?;
+        i += 2;
+    }
+    Ok(Value::Text(render(&root)))
+}
+
+/// `json_remove(X, P, ...)` — return a copy of `X` with the element at each path `P` removed.
+/// Paths that don't resolve are silently ignored. Removals happen left-to-right (a prior
+/// removal shifts indices for a later path, matching upstream). With no path arguments,
+/// `json_remove(X)` re-formats `X` (whitespace-normalized), matching `json(X)`. NULL root →
+/// NULL. A path of `$` removes the root → the result is NULL (matching upstream's
+/// `json_remove('{"x":25,"y":42}','$') → NULL`).
+pub fn json_remove_fn(args: &[Value]) -> Result<Value> {
+    if args.is_empty() {
+        return Err(Error::msg("json_remove requires at least 1 argument"));
+    }
+    if args[0].is_null() {
+        return Ok(Value::Null);
+    }
+    let mut root = value_to_json(&args[0])?;
+    // No path args → just re-render (whitespace-normalized).
+    if args.len() == 1 {
+        return Ok(Value::Text(render(&root)));
+    }
+    for p in &args[1..] {
+        let path = path_as_str(p)?;
+        if !path.starts_with('$') {
+            return Err(Error::msg("JSON path error near '"));
+        }
+        let segs = parse_path_segments(path[1..].as_bytes())?;
+        if segs.is_empty() {
+            // `$` — remove the root → NULL.
+            return Ok(Value::Null);
+        }
+        remove_at_path(&mut root, &segs);
+    }
+    Ok(Value::Text(render(&root)))
+}
+
+/// Remove the element at `segs` from `root`. Silently no-op if the path doesn't resolve.
+fn remove_at_path(root: &mut JsonNode, segs: &[PathSeg]) {
+    // Navigate to the parent of the last segment, then drop the element.
+    let last = &segs[segs.len() - 1];
+    // Navigate immutably first to verify the path exists; if not, no-op.
+    if !path_exists(root, segs) {
+        return;
+    }
+    // Navigate the parent mutably. We re-walk because the borrow checker needs a clean path.
+    let parent = match navigate_to_parent_mut(root, segs) {
+        Ok(Some(p)) => p,
+        _ => return,
+    };
+    match (last, parent) {
+        (PathSeg::Key(k), JsonNode::Object(entries)) => {
+            // Remove the LAST entry with this key (last-wins semantics).
+            if let Some(i) = entries.iter().rposition(|(ek, _)| ek == k) {
+                entries.remove(i);
+            }
+        }
+        (seg, JsonNode::Array(items)) => {
+            if let Some(i) = resolve_index(seg, items.len()) {
+                if i < items.len() {
+                    items.remove(i);
+                }
+            }
+        }
+        (_, _) => {}
+    }
+}
+
+/// `json_patch(T, P)` — apply RFC 7396 MergePatch of patch `P` against target `T`. Returns the
+/// patched copy of `T` as JSON text. NULL `T` → the patch as JSON (or NULL if `P` is also
+/// NULL). NULL `P` → NULL (the whole document is deleted per RFC 7396).
+///
+/// MergePatch rules (RFC 7396 §2):
+/// * A patch that is not an object replaces the target entirely.
+/// * For each key in the patch object:
+///   - If the value is `null`, the key is removed from the target (if present).
+///   - Otherwise, if the key exists in the target and both values are objects, merge
+///     recursively.
+///   - Otherwise, set/overwrite the key with the patch value.
+/// * Keys in the target but not in the patch are preserved.
+/// * Arrays are treated as atomic (not merged element-wise).
+pub fn json_patch_fn(args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(Error::msg("json_patch requires 2 arguments"));
+    }
+    // NULL target → NULL (upstream: json_patch(NULL, P) → NULL, regardless of P).
+    if args[0].is_null() {
+        return Ok(Value::Null);
+    }
+    if args[1].is_null() {
+        // RFC 7396: a null patch deletes the target.
+        return Ok(Value::Null);
+    }
+    let patch = value_to_json(&args[1])?;
+    let mut target = value_to_json(&args[0])?;
+    merge_patch(&mut target, &patch);
+    Ok(Value::Text(render(&target)))
+}
+
+/// Recursive MergePatch step (RFC 7396 §2). Modifies `target` in place per `patch`.
+fn merge_patch(target: &mut JsonNode, patch: &JsonNode) {
+    // If patch is not an object, it replaces target entirely.
+    let JsonNode::Object(patch_entries) = patch else {
+        *target = patch.clone();
+        return;
+    };
+    // If target is not an object, it becomes one (empty), then we apply the patch keys.
+    if !matches!(target, JsonNode::Object(_)) {
+        *target = JsonNode::Object(Vec::new());
+    }
+    let JsonNode::Object(target_entries) = target else {
+        return; // unreachable after the above
+    };
+    for (key, pval) in patch_entries {
+        if matches!(pval, JsonNode::Null) {
+            // A null patch value removes the key from the target.
+            while let Some(i) = target_entries.iter().rposition(|(ek, _)| ek == key) {
+                target_entries.remove(i);
+            }
+        } else {
+            // Set or merge. Find the last existing entry with this key.
+            let idx = target_entries.iter().rposition(|(ek, _)| ek == key);
+            match idx {
+                Some(i) => {
+                    // Recurse into the existing value (which may itself be an object).
+                    merge_patch(&mut target_entries[i].1, pval);
+                }
+                None => {
+                    target_entries.push((key.clone(), pval.clone()));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1569,5 +2009,226 @@ mod tests {
             json_extract_fn(&[j, t("$.a"), t("$.missing")]).unwrap(),
             t("[1,null]"),
         );
+    }
+
+    // ---- M24.6 / M24.7 / M24.13 json_insert/replace/set/remove/patch unit tests ----
+
+    #[test]
+    fn json_insert_creates_missing_key() {
+        // json_insert('{"a":2,"c":4}', '$.e', 99) → '{"a":2,"c":4,"e":99}'
+        let r = json_edit_fn(
+            &[t("{\"a\":2,\"c\":4}"), t("$.e"), Value::Int(99)],
+            UpdateMode::Insert,
+        )
+        .unwrap();
+        assert_eq!(r, t("{\"a\":2,\"c\":4,\"e\":99}"));
+    }
+
+    #[test]
+    fn json_insert_skips_existing_key() {
+        // json_insert('{"a":2,"c":4}', '$.a', 99) → '{"a":2,"c":4}' (no overwrite)
+        let r = json_edit_fn(
+            &[t("{\"a\":2,\"c\":4}"), t("$.a"), Value::Int(99)],
+            UpdateMode::Insert,
+        )
+        .unwrap();
+        assert_eq!(r, t("{\"a\":2,\"c\":4}"));
+    }
+
+    #[test]
+    fn json_insert_appends_to_array() {
+        // json_insert('[1,2,3,4]','$[#]',99) → '[1,2,3,4,99]'
+        let r = json_edit_fn(
+            &[t("[1,2,3,4]"), t("$[#]"), Value::Int(99)],
+            UpdateMode::Insert,
+        )
+        .unwrap();
+        assert_eq!(r, t("[1,2,3,4,99]"));
+    }
+
+    #[test]
+    fn json_insert_appends_to_nested_array() {
+        // json_insert('[1,[2,3],4]','$[1][#]',99) → '[1,[2,3,99],4]'
+        let r = json_edit_fn(
+            &[t("[1,[2,3],4]"), t("$[1][#]"), Value::Int(99)],
+            UpdateMode::Insert,
+        )
+        .unwrap();
+        assert_eq!(r, t("[1,[2,3,99],4]"));
+    }
+
+    #[test]
+    fn json_replace_overwrites_existing_key() {
+        // json_replace('{"a":2,"c":4}', '$.a', 99) → '{"a":99,"c":4}'
+        let r = json_edit_fn(
+            &[t("{\"a\":2,\"c\":4}"), t("$.a"), Value::Int(99)],
+            UpdateMode::Replace,
+        )
+        .unwrap();
+        assert_eq!(r, t("{\"a\":99,\"c\":4}"));
+    }
+
+    #[test]
+    fn json_replace_skips_missing_key() {
+        // json_replace('{"a":2,"c":4}', '$.e', 99) → '{"a":2,"c":4}' (no create)
+        let r = json_edit_fn(
+            &[t("{\"a\":2,\"c\":4}"), t("$.e"), Value::Int(99)],
+            UpdateMode::Replace,
+        )
+        .unwrap();
+        assert_eq!(r, t("{\"a\":2,\"c\":4}"));
+    }
+
+    #[test]
+    fn json_set_overwrites_and_creates() {
+        // json_set('{"a":2,"c":4}', '$.a', 99) → '{"a":99,"c":4}'
+        let r = json_edit_fn(
+            &[t("{\"a\":2,\"c\":4}"), t("$.a"), Value::Int(99)],
+            UpdateMode::Set,
+        )
+        .unwrap();
+        assert_eq!(r, t("{\"a\":99,\"c\":4}"));
+        // json_set('{"a":2,"c":4}', '$.e', 99) → '{"a":2,"c":4,"e":99}'
+        let r = json_edit_fn(
+            &[t("{\"a\":2,\"c\":4}"), t("$.e"), Value::Int(99)],
+            UpdateMode::Set,
+        )
+        .unwrap();
+        assert_eq!(r, t("{\"a\":2,\"c\":4,\"e\":99}"));
+    }
+
+    #[test]
+    fn json_set_text_value_is_quoted_string() {
+        // json_set('{"a":2,"c":4}', '$.c', '[97,96]') → '{"a":2,"c":"[97,96]"}'
+        // (without JSON subtype tracking, a TEXT value is always a JSON string — M24.20)
+        let r = json_edit_fn(
+            &[t("{\"a\":2,\"c\":4}"), t("$.c"), t("[97,96]")],
+            UpdateMode::Set,
+        )
+        .unwrap();
+        assert_eq!(r, t("{\"a\":2,\"c\":\"[97,96]\"}"));
+    }
+
+    #[test]
+    fn json_edit_multi_path_left_to_right() {
+        // Edits accumulate: first creates $.e, second overwrites $.e.
+        let r = json_edit_fn(
+            &[
+                t("{\"a\":2}"),
+                t("$.e"),
+                Value::Int(99),
+                t("$.e"),
+                Value::Int(100),
+            ],
+            UpdateMode::Set,
+        )
+        .unwrap();
+        assert_eq!(r, t("{\"a\":2,\"e\":100}"));
+    }
+
+    #[test]
+    fn json_edit_null_root_is_null() {
+        let r = json_edit_fn(
+            &[Value::Null, t("$.a"), Value::Int(1)],
+            UpdateMode::Set,
+        )
+        .unwrap();
+        assert_eq!(r, Value::Null);
+    }
+
+    #[test]
+    fn json_edit_even_arg_count_errors() {
+        assert!(json_edit_fn(&[t("{}"), t("$.a")], UpdateMode::Set).is_err());
+    }
+
+    #[test]
+    fn json_remove_array_element() {
+        // json_remove('[0,1,2,3,4]','$[2]') → '[0,1,3,4]'
+        let r = json_remove_fn(&[t("[0,1,2,3,4]"), t("$[2]")]).unwrap();
+        assert_eq!(r, t("[0,1,3,4]"));
+    }
+
+    #[test]
+    fn json_remove_sequential_shifts_indices() {
+        // json_remove('[0,1,2,3,4]','$[2]','$[0]') → '[1,3,4]' (first removes 2, then 0)
+        let r =
+            json_remove_fn(&[t("[0,1,2,3,4]"), t("$[2]"), t("$[0]")]).unwrap();
+        assert_eq!(r, t("[1,3,4]"));
+    }
+
+    #[test]
+    fn json_remove_object_key() {
+        // json_remove('{"x":25,"y":42}','$.y') → '{"x":25}'
+        let r = json_remove_fn(&[t("{\"x\":25,\"y\":42}"), t("$.y")]).unwrap();
+        assert_eq!(r, t("{\"x\":25}"));
+    }
+
+    #[test]
+    fn json_remove_missing_path_silent() {
+        // json_remove('{"x":25,"y":42}','$.z') → '{"x":25,"y":42}'
+        let r = json_remove_fn(&[t("{\"x\":25,\"y\":42}"), t("$.z")]).unwrap();
+        assert_eq!(r, t("{\"x\":25,\"y\":42}"));
+    }
+
+    #[test]
+    fn json_remove_root_is_null() {
+        // json_remove('{"x":25,"y":42}','$') → NULL
+        let r = json_remove_fn(&[t("{\"x\":25,\"y\":42}"), t("$")]).unwrap();
+        assert_eq!(r, Value::Null);
+    }
+
+    #[test]
+    fn json_remove_no_paths_just_rerenders() {
+        // json_remove('{"x":25,"y":42}') → '{"x":25,"y":42}' (whitespace-normalized)
+        let r = json_remove_fn(&[t("  {  \"x\"  :  25  }  ")]).unwrap();
+        assert_eq!(r, t("{\"x\":25}"));
+    }
+
+    #[test]
+    fn json_patch_adds_keys() {
+        // json_patch('{"a":1,"b":2}','{"c":3,"d":4}') → '{"a":1,"b":2,"c":3,"d":4}'
+        let r = json_patch_fn(&[t("{\"a\":1,\"b\":2}"), t("{\"c\":3,\"d\":4}")]).unwrap();
+        assert_eq!(r, t("{\"a\":1,\"b\":2,\"c\":3,\"d\":4}"));
+    }
+
+    #[test]
+    fn json_patch_overwrites_key() {
+        // json_patch('{"a":[1,2],"b":2}','{"a":9}') → '{"a":9,"b":2}'
+        let r = json_patch_fn(&[t("{\"a\":[1,2],\"b\":2}"), t("{\"a\":9}")]).unwrap();
+        assert_eq!(r, t("{\"a\":9,\"b\":2}"));
+    }
+
+    #[test]
+    fn json_patch_null_value_removes_key() {
+        // json_patch('{"a":[1,2],"b":2}','{"a":null}') → '{"b":2}'
+        let r = json_patch_fn(&[t("{\"a\":[1,2],\"b\":2}"), t("{\"a\":null}")]).unwrap();
+        assert_eq!(r, t("{\"b\":2}"));
+    }
+
+    #[test]
+    fn json_patch_recursive_merge() {
+        // json_patch('{"a":{"x":1,"y":2},"b":3}','{"a":{"y":9},"c":8}')
+        //   → '{"a":{"x":1,"y":9},"b":3,"c":8}'
+        let r = json_patch_fn(&[
+            t("{\"a\":{\"x\":1,\"y\":2},\"b\":3}"),
+            t("{\"a\":{\"y\":9},\"c\":8}"),
+        ])
+        .unwrap();
+        assert_eq!(r, t("{\"a\":{\"x\":1,\"y\":9},\"b\":3,\"c\":8}"));
+    }
+
+    #[test]
+    fn json_patch_null_target_is_null() {
+        // json_patch(NULL, '{"a":1}') → NULL (upstream: NULL target always yields NULL,
+        // regardless of the patch).
+        let r = json_patch_fn(&[Value::Null, t("{\"a\":1}")]).unwrap();
+        assert_eq!(r, Value::Null);
+    }
+
+    #[test]
+    fn json_patch_null_patch_is_null() {
+        // json_patch('{"a":1}', NULL) → NULL (RFC 7396: null patch deletes the target)
+        let r = json_patch_fn(&[t("{\"a\":1}"), Value::Null]).unwrap();
+        assert_eq!(r, Value::Null);
     }
 }

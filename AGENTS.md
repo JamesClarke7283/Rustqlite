@@ -1085,3 +1085,27 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   `strftime` specifier, `timediff`, numeric julian-day input, NULL/bad input;
   the volatile `current_*` are checked for type/shape and self-consistency
   (`date('now') == current_date`).
+- **M24 — JSON Functions** 🚧: a tree-based JSON implementation
+  (`crates/rustsqlite-core/src/func/json.rs`). The `JsonNode` enum mirrors the parsed-tree
+  shape (Null/Bool/Int/Real/String/Array/Object); the parser is a strict RFC 8259 recursive
+  descent with `JSON_MAX_DEPTH=1000` (no JSON5 extensions, no JSONB binary form — both
+  documented divergences, see @docs/json-internals.md). **M24.1–M24.5** parse + `json`/
+  `jsonb`/`json_array`/`json_object`/`json_extract`. **M24.6/M24.7/M24.13** `json_insert`/
+  `json_replace`/`json_set` (shared `json_edit_fn` with `UpdateMode`), `json_remove`, and
+  `json_patch` (RFC 7396 merge patch with recursive `merge_patch`): path-based mutation via
+  `parse_path_segments`/`navigate_to_parent_mut`/`apply_path_update`, with auto-vivify of
+  intermediate object keys, `$[#]` array append, and the "VALUE argument → quoted JSON
+  string" rule (a `value_arg_to_json` helper, distinct from `value_to_json` which parses
+  TEXT as JSON — the JSON-subtype-aware "value is JSON if it came from a JSON function" rule
+  is M24.20 and not yet modeled). `json_patch(NULL, P)` returns NULL (matches the oracle,
+  not the RFC 7396 spec). **M24.8–M24.12/M24.14** `json_type`/`json_valid`/`json_quote`/
+  `json_array_length`/`json_pretty`/`json_error_position`. Differential-tested vs the C
+  oracle (`json_function`, `json_array_and_object`, `json_extract`,
+  `json_type_valid_quote_array_length`, `json_pretty_and_error_position`,
+  `json_insert_replace_set_remove_patch` in `diff.rs` — 80+ queries). Known divergence: the
+  JSONB-form number/`\u`-escape preservation (documented in @docs/json-internals.md); the
+  JSON subtype (M24.20) is not modeled, so a TEXT value from a JSON function is inserted as
+  a quoted string rather than as JSON. Still M24: 24.15/24.16 `json_each`/`json_tree`
+  (table-valued functions — need virtual-table infrastructure M31), 24.17 `->`/`->>`
+  operators (need parser + codegen), 24.18/24.19 `json_group_array`/`json_group_object`
+  (aggregates), 24.20 subtype support (`SetSubtype`/`GetSubtype`/`ClrSubtype` opcodes).

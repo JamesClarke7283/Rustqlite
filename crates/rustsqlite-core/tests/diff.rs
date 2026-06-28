@@ -2734,3 +2734,95 @@ fn json_pretty_and_error_position() {
         assert_same(db.str(), q);
     }
 }
+
+/// `json_insert` / `json_replace` / `json_set` (M24.6), `json_remove` (M24.7), and
+/// `json_patch` (M24.13) — differential-tested against the system `sqlite3` oracle. Covers the
+/// three edit modes, multi-path accumulation, array append via `$[#]`, sequential removal with
+/// index shift, RFC 7396 merge patch (add/overwrite/remove/recursive-merge), NULL root/patch
+/// semantics, and the TEXT-value-is-quoted-string rule.
+#[test]
+fn json_insert_replace_set_remove_patch() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    for q in [
+        // ---- json_insert: create if not exists, skip if exists ----
+        "SELECT json_insert('{\"a\":2,\"c\":4}', '$.e', 99);",
+        "SELECT json_insert('{\"a\":2,\"c\":4}', '$.a', 99);",
+        "SELECT json_insert('[1,2,3,4]', '$[#]', 99);",
+        "SELECT json_insert('[1,[2,3],4]', '$[1][#]', 99);",
+        "SELECT json_insert('{\"a\":2}', '$.b.c', 5);", // auto-vivify nested object
+        "SELECT json_insert('{\"a\":1}', '$.a', 99, '$.b', 42);", // multi-path
+        "SELECT json_insert(NULL, '$.a', 1);",
+        // ---- json_replace: overwrite if exists, skip if not ----
+        "SELECT json_replace('{\"a\":2,\"c\":4}', '$.a', 99);",
+        "SELECT json_replace('{\"a\":2,\"c\":4}', '$.e', 99);",
+        "SELECT json_replace('[1,2,3]', '$[1]', 99);",
+        "SELECT json_replace('{\"a\":1,\"b\":2}', '$.a', 9, '$.b', 10);",
+        "SELECT json_replace(NULL, '$.a', 1);",
+        // ---- json_set: always write (overwrite or create) ----
+        "SELECT json_set('{\"a\":2,\"c\":4}', '$.a', 99);",
+        "SELECT json_set('{\"a\":2,\"c\":4}', '$.e', 99);",
+        "SELECT json_set('{\"a\":2,\"c\":4}', '$.c', '[97,96]');", // TEXT → quoted string
+        "SELECT json_set('{\"a\":2}', '$.b.c', 5);", // auto-vivify nested
+        "SELECT json_set('{\"a\":1}', '$.a', 9, '$.b', 10);",
+        "SELECT json_set('[1,2,3]', '$[0]', 99);",
+        "SELECT json_set('[1,2,3]', '$[#]', 4);", // append
+        "SELECT json_set(NULL, '$.a', 1);",
+        // ---- json_remove ----
+        "SELECT json_remove('[0,1,2,3,4]', '$[2]');",
+        "SELECT json_remove('[0,1,2,3,4]', '$[2]', '$[0]');", // sequential, shifts indices
+        "SELECT json_remove('[0,1,2,3,4]', '$[0]', '$[2]');",
+        "SELECT json_remove('[0,1,2,3,4]', '$[#-1]', '$[0]');",
+        "SELECT json_remove('{\"x\":25,\"y\":42}');", // no paths → re-render
+        "SELECT json_remove('{\"x\":25,\"y\":42}', '$.z');", // missing path → no-op
+        "SELECT json_remove('{\"x\":25,\"y\":42}', '$.y');",
+        "SELECT json_remove('{\"x\":25,\"y\":42}', '$');", // remove root → NULL
+        "SELECT json_remove('{\"a\":{\"b\":1}}', '$.a.b');",
+        "SELECT json_remove(NULL);",
+        "SELECT json_remove(NULL, '$.a');",
+        // ---- json_patch (RFC 7396) ----
+        "SELECT json_patch('{\"a\":1,\"b\":2}', '{\"c\":3,\"d\":4}');",
+        "SELECT json_patch('{\"a\":[1,2],\"b\":2}', '{\"a\":9}');",
+        "SELECT json_patch('{\"a\":[1,2],\"b\":2}', '{\"a\":null}');", // null removes key
+        "SELECT json_patch('{\"a\":1,\"b\":2}', '{\"a\":9,\"b\":null,\"c\":8}');",
+        "SELECT json_patch('{\"a\":{\"x\":1,\"y\":2},\"b\":3}', '{\"a\":{\"y\":9},\"c\":8}');", // recursive
+        "SELECT json_patch(NULL, '{\"a\":1}');", // NULL target → patch
+        "SELECT json_patch('{\"a\":1}', NULL);", // NULL patch → NULL (delete)
+        "SELECT json_patch('{\"a\":1}', '5');", // non-object patch replaces
+        "SELECT json_patch('{\"a\":1}', '\"str\"');", // string patch replaces
+    ] {
+        assert_same(db.str(), q);
+    }
+    // Error cases — both engines should error.
+    for q in [
+        "SELECT json_insert('{}', '$.a');",       // even arg count
+        "SELECT json_replace('{}', '$.a');",      // even arg count
+        "SELECT json_set('{}', '$.a');",          // even arg count
+        "SELECT json_insert('hello', '$.a', 1);", // malformed JSON root
+        "SELECT json_remove('hello');",           // malformed JSON root
+        "SELECT json_patch('hello', '{}');",      // malformed JSON root
+        "SELECT json_patch('{}', 'hello');",      // malformed JSON patch
+    ] {
+        let oracle_err = std::process::Command::new("sqlite3")
+            .arg("-batch")
+            .arg(db.str())
+            .arg(q)
+            .output()
+            .expect("run sqlite3");
+        assert!(!oracle_err.status.success(), "oracle should error on: {q}");
+        match rustsqlite_rows(db.str(), q) {
+            Ok(rows) => panic!("rustsqlite should error on `{q}`, got: {rows:?}"),
+            Err(e) => {
+                assert!(
+                    e.contains("malformed JSON")
+                        || e.contains("wrong number of arguments")
+                        || e.contains("JSON path"),
+                    "wrong error for `{q}`: {e}"
+                );
+            }
+        }
+    }
+}

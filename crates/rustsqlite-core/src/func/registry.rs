@@ -107,6 +107,17 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         }
         ("json_pretty", n) if n >= 1 && n <= 2 => json::json_pretty_fn(args),
         ("json_error_position", 1) => json::json_error_position_fn(&args[0]),
+        ("json_insert" | "jsonb_insert", n) if n >= 1 && n % 2 == 1 => {
+            json::json_edit_fn(args, json::UpdateMode::Insert)
+        }
+        ("json_replace" | "jsonb_replace", n) if n >= 1 && n % 2 == 1 => {
+            json::json_edit_fn(args, json::UpdateMode::Replace)
+        }
+        ("json_set" | "jsonb_set", n) if n >= 1 && n % 2 == 1 => {
+            json::json_edit_fn(args, json::UpdateMode::Set)
+        }
+        ("json_remove" | "jsonb_remove", n) if n >= 1 => json::json_remove_fn(args),
+        ("json_patch" | "jsonb_patch", 2) => json::json_patch_fn(args),
 
         // Should not happen: codegen validates with `check` before emitting a Function opcode.
         _ => Err(no_such_function(name, args.len())),
@@ -174,6 +185,10 @@ pub fn check(name: &str, n_arg: usize) -> Result<()> {
         "json_array_length" | "jsonb_array_length" => Some(n_arg == 1 || n_arg == 2),
         "json_pretty" => Some(n_arg == 1 || n_arg == 2),
         "json_error_position" => Some(n_arg == 1),
+        "json_insert" | "jsonb_insert" | "json_replace" | "jsonb_replace" | "json_set"
+        | "jsonb_set" => Some(n_arg >= 1 && n_arg % 2 == 1),
+        "json_remove" | "jsonb_remove" => Some(n_arg >= 1),
+        "json_patch" | "jsonb_patch" => Some(n_arg == 2),
 
         // volatile / connection-state functions (M3b): handled in the VDBE executor's Function
         // arm (they need runtime state), so `check` only learns their arities as the codegen
