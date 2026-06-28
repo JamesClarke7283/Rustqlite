@@ -529,7 +529,7 @@ fn render_into(node: &JsonNode, out: &mut String) {
     }
 }
 
-fn render_string(s: &str, out: &mut String) {
+pub fn render_string(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
         match c {

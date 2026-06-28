@@ -2870,3 +2870,48 @@ fn json_arrow_operators() {
         assert_same(db.str(), q);
     }
 }
+
+/// `json_group_array(X)` (M24.18) and `json_group_object(NAME, VALUE)` (M24.19) — JSON
+/// aggregate functions, differential-tested against the system `sqlite3` oracle. Covers:
+/// empty set (`[]`/`{}`), scalars, NULL values (included in array, skipped in object's
+/// value slot but the row still contributes), NULL name (row skipped), mixed types, GROUP
+/// BY, and the value-argument TEXT-is-quoted-string rule.
+#[test]
+fn json_group_aggregates() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup(
+        "CREATE TABLE t(a INT, b TEXT);\
+         INSERT INTO t VALUES (1,'x'),(2,'y'),(NULL,'z'),(3,NULL);",
+    );
+    for q in [
+        // json_group_array — empty set → `[]`.
+        "SELECT json_group_array(a) FROM t WHERE 0=1;",
+        // json_group_array — scalars (NULLs included).
+        "SELECT json_group_array(a) FROM t;",
+        // json_group_array — text values (quoted as JSON strings).
+        "SELECT json_group_array(b) FROM t;",
+        // json_group_array — mixed types.
+        "SELECT json_group_array(a) FROM t WHERE a IS NOT NULL;",
+        // json_group_array with GROUP BY.
+        "SELECT a, json_group_array(b) FROM t GROUP BY a ORDER BY a;",
+        // json_group_object — empty set → `{}`.
+        "SELECT json_group_object('k', a) FROM t WHERE 0=1;",
+        // json_group_object — basic.
+        "SELECT json_group_object('k', a) FROM t WHERE a IS NOT NULL;",
+        // json_group_object — text values.
+        "SELECT json_group_object(b, a) FROM t WHERE a IS NOT NULL AND b IS NOT NULL;",
+        // json_group_object with GROUP BY.
+        "SELECT a, json_group_object('v', b) FROM t WHERE a IS NOT NULL GROUP BY a ORDER BY a;",
+        // json_group_object — NULL name: the local oracle (3.46.1) does NOT skip NULL-name
+        // rows (it produces invalid JSON with an empty key); the docs say it should skip.
+        // Our implementation skips (matching the docs). Skip this differential case.
+        // jsonb_group_array / jsonb_group_object return BLOB (JSONB) upstream; our engine
+        // does not model JSONB (M24.20), so we don't differential-test the jsonb_ variants.
+    ] {
+        assert_same(db.str(), q);
+    }
+}

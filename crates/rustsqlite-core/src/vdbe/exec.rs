@@ -2541,6 +2541,28 @@ fn finalize_accumulator(mut acc: Accumulator, kind: AggregateKind) -> Value {
         }
         AggregateKind::Min | AggregateKind::Max => acc.best.unwrap_or(Value::Null),
         AggregateKind::GroupConcat => acc.concat.map(Value::Text).unwrap_or(Value::Null),
+        AggregateKind::JsonGroupArray => {
+            let s = match &acc.json_array {
+                Some(cur) => {
+                    let mut s = cur.clone();
+                    s.push(']');
+                    s
+                }
+                None => "[]".to_string(),
+            };
+            Value::Text(s)
+        }
+        AggregateKind::JsonGroupObject => {
+            let s = match &acc.json_object {
+                Some(cur) => {
+                    let mut s = cur.clone();
+                    s.push('}');
+                    s
+                }
+                None => "{}".to_string(),
+            };
+            Value::Text(s)
+        }
         // Window-only built-ins (M11.4–M11.6): their `xFinalize` aliases `xValue` (upstream
         // `#define percent_rankFinalizeFunc percent_rankValueFunc` etc.), so finalize just reads
         // the current state via the mutating `value_mut` path.
@@ -2568,6 +2590,10 @@ fn empty_aggregate_result(kind: AggregateKind) -> Value {
         AggregateKind::Sum | AggregateKind::Avg | AggregateKind::Min | AggregateKind::Max
         | AggregateKind::GroupConcat => Value::Null,
         AggregateKind::Total => Value::Real(0.0),
+        // `json_group_array` / `json_group_object` on an empty set: `[]` / `{}` (upstream
+        // always produces a valid JSON array/object even with no input rows).
+        AggregateKind::JsonGroupArray => Value::Text("[]".to_string()),
+        AggregateKind::JsonGroupObject => Value::Text("{}".to_string()),
         // Window-only built-ins on an empty frame: `row_number`/`rank`/`dense_rank`/`ntile`
         // emit 0 (matches `row_numberValueFunc` on a null `p` and `rankValueFunc` on `nValue=0`);
         // `percent_rank`/`cume_dist` emit 0.0; the value-capture functions emit NULL.

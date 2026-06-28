@@ -47,6 +47,15 @@ pub enum AggregateKind {
     Min,
     Max,
     GroupConcat,
+    /// `json_group_array(X)` — collect every X (including NULLs) into a JSON array. Even an
+    /// empty input produces `[]`. Each X is rendered per the "value argument" rule (NULL →
+    /// `null`, INTEGER/REAL → number, TEXT → quoted JSON string; the JSON-subtype-aware "value
+    /// is JSON if it came from a JSON function" rule is M24.20 and not yet modeled).
+    JsonGroupArray,
+    /// `json_group_object(NAME, VALUE)` — collect every (NAME, VALUE) pair into a JSON object.
+    /// Rows where NAME is NULL are skipped (matching upstream). VALUE is rendered per the
+    /// "value argument" rule. Even an empty input produces `{}`.
+    JsonGroupObject,
     // ---- window-only built-in functions (no plain-aggregate form) ----
     /// `row_number()` — 0 args; default frame `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
     /// Step just bumps a counter; value reads it. No inverse (the frame only grows).
@@ -113,6 +122,12 @@ impl AggregateKind {
             "group_concat" | "string_agg" if n_arg == 1 || n_arg == 2 => {
                 Some(AggregateKind::GroupConcat)
             }
+            "json_group_array" if n_arg == 1 => {
+                Some(AggregateKind::JsonGroupArray)
+            }
+            "json_group_object" if n_arg == 2 => {
+                Some(AggregateKind::JsonGroupObject)
+            }
             // window-only built-ins (M11.4–M11.6)
             "row_number" if n_arg == 0 => Some(AggregateKind::RowNumber),
             "rank" if n_arg == 0 => Some(AggregateKind::Rank),
@@ -138,6 +153,8 @@ impl AggregateKind {
             AggregateKind::Min => "min",
             AggregateKind::Max => "max",
             AggregateKind::GroupConcat => "group_concat",
+            AggregateKind::JsonGroupArray => "json_group_array",
+            AggregateKind::JsonGroupObject => "json_group_object",
             AggregateKind::RowNumber => "row_number",
             AggregateKind::Rank => "rank",
             AggregateKind::DenseRank => "dense_rank",
@@ -180,6 +197,8 @@ impl AggregateKind {
             AggregateKind::Sum | AggregateKind::Total | AggregateKind::Avg | AggregateKind::Min
             | AggregateKind::Max => 1,
             AggregateKind::GroupConcat => 2,
+            AggregateKind::JsonGroupArray => 1,
+            AggregateKind::JsonGroupObject => 2,
             AggregateKind::RowNumber
             | AggregateKind::Rank
             | AggregateKind::DenseRank
@@ -246,8 +265,9 @@ pub fn is_aggregate_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "count" | "sum" | "total" | "avg" | "min" | "max" | "group_concat" | "string_agg"
-            | "row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist" | "ntile"
-            | "first_value" | "last_value" | "nth_value" | "lead" | "lag"
+            | "json_group_array" | "json_group_object" | "row_number" | "rank" | "dense_rank"
+            | "percent_rank" | "cume_dist" | "ntile" | "first_value" | "last_value"
+            | "nth_value" | "lead" | "lag"
     )
 }
 
@@ -320,6 +340,12 @@ pub struct Accumulator {
     /// is reached). For `last_value` this is overwritten on each step; for `first_value` it's
     /// set once; for `nth_value` it's set when `nth_step == N`.
     pub captured: Option<Value>,
+    /// Running JSON array text for `json_group_array` — the accumulated `[..., ..., ...]`
+    /// rendering. `None` until the first step (so an empty aggregate can render `[]`).
+    pub json_array: Option<String>,
+    /// Running JSON object text for `json_group_object` — the accumulated `{"k":v,...}`
+    /// rendering (without the closing `}`). `None` until the first non-NULL-name step.
+    pub json_object: Option<String>,
 }
 
 impl Accumulator {
@@ -341,6 +367,8 @@ impl Accumulator {
             n_param: 0,
             nth_step: 0,
             captured: None,
+            json_array: None,
+            json_object: None,
         }
     }
 
@@ -446,6 +474,57 @@ impl Accumulator {
                     Some(cur) => {
                         cur.push_str(&self.sep);
                         cur.push_str(&text);
+                    }
+                }
+                self.count += 1;
+            }
+            AggregateKind::JsonGroupArray => {
+                // `json_group_array(X)` — collect every X (including NULLs) into a JSON array.
+                // Render each X per the "value argument" rule: NULL → `null`, INTEGER/REAL →
+                // number, TEXT → quoted JSON string. The JSON-subtype-aware rule is M24.20.
+                let arg = args.first().unwrap_or(&Value::Null);
+                let mut rendered = String::new();
+                json_render_value_arg(arg, &mut rendered);
+                match &mut self.json_array {
+                    None => {
+                        let mut s = String::from("[");
+                        s.push_str(&rendered);
+                        self.json_array = Some(s);
+                    }
+                    Some(cur) => {
+                        cur.push(',');
+                        cur.push_str(&rendered);
+                    }
+                }
+                self.count += 1;
+            }
+            AggregateKind::JsonGroupObject => {
+                // `json_group_object(NAME, VALUE)` — skip rows where NAME is NULL (matching
+                // upstream). Render NAME as a quoted JSON string key and VALUE per the "value
+                // argument" rule.
+                let name = args.first().and_then(|v| v.to_text());
+                let name = match name {
+                    Some(n) => n,
+                    None => return, // NULL name → skip this row.
+                };
+                let value = args.get(1).unwrap_or(&Value::Null);
+                let mut key = String::new();
+                crate::func::json::render_string(&name, &mut key);
+                let mut val = String::new();
+                json_render_value_arg(value, &mut val);
+                match &mut self.json_object {
+                    None => {
+                        let mut s = String::from("{");
+                        s.push_str(&key);
+                        s.push(':');
+                        s.push_str(&val);
+                        self.json_object = Some(s);
+                    }
+                    Some(cur) => {
+                        cur.push(',');
+                        cur.push_str(&key);
+                        cur.push(':');
+                        cur.push_str(&val);
                     }
                 }
                 self.count += 1;
@@ -632,6 +711,17 @@ impl Accumulator {
                 }
                 self.count = self.count.saturating_sub(1);
             }
+            // `json_group_array` / `json_group_object` sliding-frame inverse: the accumulated
+            // JSON text is not separable into per-row chunks without re-rendering (a value's
+            // rendered length depends on its type and any escapes). The M11 sliding-frame
+            // codegen rejects these kinds (`window_function_frame_spec_unsupported`), so
+            // `AggInverse` is never emitted for them in the current engine. This arm is
+            // defensive: a hand-built program reaching here leaves the accumulator untouched
+            // (the result would be wrong, but not crash) — matching the M11.8/11.9 note that
+            // the streaming-3-cursor `AggInverse` shape lands with the follow-up.
+            AggregateKind::JsonGroupArray | AggregateKind::JsonGroupObject => {
+                self.count = self.count.saturating_sub(1);
+            }
 
             // ---- window-only built-ins (M11.4–M11.6) ----
             AggregateKind::RowNumber => {
@@ -724,6 +814,30 @@ impl Accumulator {
             AggregateKind::Min | AggregateKind::Max => self.best.clone().unwrap_or(Value::Null),
             AggregateKind::GroupConcat => {
                 self.concat.clone().map(Value::Text).unwrap_or(Value::Null)
+            }
+            AggregateKind::JsonGroupArray => {
+                // Even an empty input produces `[]`.
+                let s = match &self.json_array {
+                    Some(cur) => {
+                        let mut s = cur.clone();
+                        s.push(']');
+                        s
+                    }
+                    None => "[]".to_string(),
+                };
+                Value::Text(s)
+            }
+            AggregateKind::JsonGroupObject => {
+                // Even an empty input produces `{}`.
+                let s = match &self.json_object {
+                    Some(cur) => {
+                        let mut s = cur.clone();
+                        s.push('}');
+                        s
+                    }
+                    None => "{}".to_string(),
+                };
+                Value::Text(s)
             }
             // The window-only built-ins use the mutating [`value_mut`] path; reaching this arm
             // is a bug. Return NULL defensively (matches the empty-frame result for most kinds).
@@ -842,6 +956,28 @@ impl Accumulator {
             // Returning NULL defensively is correct for an empty accumulator and unreachable in
             // a well-formed program.
             _ => Value::Null,
+        }
+    }
+}
+
+/// Render an SQL [`Value`] as a JSON value per the "value argument" rule of the JSON1 docs
+/// (§3.4): NULL → `null`, INTEGER → decimal text, REAL → `fp_to_text`, TEXT → a quoted JSON
+/// string (via `json::render_string`), BLOB → error. This is the same logic as
+/// `json::append_sql_value` but inlined here so the aggregate module doesn't need a `mut`
+/// Result-returning helper. The JSON-subtype-aware "value is JSON if it came from a JSON
+/// function" rule is M24.20 and not yet modeled — a TEXT value is always a quoted string.
+fn json_render_value_arg(arg: &Value, out: &mut String) {
+    match arg {
+        Value::Null => out.push_str("null"),
+        Value::Int(i) => out.push_str(&i.to_string()),
+        Value::Real(r) => out.push_str(&crate::util::fp::fp_to_text(*r)),
+        Value::Text(s) => crate::func::json::render_string(s, out),
+        Value::Blob(_) => {
+            // Mirrors `append_sql_value`'s error; the aggregate step swallows the error
+            // silently (the row's value becomes nothing) rather than aborting the query —
+            // upstream raises the error. For now we push `null` so the array/object stays
+            // well-formed; the M24.20 subtype work will surface the error properly.
+            out.push_str("null");
         }
     }
 }
@@ -1548,5 +1684,47 @@ mod tests {
             AggregateKind::Lag.default_frame(),
             (Rows, UnboundedPreceding, CurrentRow)
         );
+    }
+
+    // ---- M24.18 / M24.19 json_group_array / json_group_object ----
+
+    #[test]
+    fn json_group_array_collects_all_rows() {
+        let mut acc = Accumulator::new(AggregateKind::JsonGroupArray);
+        acc.step(&[Value::Int(1)], false);
+        acc.step(&[Value::Int(2)], false);
+        acc.step(&[Value::Null], false); // NULLs are included
+        acc.step(&[Value::Text("x".into())], false);
+        assert_eq!(acc.value(), Value::Text("[1,2,null,\"x\"]".into()));
+    }
+
+    #[test]
+    fn json_group_array_empty_is_empty_array() {
+        let acc = Accumulator::new(AggregateKind::JsonGroupArray);
+        assert_eq!(acc.value(), Value::Text("[]".into()));
+    }
+
+    #[test]
+    fn json_group_object_collects_pairs() {
+        let mut acc = Accumulator::new(AggregateKind::JsonGroupObject);
+        acc.step(&[Value::Text("a".into()), Value::Int(1)], false);
+        acc.step(&[Value::Text("b".into()), Value::Text("x".into())], false);
+        acc.step(&[Value::Text("c".into()), Value::Null], false);
+        assert_eq!(acc.value(), Value::Text("{\"a\":1,\"b\":\"x\",\"c\":null}".into()));
+    }
+
+    #[test]
+    fn json_group_object_skips_null_name() {
+        let mut acc = Accumulator::new(AggregateKind::JsonGroupObject);
+        acc.step(&[Value::Text("a".into()), Value::Int(1)], false);
+        acc.step(&[Value::Null, Value::Int(2)], false); // NULL name → skipped
+        acc.step(&[Value::Text("c".into()), Value::Int(3)], false);
+        assert_eq!(acc.value(), Value::Text("{\"a\":1,\"c\":3}".into()));
+    }
+
+    #[test]
+    fn json_group_object_empty_is_empty_object() {
+        let acc = Accumulator::new(AggregateKind::JsonGroupObject);
+        assert_eq!(acc.value(), Value::Text("{}".into()));
     }
 }
