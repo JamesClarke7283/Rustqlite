@@ -504,12 +504,12 @@ list every granular item needed.
 
 ## M26 — Collation Sequences
 
-- [ ] **26.1** `NOCASE` collation — case-insensitive ASCII comparison for TEXT
-- [ ] **26.2** `RTRIM` collation — right-trimmed comparison for TEXT (already partially in `mem_compare`)
-- [ ] **26.3** User-defined collation registration (`sqlite3_create_collation`)
-- [ ] **26.4** `PRAGMA collation_list` — enumerate registered collations
-- [ ] **26.5** `COLLATE` clause on expressions, column definitions, index definitions
-- [ ] **26.6** Collation precedence: explicit COLLATE > column default > comparison operand > BINARY
+- [x] **26.1** `NOCASE` collation — case-insensitive ASCII comparison for TEXT
+- [x] **26.2** `RTRIM` collation — right-trimmed comparison for TEXT (already partially in `mem_compare`)
+- [ ] **26.3** User-defined collation registration (`sqlite3_create_collation`) [BLOCKED: M29 infrastructure — `sqlite3_create_collation` is a C-API function (M29.11). The collation enum (`Collation::Binary`/`NoCase`/`RTrim`) is a closed enum in the engine; user-defined collations need either an open collation registry (callback-based) or a string-keyed `Collation` variant threaded through `mem_compare`/sorter/`KeyInfo`. Deferred to a dedicated C-API session alongside M29.]
+- [x] **26.4** `PRAGMA collation_list` — enumerate registered collations
+- [x] **26.5** `COLLATE` clause on expressions, column definitions, index definitions
+- [x] **26.6** Collation precedence: explicit COLLATE > column default > comparison operand > BINARY
 
 ---
 
@@ -1136,12 +1136,12 @@ list every granular item needed.
 
 ## M55 — Collation Sequences (Complete)
 
-- [ ] **55.1** `NOCASE` collation — case-insensitive ASCII comparison for TEXT
-- [ ] **55.2** `RTRIM` collation — right-trimmed comparison for TEXT (already partially in `mem_compare`)
-- [ ] **55.3** User-defined collation registration (`sqlite3_create_collation`)
-- [ ] **55.4** `PRAGMA collation_list` — enumerate registered collations
-- [ ] **55.5** `COLLATE` clause on expressions, column definitions, index definitions
-- [ ] **55.6** Collation precedence: explicit COLLATE > column default > comparison operand > BINARY
+- [x] **55.1** `NOCASE` collation — case-insensitive ASCII comparison for TEXT
+- [x] **55.2** `RTRIM` collation — right-trimmed comparison for TEXT (already partially in `mem_compare`)
+- [ ] **55.3** User-defined collation registration (`sqlite3_create_collation`) [BLOCKED: M29 infrastructure — see M26.3]
+- [x] **55.4** `PRAGMA collation_list` — enumerate registered collations
+- [x] **55.5** `COLLATE` clause on expressions, column definitions, index definitions
+- [x] **55.6** Collation precedence: explicit COLLATE > column default > comparison operand > BINARY
 
 ### M31 — Virtual Tables (Additional Items)
 

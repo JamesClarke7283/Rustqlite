@@ -125,6 +125,12 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   preserves quoted-identifier quotes (e.g. `"col"` stays `"col"`, not unquoted to `col`); unquoting
   is deferred to the full parse.y port. `INDEXED`/`MATCH`/`REGEXP` etc. are reserved in our grammar
   (upstream uses `%fallback ID` so they're contextually reserved); this is a minor divergence.
+  Known parser bug: `expr COLLATE name <infix> expr` (e.g. `WHERE a COLLATE NOCASE = 'X'`) panics
+  in the Pratt fold — the `collate_suffix` is in the middle of the token stream, but
+  `fold_expr` only strips trailing suffixes (BETWEEN/IN/COLLATE/IS DISTINCT FROM) before feeding
+  the rest to the Pratt parser. The column-level `COLLATE` constraint (M26.5) and the
+  postfix-only form `expr COLLATE name` (without a following infix) work correctly; the
+  infix-after-COLLATE form is a known divergence to fix in the full parse.y port.
 - **M3a — Read query path (single-table SELECT)**: ✅ a faithful register VDBE (executor + opcode set),
   code generator (projection, `WHERE` with 3-valued logic, `ORDER BY` via an in-memory sorter,
   `LIMIT`/`OFFSET`, rowid-alias substitution), value comparison + type affinity, the byte-faithful REAL→text
@@ -1132,3 +1138,26 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   (logging side-effect is a no-op). `string_agg(X, Y)` was already wired as a
   `group_concat` alias. Differential-tested vs the C oracle
   (`printf_and_utility_functions` in `diff.rs` — 45+ queries).
+- **M26 — Collation Sequences** ✅: column-level `COLLATE <name>` is now parsed
+  (`ColumnConstraint::Collate { collation }`, mirroring upstream's `c_collate` in `parse.y`)
+  and threaded through the schema (`Column.collation` is set from the constraint instead of
+  hard-coded `BINARY`). The comparison codegen (`compile_jump` and the value-form
+  comparison in `compile_binary`) computes the comparison's collation via
+  `comparison_collation` (mirrors `sqlite3CompareCollation` in `expr.c`) with the upstream
+  precedence — explicit `expr COLLATE name` > column default > BINARY — and attaches it to
+  the `Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge` opcode as `P4::Symbol("NOCASE"|"RTRIM")` so the VDBE
+  compares TEXT under the right sequence. The `expr_collation` helper resolves a column's
+  declared collation across joins (`Ctx::join_tables`), the single table, and the outer
+  scope (correlated subqueries). The `ORDER BY` / `GROUP BY` sorter `KeyInfo` now carries
+  the per-key collation (computed from the *original* pre-rewrite ORDER BY / GROUP BY
+  expression, so a GROUP BY column's collation still applies after the rewrite to `AggRef`);
+  the GROUP BY `Compare` opcode's `KeyInfo` likewise. `PRAGMA collation_list` (M26.4) was
+  already wired. The three built-ins (`BINARY`/`NOCASE`/`RTRIM`) are the closed
+  `Collation` enum; user-defined collations (`sqlite3_create_collation`, M26.3) are
+  BLOCKED on the C-API (M29.11) — the enum would need to open for callback-keyed sequences.
+  Differential-tested vs the C oracle (`collate_probe` in `diff.rs` — NOCASE/RTRIM column
+  equality, ordering, GROUP BY, mixed-binary-and-NOCASE tables) and round-tripped through
+  the C oracle (`collate_column_constraint_roundtrip_and_c_oracle` in `write_roundtrip.rs`).
+  Known divergence: `expr COLLATE name <infix> expr` (e.g. `WHERE a COLLATE NOCASE = 'X'`)
+  panics in the Pratt fold (pre-existing parser bug, documented in the M2 note above); the
+  column-level `COLLATE` constraint and the postfix-only `expr COLLATE name` work correctly.

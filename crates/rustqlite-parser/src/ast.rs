@@ -695,6 +695,9 @@ pub enum ColumnConstraint {
         expr: Expr,
         on_conflict: Option<ConflictAction>,
     },
+    /// Column-level `COLLATE name`. M26 parses this; the collation is resolved in the
+    /// schema layer (`Collation::from_name`) and threaded into comparison codegen (M26.6).
+    Collate { collation: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]

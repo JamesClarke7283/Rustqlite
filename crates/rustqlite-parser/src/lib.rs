@@ -871,6 +871,14 @@ fn build_column_constraint(pair: Pair<'_, Rule>) -> ColumnConstraint {
                 on_conflict,
             }
         }
+        Rule::c_collate => {
+            let collation = inner
+                .into_inner()
+                .find(|p| p.as_rule() == Rule::ident)
+                .map(|p| p.as_str().to_string())
+                .expect("c_collate has a collation name");
+            ColumnConstraint::Collate { collation }
+        }
         other => unreachable!("unexpected constraint {other:?}"),
     }
 }
@@ -2852,6 +2860,46 @@ mod tests {
             &ct.columns[1].constraints[0],
             ColumnConstraint::Check { on_conflict: Some(ConflictAction::Ignore), .. }
         ));
+    }
+
+    #[test]
+    fn column_constraint_collate() {
+        use crate::ColumnConstraint;
+        // Column-level `COLLATE name` (M26.5). Accepts the three built-ins and arbitrary
+        // user-defined names; the engine resolves the built-ins via `Collation::from_name`.
+        let Stmt::CreateTable(ct) = &parse(
+            "CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT COLLATE RTRIM, c TEXT COLLATE \"My_Coll\");",
+        )
+        .unwrap()[0]
+        else {
+            panic!("expected CREATE TABLE")
+        };
+        assert_eq!(ct.columns.len(), 3);
+        assert!(matches!(
+            &ct.columns[0].constraints[0],
+            ColumnConstraint::Collate { collation } if collation == "NOCASE"
+        ));
+        assert!(matches!(
+            &ct.columns[1].constraints[0],
+            ColumnConstraint::Collate { collation } if collation == "RTRIM"
+        ));
+        assert!(matches!(
+            &ct.columns[2].constraints[0],
+            ColumnConstraint::Collate { collation } if collation == "\"My_Coll\""
+        ));
+        // COLLATE composes with other column constraints in any order.
+        let Stmt::CreateTable(ct2) = &parse(
+            "CREATE TABLE t2(a TEXT NOT NULL COLLATE NOCASE UNIQUE);",
+        )
+        .unwrap()[0]
+        else {
+            panic!("expected CREATE TABLE")
+        };
+        assert_eq!(ct2.columns[0].constraints.len(), 3);
+        assert!(ct2.columns[0].constraints.iter().any(|c| matches!(
+            c,
+            ColumnConstraint::Collate { collation } if collation == "NOCASE"
+        )));
     }
 
     #[test]

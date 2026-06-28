@@ -11,7 +11,7 @@ use rustqlite_parser::{BinaryOp, Expr, FunctionArgs, Literal, SelectStmt, UnaryO
 use crate::error::{Error, Result};
 use crate::func;
 use crate::schema::{ColumnRef, IndexObject, Table};
-use crate::types::Affinity;
+use crate::types::{Affinity, Collation};
 use crate::vdbe::program::{aff_to_p5, P4, P5_JUMPIFNULL, P5_NULLEQ, P5_STOREP2};
 use crate::vdbe::Opcode;
 
@@ -636,6 +636,16 @@ fn compile_binary(
         // test r[p3] OP r[p1] = r[rl] OP r[rr]; store into p2 = target.
         let idx = b.emit(opcode, rr, target, rl);
         b.set_p5(idx, p5);
+        // M26.6: thread the comparison's collation into the opcode's P4 (see the jump
+        // form above for the precedence rule).
+        if let Some(coll) = comparison_collation(left, right, ctx) {
+            let name = match coll {
+                Collation::Binary => "BINARY",
+                Collation::NoCase => "NOCASE",
+                Collation::RTrim => "RTRIM",
+            };
+            b.set_p4(idx, P4::Symbol(name.to_string()));
+        }
         return Ok(());
     }
 
@@ -860,6 +870,18 @@ pub fn compile_jump(
             // test r[p3] OP r[p1] = r[rl] OP r[rr]; jump target is p2.
             let idx = b.emit_jump(emit_op, rr, label, rl);
             b.set_p5(idx, p5);
+            // M26.6: thread the comparison's collation into the opcode's P4 so the VDBE
+            // compares TEXT under the right sequence (NOCASE/RTRIM/explicit COLLATE). The
+            // precedence is explicit COLLATE > column default > BINARY; BINARY is encoded
+            // by the absence of a P4 (the VDBE defaults to BINARY).
+            if let Some(coll) = comparison_collation(left, right, ctx) {
+                let name = match coll {
+                    Collation::Binary => "BINARY",
+                    Collation::NoCase => "NOCASE",
+                    Collation::RTrim => "RTRIM",
+                };
+                b.set_p4(idx, P4::Symbol(name.to_string()));
+            }
             Ok(())
         }
         other => {
@@ -949,6 +971,99 @@ fn expr_affinity(e: &Expr, ctx: Ctx) -> Option<Affinity> {
             None => None,
         },
         _ => None,
+    }
+}
+
+/// The collation of an expression for comparison purposes, mirroring upstream's
+/// `sqlite3CompareCollation` (the `p4` collation attached to a comparison opcode). The
+/// precedence is: an explicit `expr COLLATE name` clause wins; otherwise a column's
+/// declared collation (searching both sides — at most one side should carry a declared
+/// collation in a typical comparison); otherwise `BINARY`. Returns `None` when no collation
+/// is needed (BINARY is the default and is encoded by the absence of a `P4::Symbol`).
+fn comparison_collation(left: &Expr, right: &Expr, ctx: Ctx) -> Option<Collation> {
+    let lc = expr_collation(left, ctx);
+    let rc = expr_collation(right, ctx);
+    match (lc, rc) {
+        (Some(c), _) | (_, Some(c)) => {
+            if c == Collation::Binary {
+                None
+            } else {
+                Some(c)
+            }
+        }
+        (None, None) => None,
+    }
+}
+
+/// The collation carried by a single expression: an explicit `COLLATE` clause, or a column's
+/// declared collation. Returns `None` for expressions with no collation (literals, computed
+/// values, columns with the default BINARY collation — `None` lets `comparison_collation`
+/// fall through to the other side or to BINARY).
+pub(crate) fn expr_collation(e: &Expr, ctx: Ctx) -> Option<Collation> {
+    match e {
+        Expr::Collate { expr, collation } => {
+            // An explicit COLLATE wins. Resolve by name; an unknown collation falls through
+            // to the underlying expression (upstream raises "no such collation" lazily; we
+            // treat it as BINARY here so the comparison still runs).
+            Collation::from_name(collation)
+                .or_else(|| expr_collation(expr, ctx))
+        }
+        Expr::Column { table, name, .. } => {
+            resolve_column_collation(table.as_deref(), name, ctx)
+        }
+        _ => None,
+    }
+}
+
+/// Look up a column's declared collation, searching `Ctx::join_tables` first (for joins),
+/// then the single `Ctx::table`, then the outer scope (for correlated subqueries). Returns
+/// `None` for the default BINARY collation (so it falls through in `comparison_collation`).
+fn resolve_column_collation(qualifier: Option<&str>, name: &str, ctx: Ctx) -> Option<Collation> {
+    // Joins: resolve via the named table (qualifier matches the table name or its alias), or
+    // the first table that has the column for a bare ref.
+    if let Some(jt) = ctx.join_tables {
+        let found: Option<(&Table, ColumnRef)> = if let Some(q) = qualifier {
+            jt.iter().find(|t| t.name.eq_ignore_ascii_case(q)).and_then(|t| {
+                t.table.resolve_column(name).map(|cr| (t.table, cr))
+            })
+        } else {
+            jt.iter().find_map(|t| {
+                t.table.resolve_column(name).map(|cr| (t.table, cr))
+            })
+        };
+        if let Some((table, cr)) = found {
+            return column_collation(table, cr);
+        }
+    }
+    // Single table. For a qualified ref (`tbl.col`), only match the named table; for a bare
+    // ref, the single table is the only candidate.
+    if let Some(q) = qualifier {
+        if !ctx.table.name.eq_ignore_ascii_case(q) {
+            return None;
+        }
+    }
+    if let Some(cr) = ctx.table.resolve_column(name) {
+        return column_collation(ctx.table, cr);
+    }
+    // Outer scope (correlated subquery). The collation is read-only metadata; the sentinel
+    // cursor is rewritten at inline time, but the column's declared collation is stable.
+    if let Some(outer) = ctx.outer {
+        if let Some((ot, cr)) = lookup_outer(outer, qualifier, name) {
+            return column_collation(ot.table, cr);
+        }
+    }
+    None
+}
+
+/// A column's declared collation, or `None` when it's the default BINARY (so it falls
+/// through in `comparison_collation`). The rowid alias has no declared collation.
+fn column_collation(table: &Table, cr: ColumnRef) -> Option<Collation> {
+    match cr {
+        ColumnRef::Index(i) => {
+            let c = table.columns[i].collation;
+            if c == Collation::Binary { None } else { Some(c) }
+        }
+        ColumnRef::Rowid => None,
     }
 }
 

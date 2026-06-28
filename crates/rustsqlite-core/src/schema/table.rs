@@ -225,6 +225,7 @@ impl Table {
             let mut notnull_oe = OeAction::None;
             let mut pk = false;
             let mut default: Option<rustqlite_parser::Expr> = None;
+            let mut collation = Collation::Binary;
             for c in &cd.constraints {
                 match c {
                     ColumnConstraint::NotNull { on_conflict } => {
@@ -262,6 +263,14 @@ impl Table {
                             col_idx: Some(i),
                         });
                     }
+                    ColumnConstraint::Collate { collation: cname } => {
+                        if let Some(c) = Collation::from_name(cname) {
+                            collation = c;
+                        }
+                        // Unknown collation names are silently left as BINARY, matching
+                        // upstream's no-op for unrecognized sequences (a user-defined
+                        // collation would need sqlite3_create_collation, M26.3/M29.11).
+                    }
                     _ => {}
                 }
             }
@@ -269,7 +278,7 @@ impl Table {
                 name: cd.name.clone(),
                 type_name: cd.type_name.clone(),
                 affinity,
-                collation: Collation::Binary,
+                collation,
                 notnull,
                 pk,
                 default,

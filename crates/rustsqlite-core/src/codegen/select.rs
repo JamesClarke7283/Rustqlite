@@ -295,14 +295,21 @@ fn compile_aggregate(
 
     // (D') Open the output sorter when ORDER BY is present. The record layout is
     // `[order_by_keys..., projection_columns...]`; the KeyInfo carries the ORDER BY
-    // directions and BINARY collation (a future task threads through explicit COLLATE).
+    // directions and per-key collation (M26.6: explicit COLLATE > column default > BINARY).
+    // The collation is computed from the *original* (pre-rewrite) ORDER BY expression so
+    // that a GROUP BY column's collation still applies after the rewrite to `AggRef`.
     if has_order_by {
         let keyinfo: Vec<KeyField> = select
             .order_by
             .iter()
-            .map(|t| KeyField {
-                desc: t.desc,
-                collation: crate::types::Collation::Binary,
+            .map(|t| {
+                let orig_expr = resolve_order_term(t, outputs).ok();
+                KeyField {
+                    desc: t.desc,
+                    collation: orig_expr
+                        .and_then(|e| super::expr::expr_collation(&e, ctx))
+                        .unwrap_or(crate::types::Collation::Binary),
+                }
             })
             .collect();
         let so = b.emit(Opcode::SorterOpen, output_sorter, norder + ncol, 0);
@@ -442,12 +449,16 @@ fn compile_aggregate(
     let n_filter_cols: i32 = agg_has_filter.iter().filter(|&&x| x).count() as i32;
     let n_sorter_fields = nkey + total_agg_args + n_filter_cols;
 
-    // KeyInfo for the sorter: the GROUP BY keys, ASC BINARY (matches SQLite's default group
-    // ordering; a future task threads through explicit COLLATE / DESC).
+    // KeyInfo for the sorter: the GROUP BY keys, ASC with per-key collation (M26.6:
+    // explicit COLLATE > column default > BINARY).
     let keyinfo: Vec<KeyField> = select
         .group_by
         .iter()
-        .map(|_| KeyField::asc_binary())
+        .map(|e| KeyField {
+            desc: false,
+            collation: super::expr::expr_collation(e, ctx)
+                .unwrap_or(crate::types::Collation::Binary),
+        })
         .collect();
     let sorter = 1i32;
     let so = b.emit(Opcode::SorterOpen, sorter, n_sorter_fields, 0);
@@ -570,11 +581,16 @@ fn compile_aggregate(
     let addr_step_only = b.new_label();
     let addr_group_changed = b.new_label();
     {
-        // We need a KeyInfo on the Compare. Reuse the GROUP BY KeyInfo (ASC BINARY).
+        // We need a KeyInfo on the Compare. Reuse the GROUP BY KeyInfo with per-key
+        // collation (M26.6).
         let cmp_ki: Vec<KeyField> = select
             .group_by
             .iter()
-            .map(|_| KeyField::asc_binary())
+            .map(|e| KeyField {
+                desc: false,
+                collation: super::expr::expr_collation(e, ctx)
+                    .unwrap_or(crate::types::Collation::Binary),
+            })
             .collect();
         let cmp = b.emit(Opcode::Compare, i_amem, i_bmem, nkey);
         b.set_p4(cmp, P4::KeyInfo(cmp_ki));
@@ -1961,9 +1977,14 @@ fn compile_scan_ordered(
 
     let keyinfo: Vec<KeyField> = order
         .iter()
-        .map(|t| KeyField {
-            desc: t.desc,
-            collation: crate::types::Collation::Binary,
+        .map(|t| {
+            let key_expr = resolve_order_term(t, outputs).ok();
+            KeyField {
+                desc: t.desc,
+                collation: key_expr
+                    .and_then(|e| super::expr::expr_collation(&e, ctx))
+                    .unwrap_or(crate::types::Collation::Binary),
+            }
         })
         .collect();
     let so = b.emit(Opcode::SorterOpen, sorter, nkey + ncol, 0);

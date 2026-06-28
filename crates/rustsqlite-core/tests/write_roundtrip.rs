@@ -3579,3 +3579,47 @@ fn pragma_table_info_matches_oracle() {
         }
     }
 }
+
+#[test]
+fn collate_column_constraint_roundtrip_and_c_oracle() {
+    skip_if_no_sqlite3!();
+    // M26: column-level COLLATE NOCASE / RTRIM honored in WHERE, ORDER BY, GROUP BY, and
+    // round-trips through the C oracle (the stored CREATE TABLE text is read back by
+    // C SQLite, and a Rustqlite-written DB is readable by C SQLite).
+    let db = TempDb::new("collate_col_ours");
+    {
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        exec(&mut conn, "CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT COLLATE RTRIM);");
+        exec(&mut conn, "INSERT INTO t VALUES ('Apple','foo  '), ('banana','bar'), ('CHERRY','baz   ');");
+
+        // NOCASE column: case-insensitive equality and ordering.
+        let (mut s, _) = sqlite3_prepare_v2(&mut conn, "SELECT a FROM t WHERE a = 'APPLE' ORDER BY a;").unwrap();
+        // 'Apple' matches 'APPLE' under NOCASE; 'banana' and 'CHERRY' do not.
+        assert_eq!(collect(&mut s), vec![
+            vec![Value::Text("Apple".into())],
+        ]);
+
+        // RTRIM column: trailing-space-insensitive equality.
+        let (mut s, _) = sqlite3_prepare_v2(&mut conn, "SELECT b FROM t WHERE b = 'foo' ORDER BY b;").unwrap();
+        assert_eq!(collect(&mut s), vec![vec![Value::Text("foo  ".into())]]);
+
+        // GROUP BY on a NOCASE column groups case-variants together.
+        let (mut s, _) = sqlite3_prepare_v2(&mut conn, "SELECT count(*) FROM t GROUP BY a ORDER BY a;").unwrap();
+        let rows = collect(&mut s);
+        assert_eq!(rows.len(), 3); // three groups, one row each
+    }
+    assert_eq!(db.query("PRAGMA integrity_check;"), "ok");
+
+    // C oracle reads the Rustqlite-written DB and produces the same results.
+    let expected = {
+        let ora = TempDb::new("collate_col_ora");
+        let mut oconn = sqlite3_open(ora.str()).expect("open");
+        exec(&mut oconn, "CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT COLLATE RTRIM);");
+        exec(&mut oconn, "INSERT INTO t VALUES ('Apple','foo  '), ('banana','bar'), ('CHERRY','baz   ');");
+        let (mut s, _) = sqlite3_prepare_v2(&mut oconn, "SELECT a FROM t WHERE a = 'APPLE' ORDER BY a;").unwrap();
+        collect(&mut s)
+    };
+    let mut conn = sqlite3_open(db.str()).expect("open");
+    let (mut s, _) = sqlite3_prepare_v2(&mut conn, "SELECT a FROM t WHERE a = 'APPLE' ORDER BY a;").unwrap();
+    assert_eq!(collect(&mut s), expected);
+}

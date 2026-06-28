@@ -3022,3 +3022,41 @@ fn printf_and_utility_functions() {
         "oracle should also error on load_extension"
     );
 }
+
+#[test]
+fn collate_probe() {
+    if !sqlite3_available() { return; }
+    let db = TempDb::new();
+    db.setup("CREATE TABLE t(a TEXT COLLATE NOCASE); INSERT INTO t VALUES ('Apple'),('banana'),('CHERRY');");
+    for q in [
+        "SELECT a FROM t WHERE a = 'APPLE';",
+        "SELECT a FROM t WHERE a = 'apple' ORDER BY a;",
+        "SELECT a FROM t WHERE a < 'b' ORDER BY a;",
+        "SELECT a FROM t ORDER BY a;",
+        "SELECT a FROM t WHERE a LIKE 'APP%' ORDER BY a;",
+        "SELECT a FROM t WHERE a IS 'APPLE' ORDER BY a;",
+        "SELECT a FROM t GROUP BY a ORDER BY a;",
+    ] {
+        assert_same(db.str(), q);
+    }
+    // RTRIM collation
+    let db2 = TempDb::new();
+    db2.setup("CREATE TABLE t2(a TEXT COLLATE RTRIM); INSERT INTO t2 VALUES ('foo'),('foo   '),('bar  ');");
+    for q in [
+        "SELECT a FROM t2 WHERE a = 'foo' ORDER BY a;",
+        "SELECT a FROM t2 WHERE a = 'foo   ' ORDER BY a;",
+        "SELECT a FROM t2 ORDER BY a;",
+    ] {
+        assert_same(db2.str(), q);
+    }
+    // Mixed: a column with default BINARY vs NOCASE in same query
+    let db3 = TempDb::new();
+    db3.setup("CREATE TABLE t3(a TEXT, b TEXT COLLATE NOCASE); INSERT INTO t3 VALUES ('ABC','abc'),('def','DEF'),('GHI','xyz');");
+    for q in [
+        "SELECT a, b FROM t3 WHERE b = 'ABC' ORDER BY a;",
+        "SELECT a, b FROM t3 WHERE a = 'ABC' ORDER BY a;",
+        "SELECT a, b FROM t3 WHERE b < 'Y' ORDER BY a;",
+    ] {
+        assert_same(db3.str(), q);
+    }
+}
