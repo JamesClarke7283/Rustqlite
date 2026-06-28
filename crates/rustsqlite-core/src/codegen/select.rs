@@ -106,9 +106,12 @@ pub fn compile_with_outer(
     } else {
         match table {
             Some(t) => {
+                let hint = select.from.first()
+                    .and_then(|tj| tj.table())
+                    .and_then(|tref| tref.indexed_by.as_ref());
                 if is_aggregate_query(select, &outputs) {
                     compile_aggregate(select, t, &outputs, limit, offset, subquery_resolver, outer)?
-                } else if let Some(plan) = pick_index(select, t, indexes) {
+                } else if let Some(plan) = pick_index(select, t, indexes, hint)? {
                     compile_indexed_select(select, t, &plan, &outputs, limit, offset, subquery_resolver, outer)?
                 } else {
                     compile_scan(select, t, &outputs, limit, offset, subquery_resolver, outer)?
@@ -997,75 +1000,194 @@ fn compile_indexed_select(
         b.emit_jump(Opcode::Rewind, idx_cursor, end_seek, 0);
     }
 
-    // DISTINCT dedup cursor (opened before the loop so it survives across iterations).
-    let distinct_cursor_id = if covering { 1i32 } else { 2i32 };
-    let distinct_cursor = select.distinct.then(|| {
-        let c = 2i32;
-        let oe = b.emit(Opcode::OpenEphemeral, c, ncol, 0);
-        b.set_p4(oe, P4::KeyInfo(Vec::new()));
-        b.note_cursor(c);
-        c
-    });
+    // When the index is forced (INDEXED BY) but does not satisfy the ORDER BY, the scan feeds
+    // a sorter that re-orders the rows by the ORDER BY keys (mirrors the oracle's
+    // `SCAN t USING INDEX <name>` + `USE TEMP B-TREE FOR ORDER BY`). The sorter-backed path
+    // diverges from the direct-emission path here; the direct path is the original M5.1/M5.2
+    // shape (ResultRow inside the scan loop).
+    let sorter_path = plan.needs_sorter;
+    if sorter_path {
+        // The sorter scan function resolves `end_seek` and emits its own `Halt`.
+        compile_indexed_sorter_scan(
+            &mut b, select, ctx, outputs, ncol,
+            idx_cursor, end_seek, nkey, key_reg,
+            limit_reg, offset_reg,
+        )?;
+    } else {
+        // DISTINCT dedup cursor (opened before the loop so it survives across iterations).
+        let distinct_cursor = select.distinct.then(|| {
+            let c = 2i32;
+            let oe = b.emit(Opcode::OpenEphemeral, c, ncol, 0);
+            b.set_p4(oe, P4::KeyInfo(Vec::new()));
+            b.note_cursor(c);
+            c
+        });
 
-    // (3) Loop body. The IdxGT boundary check is re-emitted at the top of every iteration
-    // (only for the WHERE-equality shape) so the loop terminates when the index key prefix
-    // no longer matches. A covering plan skips the IdxRowid + NotExists table lookup.
-    let loop_top = b.new_label();
-    b.resolve(loop_top);
-    if nkey > 0 {
-        let idx_gt = b.emit_jump(Opcode::IdxGT, idx_cursor, end_seek, key_reg.unwrap());
-        b.set_p4(idx_gt, P4::Int(nkey as i64));
-    }
-    let idx_next = b.new_label();
-    if !covering {
-        let rowid_reg = b.alloc_reg();
-        b.emit(Opcode::IdxRowid, idx_cursor, rowid_reg, 0);
-        b.emit_jump(Opcode::NotExists, table_cursor, idx_next, rowid_reg);
-    }
+        // (3) Loop body. The IdxGT boundary check is re-emitted at the top of every iteration
+        // (only for the WHERE-equality shape) so the loop terminates when the index key prefix
+        // no longer matches. A covering plan skips the IdxRowid + NotExists table lookup.
+        let loop_top = b.new_label();
+        b.resolve(loop_top);
+        if nkey > 0 {
+            let idx_gt = b.emit_jump(Opcode::IdxGT, idx_cursor, end_seek, key_reg.unwrap());
+            b.set_p4(idx_gt, P4::Int(nkey as i64));
+        }
+        let idx_next = b.new_label();
+        if !covering {
+            let rowid_reg = b.alloc_reg();
+            b.emit(Opcode::IdxRowid, idx_cursor, rowid_reg, 0);
+            b.emit_jump(Opcode::NotExists, table_cursor, idx_next, rowid_reg);
+        }
 
-    // Re-check the WHERE clause on the row. The SeekGE+IdxGT only verified the indexed-column
-    // equality prefix; a WHERE with additional terms (or a non-equality predicate that the
-    // planner couldn't turn into a prefix, like `IS NULL`) is re-evaluated here against the
-    // row's column values. For a covering plan the columns are read from the index cursor
-    // (via `ctx.index_read`); for a non-covering plan they're read from the table cursor.
-    if let Some(w) = &select.where_clause {
-        compile_jump(&mut b, w, idx_next, false, true, ctx)?;
-    }
+        // Re-check the WHERE clause on the row. The SeekGE+IdxGT only verified the indexed-column
+        // equality prefix; a WHERE with additional terms (or a non-equality predicate that the
+        // planner couldn't turn into a prefix, like `IS NULL`) is re-evaluated here against the
+        // row's column values. For a covering plan the columns are read from the index cursor
+        // (via `ctx.index_read`); for a non-covering plan they're read from the table cursor.
+        if let Some(w) = &select.where_clause {
+            compile_jump(&mut b, w, idx_next, false, true, ctx)?;
+        }
 
-    // OFFSET gate.
-    if let Some(oreg) = offset_reg {
-        b.emit_jump(Opcode::IfPos, oreg, idx_next, 1);
-    }
+        // OFFSET gate.
+        if let Some(oreg) = offset_reg {
+            b.emit_jump(Opcode::IfPos, oreg, idx_next, 1);
+        }
 
-    // Project the result columns.
-    let result_reg = b.alloc_regs(ncol);
-    for (j, (expr, _)) in outputs.iter().enumerate() {
-        compile_expr(&mut b, expr, result_reg + j as i32, ctx)?;
-    }
-    if let Some(dc) = distinct_cursor {
-        let found = b.emit_jump(Opcode::Found, dc, idx_next, result_reg);
-        b.set_p4(found, P4::Int(ncol as i64));
-        let rec = b.alloc_reg();
-        b.emit(Opcode::MakeRecord, result_reg, ncol, rec);
-        b.emit(Opcode::IdxInsert, dc, rec, 0);
-    }
-    b.emit(Opcode::ResultRow, result_reg, ncol, 0);
-    if let Some(lreg) = limit_reg {
-        b.emit_jump(Opcode::DecrJumpZero, lreg, end_seek, 0);
-    }
+        // Project the result columns.
+        let result_reg = b.alloc_regs(ncol);
+        for (j, (expr, _)) in outputs.iter().enumerate() {
+            compile_expr(&mut b, expr, result_reg + j as i32, ctx)?;
+        }
+        if let Some(dc) = distinct_cursor {
+            let found = b.emit_jump(Opcode::Found, dc, idx_next, result_reg);
+            b.set_p4(found, P4::Int(ncol as i64));
+            let rec = b.alloc_reg();
+            b.emit(Opcode::MakeRecord, result_reg, ncol, rec);
+            b.emit(Opcode::IdxInsert, dc, rec, 0);
+        }
+        b.emit(Opcode::ResultRow, result_reg, ncol, 0);
+        if let Some(lreg) = limit_reg {
+            b.emit_jump(Opcode::DecrJumpZero, lreg, end_seek, 0);
+        }
 
-    // Advance: next index entry, jumping back to the top of the body. `idx_next` is the
-    // "skip this row" target — it lands on the `Next` so the cursor still advances (a skip
-    // must NOT terminate the scan). `end_seek` is the "stop the scan" target (Halt).
-    b.resolve(idx_next);
-    b.emit_jump(Opcode::Next, idx_cursor, loop_top, 0);
-    b.resolve(end_seek);
+        // Advance: next index entry, jumping back to the top of the body. `idx_next` is the
+        // "skip this row" target — it lands on the `Next` so the cursor still advances (a skip
+        // must NOT terminate the scan). `end_seek` is the "stop the scan" target (Halt).
+        b.resolve(idx_next);
+        b.emit_jump(Opcode::Next, idx_cursor, loop_top, 0);
+        b.resolve(end_seek);
 
-    b.emit(Opcode::Halt, 0, 0, 0);
+        b.emit(Opcode::Halt, 0, 0, 0);
+    }
+    // When the sorter path was taken, `end_seek` is already resolved and the Halt emitted
+    // inside the helper; this block is skipped. The setup trampoline is shared.
     b.resolve(setup);
     b.emit(Opcode::Transaction, 0, 0, 0);
     b.emit(Opcode::Goto, 0, after_init, 0);
     Ok(b.finish())
+}
+
+/// The sorter-backed indexed scan (the `INDEXED BY <name>` + `ORDER BY` shape). The index has
+/// already been positioned (SeekGE for a WHERE-equality prefix, else Rewind); this function
+/// drives the scan loop, builds `[order_keys..., outputs...]` records, sorts them, and emits
+/// the sorted output with OFFSET/LIMIT — mirroring `compile_scan_ordered` but reading via the
+/// index cursor (with a table lookup when the index is non-covering).
+#[allow(clippy::too_many_arguments)]
+fn compile_indexed_sorter_scan(
+    b: &mut ProgramBuilder,
+    select: &SelectStmt,
+    ctx: Ctx,
+    outputs: &[(Expr, String)],
+    ncol: i32,
+    idx_cursor: i32,
+    end_seek: Label,
+    nkey: i32,
+    key_reg: Option<i32>,
+    limit_reg: Option<i32>,
+    offset_reg: Option<i32>,
+) -> Result<()> {
+    let covering = ctx.index_read.is_some();
+    let table_cursor = 1i32;
+    let sorter = if covering { 1i32 } else { 2i32 };
+    let order = &select.order_by;
+    let nkey_order = order.len() as i32;
+
+    let keyinfo: Vec<KeyField> = order
+        .iter()
+        .map(|t| {
+            let key_expr = resolve_order_term(t, outputs).ok();
+            KeyField {
+                desc: t.desc,
+                collation: key_expr
+                    .and_then(|e| super::expr::expr_collation(&e, ctx))
+                    .unwrap_or(crate::types::Collation::Binary),
+            }
+        })
+        .collect();
+    let so = b.emit(Opcode::SorterOpen, sorter, nkey_order + ncol, 0);
+    b.set_p4(so, P4::KeyInfo(keyinfo));
+    b.note_cursor(sorter);
+
+    // --- scan loop: filter, build [keys..., outputs...] records, insert into the sorter ---
+    let scan_top = b.new_label();
+    b.resolve(scan_top);
+    if nkey > 0 {
+        let idx_gt = b.emit_jump(Opcode::IdxGT, idx_cursor, end_seek, key_reg.unwrap());
+        b.set_p4(idx_gt, P4::Int(nkey as i64));
+    }
+    let scan_next = b.new_label();
+    if !covering {
+        let rowid_reg = b.alloc_reg();
+        b.emit(Opcode::IdxRowid, idx_cursor, rowid_reg, 0);
+        b.emit_jump(Opcode::NotExists, table_cursor, scan_next, rowid_reg);
+    }
+
+    // Re-check the WHERE clause on the row.
+    if let Some(w) = &select.where_clause {
+        compile_jump(b, w, scan_next, false, true, ctx)?;
+    }
+
+    let block = b.alloc_regs(nkey_order + ncol);
+    for (k, term) in order.iter().enumerate() {
+        let key_expr = resolve_order_term(term, outputs)?;
+        compile_expr(b, &key_expr, block + k as i32, ctx)?;
+    }
+    for (j, (expr, _)) in outputs.iter().enumerate() {
+        compile_expr(b, expr, block + nkey_order + j as i32, ctx)?;
+    }
+    let rec = b.alloc_reg();
+    b.emit(Opcode::MakeRecord, block, nkey_order + ncol, rec);
+    b.emit(Opcode::SorterInsert, sorter, rec, 0);
+    b.resolve(scan_next);
+    b.emit_jump(Opcode::Next, idx_cursor, scan_top, 0);
+    // The scan loop exits to the sorter output section when `Next` falls through (cursor
+    // exhausted) or when an `IdxGT` boundary check jumps to `end_seek`. Resolve `end_seek`
+    // here so both paths land at the start of the output section.
+    b.resolve(end_seek);
+
+    // --- output loop: sorted iteration with OFFSET/LIMIT ---
+    let end_out = b.new_label();
+    b.emit_jump(Opcode::SorterSort, sorter, end_out, 0);
+    let out_top = b.cur_addr();
+    let sort_next = b.new_label();
+    b.emit(Opcode::SorterData, sorter, 0, 0);
+    if let Some(oreg) = offset_reg {
+        b.emit_jump(Opcode::IfPos, oreg, sort_next, 1);
+    }
+    let result_reg = b.alloc_regs(ncol);
+    for j in 0..ncol {
+        // Output column j lives at record index nkey_order+j.
+        b.emit(Opcode::Column, sorter, nkey_order + j, result_reg + j);
+    }
+    b.emit(Opcode::ResultRow, result_reg, ncol, 0);
+    if let Some(lreg) = limit_reg {
+        b.emit_jump(Opcode::DecrJumpZero, lreg, end_out, 0);
+    }
+    b.resolve(sort_next);
+    b.emit(Opcode::SorterNext, sorter, out_top, 0);
+    b.resolve(end_out);
+    b.emit(Opcode::Halt, 0, 0, 0);
+    Ok(())
 }
 
 /// Build the covering-index column-position map: `column_positions[table_col_idx]` = position

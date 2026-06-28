@@ -520,7 +520,7 @@ list every granular item needed.
 - [ ] **27.3** Index selection for multi-column WHERE clauses (pick best index)
 - [ ] **27.4** Index scan for ORDER BY (avoid sorter when index provides ordering)
 - [ ] **27.5** Index scan for both WHERE + ORDER BY (prefix of index for WHERE, suffix for ORDER BY)
-- [ ] **27.6** `INDEXED BY` / `NOT INDEXED` table hints
+- [x] **27.6** `INDEXED BY` / `NOT INDEXED` table hints
 - [ ] **27.7** Automatic index creation for correlated subqueries (autoindex)
 - [ ] **27.8** Partial index matching (only use index if WHERE clause satisfies index's partial condition)
 - [ ] **27.9** Constant propagation (if `WHERE col = const` then replace col with const)

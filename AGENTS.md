@@ -1161,3 +1161,23 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   Known divergence: `expr COLLATE name <infix> expr` (e.g. `WHERE a COLLATE NOCASE = 'X'`)
   panics in the Pratt fold (pre-existing parser bug, documented in the M2 note above); the
   column-level `COLLATE` constraint and the postfix-only `expr COLLATE name` work correctly.
+- **M27 — Query Planner / Optimizer** 🚧: **27.6 `INDEXED BY` / `NOT INDEXED` table hints** ✅
+  — the parser already captured the hint (M2.54); the planner now consumes it. `pick_index`
+  accepts an `Option<&IndexedBy>` hint: `NotIndexed` forces a table scan (returns `None`),
+  `Index(name)` forces the named index (raising the oracle-matched `"no such index: <name>"`
+  when absent), and `None` is the unconstrained planner pick. A forced index is used even when
+  it provides no benefit (a full index scan via `Rewind`+`Next`); when the forced index does
+  not satisfy `ORDER BY`, the codegen wraps the index scan in a sorter
+  (`compile_indexed_sorter_scan`) — mirrors the oracle's `SCAN t USING INDEX <name>` +
+  `USE TEMP B-TREE FOR ORDER BY`. The `IndexPlan` gained a `needs_sorter` flag set iff forced
+  && ORDER BY present && `!order_by_satisfied`. The `plan_for_index` helper factors the
+  per-index evaluation shared between the unconstrained loop and the forced path (the forced
+  path skips the partial-index usability check, mirroring upstream's behavior of using a
+  forced index regardless of its predicate). `EXPLAIN QUERY PLAN` already emitted the right
+  detail strings (the existing `order_by_satisfied=false` logic produces the
+  `USE TEMP B-TREE FOR ORDER BY` row). Differential-tested vs the C oracle
+  (`indexed_by_and_not_indexed_hints` in `diff.rs` — forced full/covering/equality/ORDER-BY
+  scans, `NOT INDEXED` scans, and the `no such index` error) and EQP-matched
+  (`eqp_index_plan_details_match_oracle`). Still M27+: cost-based join ordering (needs
+  ANALYZE/M22), automatic index for correlated subqueries, constant propagation,
+  LIKE/BETWEEN optimization, MIN/MAX optimization.

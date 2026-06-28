@@ -1196,6 +1196,13 @@ fn eqp_index_plan_details_match_oracle() {
         "SELECT a FROM t",
         "SELECT a,b FROM t WHERE a=1 AND b=2",
         "SELECT c FROM t ORDER BY a,b",
+        // M27.6: `INDEXED BY` / `NOT INDEXED` hints — the EQP must reflect the forced plan.
+        "SELECT * FROM t INDEXED BY idx_a",
+        "SELECT * FROM t INDEXED BY idx_a WHERE a=1",
+        "SELECT a FROM t INDEXED BY idx_a ORDER BY a",
+        "SELECT * FROM t INDEXED BY idx_a ORDER BY b",
+        "SELECT * FROM t NOT INDEXED",
+        "SELECT * FROM t NOT INDEXED ORDER BY a",
     ] {
         let eqp = format!("EXPLAIN QUERY PLAN {q}");
         let expected: Vec<String> = sqlite3_rows(db.str(), &eqp)
@@ -3059,4 +3066,72 @@ fn collate_probe() {
     ] {
         assert_same(db3.str(), q);
     }
+}
+
+/// `INDEXED BY <name>` / `NOT INDEXED` table hints (M27.6). The hint forces the planner's
+/// hand: `INDEXED BY name` uses the named index even when it provides no benefit (a full
+/// index scan, with a sorter when ORDER BY isn't satisfied); `NOT INDEXED` forbids using
+/// any index. Result rows must match the oracle byte-for-byte; the "no such index" error
+/// for a missing forced index is also oracle-matched.
+#[test]
+fn indexed_by_and_not_indexed_hints() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup(
+        "CREATE TABLE t(a, b, c);\
+         CREATE INDEX i1 ON t(a);\
+         CREATE INDEX i2 ON t(b);\
+         INSERT INTO t VALUES (1,2,3),(4,5,6),(7,8,9),(1,2,99),(3,1,5),(2,9,8);",
+    );
+    for q in [
+        // `INDEXED BY i1` with no WHERE — a full scan of index i1 (no benefit, but forced).
+        "SELECT * FROM t INDEXED BY i1;",
+        // `INDEXED BY i1` with a WHERE on the indexed column — a SEARCH.
+        "SELECT * FROM t INDEXED BY i1 WHERE a = 1;",
+        "SELECT * FROM t INDEXED BY i1 WHERE a = 4;",
+        // `INDEXED BY i1` with a WHERE on a *non-indexed* column — forced to scan i1 anyway.
+        "SELECT * FROM t INDEXED BY i1 WHERE b = 5;",
+        // `INDEXED BY i1` with ORDER BY on the indexed column — the index provides order.
+        "SELECT a FROM t INDEXED BY i1 ORDER BY a;",
+        "SELECT a, b FROM t INDEXED BY i1 ORDER BY a;",
+        // `INDEXED BY i1` with ORDER BY on a *different* column — the index doesn't satisfy
+        // ORDER BY, so a sorter is needed (`SCAN t USING INDEX i1` + `USE TEMP B-TREE`).
+        "SELECT * FROM t INDEXED BY i1 ORDER BY b;",
+        "SELECT * FROM t INDEXED BY i1 ORDER BY b DESC;",
+        "SELECT a, b FROM t INDEXED BY i1 ORDER BY b;",
+        "SELECT a, b FROM t INDEXED BY i1 ORDER BY b LIMIT 3;",
+        "SELECT a, b FROM t INDEXED BY i1 ORDER BY b LIMIT 2 OFFSET 1;",
+        // `INDEXED BY i2` (on b) — a different forced index.
+        "SELECT * FROM t INDEXED BY i2 WHERE a = 1;",
+        "SELECT a, b FROM t INDEXED BY i2 WHERE a > 1;",
+        "SELECT * FROM t INDEXED BY i2 ORDER BY b;",
+        // Covering index: `SELECT a FROM t INDEXED BY i1` reads only from the index.
+        "SELECT a FROM t INDEXED BY i1;",
+        // `NOT INDEXED` forbids index usage — always a table scan, even with WHERE/ORDER BY.
+        "SELECT * FROM t NOT INDEXED;",
+        "SELECT * FROM t NOT INDEXED WHERE a = 1;",
+        "SELECT * FROM t NOT INDEXED ORDER BY a;",
+        "SELECT * FROM t NOT INDEXED ORDER BY a DESC, b;",
+        "SELECT a, b FROM t NOT INDEXED ORDER BY b LIMIT 3;",
+        // `INDEXED BY` + DISTINCT (the dedup cursor coexists with the index scan).
+        "SELECT DISTINCT a FROM t INDEXED BY i1;",
+        // `INDEXED BY` with a NULL WHERE on the indexed column — the indexed path rejects
+        // `col = NULL` (3-valued logic), so the result is empty (matches the oracle).
+        "SELECT * FROM t INDEXED BY i1 WHERE a = NULL;",
+    ] {
+        assert_same(db.str(), q);
+    }
+
+    // `INDEXED BY <nonexistent>` raises "no such index: <name>" in both engines.
+    let mut conn = sqlite3_open(db.str()).expect("open");
+    let res = sqlite3_prepare_v2(&mut conn, "SELECT * FROM t INDEXED BY nosuch;");
+    assert!(res.is_err(), "expected error for INDEXED BY nosuch");
+    let msg = res.err().unwrap().message;
+    assert!(
+        msg.contains("no such index: nosuch"),
+        "wrong error message: {msg}"
+    );
 }

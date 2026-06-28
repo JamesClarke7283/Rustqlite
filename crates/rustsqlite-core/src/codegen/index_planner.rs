@@ -51,8 +51,9 @@
 //! again here. When the index is covering, the WHERE is re-checked against the index-read
 //! column values instead.
 
-use rustqlite_parser::{BinaryOp, Expr, Literal, OrderingTerm, SelectStmt};
+use rustqlite_parser::{BinaryOp, Expr, IndexedBy, Literal, OrderingTerm, SelectStmt};
 
+use crate::error::{Error, Result};
 use crate::schema::{IndexObject, Table};
 use crate::types::Value;
 
@@ -77,21 +78,50 @@ pub(crate) struct IndexPlan {
     /// `true` when every column the query needs is read from the index, so no table cursor is
     /// opened and no `IdxRowid`/`NotExists` pair is emitted.
     pub covering: bool,
+    /// `true` when an `INDEXED BY <name>` hint forced this index even though the index does not
+    /// satisfy the ORDER BY clause. The codegen must emit a sorter over the index scan.
+    /// Always `false` for an unconstrained planner pick.
+    pub needs_sorter: bool,
 }
 
 /// Pick an index to use for a `SELECT`, if any. Returns `Some(plan)` when an index provides at
 /// least one of: an ORDER BY benefit, a covering benefit, or a WHERE equality prefix.
 /// `None` means the M3a table-scan path is the right choice.
+///
+/// `hint` carries the `INDEXED BY name` / `NOT INDEXED` table hint (M27.6):
+///   * `Some(NotIndexed)` → always returns `None` (force a table scan, ignoring every index).
+///   * `Some(Index(name))` → only the named index is considered; an error is raised when no
+///     such index exists on the table. The named index is used even when it provides no
+///     benefit (a full index scan with a sorter when ORDER BY is not satisfied). This mirrors
+///     upstream's `INDEXED BY` semantics: the hint forces the planner's hand.
+///   * `None` → the unconstrained planner pick (the M5.1/M5.2 behavior).
 pub(crate) fn pick_index(
     select: &SelectStmt,
     table: &Table,
     indexes: &[IndexObject],
-) -> Option<IndexPlan> {
+    hint: Option<&IndexedBy>,
+) -> Result<Option<IndexPlan>> {
     if indexes.is_empty() {
-        return None;
+        if let Some(IndexedBy::Index(name)) = hint {
+            return Err(Error::msg(format!("no such index: {}", name)));
+        }
+        return Ok(None);
     }
     if select.from.len() != 1 {
-        return None;
+        // The planner only handles single-table FROM; the hint is silently dropped here
+        // (mirrors upstream's behavior where a join ignores a per-table hint that the planner
+        // can't apply — though upstream raises "no such index" for a missing name regardless).
+        if let Some(IndexedBy::Index(name)) = hint {
+            let exists = indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name));
+            if !exists {
+                return Err(Error::msg(format!("no such index: {}", name)));
+            }
+        }
+        return Ok(None);
+    }
+    // `NOT INDEXED` forbids using any index — force a table scan.
+    if matches!(hint, Some(IndexedBy::NotIndexed)) {
+        return Ok(None);
     }
 
     let table_columns: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
@@ -101,6 +131,16 @@ pub(crate) fn pick_index(
     // index is covering. `collect_referenced_columns` walks the expressions and returns the
     // table-column indices it finds.
     let referenced = collect_referenced_columns(select, table);
+
+    // `INDEXED BY name` forces the named index. Resolve it (case-insensitive) and raise the
+    // oracle-matched "no such index: <name>" error when it doesn't exist.
+    if let Some(IndexedBy::Index(forced_name)) = hint {
+        let idx = indexes
+            .iter()
+            .find(|i| i.name.eq_ignore_ascii_case(forced_name))
+            .ok_or_else(|| Error::msg(format!("no such index: {}", forced_name)))?;
+        return Ok(Some(plan_for_index(select, idx, table, &table_columns, &where_equalities, &referenced, true)?));
+    }
 
     // Choose the index with the best combined benefit. Score is a tuple
     // (where_prefix_len, covering, order_by_satisfied): a longer WHERE prefix wins; ties go to
@@ -120,57 +160,91 @@ pub(crate) fn pick_index(
             continue;
         }
 
-        // (1) WHERE equality prefix. May be empty (no WHERE benefit).
-        let prefix = find_index_prefix_equalities(idx, &table_columns, &where_equalities)
-            .unwrap_or_default();
-
-        // (2) ORDER BY benefit. The index satisfies ORDER BY when:
-        //   * there is an ORDER BY clause,
-        //   * the ORDER BY terms are a prefix of the index columns (in index order), and
-        //   * each term's direction matches the index column's direction.
-        // The WHERE equality prefix precedes the ORDER BY prefix in the index: an equality
-        // on column 0 lets ORDER BY on column 1 be satisfied by the same index. So the
-        // ORDER BY match starts at index column `prefix.len()`.
-        let order_by_satisfied =
-            order_by_matches_index(select, idx, table, prefix.len(), &where_equalities);
-
-        // (3) Covering benefit. The index is covering when every referenced column is one of
-        // the index's columns. The rowid-alias column is satisfied by the index's trailing
-        // rowid (read via `Column` at position `nkey_fields`). A non-alias rowid reference
-        // (`SELECT rowid FROM t`) is also satisfied by the trailing rowid.
-        let covering = !referenced.is_empty() && index_covers(idx, table, &referenced);
-
+        let plan = plan_for_index(select, idx, table, &table_columns, &where_equalities, &referenced, false)?;
         // Require at least one benefit to use the index. A useless index that is neither
         // covering, nor ORDER-BY-satisfying, nor has a WHERE equality prefix would just add
         // an extra b-tree open with no gain — fall through to the table scan.
         let has_benefit =
-            !prefix.is_empty() || order_by_satisfied || (covering && !referenced.is_empty());
+            !plan.equality.is_empty() || plan.order_by_satisfied || (plan.covering && !referenced.is_empty());
         if !has_benefit {
             continue;
         }
-
         // When the query has an ORDER BY that this index does NOT satisfy, the indexed scan
         // would still need a sorter — and the codegen's indexed path does not emit one. Fall
         // through to the table-scan + sorter path (`compile_scan_ordered`) which handles
         // arbitrary ORDER BY. The indexed path is only usable when the ORDER BY is fully
         // satisfied by the index (so no sorter is needed) or there is no ORDER BY.
-        if !select.order_by.is_empty() && !order_by_satisfied {
+        if !select.order_by.is_empty() && !plan.order_by_satisfied {
             continue;
         }
 
-        let score = (prefix.len(), covering, order_by_satisfied);
+        let score = (plan.equality.len(), plan.covering, plan.order_by_satisfied);
         if score > best_score {
             best_score = score;
-            best = Some(IndexPlan {
-                index: idx.clone(),
-                equality: prefix,
-                order_by_satisfied,
-                covering,
-            });
+            best = Some(plan);
         }
     }
 
-    best
+    Ok(best)
+}
+
+/// Evaluate a single index for the query. Shared between the unconstrained planner loop and
+/// the `INDEXED BY` forced path. When `forced` is true the partial-index usability check is
+/// skipped (a forced index is used even when its predicate doesn't match the query WHERE) and
+/// `needs_sorter` is set when the index doesn't satisfy ORDER BY.
+fn plan_for_index(
+    select: &SelectStmt,
+    idx: &IndexObject,
+    table: &Table,
+    table_columns: &[&str],
+    where_equalities: &[EqualityKey],
+    referenced: &[usize],
+    forced: bool,
+) -> Result<IndexPlan> {
+    if !forced && !partial_index_usable(idx, select) {
+        // Skip partial indexes whose predicate isn't matched (the caller's loop continues).
+        // Returning a no-benefit plan here makes the loop's `has_benefit` check drop it.
+        return Ok(IndexPlan {
+            index: idx.clone(),
+            equality: Vec::new(),
+            order_by_satisfied: false,
+            covering: false,
+            needs_sorter: false,
+        });
+    }
+
+    // (1) WHERE equality prefix. May be empty (no WHERE benefit).
+    let prefix = find_index_prefix_equalities(idx, table_columns, where_equalities)
+        .unwrap_or_default();
+
+    // (2) ORDER BY benefit. The index satisfies ORDER BY when:
+    //   * there is an ORDER BY clause,
+    //   * the ORDER BY terms are a prefix of the index columns (in index order), and
+    //   * each term's direction matches the index column's direction.
+    // The WHERE equality prefix precedes the ORDER BY prefix in the index: an equality
+    // on column 0 lets ORDER BY on column 1 be satisfied by the same index. So the
+    // ORDER BY match starts at index column `prefix.len()`.
+    let order_by_satisfied =
+        order_by_matches_index(select, idx, table, prefix.len(), where_equalities);
+
+    // (3) Covering benefit. The index is covering when every referenced column is one of
+    // the index's columns. The rowid-alias column is satisfied by the index's trailing
+    // rowid (read via `Column` at position `nkey_fields`). A non-alias rowid reference
+    // (`SELECT rowid FROM t`) is also satisfied by the trailing rowid.
+    let covering = !referenced.is_empty() && index_covers(idx, table, referenced);
+
+    // A forced index is used regardless of benefit. When the ORDER BY is not satisfied,
+    // the codegen must wrap the index scan in a sorter (mirrors the oracle's
+    // `SCAN t USING INDEX <name>` + `USE TEMP B-TREE FOR ORDER BY`).
+    let needs_sorter = forced && !select.order_by.is_empty() && !order_by_satisfied;
+
+    Ok(IndexPlan {
+        index: idx.clone(),
+        equality: prefix,
+        order_by_satisfied,
+        covering,
+        needs_sorter,
+    })
 }
 
 /// True when a partial index's predicate is satisfied by the query's WHERE clause.

@@ -72,7 +72,10 @@ pub fn select_index_plan_info(
     table: Option<&Table>,
     indexes: &[IndexObject],
 ) -> Option<crate::vdbe::explain::IndexPlanInfo> {
-    table.and_then(|t| index_planner::pick_index(select, t, indexes)).map(|plan| {
+    let hint = select.from.first()
+        .and_then(|tj| tj.table())
+        .and_then(|tref| tref.indexed_by.as_ref());
+    table.and_then(|t| index_planner::pick_index(select, t, indexes, hint).ok().flatten()).map(|plan| {
         let equality_columns: Vec<String> = plan.equality.iter().map(|e| e.column.clone()).collect();
         let has_where_equality = !plan.equality.is_empty();
         crate::vdbe::explain::IndexPlanInfo {
