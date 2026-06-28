@@ -2826,3 +2826,47 @@ fn json_insert_replace_set_remove_patch() {
         }
     }
 }
+
+/// `->` and `->>` JSON operators (M24.17) — differential-tested against the system `sqlite3`
+/// oracle. Covers: full-path extraction, bare-label shorthand, integer array index,
+/// negative-from-end index, `->` (JSON representation) vs `->>` (SQL representation) for
+/// scalars/arrays/objects, NULL root, missing path, and chained `->` / `->>`.
+#[test]
+fn json_arrow_operators() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    for q in [
+        // `->` returns JSON representation (scalars are JSON-encoded).
+        r#"SELECT '{"a":2,"c":[4,5,{"f":7}]}' -> '$';"#,
+        r#"SELECT '{"a":2,"c":[4,5,{"f":7}]}' -> '$.c';"#,
+        r#"SELECT '{"a":2,"c":[4,5,{"f":7}]}' -> '$.c[2]';"#,
+        r#"SELECT '{"a":2,"c":[4,5,{"f":7}]}' -> '$.c[2].f';"#,
+        r#"SELECT '{"a":2,"c":[4,5,{"f":7}]}' -> '$.x';"#, // missing → NULL
+        // `->>` returns SQL representation (scalars are SQL values).
+        r#"SELECT '{"a":2,"c":[4,5,{"f":7}]}' ->> '$.c[2].f';"#,
+        r#"SELECT '{"a":2,"c":[4,5]}' ->> '$.c';"#, // array → JSON text
+        r#"SELECT '{"a":"xyz"}' ->> '$.a';"#,       // string → SQL text
+        r#"SELECT '{"a":null}' ->> '$.a';"#,        // null → SQL NULL
+        r#"SELECT '{"a":2,"c":[4,5,{"f":7}]}' ->> '$.x';"#,
+        // Bare-label shorthand: `'a'` ≡ `'$.a'`.
+        r#"SELECT '{"a":2,"c":[4,5,{"f":7}]}' -> 'c';"#,
+        r#"SELECT '{"a":2,"c":[4,5,{"f":7}]}' ->> 'a';"#,
+        // Integer array index: `3` ≡ `'$[3]'`.
+        r#"SELECT '[11,22,33,44]' -> 3;"#,
+        r#"SELECT '[11,22,33,44]' ->> 3;"#,
+        // Negative-from-end: `-1` ≡ `'$[#-1]'` (last element).
+        r#"SELECT '{"a":2,"c":[4,5]}' -> '$.c[#-1]';"#,
+        // Chained `->` / `->>`.
+        r#"SELECT '{"a":2,"c":[4,5,{"f":7}]}' -> 'c' -> 2 ->> 'f';"#,
+        // NULL root → NULL.
+        r#"SELECT NULL -> '$';"#,
+        r#"SELECT NULL ->> '$';"#,
+        // String with quotes via `->`.
+        r#"SELECT '{"a":"xyz"}' -> '$.a';"#,
+    ] {
+        assert_same(db.str(), q);
+    }
+}

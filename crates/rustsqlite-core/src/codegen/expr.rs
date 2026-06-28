@@ -668,13 +668,119 @@ fn compile_binary(
             b.set_p5(idx, 2);
             Ok(())
         }
-        BinaryOp::JsonExtract | BinaryOp::JsonExtractText => Err(Error::msg(
-            "JSON -> / ->> operators are not supported by the executor yet",
-        )),
+        BinaryOp::JsonExtract | BinaryOp::JsonExtractText => {
+            // `X -> P` / `X ->> P` — JSON extraction. `->` returns the JSON representation
+            // (always JSON text, even for scalars); `->>` returns the SQL representation
+            // (NULL/INTEGER/REAL/TEXT, like a single-path `json_extract`). The right operand
+            // is a path (`'$.x'`), a bare object label (`'x'` → `'$.x'`), or an integer
+            // array index (`3` → `'$[3]'`; `-K` → `'$[#-K]'`). Mirrors `jsonExtractFunc`
+            // / the `JSON` operator handling in `expr.c`.
+            compile_json_arrow(b, op, left, right, target, ctx)
+        }
         BinaryOp::Regexp | BinaryOp::Match => Err(Error::msg(
             "REGEXP / MATCH operators are not supported by the executor yet",
         )),
         _ => unreachable!("binary op already handled"),
+    }
+}
+
+/// Compile `X -> P` (`JsonExtract`) or `X ->> P` (`JsonExtractText`). The right operand `P`
+/// may be a TEXT path/label or an INTEGER array index. Per the JSON1 docs (§4.10):
+/// * a TEXT right operand that starts with `$` is a full path;
+/// * a TEXT right operand `X` that doesn't start with `$` is treated as `'$.X'` (a bare
+///   object label);
+/// * a non-negative INTEGER right operand `N` is treated as `'$[N]'`;
+/// * a negative INTEGER right operand `-K` is treated as `'$[#-K]'` (the K-th from the end).
+///
+/// `->` always returns a JSON representation (a scalar is JSON-encoded — `5` → `"5"`,
+/// `"x"` → `"\"x\""`; an array/object is its canonical JSON text). `->>` returns the SQL
+/// representation (NULL/INTEGER/REAL/TEXT, like a single-path `json_extract`).
+///
+/// The implementation lowers to a `Function` opcode call: `->` calls an internal
+/// `_json_arrow` function that renders JSON; `->>` calls `json_extract`. Both take the
+/// resolved path string as the second argument.
+fn compile_json_arrow(
+    b: &mut ProgramBuilder,
+    op: BinaryOp,
+    left: &Expr,
+    right: &Expr,
+    target: i32,
+    ctx: Ctx,
+) -> Result<()> {
+    // Resolve the path argument: a literal TEXT/INTEGER is folded into a path string at
+    // compile time (so `col -> 'a'` becomes `json_extract(col, '$.a')`). A non-literal
+    // right operand is evaluated at runtime and the path normalization is deferred to the
+    // function body (we emit a call to the internal `_json_arrow` / `_json_arrow_text`
+    // helpers which mirror the compile-time normalization).
+    let json_op = op == BinaryOp::JsonExtract;
+    // Try to fold a literal right operand into a path string.
+    if let Some(path_str) = json_arrow_path_literal(right) {
+        // Folded path: lower to a direct `json_extract` call (or the JSON-rendering variant
+        // for `->`). The 2-arg `json_extract` returns the SQL representation; for `->` we
+        // need the JSON representation, which is `json_quote` of the extract for scalars
+        // and the raw extract text for arrays/objects. The cleanest lowering is to call
+        // the internal `_json_arrow` / `_json_arrow_text` helpers, which take (X, P) and
+        // do the right thing.
+        let fn_name = if json_op { "_json_arrow" } else { "_json_arrow_text" };
+        let start = b.alloc_regs(2);
+        compile_expr(b, left, start, ctx)?; // X → first arg
+        // The path string is a literal — emit it as a String8 into the second arg slot.
+        let path_idx = b.emit(Opcode::String8, 0, start + 1, 0);
+        b.set_p4(path_idx, P4::Text(path_str));
+        let idx = b.emit(Opcode::Function, 0, start, target);
+        b.set_p4(idx, P4::Symbol(fn_name.to_string()));
+        b.set_p5(idx, 2);
+        return Ok(());
+    }
+    // Non-literal right operand: evaluate it at runtime and let the function do the
+    // normalization.
+    let fn_name = if json_op { "_json_arrow" } else { "_json_arrow_text" };
+    let start = b.alloc_regs(2);
+    compile_expr(b, left, start, ctx)?;
+    compile_expr(b, right, start + 1, ctx)?;
+    let idx = b.emit(Opcode::Function, 0, start, target);
+    b.set_p4(idx, P4::Symbol(fn_name.to_string()));
+    b.set_p5(idx, 2);
+    Ok(())
+}
+
+/// If `right` is a literal TEXT or INTEGER, fold it into the corresponding JSON path string
+/// per the `->`/`->>` operator's right-operand rules:
+/// * TEXT starting with `$` → used verbatim;
+/// * TEXT not starting with `$` → `'$.<text>'` (a bare object label);
+/// * non-negative INTEGER N → `'$[N]'`;
+/// * negative INTEGER -K → `'$[#-K]'`.
+/// Returns `None` for non-literal right operands (the path is resolved at runtime).
+fn json_arrow_path_literal(right: &Expr) -> Option<String> {
+    match right {
+        Expr::Literal(Literal::Text(s)) => {
+            if s.starts_with('$') {
+                Some(s.clone())
+            } else {
+                Some(format!("$.{s}"))
+            }
+        }
+        Expr::Literal(Literal::Integer(n)) => {
+            if *n >= 0 {
+                Some(format!("$[{n}]"))
+            } else {
+                // Negative index: `$[#-K]` where K = -n.
+                let k = n.checked_neg()?;
+                Some(format!("$[#-{k}]"))
+            }
+        }
+        Expr::Unary {
+            op: UnaryOp::Negate,
+            expr,
+        } => {
+            // `-K` for a literal K — fold to `$[#-K]`.
+            if let Expr::Literal(Literal::Integer(k)) = expr.as_ref() {
+                Some(format!("$[#-{k}]"))
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 

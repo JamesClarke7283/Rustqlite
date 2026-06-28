@@ -1594,6 +1594,68 @@ fn merge_patch(target: &mut JsonNode, patch: &JsonNode) {
     }
 }
 
+/// The internal implementation of the `->` and `->>` operators (M24.17). `json_mode = true`
+/// is `->` (returns the JSON representation — always JSON text, with scalars JSON-encoded);
+/// `json_mode = false` is `->>` (returns the SQL representation — NULL/INTEGER/REAL/TEXT,
+/// like a single-path `json_extract`).
+///
+/// The right operand `args[1]` may be a TEXT path (`'$.x'`), a bare object label (`'x'` →
+/// `'$.x'`), or an INTEGER array index (`N` → `'$[N]'`; `-K` → `'$[#-K]'`). A literal right
+/// operand is folded at codegen time; this function handles the runtime case (a column or
+/// expression on the right).
+pub fn json_arrow_fn(args: &[Value], json_mode: bool) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(Error::msg("JSON arrow operator requires 2 arguments"));
+    }
+    // Normalize the right operand into a path string.
+    let path = json_arrow_path_value(&args[1])?;
+    if args[0].is_null() {
+        return Ok(Value::Null);
+    }
+    let root = value_to_json(&args[0])?;
+    match lookup_path(&root, &path)? {
+        Some(node) => {
+            if json_mode {
+                // `->` always returns the JSON representation: a scalar is JSON-encoded
+                // (e.g. 5 → "5", "x" → "\"x\""), an array/object is its canonical JSON text.
+                Ok(Value::Text(render(node)))
+            } else {
+                // `->>` returns the SQL representation (like a single-path json_extract).
+                Ok(json_node_to_sql_value(node))
+            }
+        }
+        None => Ok(Value::Null),
+    }
+}
+
+/// Normalize a runtime right operand of `->`/`->>` into a JSON path string. Mirrors
+/// [`super::super::codegen::expr::json_arrow_path_literal`] for the runtime case:
+/// * TEXT starting with `$` → used verbatim;
+/// * TEXT not starting with `$` → `'$.<text>'`;
+/// * non-negative INTEGER N → `'$[N]'`;
+/// * negative INTEGER -K → `'$[#-K]'`.
+fn json_arrow_path_value(arg: &Value) -> Result<String> {
+    match arg {
+        Value::Text(s) => {
+            if s.starts_with('$') {
+                Ok(s.clone())
+            } else {
+                Ok(format!("$.{s}"))
+            }
+        }
+        Value::Int(n) => {
+            if *n >= 0 {
+                Ok(format!("$[{n}]"))
+            } else {
+                let k = n.checked_neg().unwrap_or(0);
+                Ok(format!("$[#-{k}]"))
+            }
+        }
+        Value::Null => Err(Error::msg("JSON path cannot be NULL")),
+        Value::Real(_) | Value::Blob(_) => Err(Error::msg("bad JSON path")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

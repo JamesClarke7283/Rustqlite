@@ -119,6 +119,16 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         ("json_remove" | "jsonb_remove", n) if n >= 1 => json::json_remove_fn(args),
         ("json_patch" | "jsonb_patch", 2) => json::json_patch_fn(args),
 
+        // ---- JSON `->` / `->>` operators (M24.17) ----
+        // `_json_arrow(X, P)` returns the JSON representation (always JSON text, even for
+        // scalars — mirrors SQLite's `->` operator). `_json_arrow_text(X, P)` returns the
+        // SQL representation (NULL/INTEGER/REAL/TEXT, like a single-path `json_extract` —
+        // mirrors `->>`). The right operand P may be a path string (`'$.x'`), a bare object
+        // label (`'x'` → `'$.x'`), or an integer array index (folded to `'$[N]'` /
+        // `'$[#-K]'` at codegen time when literal; resolved here for runtime operands).
+        ("_json_arrow", 2) => json::json_arrow_fn(args, true),
+        ("_json_arrow_text", 2) => json::json_arrow_fn(args, false),
+
         // Should not happen: codegen validates with `check` before emitting a Function opcode.
         _ => Err(no_such_function(name, args.len())),
     }
@@ -189,6 +199,7 @@ pub fn check(name: &str, n_arg: usize) -> Result<()> {
         | "jsonb_set" => Some(n_arg >= 1 && n_arg % 2 == 1),
         "json_remove" | "jsonb_remove" => Some(n_arg >= 1),
         "json_patch" | "jsonb_patch" => Some(n_arg == 2),
+        "_json_arrow" | "_json_arrow_text" => Some(n_arg == 2),
 
         // volatile / connection-state functions (M3b): handled in the VDBE executor's Function
         // arm (they need runtime state), so `check` only learns their arities as the codegen

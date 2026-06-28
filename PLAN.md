@@ -482,7 +482,7 @@ list every granular item needed.
 - [x] **24.14** `json_error_position(X)` — position of first syntax error
 - [ ] **24.15** `json_each(X [, Y])` — table-valued function (iterate array/object)
 - [ ] **24.16** `json_tree(X [, Y])` — table-valued function (walk JSON tree)
-- [ ] **24.17** `->` and `->>` operators (JSON extraction)
+- [x] **24.17** `->` and `->>` operators (JSON extraction)
 - [ ] **24.18** `json_group_array(X)` — aggregate: collect into JSON array
 - [ ] **24.19** `json_group_object(X, Y)` — aggregate: collect into JSON object
 - [ ] **24.20** VDBE: subtype support (`SetSubtype`, `GetSubtype`, `ClrSubtype`) for JSON values
