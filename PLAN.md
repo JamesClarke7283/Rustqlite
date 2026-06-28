@@ -480,12 +480,12 @@ list every granular item needed.
 - [x] **24.12** `json_pretty(X [, Y])` — pretty-print JSON
 - [x] **24.13** `json_patch(X, Y)` — RFC 7396 merge patch
 - [x] **24.14** `json_error_position(X)` — position of first syntax error
-- [ ] **24.15** `json_each(X [, Y])` — table-valued function (iterate array/object)
-- [ ] **24.16** `json_tree(X [, Y])` — table-valued function (walk JSON tree)
+- [ ] **24.15** `json_each(X [, Y])` — table-valued function (iterate array/object) [BLOCKED: M31 infrastructure — `json_each`/`json_tree` are table-valued functions (eponymous virtual tables) that need the `sqlite3_module`/`VOpen`/`VFilter`/`VColumn`/`VNext` virtual-table machinery. The JSON tree-walking logic itself is straightforward (a `JsonNode` pre-order traversal yielding `key/value/type/atom/id/parent/fullkey/path` rows), but the virtual-table dispatch layer is M31 and doesn't exist yet.]
+- [ ] **24.16** `json_tree(X [, Y])` — table-valued function (walk JSON tree) [BLOCKED: M31 infrastructure — same as 24.15; `json_tree` is the recursive variant of `json_each` and needs the same virtual-table machinery.]
 - [x] **24.17** `->` and `->>` operators (JSON extraction)
 - [x] **24.18** `json_group_array(X)` — aggregate: collect into JSON array
 - [x] **24.19** `json_group_object(X, Y)` — aggregate: collect into JSON object
-- [ ] **24.20** VDBE: subtype support (`SetSubtype`, `GetSubtype`, `ClrSubtype`) for JSON values
+- [ ] **24.20** VDBE: subtype support (`SetSubtype`, `GetSubtype`, `ClrSubtype`) for JSON values [BLOCKED: scope — the JSON subtype is a per-`Mem` flag (upstream's `Mem.eSubtype = JSON_SUBTYPE`) set on the result of every `json_*` function so a downstream `json_array`/`json_object`/`json_insert`/`json_replace`/`json_set` value argument is treated as JSON (preserving substructure) rather than as a quoted string. Modeling it requires either extending `Value` with a subtype field (touching the record codec, C-API, VDBE registers — `Value` is used everywhere) or introducing a `Mem`-layer wrapper with the flag. Plus three new VDBE opcodes and updates to every JSON function to set the subtype on its result. The divergence is documented in `tests/diff.rs` (a TEXT value from a JSON function is inserted as a quoted string rather than as JSON); it's a nested-JSON-function edge case, not a common-usage correctness issue. Deferred to a dedicated session alongside the broader `Mem`-layer work.]
 
 ---
 
