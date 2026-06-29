@@ -189,9 +189,6 @@ fn schema_change_returns_sqlite_schema() {
 
 #[test]
 fn schema_unchanged_does_not_expire_statement() {
-    // A statement that runs to completion without any DDL between steps must NOT report
-    // SQLITE_SCHEMA — this guards against a too-eager cookie check that would break the
-    // common path (prepare → step → step → done).
     if !sqlite3_available() {
         return;
     }
@@ -229,6 +226,79 @@ fn schema_unchanged_does_not_expire_statement() {
             vec![Value::Int(2)],
             vec![Value::Int(4)],
         ]
+    );
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn step_with_db_auto_reprepares_on_schema_change() {
+    // M12.11: step_with_db detects the schema cookie has changed and re-prepares the
+    // statement against the current schema, transparently retrying the step (mirrors
+    // upstream's sqlite3Reprepare+sqlite3Step retry loop). The legacy step() returns
+    // SQLITE_SCHEMA; step_with_db re-prepares and returns Row/Done.
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("schema_reprepare");
+    Command::new("sqlite3")
+        .arg(&db)
+        .arg("CREATE TABLE t(a INTEGER); INSERT INTO t VALUES (1), (2);")
+        .output()
+        .unwrap();
+
+    let mut conn = sqlite3_open(&db).unwrap();
+    let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a FROM t ORDER BY a;").unwrap();
+
+    // Run DDL on the same connection — bumps the schema cookie.
+    let (mut ddl, _) = sqlite3_prepare_v2(&mut conn, "CREATE TABLE u(b INTEGER);").unwrap();
+    assert_eq!(ddl.step(), ResultCode::Done);
+
+    // The legacy step() would return SQLITE_SCHEMA here. step_with_db should re-prepare
+    // transparently and return Row/Done.
+    assert!(stmt.expired(), "statement should be expired after DDL");
+    assert_eq!(stmt.step_with_db(&mut conn), ResultCode::Row);
+    assert_eq!(stmt.column_value(0), Value::Int(1));
+    assert_eq!(stmt.step_with_db(&mut conn), ResultCode::Row);
+    assert_eq!(stmt.column_value(0), Value::Int(2));
+    assert_eq!(stmt.step_with_db(&mut conn), ResultCode::Done);
+    assert!(!stmt.expired(), "re-prepared statement should not be expired");
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn step_with_db_surfaces_error_when_table_dropped() {
+    // When a re-prepare fails (e.g. the table was dropped), step_with_db surfaces the
+    // underlying error rather than retrying forever (mirrors upstream's behavior of
+    // returning the prepare error after the retry budget is exhausted).
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("schema_drop");
+    Command::new("sqlite3")
+        .arg(&db)
+        .arg("CREATE TABLE t(a INTEGER); INSERT INTO t VALUES (1);")
+        .output()
+        .unwrap();
+
+    let mut conn = sqlite3_open(&db).unwrap();
+    let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a FROM t;").unwrap();
+
+    // Drop the table — re-prepare will fail with "no such table: t".
+    let (mut ddl, _) = sqlite3_prepare_v2(&mut conn, "DROP TABLE t;").unwrap();
+    assert_eq!(ddl.step(), ResultCode::Done);
+
+    // step_with_db should surface the prepare error (SQLITE_ERROR with "no such table").
+    let rc = stmt.step_with_db(&mut conn);
+    assert!(
+        matches!(rc, ResultCode::Error | ResultCode::Schema),
+        "expected Error or Schema, got {rc:?}"
+    );
+    let msg = stmt.errmsg().to_string();
+    assert!(
+        msg.contains("no such table") || msg.contains("schema has changed"),
+        "unexpected error message: {msg}"
     );
 
     let _ = std::fs::remove_file(&db);

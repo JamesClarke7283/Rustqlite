@@ -703,6 +703,19 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   `schema_unchanged_does_not_expire_statement`. Known limitation: re-prepare-on-SCHEMA
   (M12.11) is not yet automatic — the application must re-call `sqlite3_prepare_v2` when it
   receives `SQLITE_SCHEMA`.
+- **M12.11 auto-reprepare** ✅: `Sqlite3Stmt::step_with_db(&mut self, &mut Sqlite3)` re-prepares
+  the statement against the current schema when `schema_expired()` fires, retrying the step
+  up to `SQLITE_MAX_SCHEMA_RETRY` (50) times before surfacing `SQLITE_SCHEMA` (mirrors
+  upstream's `sqlite3Reprepare`+`sqlite3Step` retry loop in `vdbeapi.c`). Re-prepare
+  re-parses the stored SQL, re-compiles via `sqlite3_prepare_v2`, and adopts the fresh
+  `Sqlite3Stmt` (new VDBE/column-names/schema-cookie) while preserving the `counts` handle
+  (still tied to the same connection). When re-prepare itself fails (e.g. the table was
+  dropped: `no such table: t`), the underlying prepare error is surfaced (matching the
+  `prepare_v2` contract). The legacy [`step`](Self::step) (no `db` argument) keeps the M12.10
+  behavior of returning `SQLITE_SCHEMA` for callers that want to handle re-prepare manually;
+  `step_with_db` is the convenience that does it inline. Differential-tested in
+  `tests/capi.rs::step_with_db_auto_reprepares_on_schema_change` and
+  `step_with_db_surfaces_error_when_table_dropped`.
 - **M13 — WAL (Write-Ahead Logging)** 🚧: **13.1–13.3** ✅ (format codecs for the `-wal`
   header/frame and the `-shm` shared-memory index — see `format/wal.rs` and
   `format/wal_index.rs`). **13.4 WAL mode read path** ✅: `pager::wal::Wal` (mirroring

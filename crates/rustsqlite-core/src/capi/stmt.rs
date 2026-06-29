@@ -1767,6 +1767,56 @@ impl Sqlite3Stmt {
         self.schema_expired()
     }
 
+    /// `sqlite3_step_with_db()` (M12.11) — like [`step`](Self::step) but, when the schema cookie
+    /// has changed since prepare time, automatically re-prepares the statement against the
+    /// current schema (re-parsing the stored SQL, re-compiling, and replacing the backing VDBE)
+    /// before retrying the step, up to `SQLITE_MAX_SCHEMA_RETRY` (50) times. Only when
+    /// re-prepare itself keeps failing (e.g. the table was dropped: `no such table: t`) does
+    /// it surface the underlying error to the caller, matching the `sqlite3_prepare_v2`
+    /// auto-reprepare contract.
+    ///
+    /// This is the Rust analogue of upstream's `sqlite3Reprepare`+`sqlite3Step` retry loop in
+    /// `vdbeapi.c`. The legacy [`step`](Self::step) (with no `db` argument) keeps the
+    /// M12.10 behavior of returning `SQLITE_SCHEMA` so the caller can re-prepare manually;
+    /// `step_with_db` is the convenience that does the re-prepare inline.
+    ///
+    /// Re-prepare rebuilds the VDBE, column names, and the captured schema cookie; the SQL
+    /// text is unchanged. A re-prepare that fails with a prepare-time error (parse/resolution
+    /// error) returns that error's result code and message via the statement's `last_error`
+    /// (mirrors `sqlite3Reprepare`'s `rc` propagation).
+    pub fn step_with_db(&mut self, db: &mut Sqlite3) -> ResultCode {
+        const MAX_SCHEMA_RETRY: u32 = 50;
+        for _ in 0..MAX_SCHEMA_RETRY {
+            // If the schema hasn't changed, just step. Otherwise, re-prepare and try again.
+            if !self.schema_expired() {
+                return self.step();
+            }
+            // Re-prepare against the current schema. On a prepare error, surface it.
+            match sqlite3_prepare_v2(db, &self.sql) {
+                Ok((fresh, _tail)) => {
+                    // Adopt the fresh compilation. Drop the old backing/program; the new
+                    // program/vdbe/headers take their place. Preserve the `sql` (same text)
+                    // and the `counts` handle (still tied to the same connection).
+                    let counts = self.counts.take();
+                    *self = fresh;
+                    self.counts = counts;
+                    // Loop back and try `step()` again with the fresh program.
+                }
+                Err(e) => {
+                    db.set_last_error(e.clone());
+                    self.last_error = Some(e);
+                    return ResultCode::Error;
+                }
+            }
+        }
+        // Exhausted retries — surface SQLITE_SCHEMA so the caller can give up or re-try.
+        self.last_error = Some(Error::new(
+            ResultCode::Schema,
+            "database schema has changed (re-prepare retries exhausted)",
+        ));
+        ResultCode::Schema
+    }
+
     /// True when the schema cookie captured at prepare time no longer matches the pager's
     /// current `header().schema_cookie`. Returns `false` when the statement has no pager
     /// (a constant/`VALUES` statement) or when the cookie is unchanged. Mirrors the
