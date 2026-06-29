@@ -518,11 +518,11 @@ list every granular item needed.
 - [ ] **27.1** Cost estimation: approximate row counts (from ANALYZE or heuristics) for table scans vs index lookups
 - [ ] **27.2** Multi-table join ordering (exhaustive or greedy search over join plans)
 - [ ] **27.3** Index selection for multi-column WHERE clauses (pick best index)
-- [ ] **27.4** Index scan for ORDER BY (avoid sorter when index provides ordering)
-- [ ] **27.5** Index scan for both WHERE + ORDER BY (prefix of index for WHERE, suffix for ORDER BY)
+- [x] **27.4** Index scan for ORDER BY (avoid sorter when index provides ordering)
+- [x] **27.5** Index scan for both WHERE + ORDER BY (prefix of index for WHERE, suffix for ORDER BY)
 - [x] **27.6** `INDEXED BY` / `NOT INDEXED` table hints
 - [ ] **27.7** Automatic index creation for correlated subqueries (autoindex)
-- [ ] **27.8** Partial index matching (only use index if WHERE clause satisfies index's partial condition)
+- [x] **27.8** Partial index matching (only use index if WHERE clause satisfies index's partial condition)
 - [ ] **27.9** Constant propagation (if `WHERE col = const` then replace col with const)
 - [ ] **27.10** LIKE optimization: prefix search via index (`LIKE 'abc%'` → `SeekGE + IdxLT`)
 - [x] **27.11** BETWEEN optimization: rewrite as `col >= low AND col <= high`, use index
@@ -892,8 +892,8 @@ list every granular item needed.
 
 - [ ] **27.17** Predicate pushdown through joins (move WHERE filters closer to the table scan)
 - [ ] **27.18** Bloom filter optimization for `IN` expressions (`FilterAdd` / `Filter` opcodes)
-- [ ] **27.19** Subquery flattening: merge `FROM (SELECT …)` into outer query when safe
-- [ ] **27.20** Covering index scan: satisfy SELECT columns from index without table lookup
+- [x] **27.19** Subquery flattening: merge `FROM (SELECT …)` into outer query when safe
+- [x] **27.20** Covering index scan: satisfy SELECT columns from index without table lookup
 - [ ] **27.21** `IN (value_list)` optimization: sort values and use binary search or ephemeral index
 - [ ] **27.22** `EXPLAIN QUERY PLAN` output enhancement: show estimated row counts, index use details
 
