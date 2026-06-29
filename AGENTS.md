@@ -1202,3 +1202,38 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   handling. Differential-tested vs the C oracle (`range_scan_index_access` in `diff.rs` — 30+
   queries covering single/multi-column ranges, BETWEEN/NOT BETWEEN, IS NULL/IS NOT NULL,
   covering/non-covering, ORDER BY + sorter, LIMIT/OFFSET, DISTINCT, and EQP matching).
+  **27.10 LIKE/GLOB prefix optimization** ✅: `col LIKE 'prefix%'` / `col GLOB 'prefix*'`
+  on an indexed TEXT column drives an index range scan `[prefix, prefix+1)` instead of a
+  table scan, mirroring the `TERM_LIKEOPT` virtual terms in `whereexpr.c`. The planner
+  (`codegen::index_planner::collect_like_opts` + `analyze_like_term`) detects a LIKE/GLOB
+  conjunct whose RHS is a literal string, extracts the literal prefix (with the same UTF-8
+  boundary handling as `isLikeOrGlob` — rejecting malformed UTF-8, `0xFF` last byte, and the
+  U+FFFD replacement char), computes the upper bound by incrementing the last UTF-8 byte
+  (carrying through `0xBF` continuation bytes via `increment_last_utf8_byte`), and
+  synthesizes `Ge(prefix)` + `Lt(upper)` range constraints on the column. The `IndexPlan`
+  carries a `LikeOpt { column, prefix, upper, is_complete, like_term }` so the codegen can
+  drop the LIKE term from the per-row WHERE re-check when `is_complete` (the pattern is
+  exactly `prefix<wc>` with nothing after — the range is provably equivalent to the match
+  set). When not complete (`prefix%suffix`, `prefix_`, `a_c%`, exact-match, etc.), the
+  existing per-row WHERE recheck (which includes the LIKE function call) handles it. The
+  `is_complete` flag is also cleared for the noCase `@`-boundary edge case (when
+  incrementing the last char lands at `b'@'`, the case-fold crosses back into the
+  `@`-`A` range and breaks the NOCASE comparison). Collation gating: a default
+  (case-insensitive) LIKE produces NOCASE bounds, so the column's declared collation must
+  be NOCASE (and the index inherits it — see below); a `case_sensitive_like=ON` LIKE or a
+  GLOB produces BINARY bounds, so the column must be BINARY. The `case_sensitive_like`
+  connection flag is threaded from `Sqlite3::flag` through `compile_select` ->
+  `select::compile` -> `pick_index`. ESCAPE clause: `X LIKE Y ESCAPE Z` lowers to a 3-arg
+  `like(Y, X, Z)` function call (the parser does this); `analyze_like_term` recognizes the
+  function form and uses the escape byte for prefix extraction (the escape must be a
+  single ASCII char, must not equal a wildcard, and is removed from the prefix). GLOB has
+  no escape. The `noCase` form uppercases the lower bound and lowercases the upper bound
+  (mirrors `sqlite3Toupper`/`sqlite3Tolower` on `pStr1`/`pStr2`). Prerequisite fix:
+  `IndexObject::from_schema_object_with_catalog` now inherits the table column's declared
+  collation when the indexed column has no explicit `COLLATE` (mirrors `sqlite3CreateIndex`
+  in `build.c`); the call sites in `capi::stmt` and `schema::catalog` now pass the catalog
+  so the inheritance can resolve. Differential-tested vs the C oracle
+  (`like_optimization_index_range_scan` in `diff.rs` — case-sensitive LIKE, case-insensitive
+  LIKE on a NOCASE column, GLOB, ESCAPE clause, complete vs incomplete patterns, no-prefix,
+  empty, single-char prefix, NOT LIKE, non-TEXT column, concat pattern, LIMIT/OFFSET/DISTINCT,
+  and EQP matching for all categories).

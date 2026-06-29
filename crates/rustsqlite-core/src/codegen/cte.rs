@@ -522,6 +522,7 @@ pub fn compile_recursive(
         setup_table.as_ref(),
         &[],
         None,
+        false,
     )?;
 
     // Inline the setup query's scan code, rewriting ResultRow → MakeRecord + NewRowid +
@@ -561,6 +562,7 @@ pub fn compile_recursive(
         Some(&recursive_table),
         &[],
         None,
+        false,
     )?;
 
     // Inline the recursive query, rewriting ResultRow → insert into Queue. We also patch
@@ -585,6 +587,7 @@ pub fn compile_recursive(
         Some(&cte_table),
         &[],
         None,
+        false,
     )?;
     inline_outer_scan(&mut b, &outer_program, cte_cursor, &outer_outputs, limit, offset)?;
 

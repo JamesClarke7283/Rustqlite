@@ -143,7 +143,7 @@ pub fn compile_from_subquery(
     // (`sub_addr -> inlined_addr`) as we inline, then patch every jump's `p2` using it. Jumps
     // targeting the subquery's `Halt` (the scan-end label) are redirected to `after_sub` so an
     // empty subquery or scan exhaustion falls through to the outer scan.
-    let (sub_program, _sub_names) = select::compile(subquery, subquery_table, subquery_indexes, None)?;
+    let (sub_program, _sub_names) = select::compile(subquery, subquery_table, subquery_indexes, None, false)?;
 
     // The address at which the inlined subquery scan code begins (after `Init` + `OpenEphemeral`
     // in the outer program). Used to bound the jump-patch loop below.
@@ -657,6 +657,7 @@ pub fn compile_scalar_subquery(
         subquery_indexes,
         None,
         outer_for_compile,
+        false,
     )?;
     let sub_num_regs = sub_program.num_registers as i32;
 
@@ -851,7 +852,7 @@ pub fn compile_exists_subquery(
     // must live ABOVE that range to avoid being clobbered by the subquery's `Column`/`Integer`/
     // comparison-register writes.
     let (sub_program, _sub_names) =
-        select::compile_with_outer(subquery, subquery_table, subquery_indexes, None, outer_for_compile)?;
+        select::compile_with_outer(subquery, subquery_table, subquery_indexes, None, outer_for_compile, false)?;
     let sub_num_regs = sub_program.num_registers as i32;
 
     // Cursor offset: the subquery's `select::compile` hardcodes cursor 0 for its table scan
@@ -1283,7 +1284,7 @@ pub fn compile_in_subquery(
     //    0/1/2 (table/sorter/distinct). Our ephemeral index cursor must live ABOVE that range,
     //    and our result registers must live ABOVE the subquery's register range.
     let (sub_program, _sub_names) =
-        select::compile_with_outer(subquery, subquery_table, subquery_indexes, None, outer_for_compile)?;
+        select::compile_with_outer(subquery, subquery_table, subquery_indexes, None, outer_for_compile, false)?;
     let sub_num_regs = sub_program.num_registers as i32;
 
     // Cursor offset for the inlined subquery body. The subquery's `select::compile` hardcodes

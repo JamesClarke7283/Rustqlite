@@ -524,7 +524,7 @@ list every granular item needed.
 - [ ] **27.7** Automatic index creation for correlated subqueries (autoindex)
 - [x] **27.8** Partial index matching (only use index if WHERE clause satisfies index's partial condition)
 - [ ] **27.9** Constant propagation (if `WHERE col = const` then replace col with const)
-- [ ] **27.10** LIKE optimization: prefix search via index (`LIKE 'abc%'` → `SeekGE + IdxLT`)
+- [x] **27.10** LIKE optimization: prefix search via index (`LIKE 'abc%'` → `SeekGE + IdxLT`)
 - [x] **27.11** BETWEEN optimization: rewrite as `col >= low AND col <= high`, use index
 - [ ] **27.12** OR-to-UNION rewrite (OR optimization)
 - [ ] **27.13** `ORDER BY` with `LIMIT` optimization (bounded sorter)

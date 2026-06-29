@@ -58,8 +58,9 @@ pub fn compile_select(
     table: Option<&Table>,
     indexes: &[IndexObject],
     subquery_resolver: Option<&dyn SubqueryResolver>,
+    case_sensitive_like: bool,
 ) -> Result<(Program, Vec<String>)> {
-    select::compile(select, table, indexes, subquery_resolver)
+    select::compile(select, table, indexes, subquery_resolver, case_sensitive_like)
 }
 
 /// Compute the `EXPLAIN QUERY PLAN` index-plan summary for `select` against `table` with its
@@ -71,11 +72,12 @@ pub fn select_index_plan_info(
     select: &SelectStmt,
     table: Option<&Table>,
     indexes: &[IndexObject],
+    case_sensitive_like: bool,
 ) -> Option<crate::vdbe::explain::IndexPlanInfo> {
     let hint = select.from.first()
         .and_then(|tj| tj.table())
         .and_then(|tref| tref.indexed_by.as_ref());
-    table.and_then(|t| index_planner::pick_index(select, t, indexes, hint).ok().flatten()).map(|plan| {
+    table.and_then(|t| index_planner::pick_index(select, t, indexes, hint, case_sensitive_like).ok().flatten()).map(|plan| {
         // Render the constraint list as the oracle's `(col <op> ? ...)` detail. Equality
         // columns render as `col=?`; range columns render as `col>?` / `col<?`. The same
         // column with both bounds renders as `col>? AND col<?`. The list is in index-column

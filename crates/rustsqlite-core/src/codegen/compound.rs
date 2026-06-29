@@ -42,6 +42,7 @@ pub fn compile_compound(
     table: Option<&Table>,
     indexes: &[IndexObject],
     subquery_resolver: Option<&dyn SubqueryResolver>,
+    case_sensitive_like: bool,
 ) -> Result<(Program, Vec<String>)> {
     if select.compound.is_empty() {
         return Err(Error::msg("compile_compound called on a non-compound SELECT"));
@@ -82,9 +83,9 @@ pub fn compile_compound(
         && select.compound[0].0 == CompoundOperator::UnionAll
         && select.order_by.is_empty();
     let program = if is_union_all_only {
-        compile_union_all_chain(select, table, indexes, subquery_resolver, limit, offset)?
+        compile_union_all_chain(select, table, indexes, subquery_resolver, limit, offset, case_sensitive_like)?
     } else {
-        compile_compound_merge(select, table, indexes, subquery_resolver, limit, offset)?
+        compile_compound_merge(select, table, indexes, subquery_resolver, limit, offset, case_sensitive_like)?
     };
 
     Ok((program, names))
@@ -100,6 +101,7 @@ fn compile_union_all_chain(
     subquery_resolver: Option<&dyn SubqueryResolver>,
     limit: Option<i64>,
     offset: i64,
+    case_sensitive_like: bool,
 ) -> Result<Program> {
     let (_op, trailing) = &select.compound[0];
     let trailing_table = resolve_arm_table(trailing, subquery_resolver)?;
@@ -143,7 +145,7 @@ fn compile_union_all_chain(
     leading_arm.compound.clear();
     leading_arm.limit = None;
     leading_arm.offset = None;
-    let leading_prog = select::compile(&leading_arm, table, indexes, subquery_resolver)?.0;
+    let leading_prog = select::compile(&leading_arm, table, indexes, subquery_resolver, case_sensitive_like)?.0;
 
     let leading_halt_idx = leading_prog
         .instructions
@@ -208,7 +210,7 @@ fn compile_union_all_chain(
 
     // Trailing arm prologue.
     b.resolve(trailing_prologue_label);
-    let trailing_prog = select::compile(trailing, trailing_table.as_ref(), &trailing_indexes, subquery_resolver)?.0;
+    let trailing_prog = select::compile(trailing, trailing_table.as_ref(), &trailing_indexes, subquery_resolver, case_sensitive_like)?.0;
     let trailing_halt_idx = trailing_prog
         .instructions
         .iter()
@@ -349,11 +351,12 @@ fn compile_compound_merge(
     subquery_resolver: Option<&dyn SubqueryResolver>,
     limit: Option<i64>,
     offset: i64,
+    case_sensitive_like: bool,
 ) -> Result<Program> {
     if select.compound.len() == 1 {
-        compile_two_arm_merge(select, table, indexes, subquery_resolver, limit, offset)
+        compile_two_arm_merge(select, table, indexes, subquery_resolver, limit, offset, case_sensitive_like)
     } else {
-        compile_multi_arm_merge(select, table, indexes, subquery_resolver, limit, offset)
+        compile_multi_arm_merge(select, table, indexes, subquery_resolver, limit, offset, case_sensitive_like)
     }
 }
 
@@ -366,6 +369,7 @@ fn compile_two_arm_merge(
     subquery_resolver: Option<&dyn SubqueryResolver>,
     limit: Option<i64>,
     offset: i64,
+    case_sensitive_like: bool,
 ) -> Result<Program> {
     let (outer_op, trailing) = (select.compound[0].0, &select.compound[0].1);
     let leading_outputs = expand_columns(select, table)?;
@@ -409,9 +413,9 @@ fn compile_two_arm_merge(
     trailing_arm.limit = None;
     trailing_arm.offset = None;
 
-    let leading_prog = select::compile(&leading_arm, table, indexes, subquery_resolver)?.0;
+    let leading_prog = select::compile(&leading_arm, table, indexes, subquery_resolver, case_sensitive_like)?.0;
     let trailing_prog =
-        select::compile(&trailing_arm, trailing_table.as_ref(), &trailing_indexes, subquery_resolver)?.0;
+        select::compile(&trailing_arm, trailing_table.as_ref(), &trailing_indexes, subquery_resolver, case_sensitive_like)?.0;
 
     let mut b = ProgramBuilder::new();
     let setup = b.new_label();
@@ -580,6 +584,7 @@ fn compile_multi_arm_merge(
     subquery_resolver: Option<&dyn SubqueryResolver>,
     limit: Option<i64>,
     offset: i64,
+    case_sensitive_like: bool,
 ) -> Result<Program> {
     let last_idx = select.compound.len() - 1;
     let outer_op = select.compound[last_idx].0;
@@ -592,7 +597,7 @@ fn compile_multi_arm_merge(
     left_select.offset = None;
 
     let (left_prog, left_names) =
-        compile_compound(&left_select, table, indexes, subquery_resolver)?;
+        compile_compound(&left_select, table, indexes, subquery_resolver, case_sensitive_like)?;
     let ncol = left_names.len() as i32;
 
     let order_terms: Vec<OrderingTerm> = if !select.order_by.is_empty() {
@@ -795,6 +800,7 @@ fn compile_multi_arm_merge(
         rightmost_table.as_ref(),
         &rightmost_indexes,
         subquery_resolver,
+        case_sensitive_like,
     )?
     .0;
     let co_b_start = b.new_label();

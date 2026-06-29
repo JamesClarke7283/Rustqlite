@@ -972,7 +972,7 @@ fn compile_insert_select(
     // The select compiler emits ResultRow with the result registers in a contiguous block. We
     // rewrite those ResultRow instructions into MakeRecord + SorterInsert so the selected rows
     // accumulate in the sorter.
-    let (select_program, _names) = select::compile(sel, source_table, source_indexes, None)?;
+    let (select_program, _names) = select::compile(sel, source_table, source_indexes, None, false)?;
     let select_start = b.cur_addr();
     // Append the select instructions wholesale, remapping ResultRow and Halt.
     let select_offset = select_start;

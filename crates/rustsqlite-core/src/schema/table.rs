@@ -554,15 +554,42 @@ impl IndexObject {
         let columns: Vec<IndexedColumn> = ci
             .columns
             .iter()
-            .map(|c| IndexedColumn {
-                name: c.name.clone(),
-                expr: c.expr.clone(),
-                collation: c
-                    .collation
-                    .as_deref()
-                    .and_then(Collation::from_name)
-                    .unwrap_or(Collation::Binary),
-                desc: c.desc,
+            .map(|c| {
+                // The index column's collation: an explicit `COLLATE` on the indexed column
+                // wins; otherwise the index inherits the table column's declared collation
+                // (mirrors SQLite's `sqlite3CreateIndex` which copies `pTab->aCol[iCol].collate`
+                // when the index column has no explicit collation). This matters for the LIKE
+                // optimization: an index on a `TEXT COLLATE NOCASE` column uses NOCASE
+                // comparisons, so a default `LIKE 'prefix%'` (which synthesizes NOCASE bounds)
+                // can use the index.
+                let explicit = c.collation.as_deref().and_then(Collation::from_name);
+                let collation = explicit
+                    .or_else(|| {
+                        // A bare-column index (name present, expr a plain `Expr::Column`)
+                        // inherits the table column's declared collation. A real expression
+                        // index (empty name) does not — its collation is whatever was declared
+                        // on the index column, or BINARY.
+                        if c.name.is_empty() {
+                            None
+                        } else {
+                            table.column_index(&c.name)
+                                .and_then(|idx| {
+                                    let col = &table.columns[idx];
+                                    if col.collation == Collation::Binary {
+                                        None
+                                    } else {
+                                        Some(col.collation)
+                                    }
+                                })
+                        }
+                    })
+                    .unwrap_or(Collation::Binary);
+                IndexedColumn {
+                    name: c.name.clone(),
+                    expr: c.expr.clone(),
+                    collation,
+                    desc: c.desc,
+                }
             })
             .collect();
         let unique_not_null = ci.unique

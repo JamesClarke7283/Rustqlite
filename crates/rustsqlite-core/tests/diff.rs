@@ -1276,6 +1276,238 @@ fn range_scan_index_access() {
     }
 }
 
+/// M27.10: the LIKE/GLOB prefix optimization. A `col LIKE 'prefix%'` (or `col GLOB 'prefix*'`)
+/// on an indexed TEXT column with the right collation drives an index range scan
+/// `[prefix, prefix+1)` instead of a full table scan. The "complete" pattern (`prefix` +
+/// single `%`/`*` at the end) drops the LIKE re-check; the "incomplete" pattern
+/// (`prefix%suffix`, `prefix_`, etc.) re-checks the LIKE on each row.
+#[test]
+fn like_optimization_index_range_scan() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    // Case-sensitive LIKE: BINARY column, index with BINARY collation (the default).
+    let cs_db = TempDb::new();
+    cs_db.setup(
+        "PRAGMA case_sensitive_like=ON;\
+         CREATE TABLE t(a TEXT, b INTEGER);\
+         CREATE INDEX i_a ON t(a);\
+         INSERT INTO t VALUES\
+            ('apple',1),('apricot',2),('banana',3),('cherry',4),('avocado',5),\
+            ('abc',6),('abd',7),('aBd',8),('AZ',9),('A',10),('',11),('B',12);",
+    );
+    for q in [
+        // prefix% — complete, no recheck.
+        "SELECT a FROM t WHERE a LIKE 'ap%' ORDER BY a",
+        "SELECT a, b FROM t WHERE a LIKE 'ap%' ORDER BY a",
+        // prefix%suffix — incomplete, rechecks the LIKE on each row.
+        "SELECT a FROM t WHERE a LIKE 'ap%ot' ORDER BY a",
+        "SELECT a FROM t WHERE a LIKE 'a%c%' ORDER BY a",
+        // prefix_ — incomplete (the `_` is a 1-char wildcard).
+        "SELECT a FROM t WHERE a LIKE 'ab_' ORDER BY a",
+        "SELECT a FROM t WHERE a LIKE 'a_c%' ORDER BY a",
+        // Exact pattern (no wildcard) — incomplete; the range is `[abc, abd)` so 'abc' matches.
+        "SELECT a FROM t WHERE a LIKE 'abc' ORDER BY a",
+        // No prefix — table scan (no index).
+        "SELECT a FROM t WHERE a LIKE '%ap' ORDER BY a",
+        // Empty pattern — table scan (no prefix).
+        "SELECT a FROM t WHERE a LIKE '' ORDER BY a",
+        // `%` only — table scan (no prefix).
+        "SELECT a FROM t WHERE a LIKE '%' ORDER BY a",
+        // Single-char prefix.
+        "SELECT a FROM t WHERE a LIKE 'A%' ORDER BY a",
+        "SELECT a FROM t WHERE a LIKE 'B' ORDER BY a",
+        // With ORDER BY (the index walk is already in order, no sorter).
+        "SELECT a FROM t WHERE a LIKE 'a%' ORDER BY a",
+        // With LIMIT.
+        "SELECT a FROM t WHERE a LIKE 'a%' ORDER BY a LIMIT 2",
+        "SELECT a FROM t WHERE a LIKE 'a%' ORDER BY a LIMIT 2 OFFSET 1",
+        // DISTINCT on a LIKE scan.
+        "SELECT DISTINCT substr(a,1,1) FROM t WHERE a LIKE 'a%'",
+        // Non-TEXT column — no optimization, table scan.
+        "SELECT b FROM t WHERE b LIKE '1%' ORDER BY b",
+        // Concat pattern — not folded, table scan.
+        "SELECT a FROM t WHERE a LIKE 'ap' || '%' ORDER BY a",
+        // NOT LIKE — not the positive form, table scan.
+        "SELECT a FROM t WHERE a NOT LIKE 'ap%' ORDER BY a",
+    ] {
+        assert_same(cs_db.str(), q);
+    }
+    // Verify EXPLAIN QUERY PLAN matches for a representative subset.
+    for q in [
+        "SELECT a FROM t WHERE a LIKE 'ap%'",
+        "SELECT a FROM t WHERE a LIKE 'ap%ot'",
+        "SELECT a FROM t WHERE a LIKE 'a_c%'",
+        "SELECT a FROM t WHERE a LIKE 'abc'",
+        "SELECT a FROM t WHERE a LIKE '%ap'",
+        "SELECT a FROM t WHERE a LIKE ''",
+        "SELECT a FROM t WHERE a LIKE 'A%'",
+        "SELECT b FROM t WHERE b LIKE '1%'",
+        "SELECT a FROM t WHERE a NOT LIKE 'ap%'",
+    ] {
+        let eqp = format!("EXPLAIN QUERY PLAN {q}");
+        let expected: Vec<String> = sqlite3_rows(cs_db.str(), &eqp)
+            .into_iter()
+            .filter(|l| !l.is_empty())
+            .collect();
+        let mut conn = sqlite3_open(cs_db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, &eqp).unwrap();
+        let mut got: Vec<String> = Vec::new();
+        loop {
+            match stmt.step() {
+                ResultCode::Row => {
+                    let detail = stmt.column_value(3).to_text().unwrap_or_default();
+                    got.push(detail.to_string());
+                }
+                ResultCode::Done => break,
+                other => panic!("step {other:?} for {eqp}"),
+            }
+        }
+        let expected: Vec<String> = expected
+            .into_iter()
+            .filter(|l| !l.is_empty() && l != "QUERY PLAN")
+            .map(|l| l.trim_start_matches(['`', '|', '-', ' ', '\t']).to_string())
+            .collect();
+        assert_eq!(got, expected, "EQP mismatch for: {eqp}");
+    }
+
+    // Case-insensitive LIKE (default): NOCASE column + index with inherited NOCASE collation.
+    let nc_db = TempDb::new();
+    nc_db.setup(
+        "CREATE TABLE t(a TEXT COLLATE NOCASE);\
+         CREATE INDEX i_a ON t(a);\
+         INSERT INTO t VALUES ('Apple'),('apricot'),('banana'),('Cherry'),('APX'),('ap');",
+    );
+    for q in [
+        "SELECT a FROM t WHERE a LIKE 'ap%' ORDER BY a",
+        "SELECT a FROM t WHERE a LIKE 'AP%' ORDER BY a",
+        "SELECT a FROM t WHERE a LIKE 'Ap%' ORDER BY a",
+        "SELECT a FROM t WHERE a LIKE 'ap%ot' ORDER BY a",
+        "SELECT a FROM t WHERE a LIKE 'a_c%' ORDER BY a",
+        // A non-NOCASE column doesn't get the LIKE opt under default (case-insensitive) LIKE.
+        // The following uses a BINARY column with a NOCASE-index — actually the index inherits
+        // BINARY, so the opt doesn't fire (matches the oracle).
+    ] {
+        assert_same(nc_db.str(), q);
+    }
+    for q in [
+        "SELECT a FROM t WHERE a LIKE 'ap%'",
+        "SELECT a FROM t WHERE a LIKE 'Ap%'",
+    ] {
+        let eqp = format!("EXPLAIN QUERY PLAN {q}");
+        let expected: Vec<String> = sqlite3_rows(nc_db.str(), &eqp)
+            .into_iter()
+            .filter(|l| !l.is_empty() && l != "QUERY PLAN")
+            .map(|l| l.trim_start_matches(['`', '|', '-', ' ', '\t']).to_string())
+            .collect();
+        let mut conn = sqlite3_open(nc_db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, &eqp).unwrap();
+        let mut got: Vec<String> = Vec::new();
+        loop {
+            match stmt.step() {
+                ResultCode::Row => {
+                    let detail = stmt.column_value(3).to_text().unwrap_or_default();
+                    got.push(detail.to_string());
+                }
+                ResultCode::Done => break,
+                other => panic!("step {other:?} for {eqp}"),
+            }
+        }
+        assert_eq!(got, expected, "EQP mismatch for: {eqp}");
+    }
+
+    // GLOB: always case-sensitive (BINARY), uses `*`/`?` wildcards.
+    let glob_db = TempDb::new();
+    glob_db.setup(
+        "CREATE TABLE t(a TEXT);\
+         CREATE INDEX i_a ON t(a);\
+         INSERT INTO t VALUES ('abc.txt'),('def.txt'),('abcd'),('aXc'),('abc'),('ab'),('a');",
+    );
+    for q in [
+        "SELECT a FROM t WHERE a GLOB 'abc*' ORDER BY a",
+        "SELECT a FROM t WHERE a GLOB 'abc' ORDER BY a",
+        "SELECT a FROM t WHERE a GLOB 'abc?*' ORDER BY a",
+        "SELECT a FROM t WHERE a GLOB 'a?c*' ORDER BY a",
+        "SELECT a FROM t WHERE a GLOB 'a*' ORDER BY a",
+        "SELECT a FROM t WHERE a GLOB '*abc' ORDER BY a",
+        "SELECT a FROM t WHERE a GLOB 'ABC*' ORDER BY a",
+    ] {
+        assert_same(glob_db.str(), q);
+    }
+    for q in [
+        "SELECT a FROM t WHERE a GLOB 'abc*'",
+        "SELECT a FROM t WHERE a GLOB 'abc'",
+        "SELECT a FROM t WHERE a GLOB 'a?c*'",
+        "SELECT a FROM t WHERE a GLOB '*abc'",
+    ] {
+        let eqp = format!("EXPLAIN QUERY PLAN {q}");
+        let expected: Vec<String> = sqlite3_rows(glob_db.str(), &eqp)
+            .into_iter()
+            .filter(|l| !l.is_empty() && l != "QUERY PLAN")
+            .map(|l| l.trim_start_matches(['`', '|', '-', ' ', '\t']).to_string())
+            .collect();
+        let mut conn = sqlite3_open(glob_db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, &eqp).unwrap();
+        let mut got: Vec<String> = Vec::new();
+        loop {
+            match stmt.step() {
+                ResultCode::Row => {
+                    let detail = stmt.column_value(3).to_text().unwrap_or_default();
+                    got.push(detail.to_string());
+                }
+                ResultCode::Done => break,
+                other => panic!("step {other:?} for {eqp}"),
+            }
+        }
+        assert_eq!(got, expected, "EQP mismatch for: {eqp}");
+    }
+
+    // ESCAPE clause: `col LIKE pattern ESCAPE esc` lowers to a 3-arg `like(pattern, col, esc)`
+    // function call; the opt recognizes the escape and uses it for prefix extraction.
+    let esc_db = TempDb::new();
+    esc_db.setup(
+        "PRAGMA case_sensitive_like=ON;\
+         CREATE TABLE t(a TEXT);\
+         CREATE INDEX i_a ON t(a);\
+         INSERT INTO t VALUES ('abc%def'),('abcXdef'),('abc%'),('abc'),('abcg'),('abd');",
+    );
+    for q in [
+        "SELECT a FROM t WHERE a LIKE 'abc\\%def' ESCAPE '\\' ORDER BY a",
+        "SELECT a FROM t WHERE a LIKE 'abc\\%def%' ESCAPE '\\' ORDER BY a",
+        "SELECT a FROM t WHERE a LIKE 'abc[%' ESCAPE '[' ORDER BY a",
+        "SELECT a FROM t WHERE a LIKE 'abc%' ESCAPE '\\' ORDER BY a",
+    ] {
+        assert_same(esc_db.str(), q);
+    }
+    for q in [
+        "SELECT a FROM t WHERE a LIKE 'abc\\%def' ESCAPE '\\'",
+        "SELECT a FROM t WHERE a LIKE 'abc\\%def%' ESCAPE '\\'",
+        "SELECT a FROM t WHERE a LIKE 'abc[%' ESCAPE '['",
+    ] {
+        let eqp = format!("EXPLAIN QUERY PLAN {q}");
+        let expected: Vec<String> = sqlite3_rows(esc_db.str(), &eqp)
+            .into_iter()
+            .filter(|l| !l.is_empty() && l != "QUERY PLAN")
+            .map(|l| l.trim_start_matches(['`', '|', '-', ' ', '\t']).to_string())
+            .collect();
+        let mut conn = sqlite3_open(esc_db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, &eqp).unwrap();
+        let mut got: Vec<String> = Vec::new();
+        loop {
+            match stmt.step() {
+                ResultCode::Row => {
+                    let detail = stmt.column_value(3).to_text().unwrap_or_default();
+                    got.push(detail.to_string());
+                }
+                ResultCode::Done => break,
+                other => panic!("step {other:?} for {eqp}"),
+            }
+        }
+        assert_eq!(got, expected, "EQP mismatch for: {eqp}");
+    }
+}
+
 /// `EXPLAIN QUERY PLAN` detail strings for index-based plans (M5.2.12–5.2.14). The wording
 /// must match the oracle: `SCAN/SEARCH t USING [COVERING] INDEX <name> [(<col>=? ...)]`.
 #[test]

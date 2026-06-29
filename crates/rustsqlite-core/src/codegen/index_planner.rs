@@ -51,11 +51,11 @@
 //! again here. When the index is covering, the WHERE is re-checked against the index-read
 //! column values instead.
 
-use rustqlite_parser::{BinaryOp, Expr, IndexedBy, Literal, OrderingTerm, SelectStmt};
+use rustqlite_parser::{BinaryOp, Expr, FunctionArgs, IndexedBy, Literal, OrderingTerm, SelectStmt};
 
 use crate::error::{Error, Result};
 use crate::schema::{IndexObject, Table};
-use crate::types::Value;
+use crate::types::{Collation, Value};
 
 /// A comparison operator on an indexed column against a constant RHS, in the form the index
 /// range-scan machinery consumes. Mirrors the `WO_EQ`/`WO_GT`/`WO_LE`/... bit flags in
@@ -131,6 +131,40 @@ pub(crate) struct IndexPlan {
     /// satisfy the ORDER BY clause. The codegen must emit a sorter over the index scan.
     /// Always `false` for an unconstrained planner pick.
     pub needs_sorter: bool,
+    /// The LIKE/GLOB optimization that synthesized the `Ge`/`Lt` range prefix, when present.
+    /// When `is_complete`, the codegen drops the LIKE term from the per-row WHERE re-check
+    /// (the index range `[prefix, prefix+1)` is provably equivalent to the LIKE match).
+    /// When not complete, the LIKE term is re-checked on each row via the normal WHERE
+    /// re-check (the range is a superset of the match set).
+    pub like_opt: Option<LikeOpt>,
+}
+
+/// A LIKE/GLOB range-prefix optimization (mirrors the `TERM_LIKEOPT` virtual terms in
+/// `whereexpr.c`). The LIKE term `col LIKE 'prefix%'` (or `col GLOB 'prefix*'`) synthesizes a
+/// `col >= prefix AND col < prefix_upper` pair, where `prefix_upper` is the prefix with its
+/// last UTF-8 byte incremented (carrying through `0xBF` continuation bytes). The `is_complete`
+/// flag is true only when the pattern is `prefix` followed by exactly one multi-char wildcard
+/// (`%` for LIKE, `*` for GLOB) and nothing else — in that case the LIKE term need not be
+/// re-evaluated per row.
+///
+/// `like_term` is the AST node of the original LIKE/GLOB expression, so the codegen can
+/// identify and drop it from the WHERE re-check when `is_complete`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LikeOpt {
+    /// The column name the LIKE/GLOB operates on.
+    pub column: String,
+    /// The literal prefix (with escape sequences resolved).
+    pub prefix: String,
+    /// The upper-bound string (the prefix with its last UTF-8 byte incremented, carrying
+    /// through `0xBF` continuation bytes). `None` when the prefix's last byte is `0xFF` (no
+    /// representable upper bound — the range is open-ended, scanned with `>= prefix` only).
+    pub upper: Option<String>,
+    /// True when the pattern is exactly `prefix<wc>` with nothing after the wildcard — the
+    /// index range is equivalent to the LIKE match, so the LIKE term is dropped from the
+    /// re-check.
+    pub is_complete: bool,
+    /// The original LIKE/GLOB expression (for re-check elision when complete).
+    pub like_term: Expr,
 }
 
 impl IndexPlan {
@@ -190,6 +224,7 @@ pub(crate) fn pick_index(
     table: &Table,
     indexes: &[IndexObject],
     hint: Option<&IndexedBy>,
+    case_sensitive_like: bool,
 ) -> Result<Option<IndexPlan>> {
     if indexes.is_empty() {
         if let Some(IndexedBy::Index(name)) = hint {
@@ -215,7 +250,33 @@ pub(crate) fn pick_index(
     }
 
     let table_columns: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
-    let where_constraints = collect_where_range_constraints(select);
+    let mut where_constraints = collect_where_range_constraints(select);
+    // The LIKE/GLOB optimization: scan the WHERE conjuncts for `col LIKE 'prefix%'` /
+    // `col GLOB 'prefix*'` patterns and synthesize `col >= prefix AND col < prefix_upper`
+    // range constraints on the column. The synthesized constraints carry the LIKE term so
+    // the codegen can drop the LIKE re-check when the pattern is "complete" (only the
+    // multi-char wildcard at the end). This mirrors the `TERM_LIKEOPT` virtual terms in
+    // `whereexpr.c`. The optimization requires the index's leading column to match the LIKE
+    // column AND have the right collation: NOCASE for default (case-insensitive) LIKE,
+    // BINARY for case-sensitive LIKE and for GLOB.
+    let like_opts = collect_like_opts(select, table, case_sensitive_like);
+    for opt in &like_opts {
+        // Synthesize the `>= prefix` and `< prefix_upper` constraints. The column's
+        // declared collation is left implicit here; the index-column collation (which the
+        // codegen threads into the `SeekGE`/`IdxLT` `KeyInfo`) is what the VDBE uses.
+        where_constraints.push(RangeKey {
+            column: opt.column.clone(),
+            op: RangeOp::Ge,
+            value: Value::Text(opt.prefix.clone()),
+        });
+        if let Some(upper) = &opt.upper {
+            where_constraints.push(RangeKey {
+                column: opt.column.clone(),
+                op: RangeOp::Lt,
+                value: Value::Text(upper.clone()),
+            });
+        }
+    }
 
     // The columns the query references (projection + WHERE + ORDER BY). Used to decide if an
     // index is covering. `collect_referenced_columns` walks the expressions and returns the
@@ -229,7 +290,7 @@ pub(crate) fn pick_index(
             .iter()
             .find(|i| i.name.eq_ignore_ascii_case(forced_name))
             .ok_or_else(|| Error::msg(format!("no such index: {}", forced_name)))?;
-        return Ok(Some(plan_for_index(select, idx, table, &table_columns, &where_constraints, &referenced, true)?));
+        return Ok(Some(plan_for_index(select, idx, table, &table_columns, &where_constraints, &referenced, &like_opts, true)?));
     }
 
     // Choose the index with the best combined benefit. Score is a tuple
@@ -250,7 +311,7 @@ pub(crate) fn pick_index(
             continue;
         }
 
-        let plan = plan_for_index(select, idx, table, &table_columns, &where_constraints, &referenced, false)?;
+        let plan = plan_for_index(select, idx, table, &table_columns, &where_constraints, &referenced, &like_opts, false)?;
         // Require at least one benefit to use the index. A useless index that is neither
         // covering, nor ORDER-BY-satisfying, nor has a WHERE constraint would just add an
         // extra b-tree open with no gain — fall through to the table scan.
@@ -304,6 +365,7 @@ fn plan_for_index(
     table_columns: &[&str],
     where_constraints: &[RangeKey],
     referenced: &[usize],
+    like_opts: &[LikeOpt],
     forced: bool,
 ) -> Result<IndexPlan> {
     if !forced && !partial_index_usable(idx, select) {
@@ -315,6 +377,7 @@ fn plan_for_index(
             order_by_satisfied: false,
             covering: false,
             needs_sorter: false,
+            like_opt: None,
         });
     }
 
@@ -355,12 +418,36 @@ fn plan_for_index(
     // `SCAN t USING INDEX <name>` + `USE TEMP B-TREE FOR ORDER BY`).
     let needs_sorter = forced && !select.order_by.is_empty() && !order_by_satisfied;
 
+    // The LIKE/GLOB optimization applies when the LIKE column is the index's leading column
+    // and the range includes the synthesized `>= prefix` constraint on that column. The
+    // matching `LikeOpt` is attached so the codegen can drop the LIKE re-check when the
+    // pattern is "complete".
+    let like_opt = like_opts.iter().find(|opt| {
+        // The LIKE column must be the index's leading plain column (the synthesized `>=` is
+        // a lower bound on the leading column; an equality prefix would pin the LIKE column
+        // to a single value, defeating the range scan). The range must include a `Ge`
+        // constraint on that column (i.e. the LIKE opt was actually incorporated, not
+        // shadowed by a user-supplied tighter constraint).
+        if let Some(ic0) = idx.columns.first() {
+            if ic0.is_expression() {
+                return false;
+            }
+            ic0.name.eq_ignore_ascii_case(&opt.column)
+                && range
+                    .iter()
+                    .any(|k| k.column.eq_ignore_ascii_case(&opt.column) && matches!(k.op, RangeOp::Ge))
+        } else {
+            false
+        }
+    }).cloned();
+
     Ok(IndexPlan {
         index: idx.clone(),
         range,
         order_by_satisfied,
         covering,
         needs_sorter,
+        like_opt,
     })
 }
 
@@ -537,6 +624,319 @@ fn as_range_key(expr: &Expr) -> Option<RangeKey> {
     }
 
     Some(RangeKey { column: col, op, value })
+}
+
+/// Scan the WHERE conjuncts for `col LIKE 'pattern'` / `col GLOB 'pattern'` patterns that can
+/// drive an index range scan, and return the synthesized `LikeOpt`s. Mirrors the
+/// `isLikeOrGlob` + `TERM_LIKEOPT` synthesis in `whereexpr.c`.
+///
+/// The optimization is gated on:
+///   * The LHS is a bare column with TEXT affinity (the common case for a `LIKE` on a string
+///     column). A non-TEXT column falls through to a table scan (the prefix might be parsed
+///     as a number, invalidating the b-tree order — upstream does a numeric check we skip).
+///   * The RHS is a literal string (concat, bind parameters, and other expressions are not
+///     folded — matches the oracle, which only folds a literal `TK_STRING`).
+///   * The pattern has a non-empty literal prefix that does not end in `0xFF` and is not a
+///     single-character escape sequence alone.
+///   * The collation matches: a default (case-insensitive) LIKE produces NOCASE bounds, so
+///     the column's declared collation must be NOCASE; a case-sensitive LIKE or a GLOB
+///     produces BINARY bounds, so the column's declared collation must be BINARY. (The
+///     synthesized constraints carry no explicit collation here — the index-column collation
+///     in the `KeyInfo` is what the VDBE consults, and the planner's index-pick step matches
+///     the column's declared collation against the index column's collation.)
+fn collect_like_opts(select: &SelectStmt, table: &Table, case_sensitive_like: bool) -> Vec<LikeOpt> {
+    let mut out = Vec::new();
+    let Some(w) = &select.where_clause else { return out };
+    let mut conjuncts = Vec::new();
+    flatten_and(w, &mut conjuncts);
+    for c in &conjuncts {
+        if let Some(opt) = analyze_like_term(c, table, case_sensitive_like) {
+            out.push(opt);
+        }
+    }
+    out
+}
+
+/// Analyze a single conjunct as a potential LIKE/GLOB optimization. Returns `Some(LikeOpt)`
+/// when the term is `col LIKE 'pat'` / `col GLOB 'pat'` (or the equivalent 2/3-arg
+/// `like('pat', col [, esc])` / `glob('pat', col)` function form, which is what `X LIKE Y
+/// ESCAPE Z` lowers to) and all the gating conditions hold.
+fn analyze_like_term(expr: &Expr, table: &Table, case_sensitive_like: bool) -> Option<LikeOpt> {
+    // The parser lowers `X LIKE Y` / `X GLOB Y` to `Expr::Binary { op: Like/Glob, left: X,
+    // right: Y }`. The 3-arg `X LIKE Y ESCAPE Z` (and the explicit `like(Y, X, Z)` function
+    // form) lowers to `Expr::Function { name: "like", args: [Y, X, Z] }`. `NOT LIKE` /
+    // `NOT GLOB` is `Expr::Unary { op: Not, expr: Binary { op: Like, ... } }` (or a Function
+    // with a Not wrapper) — the optimization targets the positive form only.
+    let (kind, col_expr, pattern_expr, escape_byte) = match expr {
+        Expr::Binary { op: BinaryOp::Like, left, right } => {
+            (LikeKind::Like, left.as_ref(), right.as_ref(), 0u8)
+        }
+        Expr::Binary { op: BinaryOp::Glob, left, right } => {
+            (LikeKind::Glob, left.as_ref(), right.as_ref(), 0u8)
+        }
+        Expr::Function { name, args, .. } if matches!(name.as_str(), "like" | "glob") => {
+            let list = match args {
+                FunctionArgs::List(v) => v,
+                _ => return None,
+            };
+            // `like(pattern, text [, escape])` / `glob(pattern, text)`.
+            if list.len() < 2 || list.len() > 3 {
+                return None;
+            }
+            let kind = if name == "like" { LikeKind::Like } else { LikeKind::Glob };
+            let pattern_expr = &list[0];
+            let col_expr = &list[1];
+            let escape_byte = if list.len() == 3 {
+                match &list[2] {
+                    // The escape operand must be a single-character string literal. Upstream's
+                    // `isLikeFunction` rejects an empty or multi-char escape and rejects when
+                    // the escape equals a wildcard char.
+                    Expr::Literal(Literal::Text(s)) => {
+                        let bytes = s.as_bytes();
+                        if bytes.len() != 1 {
+                            return None;
+                        }
+                        bytes[0]
+                    }
+                    _ => return None,
+                }
+            } else {
+                0u8
+            };
+            (kind, col_expr, pattern_expr, escape_byte)
+        }
+        _ => return None,
+    };
+
+    // LHS must be a bare column with TEXT affinity.
+    let col_name = column_name(col_expr)?;
+    let col_idx = table.column_index(&col_name)?;
+    if !matches!(table.columns[col_idx].affinity, crate::types::Affinity::Text) {
+        return None;
+    }
+    let col_collation = table.columns[col_idx].collation;
+
+    // RHS (the pattern) must be a literal string.
+    let pattern = match pattern_expr {
+        Expr::Literal(Literal::Text(s)) => s.as_str(),
+        _ => return None,
+    };
+
+    // For LIKE: noCase is true when the connection has not set `case_sensitive_like` (the
+    // `like()` function's `SQLITE_FUNC_CASE` flag is unset by default). The synthesized bounds
+    // use NOCASE collation, so the column must have NOCASE collation. When case-sensitive, the
+    // bounds use BINARY and the column must have BINARY collation. For GLOB: always
+    // case-sensitive (BINARY bounds). An explicit ESCAPE clause doesn't change the case
+    // sensitivity — `like()` keeps the same `SQLITE_FUNC_CASE` flag regardless of the escape.
+    let no_case = matches!(kind, LikeKind::Like) && !case_sensitive_like;
+    let required_collation = if no_case { Collation::NoCase } else { Collation::Binary };
+    if col_collation != required_collation {
+        return None;
+    }
+
+    // Wildcard set (as raw bytes): LIKE uses `%`/`_` with an optional escape; GLOB uses
+    // `*`/`?` and `[...]` (no escape). The escape byte is `0` when no ESCAPE clause is present.
+    let (wc_all, wc_one, wc_set): (u8, u8, u8) = match kind {
+        LikeKind::Like => (b'%', b'_', 0),
+        LikeKind::Glob => (b'*', b'?', b'['),
+    };
+
+    // The escape must not equal a wildcard char (upstream rejects this in `isLikeFunction`).
+    if escape_byte != 0 && (escape_byte == wc_all || escape_byte == wc_one || escape_byte == wc_set) {
+        return None;
+    }
+
+    // Count the literal prefix: bytes before the first unescaped wildcard, with the same
+    // UTF-8 boundary handling as `isLikeOrGlob` in `whereexpr.c`. An escape char is
+    // recognized only for LIKE (GLOB has no escape); the escape must be followed by an ASCII
+    // byte (<0x80) that is then taken literally.
+    let bytes = pattern.as_bytes();
+    let mut cnt = 0usize;
+    let mut c: u8;
+    loop {
+        c = if cnt < bytes.len() { bytes[cnt] } else { 0 };
+        if c == 0 || c == wc_all || c == wc_one || (c == wc_set && matches!(kind, LikeKind::Glob)) {
+            break;
+        }
+        cnt += 1;
+        if escape_byte != 0 && c == escape_byte && cnt < bytes.len() && bytes[cnt] < 0x80 {
+            cnt += 1;
+        } else if c >= 0x80 {
+            // Validate the UTF-8 sequence. A malformed byte or 0xFF stops the prefix (the b-tree
+            // can't order on an invalid code point). The `sqlite3Utf8Read` validation in
+            // upstream rejects 0xFF and the replacement char U+FFFD.
+            if c == 0xFF {
+                cnt -= 1;
+                break;
+            }
+            let seq_start = cnt - 1;
+            // Walk the multi-byte sequence by reading continuation bytes.
+            let mut p = seq_start + 1;
+            while p < bytes.len() && (bytes[p] & 0xC0) == 0x80 {
+                p += 1;
+            }
+            // Decode the code point to check for U+FFFD (malformed). We use a lightweight
+            // check: if the byte length doesn't match the lead-byte expectation, treat as
+            // malformed. The full `sqlite3Utf8Read` does the same.
+            let expected_len = match c {
+                0xC0..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                0xF0..=0xF7 => 4,
+                _ => 1, // 0xF8..=0xFE: invalid lead byte — stop the prefix
+            };
+            if p - seq_start != expected_len {
+                // Malformed — back up to the lead byte and stop.
+                cnt = seq_start;
+                break;
+            }
+            // Decode the code point to check for U+FFFD.
+            let mut codepoint: u32 = (c as u32) & match expected_len {
+                2 => 0x1F,
+                3 => 0x0F,
+                4 => 0x07,
+                _ => 0,
+            };
+            for i in 1..expected_len {
+                codepoint = (codepoint << 6) | ((bytes[seq_start + i] as u32) & 0x3F);
+            }
+            if codepoint == 0xFFFD {
+                cnt = seq_start;
+                break;
+            }
+            cnt = p;
+        }
+    }
+
+    // The prefix must be non-empty and not end in 0xFF. The `cnt > 1 || (cnt > 0 && z[0] != wc[3])`
+    // gate from upstream ensures a single-char prefix consisting of just the escape char is
+    // rejected (after escape removal the prefix would be empty).
+    if cnt == 0 {
+        return None;
+    }
+    if cnt == 1 && escape_byte != 0 && bytes[0] == escape_byte {
+        return None;
+    }
+    if bytes[cnt - 1] == 0xFF {
+        return None;
+    }
+
+    // Extract the prefix and resolve escape sequences (LIKE only). The escape char is the
+    // first byte of an escaped pair; the second byte is taken literally.
+    let mut prefix = Vec::with_capacity(cnt);
+    let mut i = 0;
+    while i < cnt {
+        if escape_byte != 0 && bytes[i] == escape_byte {
+            i += 1;
+            if i >= cnt {
+                break;
+            }
+        }
+        prefix.push(bytes[i]);
+        i += 1;
+    }
+    // The escape removal may have shortened the prefix; check the last byte again.
+    if prefix.is_empty() || prefix[prefix.len() - 1] == 0xFF {
+        return None;
+    }
+
+    // `isComplete`: the only wildcard is the multi-char wildcard at the very end, with
+    // nothing after it. This is the case where the LIKE term can be dropped from the
+    // per-row re-check (the range is provably equivalent to the match set).
+    let is_complete = c == wc_all && (cnt + 1 >= bytes.len() || bytes.get(cnt + 1).copied() == Some(0));
+
+    // For noCase LIKE: upstream uppercases the lower bound and lowercases the upper bound so
+    // the bounds work for BLOB comparisons too (uppercase < lowercase in ASCII). The index
+    // uses NOCASE collation, so the comparison is case-insensitive at the index level, but
+    // the bounds are folded to match the storage order (NOCASE sorts uppercase before
+    // lowercase for distinct case-variants, matching BINARY's order — so the folded bounds
+    // still select the same range). We apply the fold here.
+    let prefix_folded: Vec<u8> = if no_case {
+        prefix.iter().map(|&b| if b.is_ascii_lowercase() { b.to_ascii_uppercase() } else { b }).collect()
+    } else {
+        prefix.clone()
+    };
+
+    // Compute the upper bound: increment the last UTF-8 byte, carrying through `0xBF`
+    // continuation bytes (set them to `0x80` and increment the lead byte). When the lead
+    // byte is `0xFF`, there's no representable upper bound — the range is open-ended
+    // (scanned with `>= prefix` only, no `< upper`).
+    let mut upper = increment_last_utf8_byte(&prefix_folded);
+    if no_case {
+        if let Some(up) = &mut upper {
+            // Lowercase the upper bound (mirrors `sqlite3Tolower` on `pStr2`).
+            let lowered: Vec<u8> = up.as_bytes().iter().map(|&b| if b.is_ascii_uppercase() { b.to_ascii_lowercase() } else { b }).collect();
+            *up = String::from_utf8_lossy(&lowered).into_owned();
+        }
+    }
+    let prefix_str = String::from_utf8_lossy(&prefix_folded).into_owned();
+
+    // For noCase LIKE: upstream uppercases the lower bound and lowercases the upper bound so
+    // the bounds work for BLOB comparisons too (uppercase < lowercase in ASCII). Our
+    // NOCASE index uses the NOCASE collation directly so the comparison is case-insensitive
+    // at the index level; we don't need to fold the bounds. However, the `@`-boundary edge
+    // case (when incrementing the last char lands at `'A'-1 == '@'`, the case-fold would
+    // cross back into the `@`-`A` range and the NOCASE comparison breaks) forces a re-check
+    // even when the pattern is otherwise complete. We mirror that by clearing `is_complete`
+    // when the upper bound's last byte is exactly `b'@'` (the post-increment value).
+    let mut is_complete = is_complete;
+    if no_case {
+        if let Some(up) = &upper {
+            if let Some(&last) = up.as_bytes().last() {
+                if last == b'@' {
+                    is_complete = false;
+                }
+            }
+        }
+    }
+
+    Some(LikeOpt {
+        column: col_name,
+        prefix: prefix_str,
+        upper,
+        is_complete,
+        like_term: expr.clone(),
+    })
+}
+
+/// The kind of pattern match: LIKE (case-insensitive by default, with optional escape) or
+/// GLOB (always case-sensitive, no escape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LikeKind {
+    Like,
+    Glob,
+}
+
+/// Increment the last UTF-8 byte of `s`, carrying through `0xBF` continuation bytes.
+/// Returns `None` when the lead byte is `0xFF` (no representable upper bound). Mirrors the
+/// `while( *pC==0xBF && pC>z ) { *pC = 0x80; pC--; } (*pC)++;` loop in `whereexpr.c`. The
+/// returned string may not be valid UTF-8 (e.g. incrementing `0x80` produces `0x81`, a
+/// continuation byte); SQLite operates on raw bytes and lets the b-tree compare them as
+/// BLOBs, so we return the raw bytes as a `String` via `from_utf8_lossy`-style replacement
+/// when invalid (the b-tree's `mem_compare` compares the bytes regardless).
+fn increment_last_utf8_byte(prefix: &[u8]) -> Option<String> {
+    if prefix.is_empty() {
+        return None;
+    }
+    let mut bytes = prefix.to_vec();
+    let mut i = bytes.len() - 1;
+    while bytes[i] == 0xBF && i > 0 {
+        bytes[i] = 0x80;
+        i -= 1;
+    }
+    if bytes[i] == 0xFF {
+        return None;
+    }
+    bytes[i] += 1;
+    // The modified byte sequence may not be valid UTF-8 (e.g. incrementing `0x80` would
+    // produce `0x81` which is a continuation byte — not a valid lead). SQLite operates on
+    // raw bytes and lets the b-tree compare them as BLOBs; we mirror that by constructing a
+    // string from the raw bytes when they're valid UTF-8 and falling back to a byte-wise
+    // string otherwise. The b-tree's `mem_compare` on TEXT values compares the UTF-8
+    // bytes, so a raw-byte string compares the same way regardless of UTF-8 validity.
+    match String::from_utf8(bytes.clone()) {
+        Ok(s) => Some(s),
+        Err(_) => Some(bytes.iter().map(|&b| b as char).collect()),
+    }
 }
 
 /// Walk the index columns in order, matching each against the collected WHERE constraints.

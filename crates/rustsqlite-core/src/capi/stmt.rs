@@ -66,7 +66,7 @@ impl SubqueryResolver for CatalogSubqueryResolver {
         let mut indexes = Vec::new();
         for obj in catalog.indexes() {
             if obj.tbl_name.eq_ignore_ascii_case(&table_ref.name) {
-                indexes.push(IndexObject::from_schema_object(obj)?);
+                indexes.push(IndexObject::from_schema_object_with_catalog(obj, Some(&catalog))?);
             }
         }
         Ok((Some(table), indexes))
@@ -297,7 +297,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                     let mut idxs = Vec::new();
                     for obj in catalog.indexes() {
                         if obj.tbl_name.eq_ignore_ascii_case(&tref.name) {
-                            idxs.push(IndexObject::from_schema_object(obj)?);
+                            idxs.push(IndexObject::from_schema_object_with_catalog(obj, Some(&catalog))?);
                         }
                     }
                     owned.push((t, name, idxs));
@@ -736,7 +736,7 @@ fn resolve_insert_source(
     let mut indexes = Vec::new();
     for obj in catalog.indexes() {
         if obj.tbl_name.eq_ignore_ascii_case(&table_ref.name) {
-            indexes.push(IndexObject::from_schema_object(obj)?);
+            indexes.push(IndexObject::from_schema_object_with_catalog(obj, Some(&catalog))?);
         }
     }
     Ok(Some((table, indexes)))
@@ -757,7 +757,7 @@ fn resolve_table_and_indexes(
     let mut indexes = Vec::new();
     for obj in catalog.indexes() {
         if obj.tbl_name.eq_ignore_ascii_case(table_name) {
-            indexes.push(IndexObject::from_schema_object(obj)?);
+            indexes.push(IndexObject::from_schema_object_with_catalog(obj, Some(&catalog))?);
         }
     }
     Ok((table, indexes))
@@ -1112,7 +1112,7 @@ fn resolve_drop_index_target(
             && dequote_ident(&obj.name)
                 .eq_ignore_ascii_case(&dequote_ident(&di.name))
         {
-            let idx = IndexObject::from_schema_object(obj)?;
+            let idx = IndexObject::from_schema_object_with_catalog(obj, Some(&catalog))?;
             return Ok((Some(idx), obj.rowid));
         }
     }
@@ -1477,7 +1477,7 @@ fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelec
             let mut indexes = Vec::new();
             for obj in catalog.indexes() {
                 if obj.tbl_name.eq_ignore_ascii_case(&table_ref.name) {
-                    indexes.push(IndexObject::from_schema_object(obj)?);
+                    indexes.push(IndexObject::from_schema_object_with_catalog(obj, Some(&catalog))?);
                 }
             }
             (Some(table), Some(pager), indexes)
@@ -1518,9 +1518,10 @@ fn compile_select(db: &mut Sqlite3, select: &SelectStmt) -> Result<CompiledSelec
             Ok(p) => (Box::new(CatalogSubqueryResolver { pager: p.clone() }), Some(p)),
             Err(_) => (Box::new(NoDbSubqueryResolver), None),
         };
+    let case_sensitive_like = db.flag("case_sensitive_like");
     let (program, column_names) =
-        codegen::compile_select(select, table.as_ref(), &indexes, Some(resolver.as_ref()))?;
-    let index_plan_info = codegen::select_index_plan_info(select, table.as_ref(), &indexes);
+        codegen::compile_select(select, table.as_ref(), &indexes, Some(resolver.as_ref()), case_sensitive_like)?;
+    let index_plan_info = codegen::select_index_plan_info(select, table.as_ref(), &indexes, case_sensitive_like);
     // If the outer SELECT itself has no FROM, its `pager` is `None` — but a scalar subquery in
     // its projection may have needed the pager to scan a real table. The inlined subquery body
     // emits `OpenRead` opcodes that the VDBE must be able to satisfy, so when the resolver
@@ -1596,7 +1597,7 @@ fn resolve_subquery_source(
     let mut indexes = Vec::new();
     for obj in catalog.indexes() {
         if obj.tbl_name.eq_ignore_ascii_case(&table_ref.name) {
-            indexes.push(IndexObject::from_schema_object(obj)?);
+            indexes.push(IndexObject::from_schema_object_with_catalog(obj, Some(&catalog))?);
         }
     }
     Ok((Some(table), indexes, Some(pager)))

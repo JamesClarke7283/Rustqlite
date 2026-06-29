@@ -162,7 +162,7 @@ pub fn resolve_index_object(catalog: &Catalog, name: &str) -> Result<Option<Inde
     let Some(obj) = catalog.find_index(name) else {
         return Ok(None);
     };
-    let io = IndexObject::from_schema_object(obj)?;
+    let io = IndexObject::from_schema_object_with_catalog(obj, Some(catalog))?;
     Ok(Some(io))
 }
 
@@ -176,7 +176,7 @@ pub fn resolve_index_for_column(
     let Some(obj) = catalog.find_index_for_column(table_name, column_name) else {
         return Ok(None);
     };
-    let io = IndexObject::from_schema_object(obj)?;
+    let io = IndexObject::from_schema_object_with_catalog(obj, Some(catalog))?;
     Ok(Some(io))
 }
 

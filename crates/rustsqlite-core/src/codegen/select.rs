@@ -21,7 +21,7 @@ use crate::vdbe::{KeyField, Opcode};
 
 use super::builder::{Label, ProgramBuilder};
 use super::expr::{compile_expr, compile_jump, Ctx, OuterScope, SubqueryResolver};
-use super::index_planner::{pick_index, IndexPlan, RangeOp};
+use super::index_planner::{pick_index, IndexPlan, LikeOpt, RangeOp};
 
 /// Compile a single-table (or constant) `SELECT`, returning the program and the result column
 /// names. `table` is the resolved table when there is exactly one `FROM` entry, else `None`.
@@ -36,8 +36,9 @@ pub fn compile(
     table: Option<&Table>,
     indexes: &[IndexObject],
     subquery_resolver: Option<&dyn SubqueryResolver>,
+    case_sensitive_like: bool,
 ) -> Result<(Program, Vec<String>)> {
-    compile_with_outer(select, table, indexes, subquery_resolver, None)
+    compile_with_outer(select, table, indexes, subquery_resolver, None, case_sensitive_like)
 }
 
 /// Like [`compile`] but additionally accepts an outer-query scope for correlated subquery
@@ -51,12 +52,13 @@ pub fn compile_with_outer(
     indexes: &[IndexObject],
     subquery_resolver: Option<&dyn SubqueryResolver>,
     outer: Option<&OuterScope<'_>>,
+    case_sensitive_like: bool,
 ) -> Result<(Program, Vec<String>)> {
     // A compound SELECT (UNION/UNION ALL/INTERSECT/EXCEPT) is lowered by the dedicated
     // `codegen::compound` module, which mirrors `multiSelect`/`multiSelectByMerge` in
     // `select.c`. The non-compound path continues below.
     if !select.compound.is_empty() {
-        return super::compound::compile_compound(select, table, indexes, subquery_resolver);
+        return super::compound::compile_compound(select, table, indexes, subquery_resolver, case_sensitive_like);
     }
     reject_unsupported(select)?;
 
@@ -111,7 +113,7 @@ pub fn compile_with_outer(
                     .and_then(|tref| tref.indexed_by.as_ref());
                 if is_aggregate_query(select, &outputs) {
                     compile_aggregate(select, t, &outputs, limit, offset, subquery_resolver, outer)?
-                } else if let Some(plan) = pick_index(select, t, indexes, hint)? {
+                } else if let Some(plan) = pick_index(select, t, indexes, hint, case_sensitive_like)? {
                     compile_indexed_select(select, t, &plan, &outputs, limit, offset, subquery_resolver, outer)?
                 } else {
                     compile_scan(select, t, &outputs, limit, offset, subquery_resolver, outer)?
@@ -1065,6 +1067,7 @@ fn compile_indexed_select(
             idx_cursor, end_seek, seek_nfields, key_reg,
             upper_reg, upper_nfields, upper.as_ref().map(|u| u.op),
             lower.as_ref().map(|l| l.op),
+            plan.like_opt.as_ref(),
             limit_reg, offset_reg,
         )?;
     } else {
@@ -1115,8 +1118,24 @@ fn compile_indexed_select(
         // the row's column values. For a covering plan the columns are read from the index
         // cursor (via `ctx.index_read`); for a non-covering plan they're read from the table
         // cursor.
+        //
+        // When the LIKE/GLOB optimization is "complete" (`col LIKE 'prefix%'` with nothing
+        // after the multi-char wildcard), the index range is provably equivalent to the LIKE
+        // match set, so the LIKE term is dropped from the re-check (mirrors upstream's
+        // `markTermAsChild` which makes the LIKE term a no-op when complete).
         if let Some(w) = &select.where_clause {
-            compile_jump(&mut b, w, idx_next, false, true, ctx)?;
+            let w_dropped: Option<Expr> = match &plan.like_opt {
+                Some(opt) if opt.is_complete => where_without_complete_like(w, opt),
+                _ => None,
+            };
+            let w_for_recheck: &Expr = w_dropped.as_ref().unwrap_or(w);
+            // Skip the re-check entirely when the LIKE term was the only conjunct and it was
+            // dropped (the AND tree reduced to `None`).
+            let skip_recheck = w_dropped.is_none()
+                && plan.like_opt.as_ref().map(|o| o.is_complete).unwrap_or(false);
+            if !skip_recheck {
+                compile_jump(&mut b, w_for_recheck, idx_next, false, true, ctx)?;
+            }
         }
 
         // OFFSET gate.
@@ -1158,6 +1177,48 @@ fn compile_indexed_select(
     Ok(b.finish())
 }
 
+/// When the LIKE/GLOB optimization's "complete" flag is set, the index range
+/// `[prefix, prefix+1)` is provably equivalent to the LIKE match set, so the LIKE term can be
+/// dropped from the per-row WHERE re-check. This helper walks the WHERE conjuncts and
+/// removes the LIKE term identified by `like_opt.like_term` (an `Expr::Binary` /
+/// `Expr::Function` whose AST identity matches). Returns `None` when the WHERE is empty
+/// after removal (no re-check is emitted by the caller).
+fn where_without_complete_like(w: &Expr, like_opt: &LikeOpt) -> Option<Expr> {
+    // The LIKE term to drop is `like_opt.like_term`. Walk the AND tree and elide the matching
+    // conjunct; when an AND side becomes empty, the other side is returned alone.
+    fn drop_term(expr: &Expr, target: &Expr) -> Option<Expr> {
+        // Pointer-equality on the AST node is the simplest identity check — the LIKE term
+        // stored in `LikeOpt.like_term` is a clone of the conjunct the planner saw. We
+        // compare by structural equality (`PartialEq`) instead so the drop works regardless
+        // of cloning across the planner boundary.
+        if expr == target {
+            return None;
+        }
+        match expr {
+            Expr::Binary {
+                op: rustqlite_parser::BinaryOp::And,
+                left,
+                right,
+            } => {
+                let l = drop_term(left.as_ref(), target);
+                let r = drop_term(right.as_ref(), target);
+                match (l, r) {
+                    (Some(l), Some(r)) => Some(Expr::Binary {
+                        op: rustqlite_parser::BinaryOp::And,
+                        left: Box::new(l),
+                        right: Box::new(r),
+                    }),
+                    (Some(l), None) => Some(l),
+                    (None, Some(r)) => Some(r),
+                    (None, None) => None,
+                }
+            }
+            other => Some(other.clone()),
+        }
+    }
+    drop_term(w, &like_opt.like_term)
+}
+
 /// The sorter-backed indexed scan (the `INDEXED BY <name>` + `ORDER BY` shape). The index has
 /// already been positioned (SeekGE/SeekGT for a WHERE-equality/range prefix, else Rewind); this
 /// function drives the scan loop, builds `[order_keys..., outputs...]` records, sorts them, and
@@ -1178,6 +1239,7 @@ fn compile_indexed_sorter_scan(
     upper_nfields: i32,
     upper_op: Option<crate::codegen::index_planner::RangeOp>,
     lower_op: Option<crate::codegen::index_planner::RangeOp>,
+    like_opt: Option<&LikeOpt>,
     limit_reg: Option<i32>,
     offset_reg: Option<i32>,
 ) -> Result<()> {
@@ -1228,9 +1290,19 @@ fn compile_indexed_sorter_scan(
         b.emit_jump(Opcode::NotExists, table_cursor, scan_next, rowid_reg);
     }
 
-    // Re-check the WHERE clause on the row.
+    // Re-check the WHERE clause on the row. When the LIKE/GLOB optimization is "complete",
+    // drop the LIKE term from the re-check (mirrors the non-sorter path).
     if let Some(w) = &select.where_clause {
-        compile_jump(b, w, scan_next, false, true, ctx)?;
+        let w_dropped: Option<Expr> = match like_opt {
+            Some(opt) if opt.is_complete => where_without_complete_like(w, opt),
+            _ => None,
+        };
+        let w_for_recheck: &Expr = w_dropped.as_ref().unwrap_or(w);
+        let skip_recheck = w_dropped.is_none()
+            && like_opt.map(|o| o.is_complete).unwrap_or(false);
+        if !skip_recheck {
+            compile_jump(b, w_for_recheck, scan_next, false, true, ctx)?;
+        }
     }
 
     let block = b.alloc_regs(nkey_order + ncol);
@@ -2619,7 +2691,7 @@ mod tests {
         let Stmt::Select(s) = parse(select_sql).unwrap().into_iter().next().unwrap() else {
             panic!("expected SELECT")
         };
-        compile(&s, Some(&table), &[], None).unwrap()
+        compile(&s, Some(&table), &[], None, false).unwrap()
     }
 
     #[test]
