@@ -136,3 +136,100 @@ fn update_changes_counting_and_last_insert_rowid_preserved() {
 
     let _ = std::fs::remove_file(&db);
 }
+
+#[test]
+fn schema_change_returns_sqlite_schema() {
+    // M12.10: a prepared statement whose schema cookie no longer matches the database's
+    // current cookie must return SQLITE_SCHEMA from sqlite3_step() so the caller can
+    // re-prepare. Mirrors the legacy `sqlite3_prepare` behavior (the `prepare_v2` auto-
+    // reprepare of upstream is M12.11; for now we surface SQLITE_SCHEMA directly).
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("schema");
+    Command::new("sqlite3")
+        .arg(&db)
+        .arg("CREATE TABLE t(a INTEGER); INSERT INTO t VALUES (1), (2), (3);")
+        .output()
+        .unwrap();
+
+    let mut conn = sqlite3_open(&db).unwrap();
+    // Prepare a SELECT; do not step it yet.
+    let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a FROM t ORDER BY a;").unwrap();
+    // Sanity: the statement is not expired at prepare time.
+    assert!(!stmt.expired(), "fresh statement should not be expired");
+
+    // Run DDL on the same connection — this bumps the schema cookie.
+    let (mut ddl, _) = sqlite3_prepare_v2(&mut conn, "CREATE TABLE u(b INTEGER);").unwrap();
+    assert_eq!(ddl.step(), ResultCode::Done);
+
+    // The previously-prepared SELECT should now be expired.
+    assert!(stmt.expired(), "statement should be expired after DDL");
+
+    // Stepping it must return SQLITE_SCHEMA, not Row/Done.
+    assert_eq!(stmt.step(), ResultCode::Schema);
+    // The error message should reflect the schema change.
+    assert_eq!(stmt.errmsg(), "database schema has changed");
+
+    // After re-prepare, the statement works again.
+    let (mut stmt2, _) = sqlite3_prepare_v2(&mut conn, "SELECT a FROM t ORDER BY a;").unwrap();
+    assert!(!stmt2.expired(), "re-prepared statement should not be expired");
+    let rows = collect(&mut stmt2);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(3)]
+        ]
+    );
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn schema_unchanged_does_not_expire_statement() {
+    // A statement that runs to completion without any DDL between steps must NOT report
+    // SQLITE_SCHEMA — this guards against a too-eager cookie check that would break the
+    // common path (prepare → step → step → done).
+    if !sqlite3_available() {
+        return;
+    }
+    let db = temp_db("schema_stable");
+    Command::new("sqlite3")
+        .arg(&db)
+        .arg("CREATE TABLE t(a INTEGER); INSERT INTO t VALUES (1), (2);")
+        .output()
+        .unwrap();
+
+    let mut conn = sqlite3_open(&db).unwrap();
+    let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, "SELECT a FROM t ORDER BY a;").unwrap();
+    assert_eq!(stmt.step(), ResultCode::Row);
+    assert_eq!(stmt.column_value(0), Value::Int(1));
+    assert_eq!(stmt.step(), ResultCode::Row);
+    assert_eq!(stmt.column_value(0), Value::Int(2));
+    assert_eq!(stmt.step(), ResultCode::Done);
+    assert!(!stmt.expired(), "stable statement should not be expired");
+
+    // Reset and re-run — still not expired (no DDL happened).
+    assert_eq!(stmt.reset(), ResultCode::Ok);
+    assert!(!stmt.expired());
+    assert_eq!(stmt.step(), ResultCode::Row);
+
+    // DML (not DDL) does not bump the schema cookie, so the statement is still valid.
+    let (mut ins, _) = sqlite3_prepare_v2(&mut conn, "INSERT INTO t VALUES (4);").unwrap();
+    assert_eq!(ins.step(), ResultCode::Done);
+    assert!(!stmt.expired(), "DML must not expire the statement");
+    assert_eq!(stmt.reset(), ResultCode::Ok);
+    let rows = collect(&mut stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(4)],
+        ]
+    );
+
+    let _ = std::fs::remove_file(&db);
+}

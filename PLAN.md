@@ -849,9 +849,9 @@ list every granular item needed.
 
 ### M12 — Transactions (Additional Items)
 
-- [ ] **12.10** `SQLITE_SCHEMA` error: detect stale prepared statements when schema changes, return `SQLITE_SCHEMA` so caller can re-prepare
+- [x] **12.10** `SQLITE_SCHEMA` error: detect stale prepared statements when schema changes, return `SQLITE_SCHEMA` so caller can re-prepare
 - [ ] **12.11** Schema recompilation: automatically re-prepare statements that encounter `SQLITE_SCHEMA`
-- [ ] **12.12** `sqlite3_expired()` / statement expiry on schema change
+- [x] **12.12** `sqlite3_expired()` / statement expiry on schema change
 
 ### M13 — WAL (Additional Items)
 

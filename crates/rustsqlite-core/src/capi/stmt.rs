@@ -98,6 +98,21 @@ fn vdbe_for(program: Arc<Program>, pager: Option<Arc<Pager>>, db: &Sqlite3) -> V
     v
 }
 
+/// Capture the schema cookie at prepare time so `step()` can detect a stale program
+/// (M12.10). Returns the pager (cheap `Arc` clone) and the current `header().schema_cookie`
+/// so the caller can store both on the `Sqlite3Stmt`. Mirrors how upstream's
+/// `sqlite3VdbeMakeReady` snapshots `db->pSchema->schema_cookie` into `p->pSchema->schema_cookie`
+/// (via the prepare-time `Schema` object) for the runtime check in `sqlite3Step`.
+fn capture_schema_cookie(pager: Option<&Arc<Pager>>) -> (Option<Arc<Pager>>, Option<u32>) {
+    match pager {
+        Some(p) => {
+            let cookie = p.header().schema_cookie;
+            (Some(p.clone()), Some(cookie))
+        }
+        None => (None, None),
+    }
+}
+
 /// A compiled statement. The Rust analogue of `sqlite3_stmt *`.
 pub struct Sqlite3Stmt {
     sql: String,
@@ -111,6 +126,17 @@ pub struct Sqlite3Stmt {
     /// For a write statement (`CREATE TABLE`/`INSERT`), the connection's shared change counters to
     /// publish into when the program finishes. `None` for read-only statements.
     counts: Option<Arc<Mutex<ChangeCounts>>>,
+    /// The pager the statement compiled against, held as a cheap `Arc` clone so the schema
+    /// cookie can be re-checked on each `step()` (M12.10). `None` for a FROM-less/`VALUES`
+    /// statement or a `:memory:` connection with no opened file — these never observe a schema
+    /// change so the check is a no-op for them.
+    pager: Option<Arc<Pager>>,
+    /// The schema cookie captured at prepare time. `step()` compares this against the pager's
+    /// current `header().schema_cookie`; a mismatch means another statement (or another
+    /// connection) bumped the cookie, the prepared program may be stale, and `step()` returns
+    /// `SQLITE_SCHEMA` so the caller can re-prepare (mirrors the legacy `sqlite3_prepare`
+    /// behavior — the `prepare_v2` auto-reprepare of upstream is M12.11).
+    prepare_schema_cookie: Option<u32>,
     last_error: Option<Error>,
 }
 
@@ -141,7 +167,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             let compiled = compile_select(db, &select)?;
             let program = Arc::new(compiled.program);
             let pager = compiled.pager;
-            let vdbe = vdbe_for(Arc::clone(&program), pager, db);
+            let vdbe = vdbe_for(Arc::clone(&program), pager.clone(), db);
+            let (pager_cookie, schema_cookie) = capture_schema_cookie(pager.as_ref());
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
                 program,
@@ -150,6 +177,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 explain: 0,
                 counts: None,
                 last_error: None,
+                pager: pager_cookie,
+                prepare_schema_cookie: schema_cookie,
             })
         }
         Stmt::Explain(inner, kind) => prepare_explain(db, sql, *inner, kind),
@@ -160,6 +189,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             let schema_cookie = pager.header().schema_cookie;
             let sql_text = create_table_text(sql);
             let program = Arc::new(codegen::compile_create_table(&ct, sql_text, schema_cookie)?);
+            let (pager_cookie, prepare_schema_cookie) = capture_schema_cookie(Some(&pager));
             let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
@@ -169,6 +199,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 explain: 0,
                 counts: Some(db.counts_handle()),
                 last_error: None,
+                pager: pager_cookie,
+                prepare_schema_cookie,
             })
         }
         Stmt::Insert(ins) => {
@@ -204,6 +236,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 &source_indexes,
                 &fk_checks,
             )?);
+            let (pager_cookie, prepare_schema_cookie) = capture_schema_cookie(Some(&pager));
             let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
@@ -213,6 +246,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 explain: 0,
                 counts: Some(db.counts_handle()),
                 last_error: None,
+                pager: pager_cookie,
+                prepare_schema_cookie,
             })
         }
         Stmt::Delete(del) => {
@@ -227,6 +262,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 .map(|ret| ret.column_names())
                 .unwrap_or_default();
             let program = Arc::new(codegen::compile_delete(&del, &table, &indexes)?);
+            let (pager_cookie, prepare_schema_cookie) = capture_schema_cookie(Some(&pager));
             let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
@@ -236,6 +272,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 explain: 0,
                 counts: Some(db.counts_handle()),
                 last_error: None,
+                pager: pager_cookie,
+                prepare_schema_cookie,
             })
         }
         Stmt::DropTable(drop) => {
@@ -248,6 +286,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 schema_cookie,
                 table_opt.as_ref(),
             )?);
+            let (pager_cookie, prepare_schema_cookie) = capture_schema_cookie(Some(&pager));
             let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
@@ -257,6 +296,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 explain: 0,
                 counts: Some(db.counts_handle()),
                 last_error: None,
+                pager: pager_cookie,
+                prepare_schema_cookie,
             })
         }
         Stmt::Update(upd) => {
@@ -324,6 +365,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 &indexes,
                 &from_tables,
             )?);
+            let (pager_cookie, prepare_schema_cookie) = capture_schema_cookie(Some(&pager));
             let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
@@ -333,6 +375,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 explain: 0,
                 counts: Some(db.counts_handle()),
                 last_error: None,
+                pager: pager_cookie,
+                prepare_schema_cookie,
             })
         }
         Stmt::CreateIndex(ci) => {
@@ -351,6 +395,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                     explain: 0,
                     counts: Some(db.counts_handle()),
                     last_error: None,
+                    pager: None,
+                    prepare_schema_cookie: None,
                 });
             }
             let table_obj = catalog
@@ -365,6 +411,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 sql_text,
                 schema_cookie,
             )?);
+            let (pager_cookie, prepare_schema_cookie) = capture_schema_cookie(Some(&pager));
             let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
@@ -374,6 +421,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 explain: 0,
                 counts: Some(db.counts_handle()),
                 last_error: None,
+                pager: pager_cookie,
+                prepare_schema_cookie,
             })
         }
         Stmt::DropIndex(di) => {
@@ -389,6 +438,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 schema_cookie,
                 schema_rowid,
             )?);
+            let (pager_cookie, prepare_schema_cookie) = capture_schema_cookie(Some(&pager));
             let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
@@ -398,6 +448,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 explain: 0,
                 counts: Some(db.counts_handle()),
                 last_error: None,
+                pager: pager_cookie,
+                prepare_schema_cookie,
             })
         }
         Stmt::AlterTable(alter) => {
@@ -414,6 +466,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                         schema_cookie,
                         &edits,
                     )?);
+                    let (pager_cookie, prepare_schema_cookie) = capture_schema_cookie(Some(&pager));
                     let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
                     Ok(Sqlite3Stmt {
                         sql: sql.to_string(),
@@ -423,6 +476,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                         explain: 0,
                         counts: Some(db.counts_handle()),
                         last_error: None,
+                        pager: pager_cookie,
+                        prepare_schema_cookie,
                     })
                 }
                 AlterTableAction::AddColumn(col_def) => {
@@ -441,6 +496,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                         &old_sql,
                         &col_def_text,
                     )?);
+                    let (pager_cookie, prepare_schema_cookie) = capture_schema_cookie(Some(&pager));
                     let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
                     Ok(Sqlite3Stmt {
                         sql: sql.to_string(),
@@ -450,6 +506,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                         explain: 0,
                         counts: Some(db.counts_handle()),
                         last_error: None,
+                        pager: pager_cookie,
+                        prepare_schema_cookie,
                     })
                 }
                 AlterTableAction::DropColumn(col_name) => {
@@ -466,6 +524,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                         drop_col_idx,
                         &drop_col_name_dequoted,
                     )?);
+                    let (pager_cookie, prepare_schema_cookie) = capture_schema_cookie(Some(&pager));
                     let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
                     Ok(Sqlite3Stmt {
                         sql: sql.to_string(),
@@ -475,6 +534,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                         explain: 0,
                         counts: Some(db.counts_handle()),
                         last_error: None,
+                        pager: pager_cookie,
+                        prepare_schema_cookie,
                     })
                 }
                 AlterTableAction::RenameColumn { old, new } => {
@@ -485,6 +546,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                         schema_cookie,
                         &edits,
                     )?);
+                    let (pager_cookie, prepare_schema_cookie) = capture_schema_cookie(Some(&pager));
                     let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
                     Ok(Sqlite3Stmt {
                         sql: sql.to_string(),
@@ -494,6 +556,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                         explain: 0,
                         counts: Some(db.counts_handle()),
                         last_error: None,
+                        pager: pager_cookie,
+                        prepare_schema_cookie,
                     })
                 }
                 _ => Err(Error::msg(format!(
@@ -517,6 +581,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                     explain: 0,
                     counts: Some(db.counts_handle()),
                     last_error: None,
+                    pager: None,
+                    prepare_schema_cookie: None,
                 });
             }
             // Reject if a table, view, or index with this name already exists.
@@ -529,6 +595,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             let schema_cookie = schema_cookie(&pager);
             let sql_text = create_table_text(sql);
             let program = Arc::new(codegen::compile_create_view(&cv, sql_text, schema_cookie)?);
+            let (pager_cookie, prepare_schema_cookie) = capture_schema_cookie(Some(&pager));
             let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
@@ -538,6 +605,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 explain: 0,
                 counts: Some(db.counts_handle()),
                 last_error: None,
+                pager: pager_cookie,
+                prepare_schema_cookie,
             })
         }
         Stmt::DropView(dv) => {
@@ -559,6 +628,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             }
             let schema_cookie = schema_cookie(&pager);
             let program = Arc::new(codegen::compile_drop_view(&dv, schema_cookie, schema_rowid)?);
+            let (pager_cookie, prepare_schema_cookie) = capture_schema_cookie(Some(&pager));
             let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
@@ -568,6 +638,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 explain: 0,
                 counts: Some(db.counts_handle()),
                 last_error: None,
+                pager: pager_cookie,
+                prepare_schema_cookie,
             })
         }
         Stmt::CreateTrigger(ct) => {
@@ -589,6 +661,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                     explain: 0,
                     counts: Some(db.counts_handle()),
                     last_error: None,
+                    pager: None,
+                    prepare_schema_cookie: None,
                 });
             }
             // Reject if an object with this name already exists.
@@ -601,6 +675,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             let schema_cookie = schema_cookie(&pager);
             let sql_text = create_table_text(sql);
             let program = Arc::new(codegen::compile_create_trigger(&ct, sql_text, schema_cookie)?);
+            let (pager_cookie, prepare_schema_cookie) = capture_schema_cookie(Some(&pager));
             let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
@@ -610,6 +685,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 explain: 0,
                 counts: Some(db.counts_handle()),
                 last_error: None,
+                pager: pager_cookie,
+                prepare_schema_cookie,
             })
         }
         Stmt::DropTrigger(dt) => {
@@ -633,6 +710,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             }
             let schema_cookie = schema_cookie(&pager);
             let program = Arc::new(codegen::compile_drop_trigger(&dt, schema_cookie, schema_rowid)?);
+            let (pager_cookie, prepare_schema_cookie) = capture_schema_cookie(Some(&pager));
             let vdbe = vdbe_for(Arc::clone(&program), Some(pager), db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
@@ -642,6 +720,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 explain: 0,
                 counts: Some(db.counts_handle()),
                 last_error: None,
+                pager: pager_cookie,
+                prepare_schema_cookie,
             })
         }
         Stmt::Pragma(pragma) => {
@@ -663,6 +743,7 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
             // (there's no write transaction to commit). For BEGIN against an empty DB we
             // pass `None` so OP_AutoCommit doesn't try to consult a missing pager.
             let pager = db.pager_arc().ok();
+            let (pager_cookie, prepare_schema_cookie) = capture_schema_cookie(pager.as_ref());
             let vdbe = vdbe_for(Arc::clone(&program), pager, db);
             Ok(Sqlite3Stmt {
                 sql: sql.to_string(),
@@ -672,6 +753,8 @@ fn prepare(db: &mut Sqlite3, sql: &str) -> Result<Sqlite3Stmt> {
                 explain: 0,
                 counts: None,
                 last_error: None,
+                pager: pager_cookie,
+                prepare_schema_cookie,
             })
         }
         Stmt::Attach(_) => {
@@ -1192,6 +1275,8 @@ fn prepare_explain(
         explain,
         counts: None,
         last_error: None,
+        pager: None,
+        prepare_schema_cookie: None,
     })
 }
 
@@ -1607,6 +1692,23 @@ impl Sqlite3Stmt {
     /// `sqlite3_step()` — advance the statement, returning `Row` (a result row is available),
     /// `Done`, or `Error`.
     pub fn step(&mut self) -> ResultCode {
+        // M12.10: detect a stale prepared statement. If the schema cookie has changed since
+        // prepare time (another statement on this connection ran DDL, or another connection
+        // modified the schema), the compiled program may reference tables/columns/indexes that
+        // no longer exist or have moved — return `SQLITE_SCHEMA` so the caller can re-prepare
+        // (mirrors the legacy `sqlite3_prepare` behavior; the `prepare_v2` auto-reprepare of
+        // upstream is M12.11). The check runs only when the VDBE has not yet started (i.e. at
+        // the first step after a fresh prepare or a `reset()`); a statement mid-iteration has
+        // already opened its cursors against the old schema and is left to finish, matching
+        // upstream's `sqlite3SchemaToHandles`/`sqlite3Step` precedence (the cookie check is in
+        // `sqlite3Step`'s prologue, not inside the per-opcode loop).
+        if self.schema_expired() {
+            self.last_error = Some(Error::new(
+                ResultCode::Schema,
+                "database schema has changed",
+            ));
+            return ResultCode::Schema;
+        }
         match &mut self.backing {
             Backing::Vdbe(vdbe) => match block_on(vdbe.step()) {
                 Ok(StepResult::Row) => ResultCode::Row,
@@ -1652,6 +1754,30 @@ impl Sqlite3Stmt {
         match &self.last_error {
             Some(e) => &e.message,
             None => "not an error",
+        }
+    }
+
+    /// `sqlite3_expired()` (M12.12) — return `true` when the prepared statement's schema
+    /// cookie no longer matches the database's current cookie, i.e. the statement is stale
+    /// and must be re-prepared before it can be stepped again. Mirrors the legacy
+    /// `sqlite3_expired` API (deprecated upstream but kept for compatibility); always
+    /// returns `false` for a statement with no pager (a FROM-less/`VALUES` statement that
+    /// never observes a schema change).
+    pub fn expired(&self) -> bool {
+        self.schema_expired()
+    }
+
+    /// True when the schema cookie captured at prepare time no longer matches the pager's
+    /// current `header().schema_cookie`. Returns `false` when the statement has no pager
+    /// (a constant/`VALUES` statement) or when the cookie is unchanged. Mirrors the
+    /// `p->pSchema->schema_cookie != db->pSchema->schema_cookie` check in upstream's
+    /// `sqlite3Step`.
+    fn schema_expired(&self) -> bool {
+        match (&self.pager, self.prepare_schema_cookie) {
+            (Some(pager), Some(prepare_cookie)) => {
+                pager.header().schema_cookie != prepare_cookie
+            }
+            _ => false,
         }
     }
 
@@ -1817,6 +1943,8 @@ fn compile_pragma_integrity_check(
         explain: 0,
         counts: None,
         last_error: None,
+        pager: None,
+        prepare_schema_cookie: None,
     })
 }
 
@@ -1872,6 +2000,8 @@ fn compile_pragma_wal_checkpoint(
         explain: 0,
         counts: None,
         last_error: None,
+        pager: None,
+        prepare_schema_cookie: None,
     })
 }
 
@@ -1951,6 +2081,8 @@ fn compile_pragma_journal_mode(
         explain: 0,
         counts: None,
         last_error: None,
+        pager: None,
+        prepare_schema_cookie: None,
     })
 }
 
@@ -1988,6 +2120,8 @@ fn compile_pragma_foreign_keys(
                 explain: 0,
                 counts: None,
                 last_error: None,
+                pager: None,
+                prepare_schema_cookie: None,
             })
         }
         Some(PragmaValue::Equal(kind)) | Some(PragmaValue::Paren(kind)) => {
@@ -2015,6 +2149,8 @@ fn compile_pragma_foreign_keys(
                 explain: 0,
                 counts: None,
                 last_error: None,
+                pager: None,
+                prepare_schema_cookie: None,
             })
         }
     }
@@ -2117,6 +2253,8 @@ fn compile_pragma_foreign_key_list(
         explain: 0,
         counts: None,
         last_error: None,
+        pager: None,
+        prepare_schema_cookie: None,
     })
 }
 
@@ -2287,6 +2425,8 @@ fn compile_pragma_foreign_key_check(
         explain: 0,
         counts: None,
         last_error: None,
+        pager: None,
+        prepare_schema_cookie: None,
     })
 }
 
@@ -2305,6 +2445,8 @@ fn empty_static_stmt(sql: &str, column_names: &[&str]) -> Sqlite3Stmt {
         explain: 0,
         counts: None,
         last_error: None,
+        pager: None,
+        prepare_schema_cookie: None,
     }
 }
 
@@ -2384,6 +2526,8 @@ fn compile_pragma_table_info(
         explain: 0,
         counts: None,
         last_error: None,
+        pager: None,
+        prepare_schema_cookie: None,
     })
 }
 
@@ -2659,6 +2803,8 @@ fn static_stmt_rows(sql: &str, column_names: &[&str], rows: Vec<Vec<Value>>) -> 
         explain: 0,
         counts: None,
         last_error: None,
+        pager: None,
+        prepare_schema_cookie: None,
     }
 }
 
@@ -3206,6 +3352,8 @@ fn compile_pragma_auto_vacuum(
                 explain: 0,
                 counts: None,
                 last_error: None,
+                pager: None,
+                prepare_schema_cookie: None,
             })
         }
         Some(PragmaValue::Equal(kind)) | Some(PragmaValue::Paren(kind)) => {
@@ -3248,6 +3396,8 @@ fn compile_pragma_auto_vacuum(
                 explain: 0,
                 counts: Some(db.counts_handle()),
                 last_error: None,
+                pager: None,
+                prepare_schema_cookie: None,
             })
         }
     }
@@ -3312,6 +3462,8 @@ fn compile_pragma_incremental_vacuum(
             explain: 0,
             counts: None,
             last_error: None,
+            pager: None,
+            prepare_schema_cookie: None,
         });
     }
     // Determine the step limit. Default (no value) is "until done" — use u32::MAX.
@@ -3350,6 +3502,8 @@ fn compile_pragma_incremental_vacuum(
         explain: 0,
         counts: None,
         last_error: None,
+        pager: None,
+        prepare_schema_cookie: None,
     })
 }
 

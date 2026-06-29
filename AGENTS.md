@@ -689,6 +689,20 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   pre-existing `insert_or_fail_keeps_prior_rows` test was updated to verify this. CHECK
   constraint enforcement (the `ON CONFLICT` clause is captured but the CHECK itself is not
   evaluated yet — that's M19.8/M35.1).
+- **M12.10 `SQLITE_SCHEMA` detection** ✅: a prepared statement captures the schema cookie at
+  prepare time (`Sqlite3Stmt::prepare_schema_cookie` + a cheap `Arc<Pager>` clone via
+  `capture_schema_cookie`); `sqlite3_step()` consults `schema_expired()` at its prologue and
+  returns `SQLITE_SCHEMA` ("database schema has changed") when the cookie no longer matches
+  the pager's `header().schema_cookie`. Mirrors the legacy `sqlite3_prepare` behavior (the
+  `prepare_v2` auto-reprepare of upstream is M12.11). A statement mid-iteration is left to
+  finish — the check fires only on a fresh step after prepare/reset, matching upstream's
+  `sqlite3Step` precedence. DML (INSERT/UPDATE/DELETE) does not bump the cookie, so a SELECT
+  re-stepped after DML is unaffected; only DDL (CREATE/DROP/ALTER) does. The companion
+  `Sqlite3Stmt::expired()` exposes the check as the legacy `sqlite3_expired()` API (M12.12).
+  Differential-tested in `tests/capi.rs::schema_change_returns_sqlite_schema` and
+  `schema_unchanged_does_not_expire_statement`. Known limitation: re-prepare-on-SCHEMA
+  (M12.11) is not yet automatic — the application must re-call `sqlite3_prepare_v2` when it
+  receives `SQLITE_SCHEMA`.
 - **M13 — WAL (Write-Ahead Logging)** 🚧: **13.1–13.3** ✅ (format codecs for the `-wal`
   header/frame and the `-shm` shared-memory index — see `format/wal.rs` and
   `format/wal_index.rs`). **13.4 WAL mode read path** ✅: `pager::wal::Wal` (mirroring
