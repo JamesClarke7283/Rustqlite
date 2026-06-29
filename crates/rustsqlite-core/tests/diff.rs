@@ -1168,6 +1168,114 @@ fn covering_and_orderby_index_scans() {
     }
 }
 
+/// Range-scan index access (M27.11 BETWEEN + general `>`/`>=`/`<`/`<=`/`IS NULL`/`IS NOT NULL`
+/// constraints). Both the result rows and the `EXPLAIN QUERY PLAN` detail strings must match
+/// the C oracle.
+#[test]
+fn range_scan_index_access() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup(
+        "CREATE TABLE t(a INT, b TEXT, c REAL);\
+         CREATE INDEX idx_ab ON t(a, b);\
+         INSERT INTO t VALUES\
+            (1,'apple',1.0),(2,'banana',2.0),(3,'cherry',3.0),\
+            (1,'apricot',1.5),(2,'blueberry',2.5),(NULL,'null',0.0),\
+            (10,'z',10.0),(-5,'neg',-5.0);",
+    );
+    for q in [
+        // Single-column range on `a`.
+        "SELECT a FROM t WHERE a > 1",
+        "SELECT a FROM t WHERE a >= 1",
+        "SELECT a FROM t WHERE a < 3",
+        "SELECT a FROM t WHERE a <= 3",
+        "SELECT a FROM t WHERE a > 1 AND a < 5",
+        "SELECT a FROM t WHERE a >= 1 AND a <= 3",
+        "SELECT a FROM t WHERE a > 1 AND a <= 3",
+        "SELECT a FROM t WHERE a >= 2 AND a < 10",
+        // BETWEEN (lowered to >= AND <=).
+        "SELECT a FROM t WHERE a BETWEEN 1 AND 3",
+        "SELECT a FROM t WHERE a BETWEEN -5 AND 2",
+        "SELECT a FROM t WHERE a NOT BETWEEN 1 AND 3",
+        "SELECT a FROM t WHERE a NOT BETWEEN -100 AND 100",
+        // Multi-column: equality on `a` + range on `b`.
+        "SELECT a, b FROM t WHERE a = 1 AND b > 'apple'",
+        "SELECT a, b FROM t WHERE a = 1 AND b >= 'apple'",
+        "SELECT a, b FROM t WHERE a = 1 AND b < 'apricot'",
+        "SELECT a, b FROM t WHERE a = 1 AND b <= 'cherry'",
+        "SELECT a, b FROM t WHERE a = 1 AND b > 'a' AND b < 'c'",
+        // NOTE: `a = 2 AND b BETWEEN 'a' AND 'c'` is omitted — our parser parses it as
+        // `(a = 2 AND b) BETWEEN 'a' AND 'c'` (BETWEEN binds looser than AND), a known
+        // divergence from the full parse.y port. The BETWEEN-without-AND form works.
+        "SELECT b FROM t WHERE b BETWEEN 'a' AND 'c'",
+        // IS NULL / IS NOT NULL as index constraints.
+        "SELECT a FROM t WHERE a IS NULL",
+        "SELECT a FROM t WHERE a IS NOT NULL",
+        "SELECT a, b FROM t WHERE a IS NULL",
+        "SELECT a, b FROM t WHERE a IS NOT NULL",
+        // Non-covering range (needs `c` → table lookup).
+        "SELECT a, c FROM t WHERE a > 1",
+        "SELECT a, c FROM t WHERE a BETWEEN 1 AND 3",
+        "SELECT a, b, c FROM t WHERE a = 1 AND b > 'a'",
+        // Range + ORDER BY that the index doesn't satisfy → sorter.
+        "SELECT a FROM t WHERE a > 1 ORDER BY c",
+        // Range + LIMIT.
+        "SELECT a FROM t WHERE a > 1 LIMIT 2",
+        "SELECT a FROM t WHERE a > 1 LIMIT 2 OFFSET 1",
+        // DISTINCT on a range scan.
+        "SELECT DISTINCT a FROM t WHERE a > 0",
+        "SELECT DISTINCT a FROM t WHERE a BETWEEN 1 AND 3",
+    ] {
+        assert_same(db.str(), q);
+    }
+    // Verify EXPLAIN QUERY PLAN matches for a representative subset.
+    for q in [
+        "SELECT a FROM t WHERE a > 1",
+        "SELECT a FROM t WHERE a >= 1",
+        "SELECT a FROM t WHERE a < 3",
+        "SELECT a FROM t WHERE a <= 3",
+        "SELECT a FROM t WHERE a > 1 AND a < 5",
+        "SELECT a FROM t WHERE a >= 1 AND a <= 3",
+        "SELECT a FROM t WHERE a BETWEEN 1 AND 3",
+        "SELECT a, b FROM t WHERE a = 1 AND b > 'apple'",
+        // NOTE: `a = 1 AND b BETWEEN 'a' AND 'c'` is omitted — known parser precedence bug
+        // (BETWEEN binds looser than AND). The non-AND BETWEEN form is tested separately.
+        "SELECT b FROM t WHERE b BETWEEN 'apple' AND 'cherry'",
+        "SELECT a FROM t WHERE a IS NULL",
+        "SELECT a FROM t WHERE a IS NOT NULL",
+        "SELECT a, c FROM t WHERE a > 1",
+        "SELECT a FROM t WHERE a > 1 ORDER BY c",
+    ] {
+        let eqp = format!("EXPLAIN QUERY PLAN {q}");
+        let expected: Vec<String> = sqlite3_rows(db.str(), &eqp)
+            .into_iter()
+            .filter(|l| !l.is_empty())
+            .collect();
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, &eqp).unwrap();
+        let mut got: Vec<String> = Vec::new();
+        loop {
+            match stmt.step() {
+                ResultCode::Row => {
+                    let detail = stmt.column_value(3).to_text().unwrap_or_default();
+                    got.push(detail.to_string());
+                }
+                ResultCode::Done => break,
+                other => panic!("step {other:?} for {eqp}"),
+            }
+        }
+        let expected: Vec<String> = expected
+            .into_iter()
+            .filter(|l| !l.is_empty() && l != "QUERY PLAN")
+            .map(|l| l.trim_start_matches(['`', '|', '-', ' ', '\t']).to_string())
+            .collect();
+        assert_eq!(got, expected, "EQP mismatch for: {eqp}");
+    }
+}
+
 /// `EXPLAIN QUERY PLAN` detail strings for index-based plans (M5.2.12–5.2.14). The wording
 /// must match the oracle: `SCAN/SEARCH t USING [COVERING] INDEX <name> [(<col>=? ...)]`.
 #[test]

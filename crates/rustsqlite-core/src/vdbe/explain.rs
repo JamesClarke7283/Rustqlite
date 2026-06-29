@@ -169,12 +169,14 @@ pub struct IndexPlanInfo {
     pub index_name: String,
     /// `true` when the index covers all columns the query needs (index-only scan).
     pub covering: bool,
-    /// `true` when the plan has a WHERE equality prefix (a `SeekGE`+`IdxGT` search, not a
-    /// full index scan).
-    pub has_where_equality: bool,
-    /// The WHERE equality column names, in index order. Empty when there is no equality
-    /// prefix. Rendered as `(a=? AND b=?)`.
-    pub equality_columns: Vec<String>,
+    /// `true` when the plan has a WHERE constraint (equality or range) — a `SeekGE`/`SeekGT`
+    /// search, not a full index walk.
+    pub has_where_constraint: bool,
+    /// The WHERE constraint tokens, in index-column order, as they should appear in the
+    /// `(col <op> ? ...)` detail suffix. Each entry is already formatted (e.g. `a=?`, `b>?`,
+    /// `b<?`). Empty when there is no WHERE constraint. The same column with both bounds
+    /// appears twice (e.g. `a>? AND a<?`).
+    pub constraint_columns: Vec<String>,
     /// `true` when the index scan ordering satisfies the ORDER BY clause (no sorter).
     pub order_by_satisfied: bool,
 }
@@ -217,13 +219,13 @@ pub fn query_plan_rows(
             Some(name) => {
                 if let Some(info) = index_plan {
                     // An index-based plan. Upstream's wording:
-                    //   SEARCH t USING [COVERING] INDEX <name> (<col>=? AND <col>=?)
+                    //   SEARCH t USING [COVERING] INDEX <name> (<col>=? AND <col>>?)
                     //   SCAN  t USING [COVERING] INDEX <name>
-                    // The SEARCH form is used when there is a WHERE equality prefix (a
-                    // SeekGE+IdxGT search); the SCAN form is a full index walk (covering-only
-                    // or ORDER-BY-only plans). The "(<col>=? ...)" suffix lists the equality
-                    // columns; it is omitted for a SCAN.
-                    let verb = if info.has_where_equality {
+                    // The SEARCH form is used when there is a WHERE constraint (a seek, not a
+                    // full walk); the SCAN form is a full index walk (covering-only or
+                    // ORDER-BY-only plans). The "(<col> <op> ? ...)" suffix lists the
+                    // constrained columns; it is omitted for a SCAN.
+                    let verb = if info.has_where_constraint {
                         "SEARCH"
                     } else {
                         "SCAN"
@@ -233,13 +235,8 @@ pub fn query_plan_rows(
                         "{verb} {name} USING {covering}INDEX {}",
                         info.index_name
                     );
-                    if info.has_where_equality && !info.equality_columns.is_empty() {
-                        let cols = info
-                            .equality_columns
-                            .iter()
-                            .map(|c| format!("{c}=?"))
-                            .collect::<Vec<_>>()
-                            .join(" AND ");
+                    if info.has_where_constraint && !info.constraint_columns.is_empty() {
+                        let cols = info.constraint_columns.join(" AND ");
                         detail.push_str(&format!(" ({cols})"));
                     }
                     details.push(detail);

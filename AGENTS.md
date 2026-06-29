@@ -1180,4 +1180,25 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   scans, `NOT INDEXED` scans, and the `no such index` error) and EQP-matched
   (`eqp_index_plan_details_match_oracle`). Still M27+: cost-based join ordering (needs
   ANALYZE/M22), automatic index for correlated subqueries, constant propagation,
-  LIKE/BETWEEN optimization, MIN/MAX optimization.
+  LIKE optimization, MIN/MAX optimization.
+  **27.11 BETWEEN + range-scan index access** ✅: the index planner now generalizes the
+  equality-prefix shape to a full range prefix — `>`, `>=`, `<`, `<=`, `IS NULL`, and
+  `IS NOT NULL` (lowered to `> NULL`) on the index's leading columns, with `BETWEEN` rewritten
+  to `>= low AND <= high` (the same rewrite upstream's `where.c` does). The `IndexPlan.equality`
+  list was replaced by a `range: Vec<RangeKey>` carrying `(column, RangeOp, value)` tuples; a
+  prefix is a run of `Eq`/`IsNull` columns followed by at most one column with a lower and/or
+  upper bound. The codegen (`compile_indexed_select`) emits `SeekGE`/`SeekGT` on the
+  equality-prefix + lower-bound key, an `IdxLE`/`IdxLT` boundary check at the loop top for the
+  upper bound, and the existing `IdxGT` for a pure equality prefix. The sorter-backed path
+  (`compile_indexed_sorter_scan`, used when ORDER BY is not satisfied by the index but a WHERE
+  constraint makes the index worthwhile) was extended with the same boundary-check operands.
+  `EXPLAIN QUERY PLAN` renders the oracle-faithful `(a>? AND a<?)` / `(a=? AND b>?)` /
+  `(a=?)` detail suffixes. The `SELECT *` covering detection was fixed to expand `*` to all
+  table columns (so a WHERE-constrained `SELECT *` picks a covering index when the index
+  covers every column), with a `index_strictly_smaller_than_table` guard so a redundant index
+  (same columns as the table) doesn't trigger a useless covering scan. The `BETWEEN`
+  expression (previously rejected as "not supported by the executor") is now lowered in both
+  `compile_jump` (WHERE form) and `compile_expr` (value form) with correct 3-valued-logic NULL
+  handling. Differential-tested vs the C oracle (`range_scan_index_access` in `diff.rs` — 30+
+  queries covering single/multi-column ranges, BETWEEN/NOT BETWEEN, IS NULL/IS NOT NULL,
+  covering/non-covering, ORDER BY + sorter, LIMIT/OFFSET, DISTINCT, and EQP matching).

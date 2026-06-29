@@ -57,21 +57,70 @@ use crate::error::{Error, Result};
 use crate::schema::{IndexObject, Table};
 use crate::types::Value;
 
-/// One equality predicate: `column = <const>` (or `column IS <const>`) where the RHS is a
-/// literal/bind-param.
+/// A comparison operator on an indexed column against a constant RHS, in the form the index
+/// range-scan machinery consumes. Mirrors the `WO_EQ`/`WO_GT`/`WO_LE`/... bit flags in
+/// `where.c`'s `WhereTerm`/`WhereLoop` planning, collapsed to a single closed enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RangeOp {
+    /// `col = const` / `col IS const`. The column is pinned to a single value.
+    Eq,
+    /// `col > const`.
+    Gt,
+    /// `col >= const`.
+    Ge,
+    /// `col < const`.
+    Lt,
+    /// `col <= const`.
+    Le,
+    /// `col IS NULL`. The column is pinned to NULL (a single-value range).
+    IsNull,
+}
+
+impl RangeOp {
+    /// The `EXPLAIN QUERY PLAN` detail token for this operator (`=`, `>`, `<`).
+    /// `>=`/`<=`/`IS NULL` all render as their strict counterpart because SQLite collapses
+    /// `a>=?` to `a>?` (seeking one position earlier and relying on the row scan to include
+    /// the equal row) and `a<=?` to `a<?` likewise; `IS NULL` renders as `=?`.
+    pub fn detail_token(self) -> &'static str {
+        match self {
+            RangeOp::Eq | RangeOp::IsNull => "=",
+            RangeOp::Gt | RangeOp::Ge => ">",
+            RangeOp::Lt | RangeOp::Le => "<",
+        }
+    }
+
+    /// True when this operator pins the column to a single value (`=` or `IS NULL`), so the
+    /// next index column can be constrained (an equality prefix).
+    pub fn is_equality(self) -> bool {
+        matches!(self, RangeOp::Eq | RangeOp::IsNull)
+    }
+}
+
+/// One constraint on an indexed column: the column, the operator, and the constant RHS value
+/// (NULL for `IS NULL` and for the open end of a half-bounded range).
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct EqualityKey {
+pub(crate) struct RangeKey {
     pub column: String,
+    pub op: RangeOp,
     pub value: Value,
 }
 
-/// An index plan: the chosen index, the matched equality prefix, whether the index covers all
-/// columns needed by the query (so no table lookup is required), and whether the index scan
-/// ordering satisfies the `ORDER BY` clause (so no sorter is required).
+/// An index plan: the chosen index, the matched range prefix (which subsumes the old
+/// equality-only prefix — an `Eq` constraint is just a single-ended range), whether the index
+/// covers all columns needed by the query (so no table lookup is required), and whether the
+/// index scan ordering satisfies the `ORDER BY` clause (so no sorter is required).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct IndexPlan {
     pub index: IndexObject,
-    pub equality: Vec<EqualityKey>,
+    /// The constraints on the index's leading columns. The prefix consists of zero or more
+    /// `Eq`/`IsNull` columns (the "equality prefix") followed by at most one column with a
+    /// range constraint (`Gt`/`Ge`/`Lt`/`Le`) — possibly with both a lower and an upper bound
+    /// on that same column (`a > 1 AND a < 3`). A column past the first range-bound column is
+    /// never constrained (the b-tree order is unknown past a range).
+    ///
+    /// The list is in index-column order. Each entry is one constraint; when the same column has
+    /// both a lower and an upper bound there are two entries (one `Gt`/`Ge`, one `Lt`/`Le`).
+    pub range: Vec<RangeKey>,
     /// `true` when the index scan yields rows in the ORDER BY order, so the sorter is dropped.
     /// Only set when `select.order_by` is non-empty AND the index ordering satisfies it.
     pub order_by_satisfied: bool,
@@ -82,6 +131,47 @@ pub(crate) struct IndexPlan {
     /// satisfy the ORDER BY clause. The codegen must emit a sorter over the index scan.
     /// Always `false` for an unconstrained planner pick.
     pub needs_sorter: bool,
+}
+
+impl IndexPlan {
+    /// The equality prefix length: the number of leading `Eq`/`IsNull` constraints. The
+    /// codegen's `SeekGE`/`SeekGT` key covers `eq_prefix_len` columns; the `IdxGT`/`IdxGE`
+    /// boundary check covers `eq_prefix_len` columns (for an equality prefix) or
+    /// `eq_prefix_len + 1` (for a range-bounded column).
+    pub fn eq_prefix_len(&self) -> usize {
+        self.range.iter().take_while(|k| k.op.is_equality()).count()
+    }
+
+    /// True when the plan has at least one WHERE constraint (equality or range) — i.e. the
+    /// scan is a `SeekGE`/`SeekGT` search, not a full index walk.
+    pub fn has_where_constraint(&self) -> bool {
+        !self.range.is_empty()
+    }
+
+    /// True when the plan has an equality prefix (the old `equality`-non-empty shape).
+    pub fn has_where_equality(&self) -> bool {
+        self.range.iter().any(|k| k.op.is_equality())
+    }
+
+    /// The lower-bound constraint on the first range column (the column right after the
+    /// equality prefix), if any.
+    pub fn lower_bound(&self) -> Option<&RangeKey> {
+        self.range.iter().find(|k| matches!(k.op, RangeOp::Gt | RangeOp::Ge))
+    }
+
+    /// The upper-bound constraint on the first range column, if any.
+    pub fn upper_bound(&self) -> Option<&RangeKey> {
+        self.range.iter().find(|k| matches!(k.op, RangeOp::Lt | RangeOp::Le))
+    }
+
+    /// The equality-prefix constraint values, in index order. Used by the codegen to load the
+    /// `SeekGE` key registers.
+    pub fn equality_values(&self) -> Vec<&RangeKey> {
+        self.range
+            .iter()
+            .filter(|k| k.op.is_equality())
+            .collect()
+    }
 }
 
 /// Pick an index to use for a `SELECT`, if any. Returns `Some(plan)` when an index provides at
@@ -125,7 +215,7 @@ pub(crate) fn pick_index(
     }
 
     let table_columns: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
-    let where_equalities = collect_where_equalities(select);
+    let where_constraints = collect_where_range_constraints(select);
 
     // The columns the query references (projection + WHERE + ORDER BY). Used to decide if an
     // index is covering. `collect_referenced_columns` walks the expressions and returns the
@@ -139,14 +229,14 @@ pub(crate) fn pick_index(
             .iter()
             .find(|i| i.name.eq_ignore_ascii_case(forced_name))
             .ok_or_else(|| Error::msg(format!("no such index: {}", forced_name)))?;
-        return Ok(Some(plan_for_index(select, idx, table, &table_columns, &where_equalities, &referenced, true)?));
+        return Ok(Some(plan_for_index(select, idx, table, &table_columns, &where_constraints, &referenced, true)?));
     }
 
     // Choose the index with the best combined benefit. Score is a tuple
-    // (where_prefix_len, covering, order_by_satisfied): a longer WHERE prefix wins; ties go to
-    // a covering index (saves the table lookup); further ties go to an ORDER BY-satisfying
-    // index (saves the sorter). This is a simple proxy for cost — a real planner would
-    // estimate row counts and I/O.
+    // (constraint_count, covering, order_by_satisfied): more WHERE constraints (equality +
+    // range bounds) win; ties go to a covering index (saves the table lookup); further ties go
+    // to an ORDER BY-satisfying index (saves the sorter). This is a simple proxy for cost — a
+    // real planner would estimate row counts and I/O.
     let mut best: Option<IndexPlan> = None;
     let mut best_score: (usize, bool, bool) = (0, false, false);
     for idx in indexes {
@@ -160,25 +250,40 @@ pub(crate) fn pick_index(
             continue;
         }
 
-        let plan = plan_for_index(select, idx, table, &table_columns, &where_equalities, &referenced, false)?;
+        let plan = plan_for_index(select, idx, table, &table_columns, &where_constraints, &referenced, false)?;
         // Require at least one benefit to use the index. A useless index that is neither
-        // covering, nor ORDER-BY-satisfying, nor has a WHERE equality prefix would just add
-        // an extra b-tree open with no gain — fall through to the table scan.
+        // covering, nor ORDER-BY-satisfying, nor has a WHERE constraint would just add an
+        // extra b-tree open with no gain — fall through to the table scan.
         let has_benefit =
-            !plan.equality.is_empty() || plan.order_by_satisfied || (plan.covering && !referenced.is_empty());
+            plan.has_where_constraint()
+                || plan.order_by_satisfied
+                || (plan.covering && !referenced.is_empty() && index_strictly_smaller_than_table(idx, table));
         if !has_benefit {
             continue;
         }
         // When the query has an ORDER BY that this index does NOT satisfy, the indexed scan
-        // would still need a sorter — and the codegen's indexed path does not emit one. Fall
-        // through to the table-scan + sorter path (`compile_scan_ordered`) which handles
-        // arbitrary ORDER BY. The indexed path is only usable when the ORDER BY is fully
-        // satisfied by the index (so no sorter is needed) or there is no ORDER BY.
+        // would still need a sorter. The codegen's indexed path handles this via the sorter
+        // path (`needs_sorter`) when there is a WHERE constraint — the index is used for the
+        // seek, and a sorter re-orders the rows by the ORDER BY keys. When there is no WHERE
+        // constraint (covering-only or ORDER-BY-only), the index offers no benefit over a
+        // table scan + sorter, so fall through to the table-scan + sorter path.
         if !select.order_by.is_empty() && !plan.order_by_satisfied {
+            if plan.has_where_constraint() {
+                // Use the index for the WHERE seek + a sorter for ORDER BY.
+                let mut plan = plan;
+                plan.needs_sorter = true;
+                let eq_len = plan.range.len();
+                let score = (eq_len, plan.covering, plan.order_by_satisfied);
+                if score > best_score {
+                    best_score = score;
+                    best = Some(plan);
+                }
+            }
             continue;
         }
 
-        let score = (plan.equality.len(), plan.covering, plan.order_by_satisfied);
+        let eq_len = plan.range.len();
+        let score = (eq_len, plan.covering, plan.order_by_satisfied);
         if score > best_score {
             best_score = score;
             best = Some(plan);
@@ -197,7 +302,7 @@ fn plan_for_index(
     idx: &IndexObject,
     table: &Table,
     table_columns: &[&str],
-    where_equalities: &[EqualityKey],
+    where_constraints: &[RangeKey],
     referenced: &[usize],
     forced: bool,
 ) -> Result<IndexPlan> {
@@ -206,26 +311,38 @@ fn plan_for_index(
         // Returning a no-benefit plan here makes the loop's `has_benefit` check drop it.
         return Ok(IndexPlan {
             index: idx.clone(),
-            equality: Vec::new(),
+            range: Vec::new(),
             order_by_satisfied: false,
             covering: false,
             needs_sorter: false,
         });
     }
 
-    // (1) WHERE equality prefix. May be empty (no WHERE benefit).
-    let prefix = find_index_prefix_equalities(idx, table_columns, where_equalities)
-        .unwrap_or_default();
+    // (1) WHERE range prefix. Walk the index columns in order, matching each against the WHERE
+    // constraints. An equality (`=`/`IS NULL`) on column N lets column N+1 be constrained; a
+    // range (`>`/`>=`/`<`/`<=`) on column N terminates the prefix (column N+1 is unconstrained
+    // — the b-tree order past a range is unknown). A single column may carry both a lower and
+    // an upper bound (`a > 1 AND a < 3`).
+    let range = match find_index_range_prefix(idx, table_columns, where_constraints) {
+        Some(r) => r,
+        None => Vec::new(),
+    };
+
+    // The equality prefix length (number of leading `=`/`IS NULL` constraints) determines
+    // where the ORDER BY match starts: an equality on column 0 lets ORDER BY on column 1 be
+    // satisfied by the same index.
+    let eq_prefix_len = range.iter().take_while(|k| k.op.is_equality()).count();
 
     // (2) ORDER BY benefit. The index satisfies ORDER BY when:
     //   * there is an ORDER BY clause,
-    //   * the ORDER BY terms are a prefix of the index columns (in index order), and
+    //   * the ORDER BY terms are a prefix of the index columns (in index order) starting
+    //     right after the equality prefix, and
     //   * each term's direction matches the index column's direction.
-    // The WHERE equality prefix precedes the ORDER BY prefix in the index: an equality
-    // on column 0 lets ORDER BY on column 1 be satisfied by the same index. So the
-    // ORDER BY match starts at index column `prefix.len()`.
+    // A range-bounded column past the equality prefix is NOT part of the ORDER BY (the scan
+    // walks the range, which is in order for the column itself but the ORDER BY must name that
+    // column too — we don't model that subtlety, conservatively rejecting).
     let order_by_satisfied =
-        order_by_matches_index(select, idx, table, prefix.len(), where_equalities);
+        order_by_matches_index(select, idx, table, eq_prefix_len, &range);
 
     // (3) Covering benefit. The index is covering when every referenced column is one of
     // the index's columns. The rowid-alias column is satisfied by the index's trailing
@@ -240,7 +357,7 @@ fn plan_for_index(
 
     Ok(IndexPlan {
         index: idx.clone(),
-        equality: prefix,
+        range,
         order_by_satisfied,
         covering,
         needs_sorter,
@@ -281,102 +398,207 @@ fn exprs_equal(a: &Expr, b: &Expr) -> bool {
     a == b
 }
 
-/// Collect all equality predicates from the WHERE clause as a flat list. The M3a/M5.2
-/// supported WHERE shape is a conjunction of `column = const` / `column IS const`
-/// comparisons (possibly with extra terms); we flatten `AND` and gather every equality.
-fn collect_where_equalities(select: &SelectStmt) -> Vec<EqualityKey> {
+/// Collect all range/equality constraints from the WHERE clause as a flat list. The supported
+/// WHERE shape is a conjunction of `col <op> const` comparisons (possibly with extra terms);
+/// we flatten `AND` and gather every constraint whose RHS is a constant literal or bind
+/// parameter. `BETWEEN` is rewritten to `>= low AND <= high` (the same rewrite upstream's
+/// `where.c` does in `sqlite3WhereCanonicalFuncUsage`/`whereLoopInfo` via the
+/// `WO_GE`/`WO_LE` pair derived from a `BETWEEN` term).
+fn collect_where_range_constraints(select: &SelectStmt) -> Vec<RangeKey> {
     let Some(w) = select.where_clause.as_ref() else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    flatten_and_collect_equalities(w, &mut out);
+    flatten_and_collect_range(w, &mut out);
     out
 }
 
-/// Recursively walk `expr`, flattening `AND` chains and recording every `col = const` /
-/// `col IS const` predicate. The RHS must be a constant literal or bind parameter.
-fn flatten_and_collect_equalities(expr: &Expr, out: &mut Vec<EqualityKey>) {
+/// Recursively walk `expr`, flattening `AND` chains and recording every range/equality
+/// constraint. `BETWEEN` lowers to a `Ge` + `Le` pair on the same column. `IS NULL` lowers to
+/// an `IsNull` constraint. `IS NOT NULL` is not a usable index constraint (it's a not-NULL
+/// scan, which the b-tree can't seek to) and is dropped here.
+fn flatten_and_collect_range(expr: &Expr, out: &mut Vec<RangeKey>) {
     match expr {
         Expr::Binary {
             op: BinaryOp::And,
             left,
             right,
         } => {
-            flatten_and_collect_equalities(left, out);
-            flatten_and_collect_equalities(right, out);
+            flatten_and_collect_range(left, out);
+            flatten_and_collect_range(right, out);
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated: false,
+        } => {
+            // `expr BETWEEN low AND high` → `expr >= low AND expr <= high`.
+            if let Some(col) = column_name(expr) {
+                if let Some(lo) = const_value(low) {
+                    out.push(RangeKey { column: col.clone(), op: RangeOp::Ge, value: lo });
+                }
+                if let Some(hi) = const_value(high) {
+                    out.push(RangeKey { column: col, op: RangeOp::Le, value: hi });
+                }
+            }
         }
         other => {
-            if let Some(ek) = as_equality_key(other) {
-                out.push(ek);
+            if let Some(rk) = as_range_key(other) {
+                out.push(rk);
             }
         }
     }
 }
 
-/// If `expr` is `col = const` or `col IS const` (or the commutative equality forms), return
-/// the equality key. Returns `None` for non-equality expressions or when the RHS is not a
-/// constant.
-fn as_equality_key(expr: &Expr) -> Option<EqualityKey> {
-    let (col_expr, val_expr) = match expr {
+/// If `expr` is `col <op> const` (or the commutative form), return the range key. Recognizes
+/// `=`, `IS`, `>`, `>=`, `<`, `<=`, `IS NULL` (parsed as `col IS NULL` which the parser
+/// lowers to a `Binary { op: Is, right: Literal(Null) }`), and `IS NOT NULL` (parsed as
+/// `Binary { op: IsNot, right: Literal(Null) }`, lowered to `Gt(NULL)` — the b-tree seek past
+/// the NULL entries). Returns `None` for `!=`, `<>`, non-constant RHS, or a non-column LHS.
+fn as_range_key(expr: &Expr) -> Option<RangeKey> {
+    let (col_expr, val_expr, op) = match expr {
         Expr::Binary {
-            op: BinaryOp::Eq | BinaryOp::Is,
+            op: BinaryOp::Is,
             left,
             right,
-        } => (left.as_ref(), right.as_ref()),
+        } => {
+            // `col IS NULL` is a real constraint (RangeOp::IsNull); `col IS <non-null>` is an
+            // equality. Don't reject NULL here — the `Is` operator explicitly compares to NULL.
+            let col = column_name(left.as_ref()).or_else(|| column_name(right.as_ref()))?;
+            let val_expr = if column_name(left.as_ref()).is_some() {
+                right.as_ref()
+            } else {
+                left.as_ref()
+            };
+            let value = const_value(val_expr)?;
+            if matches!(value, Value::Null) {
+                return Some(RangeKey { column: col, op: RangeOp::IsNull, value });
+            }
+            return Some(RangeKey { column: col, op: RangeOp::Eq, value });
+        }
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => (left.as_ref(), right.as_ref(), RangeOp::Eq),
+        Expr::Binary {
+            op: BinaryOp::IsNot,
+            left,
+            right,
+        } => {
+            // `col IS NOT NULL` → `col > NULL` (seek past the NULL entries). Only useful when
+            // the RHS is NULL; `col IS NOT <non-null>` is not a range constraint.
+            let val = const_value(right.as_ref())?;
+            if !matches!(val, Value::Null) {
+                return None;
+            }
+            let col = column_name(left.as_ref())?;
+            return Some(RangeKey { column: col, op: RangeOp::Gt, value: Value::Null });
+        }
+        Expr::Binary {
+            op: BinaryOp::Gt,
+            left,
+            right,
+        } => (left.as_ref(), right.as_ref(), RangeOp::Gt),
+        Expr::Binary {
+            op: BinaryOp::Ge,
+            left,
+            right,
+        } => (left.as_ref(), right.as_ref(), RangeOp::Ge),
+        Expr::Binary {
+            op: BinaryOp::Lt,
+            left,
+            right,
+        } => (left.as_ref(), right.as_ref(), RangeOp::Lt),
+        Expr::Binary {
+            op: BinaryOp::Le,
+            left,
+            right,
+        } => (left.as_ref(), right.as_ref(), RangeOp::Le),
         _ => return None,
     };
 
-    let col = column_name(col_expr).or_else(|| column_name(val_expr))?;
-    let val_expr = if column_name(col_expr).is_some() {
-        val_expr
+    // Resolve the column side (LHS or RHS) and the value side (the other).
+    let (col, val_expr) = if let Some(c) = column_name(col_expr) {
+        (c, val_expr)
     } else {
-        col_expr
+        // Try the commutative form: const <op> col.
+        let c = column_name(val_expr)?;
+        (c, col_expr)
     };
     let value = const_value(val_expr)?;
 
-    // `WHERE col = NULL` is always UNKNOWN in three-valued logic, so the indexed path
-    // (which would return the NULL row) is wrong. Reject the equality.
-    if matches!(value, Value::Null) {
+    // `col = NULL` is always UNKNOWN in three-valued logic, so the indexed path (which would
+    // return the NULL row) is wrong. Reject the equality. (`col IS NULL` is handled above as
+    // `RangeOp::IsNull` and is NOT rejected.)
+    if matches!(value, Value::Null) && op == RangeOp::Eq {
         return None;
     }
 
-    Some(EqualityKey { column: col, value })
+    Some(RangeKey { column: col, op, value })
 }
 
-/// Find the longest prefix of `index.columns` that is covered by equality predicates in
-/// `equalities`. Returns `Some(prefix)` when at least the first column has an equality.
-fn find_index_prefix_equalities(
+/// Walk the index columns in order, matching each against the collected WHERE constraints.
+/// The prefix is a run of `Eq`/`IsNull` columns followed by at most one column with a range
+/// constraint (which may carry both a lower and an upper bound). Returns `Some(prefix)` when
+/// at least the first index column has a constraint; `None` when the index provides no WHERE
+/// benefit (the caller still considers the index for covering / ORDER BY benefits).
+fn find_index_range_prefix(
     index: &IndexObject,
     table_columns: &[&str],
-    equalities: &[EqualityKey],
-) -> Option<Vec<EqualityKey>> {
-    let mut prefix = Vec::new();
+    constraints: &[RangeKey],
+) -> Option<Vec<RangeKey>> {
+    let mut prefix: Vec<RangeKey> = Vec::new();
+    let mut saw_range = false;
     for ic in &index.columns {
-        // Sanity check: the indexed column must exist on the table. If it doesn't, the
-        // index is corrupt/inconsistent; we simply can't use it.
+        // Sanity check: the indexed column must exist on the table.
         if !table_columns
             .iter()
             .any(|c| c.eq_ignore_ascii_case(&ic.name))
         {
-            // A corrupt index can't be used at all; return None so the caller skips it.
             return None;
         }
-        // The prefix extends as long as each index column (in order) has an equality
-        // predicate. The first column without an equality terminates the prefix — columns
-        // after it are not pinned to a single value, so they can't be part of the seek key.
-        let Some(ek) = equalities
-            .iter()
-            .find(|e| e.column.eq_ignore_ascii_case(&ic.name))
-        else {
+        // Past a range-bounded column, no further column is constrained.
+        if saw_range {
             break;
-        };
-        prefix.push(ek.clone());
+        }
+        // Gather every constraint on this index column.
+        let matches: Vec<&RangeKey> = constraints
+            .iter()
+            .filter(|c| c.column.eq_ignore_ascii_case(&ic.name))
+            .collect();
+        if matches.is_empty() {
+            break;
+        }
+        // Equality / IS NULL constraints: take the first one (the b-tree pins the column).
+        // If there are multiple equalities on the same column, take the first (the planner
+        // doesn't model contradiction — the codegen re-checks WHERE on the row anyway).
+        if let Some(eq) = matches.iter().find(|c| c.op.is_equality()) {
+            prefix.push((*eq).clone());
+            continue;
+        }
+        // No equality — look for a range (lower and/or upper bound).
+        let lower = matches.iter().find(|c| matches!(c.op, RangeOp::Gt | RangeOp::Ge));
+        let upper = matches.iter().find(|c| matches!(c.op, RangeOp::Lt | RangeOp::Le));
+        if let Some(lo) = lower {
+            prefix.push((*lo).clone());
+        }
+        if let Some(hi) = upper {
+            prefix.push((*hi).clone());
+        }
+        if lower.is_some() || upper.is_some() {
+            saw_range = true;
+            continue;
+        }
+        // No usable constraint on this column — stop.
+        break;
     }
-    // The prefix is usable when at least the first index column has an equality. An empty
-    // prefix (no equality on the first column) means the index can't be seeked — the
-    // caller still considers the index for covering / ORDER BY benefits, but not for a
-    // WHERE-equality seek.
-    if prefix.is_empty() { None } else { Some(prefix) }
+    if prefix.is_empty() {
+        None
+    } else {
+        Some(prefix)
+    }
 }
 
 /// True when the `ORDER BY` clause is satisfied by walking this index forward starting at
@@ -397,7 +619,7 @@ fn order_by_matches_index(
     index: &IndexObject,
     table: &Table,
     prefix_len: usize,
-    where_equalities: &[EqualityKey],
+    where_constraints: &[RangeKey],
 ) -> bool {
     if select.order_by.is_empty() {
         return false;
@@ -437,7 +659,7 @@ fn order_by_matches_index(
     // The ORDER BY columns after the prefix must not be constrained by an equality — if they
     // were, they'd be pinned and the ORDER BY would be over-constrained (upstream handles
     // this via `nDistinctCol`); for simplicity we just reject the rare case.
-    let _ = where_equalities;
+    let _ = where_constraints;
     true
 }
 
@@ -473,7 +695,10 @@ fn nulls_is_default(term: &OrderingTerm) -> bool {
 /// clauses. Used to decide if an index is covering. The rowid-alias column is included when
 /// it's referenced (it's readable from the index's trailing rowid). Returns an empty set for
 /// a FROM-less / `*`-only query that we can't analyze — the caller treats empty as "not
-/// covering" so `SELECT *` never picks a covering index (correct: `*` includes every column).
+/// covering" so `SELECT *` never picks a covering index. The oracle's cost model also avoids
+/// the covering index for `SELECT *` when the index is redundant (same columns as the table);
+/// expanding `*` to all columns and checking `index_covers` would match that, but the
+/// `has_benefit` gate (no WHERE, no ORDER BY → no benefit) already drops the redundant case.
 fn collect_referenced_columns(select: &SelectStmt, table: &Table) -> Vec<usize> {
     let mut cols: Vec<usize> = Vec::new();
     let mut push = |idx: usize| {
@@ -481,12 +706,13 @@ fn collect_referenced_columns(select: &SelectStmt, table: &Table) -> Vec<usize> 
             cols.push(idx);
         }
     };
-    // Projection. A `*` / `t.*` references every column — bail out (return empty) so the
-    // index is never considered covering for `SELECT *`.
+    // Projection. `*` / `t.*` reference every column on the table.
     for rc in &select.columns {
         match rc {
             rustqlite_parser::ResultColumn::Star | rustqlite_parser::ResultColumn::TableStar(_) => {
-                return Vec::new();
+                for (i, _c) in table.columns.iter().enumerate() {
+                    push(i);
+                }
             }
             rustqlite_parser::ResultColumn::Expr { expr, .. } => {
                 collect_columns(expr, table, &mut push);
@@ -599,6 +825,15 @@ fn index_covers(index: &IndexObject, table: &Table, referenced: &[usize]) -> boo
         }
     }
     true
+}
+
+/// True when the index's plain (non-expression) columns are a strict subset of the table's
+/// columns — the index is smaller than the table, so a covering index scan reads fewer bytes
+/// per row than a table scan. A redundant index (same columns as the table) offers no covering
+/// benefit; the oracle's cost model prefers the table scan in that case.
+fn index_strictly_smaller_than_table(index: &IndexObject, table: &Table) -> bool {
+    let plain_indexed: usize = index.columns.iter().filter(|ic| !ic.is_expression()).count();
+    plain_indexed < table.columns.len()
 }
 
 fn column_name(expr: &Expr) -> Option<String> {

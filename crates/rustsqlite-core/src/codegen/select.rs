@@ -21,7 +21,7 @@ use crate::vdbe::{KeyField, Opcode};
 
 use super::builder::{Label, ProgramBuilder};
 use super::expr::{compile_expr, compile_jump, Ctx, OuterScope, SubqueryResolver};
-use super::index_planner::{pick_index, IndexPlan};
+use super::index_planner::{pick_index, IndexPlan, RangeOp};
 
 /// Compile a single-table (or constant) `SELECT`, returning the program and the result column
 /// names. `table` is the resolved table when there is exactly one `FROM` entry, else `None`.
@@ -980,22 +980,74 @@ fn compile_indexed_select(
         .collect();
     b.set_p4(open_idx, P4::KeyInfo(key_info));
 
-    // (2) Position the index. A WHERE-equality plan seeks to the first entry `>=` the search
-    // key prefix; an ORDER-BY-only (or covering-only) plan rewinds to the first entry.
-    let nkey = plan.equality.len() as i32;
-    let key_reg = if nkey > 0 {
-        let key_reg = b.alloc_regs(nkey);
-        for (i, ek) in plan.equality.iter().enumerate() {
-            emit_value_load(&mut b, &ek.value, key_reg + i as i32);
+    // (2) Position the index. The plan's `range` is a run of `Eq`/`IsNull` constraints (the
+    // equality prefix) optionally followed by a single column with a lower and/or upper bound
+    // (the range column). The codegen emits:
+    //
+    //   * `SeekGE` on the equality-prefix key registers when there is an equality prefix and
+    //     no lower bound on a range column (the equality pins the column to a single value,
+    //     which is `>=` itself). `nField` = eq_prefix_len.
+    //   * `SeekGE` on the equality-prefix + range-lower-bound key registers when there is a
+    //     range lower bound. `nField` = eq_prefix_len + 1. `SeekGT` is used when the lower
+    //     bound is strict (`>`); `SeekGE` when inclusive (`>=`).
+    //   * `Rewind` when there is no lower bound (the scan starts at the first index entry).
+    //     This includes an upper-bound-only range (`a < 5`) — the scan walks from the start
+    //     until the upper-bound boundary check fires.
+    //
+    // A NULL lower bound (`a > NULL` is always UNKNOWN, dropped by the planner) never reaches
+    // here. An `IS NULL` equality lowers to a NULL key register (the b-tree's NULL entries sort
+    // first, so `SeekGE` on NULL positions at the first NULL entry).
+    let eq_prefix_len = plan.eq_prefix_len();
+    let lower = plan.lower_bound().cloned();
+    let upper = plan.upper_bound().cloned();
+
+    // The seek key is [eq_prefix values..., (lower-bound value if any)]. The equality prefix
+    // registers are reused as the upper-bound boundary-check key prefix when the upper bound
+    // is on the same column as the lower bound (the common `a > 1 AND a < 3` case) or on the
+    // first range column after the equality prefix.
+    let seek_nfields = (eq_prefix_len + if lower.is_some() { 1 } else { 0 }) as i32;
+    let key_reg = if seek_nfields > 0 {
+        let key_reg = b.alloc_regs(seek_nfields);
+        for (i, rk) in plan.equality_values().iter().enumerate() {
+            emit_value_load(&mut b, &rk.value, key_reg + i as i32);
+        }
+        if let Some(lo) = &lower {
+            emit_value_load(&mut b, &lo.value, key_reg + eq_prefix_len as i32);
         }
         Some(key_reg)
     } else {
         None
     };
+
+    // The upper-bound boundary-check key: [eq_prefix values..., upper-bound value]. Allocated
+    // and loaded only when there is an upper bound. When the upper bound is on the same column
+    // as a lower bound, the lower-bound register is overwritten with the upper-bound value
+    // (matching upstream's `SeekGE`+`IdxGE` shape where the key register is repurposed).
+    let upper_nfields = (eq_prefix_len + if upper.is_some() { 1 } else { 0 }) as i32;
+    let upper_reg = if upper.is_some() && upper_nfields > 0 {
+        let ur = b.alloc_regs(upper_nfields);
+        // Copy the equality-prefix values into the upper-bound key (they're the same prefix).
+        for i in 0..eq_prefix_len {
+            b.emit(Opcode::SCopy, key_reg.unwrap() + i as i32, ur + i as i32, 0);
+        }
+        if let Some(hi) = &upper {
+            emit_value_load(&mut b, &hi.value, ur + eq_prefix_len as i32);
+        }
+        Some(ur)
+    } else {
+        None
+    };
+
     let end_seek = b.new_label();
-    if nkey > 0 {
-        let seek = b.emit_jump(Opcode::SeekGE, idx_cursor, end_seek, key_reg.unwrap());
-        b.set_p4(seek, P4::Int(nkey as i64));
+    if seek_nfields > 0 {
+        // `>=` for an inclusive lower bound (`>=`) or an equality prefix; `>` for a strict
+        // lower bound (`>`). Upstream always uses `SeekGE` for `>=` and `SeekGT` for `>`.
+        let seek_op = match lower.as_ref().map(|l| l.op) {
+            Some(RangeOp::Gt) => Opcode::SeekGT,
+            _ => Opcode::SeekGE,
+        };
+        let seek = b.emit_jump(seek_op, idx_cursor, end_seek, key_reg.unwrap());
+        b.set_p4(seek, P4::Int(seek_nfields as i64));
     } else {
         b.emit_jump(Opcode::Rewind, idx_cursor, end_seek, 0);
     }
@@ -1010,7 +1062,9 @@ fn compile_indexed_select(
         // The sorter scan function resolves `end_seek` and emits its own `Halt`.
         compile_indexed_sorter_scan(
             &mut b, select, ctx, outputs, ncol,
-            idx_cursor, end_seek, nkey, key_reg,
+            idx_cursor, end_seek, seek_nfields, key_reg,
+            upper_reg, upper_nfields, upper.as_ref().map(|u| u.op),
+            lower.as_ref().map(|l| l.op),
             limit_reg, offset_reg,
         )?;
     } else {
@@ -1023,14 +1077,31 @@ fn compile_indexed_select(
             c
         });
 
-        // (3) Loop body. The IdxGT boundary check is re-emitted at the top of every iteration
-        // (only for the WHERE-equality shape) so the loop terminates when the index key prefix
-        // no longer matches. A covering plan skips the IdxRowid + NotExists table lookup.
+        // (3) Loop body. The boundary check at the top of every iteration terminates the scan
+        // when the index key goes past the range. For an equality prefix with no range column,
+        // `IdxGT` on `eq_prefix_len` fields jumps when the prefix no longer matches. For a
+        // range with an upper bound, `IdxGE` (inclusive `<=`) or `IdxGT` (strict `<`) on
+        // `upper_nfields` fields jumps when the key exceeds the upper bound.
         let loop_top = b.new_label();
         b.resolve(loop_top);
-        if nkey > 0 {
+        if upper.is_some() {
+            // The upper-bound boundary check terminates the scan when the entry exceeds the
+            // bound. The `IdxLE`/`IdxLT` opcodes jump when the entry is `>` / `>=` the key
+            // (the "out of range" direction), matching the `SeekLE+IdxLE`/`SeekLE+IdxLT`
+            // pairings in the VDBE. We use them for a forward `SeekGE` scan's upper bound:
+            //   `a <= X` → `IdxLE` (jump when entry `>` X)
+            //   `a < X`  → `IdxLT` (jump when entry `>=` X)
+            let boundary_op = match upper.as_ref().unwrap().op {
+                RangeOp::Le => Opcode::IdxLE,
+                RangeOp::Lt => Opcode::IdxLT,
+                _ => Opcode::IdxLE,
+            };
+            let bd = b.emit_jump(boundary_op, idx_cursor, end_seek, upper_reg.unwrap());
+            b.set_p4(bd, P4::Int(upper_nfields as i64));
+        } else if seek_nfields > 0 && lower.is_none() {
+            // Pure equality prefix (no range column): `IdxGT` on `eq_prefix_len` fields.
             let idx_gt = b.emit_jump(Opcode::IdxGT, idx_cursor, end_seek, key_reg.unwrap());
-            b.set_p4(idx_gt, P4::Int(nkey as i64));
+            b.set_p4(idx_gt, P4::Int(eq_prefix_len as i64));
         }
         let idx_next = b.new_label();
         if !covering {
@@ -1039,11 +1110,11 @@ fn compile_indexed_select(
             b.emit_jump(Opcode::NotExists, table_cursor, idx_next, rowid_reg);
         }
 
-        // Re-check the WHERE clause on the row. The SeekGE+IdxGT only verified the indexed-column
-        // equality prefix; a WHERE with additional terms (or a non-equality predicate that the
-        // planner couldn't turn into a prefix, like `IS NULL`) is re-evaluated here against the
-        // row's column values. For a covering plan the columns are read from the index cursor
-        // (via `ctx.index_read`); for a non-covering plan they're read from the table cursor.
+        // Re-check the WHERE clause on the row. The SeekGE/SeekGT + IdxGT/IdxGE only verified
+        // the indexed-column prefix; a WHERE with additional terms is re-evaluated here against
+        // the row's column values. For a covering plan the columns are read from the index
+        // cursor (via `ctx.index_read`); for a non-covering plan they're read from the table
+        // cursor.
         if let Some(w) = &select.where_clause {
             compile_jump(&mut b, w, idx_next, false, true, ctx)?;
         }
@@ -1088,10 +1159,10 @@ fn compile_indexed_select(
 }
 
 /// The sorter-backed indexed scan (the `INDEXED BY <name>` + `ORDER BY` shape). The index has
-/// already been positioned (SeekGE for a WHERE-equality prefix, else Rewind); this function
-/// drives the scan loop, builds `[order_keys..., outputs...]` records, sorts them, and emits
-/// the sorted output with OFFSET/LIMIT — mirroring `compile_scan_ordered` but reading via the
-/// index cursor (with a table lookup when the index is non-covering).
+/// already been positioned (SeekGE/SeekGT for a WHERE-equality/range prefix, else Rewind); this
+/// function drives the scan loop, builds `[order_keys..., outputs...]` records, sorts them, and
+/// emits the sorted output with OFFSET/LIMIT — mirroring `compile_scan_ordered` but reading via
+/// the index cursor (with a table lookup when the index is non-covering).
 #[allow(clippy::too_many_arguments)]
 fn compile_indexed_sorter_scan(
     b: &mut ProgramBuilder,
@@ -1101,11 +1172,16 @@ fn compile_indexed_sorter_scan(
     ncol: i32,
     idx_cursor: i32,
     end_seek: Label,
-    nkey: i32,
+    seek_nfields: i32,
     key_reg: Option<i32>,
+    upper_reg: Option<i32>,
+    upper_nfields: i32,
+    upper_op: Option<crate::codegen::index_planner::RangeOp>,
+    lower_op: Option<crate::codegen::index_planner::RangeOp>,
     limit_reg: Option<i32>,
     offset_reg: Option<i32>,
 ) -> Result<()> {
+    use crate::codegen::index_planner::RangeOp;
     let covering = ctx.index_read.is_some();
     let table_cursor = 1i32;
     let sorter = if covering { 1i32 } else { 2i32 };
@@ -1131,9 +1207,19 @@ fn compile_indexed_sorter_scan(
     // --- scan loop: filter, build [keys..., outputs...] records, insert into the sorter ---
     let scan_top = b.new_label();
     b.resolve(scan_top);
-    if nkey > 0 {
+    // Boundary check at loop top: terminate when the index key goes past the range.
+    if upper_op.is_some() && upper_reg.is_some() {
+        let boundary_op = match upper_op.unwrap() {
+            RangeOp::Le => Opcode::IdxLE,
+            RangeOp::Lt => Opcode::IdxLT,
+            _ => Opcode::IdxLE,
+        };
+        let bd = b.emit_jump(boundary_op, idx_cursor, end_seek, upper_reg.unwrap());
+        b.set_p4(bd, P4::Int(upper_nfields as i64));
+    } else if seek_nfields > 0 && upper_op.is_none() && lower_op.is_none() && key_reg.is_some() {
+        // Pure equality prefix (no range column): `IdxGT` on `seek_nfields` fields.
         let idx_gt = b.emit_jump(Opcode::IdxGT, idx_cursor, end_seek, key_reg.unwrap());
-        b.set_p4(idx_gt, P4::Int(nkey as i64));
+        b.set_p4(idx_gt, P4::Int(seek_nfields as i64));
     }
     let scan_next = b.new_label();
     if !covering {
@@ -1161,8 +1247,8 @@ fn compile_indexed_sorter_scan(
     b.resolve(scan_next);
     b.emit_jump(Opcode::Next, idx_cursor, scan_top, 0);
     // The scan loop exits to the sorter output section when `Next` falls through (cursor
-    // exhausted) or when an `IdxGT` boundary check jumps to `end_seek`. Resolve `end_seek`
-    // here so both paths land at the start of the output section.
+    // exhausted) or when a boundary check jumps to `end_seek`. Resolve `end_seek` here so
+    // both paths land at the start of the output section.
     b.resolve(end_seek);
 
     // --- output loop: sorted iteration with OFFSET/LIMIT ---

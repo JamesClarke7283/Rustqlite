@@ -155,8 +155,62 @@ pub fn compile_expr(b: &mut ProgramBuilder, e: &Expr, target: i32, ctx: Ctx) -> 
             b.set_p5(idx, arg_exprs.len() as u8);
         }
         Expr::BindParam(_) => return Err(Error::msg("bind parameters are not supported in M3a")),
-        Expr::Between { .. } => {
-            return Err(Error::msg("BETWEEN is not supported by the executor yet"))
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            // `expr BETWEEN low AND high` lowers to `expr >= low AND expr <= high` (and NOT
+            // BETWEEN to its negation). The value form stores 1/0/NULL — NULL when the LHS or
+            // any comparison is UNKNOWN (3-valued logic). Mirrors upstream's
+            // `sqlite3ExprCodeBetween` (the `SQLITE_JUMPIFNULL` path).
+            let r = b.alloc_reg();
+            compile_expr(b, expr, r, ctx)?;
+            let lo = b.alloc_reg();
+            compile_expr(b, low, lo, ctx)?;
+            let hi = b.alloc_reg();
+            compile_expr(b, high, hi, ctx)?;
+            let aff = comparison_affinity(expr, low, ctx)
+                .or_else(|| comparison_affinity(expr, high, ctx));
+            let p5 = aff_to_p5(aff) | P5_JUMPIFNULL;
+            let dest_true = b.new_label();
+            let dest_false = b.new_label();
+            let dest_null = b.new_label();
+            let dest_end = b.new_label();
+            if *negated {
+                // NOT BETWEEN: TRUE when (r < lo) OR (r > hi); FALSE when (r >= lo) AND (r <= hi);
+                // NULL when r IS NULL or any comparison is UNKNOWN.
+                b.emit_jump(Opcode::IsNull, r, dest_null, 0);
+                let lt = b.emit_jump(Opcode::Lt, lo, dest_true, r);
+                b.set_p5(lt, p5 & !P5_JUMPIFNULL);
+                let gt = b.emit_jump(Opcode::Gt, hi, dest_true, r);
+                b.set_p5(gt, p5 & !P5_JUMPIFNULL);
+                // Fall-through: in range → FALSE.
+                b.emit(Opcode::Integer, 0, target, 0);
+                b.emit_jump(Opcode::Goto, 0, dest_end, 0);
+                b.resolve(dest_true);
+                b.emit(Opcode::Integer, 1, target, 0);
+                b.emit_jump(Opcode::Goto, 0, dest_end, 0);
+                b.resolve(dest_null);
+                b.emit(Opcode::Null, target, 0, 0);
+            } else {
+                // BETWEEN: TRUE when (r >= lo) AND (r <= hi); FALSE otherwise; NULL when r IS NULL.
+                b.emit_jump(Opcode::IsNull, r, dest_null, 0);
+                let lt = b.emit_jump(Opcode::Lt, lo, dest_false, r);
+                b.set_p5(lt, p5 & !P5_JUMPIFNULL);
+                let gt = b.emit_jump(Opcode::Gt, hi, dest_false, r);
+                b.set_p5(gt, p5 & !P5_JUMPIFNULL);
+                // Fall-through: in range → TRUE.
+                b.emit(Opcode::Integer, 1, target, 0);
+                b.emit_jump(Opcode::Goto, 0, dest_end, 0);
+                b.resolve(dest_false);
+                b.emit(Opcode::Integer, 0, target, 0);
+                b.emit_jump(Opcode::Goto, 0, dest_end, 0);
+                b.resolve(dest_null);
+                b.emit(Opcode::Null, target, 0, 0);
+            }
+            b.resolve(dest_end);
         }
         Expr::In { .. } => return Err(Error::msg("IN is not supported by the executor yet")),
         Expr::InSubquery { expr, subquery, negated } => {
@@ -848,6 +902,68 @@ pub fn compile_jump(
             op: UnaryOp::Not,
             expr,
         } => compile_jump(b, expr, label, !jump_if_true, jump_if_null, ctx),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            // `expr BETWEEN low AND high` is `expr >= low AND expr <= high`. The jump form
+            // mirrors upstream's `ExprIfTrue`/`ExprIfFalse` for a BETWEEN term: evaluate the
+            // LHS once, then two comparisons joined by AND (for BETWEEN) or OR (for NOT
+            // BETWEEN). `NOT BETWEEN` is `(expr < low OR expr > high)`.
+            let r = b.alloc_reg();
+            compile_expr(b, expr, r, ctx)?;
+            let lo = b.alloc_reg();
+            compile_expr(b, low, lo, ctx)?;
+            let hi = b.alloc_reg();
+            compile_expr(b, high, hi, ctx)?;
+            let aff = comparison_affinity(expr, low, ctx)
+                .or_else(|| comparison_affinity(expr, high, ctx));
+            let p5 = aff_to_p5(aff) | if jump_if_null { P5_JUMPIFNULL } else { 0 };
+            if *negated {
+                // NOT BETWEEN = `(r < lo) OR (r > hi)`. TRUE when out of range, FALSE when in
+                // range, NULL when r is NULL. The OR pattern threads `!jn` into the
+                // short-circuit operand (mirroring `ExprIfTrue`/`ExprIfFalse` for OR).
+                let p5_short = aff_to_p5(aff) | if !jump_if_null { P5_JUMPIFNULL } else { 0 };
+                if jump_if_true {
+                    // jump-when-TRUE: IfTrue(L, dest, jn); IfTrue(R, dest, jn).
+                    let lo_cmp = b.emit_jump(Opcode::Lt, lo, label, r);
+                    b.set_p5(lo_cmp, p5);
+                    let hi_cmp = b.emit_jump(Opcode::Gt, hi, label, r);
+                    b.set_p5(hi_cmp, p5);
+                } else {
+                    // jump-when-FALSE (WHERE skip): IfTrue(L, d2, !jn); IfFalse(R, dest, jn); d2:.
+                    let d2 = b.new_label();
+                    let lt = b.emit_jump(Opcode::Lt, lo, d2, r);
+                    b.set_p5(lt, p5_short);
+                    let le = b.emit_jump(Opcode::Le, hi, label, r);
+                    b.set_p5(le, p5);
+                    b.resolve(d2);
+                }
+            } else {
+                // BETWEEN = `(r >= lo) AND (r <= hi)`. TRUE when in range, FALSE when out of
+                // range, NULL when r is NULL. The AND pattern threads `!jn` into the
+                // short-circuit operand.
+                let p5_short = aff_to_p5(aff) | if !jump_if_null { P5_JUMPIFNULL } else { 0 };
+                if jump_if_true {
+                    // jump-when-TRUE: IfFalse(L, d2, !jn); IfTrue(R, dest, jn); d2:.
+                    let d2 = b.new_label();
+                    let ge = b.emit_jump(Opcode::Lt, lo, d2, r);
+                    b.set_p5(ge, p5_short);
+                    let le = b.emit_jump(Opcode::Le, hi, label, r);
+                    b.set_p5(le, p5);
+                    b.resolve(d2);
+                } else {
+                    // jump-when-FALSE (WHERE skip): IfFalse(L, dest, jn); IfFalse(R, dest, jn).
+                    let lt = b.emit_jump(Opcode::Lt, lo, label, r);
+                    b.set_p5(lt, p5);
+                    let gt = b.emit_jump(Opcode::Gt, hi, label, r);
+                    b.set_p5(gt, p5);
+                }
+            }
+            Ok(())
+        }
         Expr::Binary { op, left, right } if cmp_opcode(*op).is_some() => {
             let (opcode, nulleq) = cmp_opcode(*op).unwrap();
             let rl = b.alloc_reg();

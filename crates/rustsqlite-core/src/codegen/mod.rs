@@ -76,13 +76,21 @@ pub fn select_index_plan_info(
         .and_then(|tj| tj.table())
         .and_then(|tref| tref.indexed_by.as_ref());
     table.and_then(|t| index_planner::pick_index(select, t, indexes, hint).ok().flatten()).map(|plan| {
-        let equality_columns: Vec<String> = plan.equality.iter().map(|e| e.column.clone()).collect();
-        let has_where_equality = !plan.equality.is_empty();
+        // Render the constraint list as the oracle's `(col <op> ? ...)` detail. Equality
+        // columns render as `col=?`; range columns render as `col>?` / `col<?`. The same
+        // column with both bounds renders as `col>? AND col<?`. The list is in index-column
+        // order; duplicates (both bounds on one column) appear consecutively.
+        let constraint_columns: Vec<String> = plan
+            .range
+            .iter()
+            .map(|k| format!("{}{}?", k.column, k.op.detail_token()))
+            .collect();
+        let has_where_constraint = plan.has_where_constraint();
         crate::vdbe::explain::IndexPlanInfo {
             index_name: plan.index.name.clone(),
             covering: plan.covering,
-            has_where_equality,
-            equality_columns,
+            has_where_constraint,
+            constraint_columns,
             order_by_satisfied: plan.order_by_satisfied,
         }
     })
