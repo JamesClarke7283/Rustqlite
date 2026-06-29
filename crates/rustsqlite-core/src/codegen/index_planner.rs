@@ -53,6 +53,10 @@
 
 use rustqlite_parser::{BinaryOp, Expr, FunctionArgs, IndexedBy, Literal, OrderingTerm, SelectStmt};
 
+use crate::codegen::cost::{
+    default_ai_row_log_est, est_log, estimated_index_width_log, estimated_table_width_log,
+    log_est_add, LogEst,
+};
 use crate::error::{Error, Result};
 use crate::schema::{IndexObject, Table};
 use crate::types::{Collation, Value};
@@ -198,6 +202,107 @@ impl IndexPlan {
         self.range.iter().find(|k| matches!(k.op, RangeOp::Lt | RangeOp::Le))
     }
 
+    /// The estimated cost of running this index plan, as a `(rRun, nOut)` pair
+    /// in LogEst units (mirrors the `pNew->rRun` and `pNew->nOut` fields
+    /// upstream's `whereLoopAddBtreeIndex` computes). Lower `rRun` is better;
+    /// on a tie, lower `nOut` is better; on a further tie, the later-defined
+    /// index wins (mirrors `whereLoopFindLesser`'s strict `>=` comparisons
+    /// which make a new template replace an equal-cost existing loop).
+    ///
+    /// `rRun` accumulates:
+    ///   * `rCostIdx = nOut + 1 + (15 * szIdxRow) / szTabRow` — the cost of
+    ///     seeking to the first match and walking `nOut` index entries.
+    ///   * `rLogSize` — the log of the table size, added via `LogEstAdd`
+    ///     (the seek cost in the b-tree).
+    ///   * For a non-covering index: `nOut + 16` — the cost of `nOut` table
+    ///     lookups (3.0× the row count, the same penalty a full table scan
+    ///     pays per row).
+    ///
+    /// `nOut` is the estimated number of rows the scan yields: starts at
+    /// `a[0]` (the table row count) and each equality prefix column
+    /// subtracts `a[nEq-1] - a[nEq]` (the per-prefix row reduction from the
+    /// default `aiRowLogEst`). A range column lowers `nOut` by 20 per bound
+    /// (the `whereRangeAdjust` default: 1/4 of rows per bound, 1/64 for a
+    /// closed range with both bounds).
+    pub(crate) fn plan_cost(&self, table: &Table) -> (LogEst, LogEst) {
+        // The default aiRowLogEst[] for an index with no sqlite_stat1 data.
+        let n_key_cols = self
+            .index
+            .columns
+            .iter()
+            .filter(|c| !c.is_expression())
+            .count();
+        let a = default_ai_row_log_est(n_key_cols);
+        let r_size = a[0];
+        let r_log_size = est_log(r_size);
+
+        // nOut starts at the table row count and is reduced by each prefix
+        // constraint. The equality prefix reduces nOut by the per-column
+        // delta (a[nEq-1] - a[nEq]); the range column reduces nOut by 20 per
+        // bound (the default whereRangeAdjust penalty — 1/4 of rows).
+        let mut n_out = r_size;
+        let mut eq_count = 0usize;
+        let mut saw_range = false;
+        let mut has_lower = false;
+        let mut has_upper = false;
+        for k in &self.range {
+            if k.op.is_equality() {
+                if saw_range {
+                    break;
+                }
+                eq_count += 1;
+                if eq_count < a.len() {
+                    let delta = a[eq_count - 1] - a[eq_count];
+                    n_out -= delta;
+                }
+            } else {
+                // Range bound on the first non-equality column.
+                if matches!(k.op, RangeOp::Gt | RangeOp::Ge) {
+                    has_lower = true;
+                }
+                if matches!(k.op, RangeOp::Lt | RangeOp::Le) {
+                    has_upper = true;
+                }
+                saw_range = true;
+            }
+        }
+        // The range-adjustment: each bound subtracts 20 (1/4 of rows); both
+        // bounds subtract an additional 20 (the closed-range 1/64 penalty).
+        if has_lower || has_upper {
+            n_out -= (has_lower as i64) * 20;
+            n_out -= (has_upper as i64) * 20;
+            if has_lower && has_upper {
+                n_out -= 20;
+            }
+            // Subtract 1 per bound (the `nOut -= (pLower!=0) + (pUpper!=0)`
+            // line in whereRangeScanEst — a minor per-bound bookkeeping
+            // adjustment).
+            n_out -= (has_lower as i64) + (has_upper as i64);
+        }
+        if n_out < 10 {
+            n_out = 10;
+        }
+
+        // The index-scan cost: seek + walk nOut entries.
+        let sz_tab = estimated_table_width_log(table);
+        let sz_idx = estimated_index_width_log(&self.index, table);
+        // rCostIdx = nOut + 1 + (15 * szIdxRow) / szTabRow
+        // (the division is on LogEst values, which are 10*log2; upstream
+        // uses integer division on i16. We mirror that.)
+        let ratio = (15 * sz_idx) / sz_tab.max(1);
+        let r_cost_idx = n_out + 1 + ratio;
+        let r_cost_idx = log_est_add(r_log_size, r_cost_idx);
+
+        let mut r_run = r_cost_idx;
+        if !self.covering {
+            // Add the cost of nOut table lookups: nOut + 16 (the 3.0× per-row
+            // penalty for the table seek, matching the IPK full-scan cost).
+            r_run = log_est_add(r_run, n_out + 16);
+        }
+
+        (r_run, n_out)
+    }
+
     /// The equality-prefix constraint values, in index order. Used by the codegen to load the
     /// `SeekGE` key registers.
     pub fn equality_values(&self) -> Vec<&RangeKey> {
@@ -293,13 +398,20 @@ pub(crate) fn pick_index(
         return Ok(Some(plan_for_index(select, idx, table, &table_columns, &where_constraints, &referenced, &like_opts, true)?));
     }
 
-    // Choose the index with the best combined benefit. Score is a tuple
-    // (constraint_count, covering, order_by_satisfied): more WHERE constraints (equality +
-    // range bounds) win; ties go to a covering index (saves the table lookup); further ties go
-    // to an ORDER BY-satisfying index (saves the sorter). This is a simple proxy for cost — a
-    // real planner would estimate row counts and I/O.
+    // Choose the index with the lowest estimated cost. The cost is a `(rRun, nOut)`
+    // pair in LogEst units (mirrors upstream's `whereLoopAddBtreeIndex`), computed by
+    // `IndexPlan::plan_cost`. Lower `rRun` wins; on a tie, lower `nOut` wins; on a
+    // further tie, the later-defined index wins (mirrors `whereLoopFindLesser`'s
+    // strict `>=` comparisons — a new equal-cost template replaces an existing loop).
+    //
+    // The `has_benefit` / `needs_sorter` structural gates are kept on top of the
+    // cost comparison: a useless index (no WHERE constraint, not covering, not
+    // ORDER-BY-satisfying) is dropped even if its cost is lower than the table scan
+    // (matches upstream's behavior where an unconstrained index scan is only used
+    // when covering and strictly smaller than the table), and an index that needs
+    // a sorter for ORDER BY is only used when it also provides a WHERE seek.
     let mut best: Option<IndexPlan> = None;
-    let mut best_score: (usize, bool, bool) = (0, false, false);
+    let mut best_cost: (LogEst, LogEst) = (i64::MAX, i64::MAX);
     for idx in indexes {
         // Partial indexes can only be used when the query's WHERE implies the index predicate.
         // A safe, conservative rule that matches SQLite for simple cases: the index predicate
@@ -333,20 +445,21 @@ pub(crate) fn pick_index(
                 // Use the index for the WHERE seek + a sorter for ORDER BY.
                 let mut plan = plan;
                 plan.needs_sorter = true;
-                let eq_len = plan.range.len();
-                let score = (eq_len, plan.covering, plan.order_by_satisfied);
-                if score > best_score {
-                    best_score = score;
+                let cost = plan.plan_cost(table);
+                // Lower (rRun, nOut) wins; on tie, the later-defined index wins
+                // (mirrors `whereLoopFindLesser`'s strict `>=` — a new equal-cost
+                // template replaces an existing loop). So we use `<=`, not `<`.
+                if cost <= best_cost {
+                    best_cost = cost;
                     best = Some(plan);
                 }
             }
             continue;
         }
 
-        let eq_len = plan.range.len();
-        let score = (eq_len, plan.covering, plan.order_by_satisfied);
-        if score > best_score {
-            best_score = score;
+        let cost = plan.plan_cost(table);
+        if cost <= best_cost {
+            best_cost = cost;
             best = Some(plan);
         }
     }

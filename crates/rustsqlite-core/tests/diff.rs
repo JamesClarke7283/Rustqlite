@@ -1526,9 +1526,11 @@ fn eqp_index_plan_details_match_oracle() {
     for q in [
         "SELECT a FROM t WHERE a=1",
         "SELECT a,b FROM t WHERE a=1",
-        // `SELECT a,b,c FROM t WHERE a=1` is omitted: the oracle prefers idx_ab over idx_a
-        // for a non-covering query (a cost-based tiebreak our simple planner doesn't model);
-        // both plans produce identical results, only the EQP wording differs.
+        // M27.1 cost model: the oracle prefers idx_ab over idx_a for a non-covering
+        // `SELECT a,b,c FROM t WHERE a=1` (the index-scan cost ties on nEq=1 and the
+        // later-defined idx_ab wins via `whereLoopFindLesser`'s strict->= tiebreak). Our
+        // LogEst cost model reproduces the tie, so this case now matches.
+        "SELECT a,b,c FROM t WHERE a=1",
         "SELECT a FROM t ORDER BY a",
         "SELECT a,b FROM t ORDER BY a",
         "SELECT a FROM t WHERE a=1 ORDER BY b",
@@ -1573,6 +1575,80 @@ fn eqp_index_plan_details_match_oracle() {
             })
             .collect();
         assert_eq!(got, expected, "EQP mismatch for: {eqp}");
+    }
+}
+
+/// M27.1 cost-based index selection: the planner must pick the same index the
+/// oracle does for queries where multiple indexes have equal structural
+/// benefit (same equality prefix length, same covering status) and the choice
+/// is purely cost-driven. SQLite's `whereLoopFindLesser` breaks cost ties in
+/// favor of the later-defined index (strict `>=` makes a new equal-cost
+/// template replace an existing loop); our LogEst cost model reproduces the
+/// same tie and the same tiebreak, so the EQP matches the oracle across:
+///   * single-equality ties (`WHERE a=1 AND b=2` → `i_b` wins over `i_a`),
+///   * three-way single-equality ties (`WHERE a=1 AND b=2 AND c=3` → `i_c`),
+///   * composite-vs-single covering ties (`SELECT a FROM t WHERE a=1` with
+///     `i_a` and `i_ab` → `i_a`, the covering single-eq),
+///   * non-covering composite-vs-single ties (`SELECT * FROM t WHERE a=1`
+///     with `i_a` and `i_ab` → `i_ab`, the later-defined tiebreak), and
+///   * multi-equality prefix wins over single-equality
+///     (`WHERE a=1 AND b=2` with `i_a` and `i_ab` → `i_ab`).
+#[test]
+fn cost_based_index_selection_matches_oracle() {
+    if !sqlite3_available() {
+        eprintln!("skipping: no sqlite3");
+        return;
+    }
+    let db = TempDb::new();
+    db.setup(
+        "CREATE TABLE t(a, b, c, d);\
+         CREATE INDEX i_a ON t(a);\
+         CREATE INDEX i_b ON t(b);\
+         CREATE INDEX i_c ON t(c);\
+         CREATE INDEX i_ab ON t(a, b);\
+         CREATE INDEX i_ac ON t(a, c);\
+         INSERT INTO t VALUES (1,2,3,4),(2,3,4,5),(1,2,5,6);",
+    );
+    let queries = [
+        // Single-equality ties: later-defined wins.
+        "SELECT * FROM t WHERE a=1 AND b=2", // i_a vs i_b → i_b
+        "SELECT * FROM t WHERE c=3 AND a=1", // i_a vs i_c → i_c
+        "SELECT * FROM t WHERE a=1 AND b=2 AND c=3", // i_a, i_b, i_c → i_c
+        // Composite-vs-single: the composite with more eq wins.
+        "SELECT * FROM t WHERE a=1 AND b=2", // i_ab over i_a, i_b
+        // Covering single-eq beats non-covering single-eq.
+        "SELECT a FROM t WHERE a=1", // i_a (covering) over i_ab (non-covering)
+        "SELECT a,b FROM t WHERE a=1", // i_ab (covering, 1 eq)
+        // Non-covering tie: later-defined composite wins.
+        "SELECT * FROM t WHERE a=1", // i_ab over i_a (later, same eq)
+        // Multi-eq prefix: composite with longer prefix wins.
+        "SELECT * FROM t WHERE a=1 AND c=3", // i_ac over i_a, i_c
+    ];
+    for q in queries {
+        let eqp = format!("EXPLAIN QUERY PLAN {q}");
+        let expected: Vec<String> = sqlite3_rows(db.str(), &eqp)
+            .into_iter()
+            .filter(|l| !l.is_empty())
+            .collect();
+        let mut conn = sqlite3_open(db.str()).expect("open");
+        let (mut stmt, _) = sqlite3_prepare_v2(&mut conn, &eqp).unwrap();
+        let mut got: Vec<String> = Vec::new();
+        loop {
+            match stmt.step() {
+                ResultCode::Row => {
+                    let detail = stmt.column_value(3).to_text().unwrap_or_default();
+                    got.push(detail.to_string());
+                }
+                ResultCode::Done => break,
+                other => panic!("step {other:?} for {eqp}"),
+            }
+        }
+        let expected: Vec<String> = expected
+            .into_iter()
+            .filter(|l| !l.is_empty() && l != "QUERY PLAN")
+            .map(|l| l.trim_start_matches(['`', '|', '-', ' ', '\t']).to_string())
+            .collect();
+        assert_eq!(got, expected, "cost-based EQP mismatch for: {eqp}");
     }
 }
 

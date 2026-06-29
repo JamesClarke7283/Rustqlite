@@ -1188,7 +1188,37 @@ and behavior matches upstream (including quirks). No feature is "done" if it div
   Known divergence: `expr COLLATE name <infix> expr` (e.g. `WHERE a COLLATE NOCASE = 'X'`)
   panics in the Pratt fold (pre-existing parser bug, documented in the M2 note above); the
   column-level `COLLATE` constraint and the postfix-only `expr COLLATE name` work correctly.
-- **M27 — Query Planner / Optimizer** 🚧: **27.6 `INDEXED BY` / `NOT INDEXED` table hints** ✅
+- **M27 — Query Planner / Optimizer** 🚧: **27.1 Cost estimation** ✅ — `pick_index` now ranks
+  candidate index plans by a `(rRun, nOut)` cost pair in LogEst units (a faithful port of
+  upstream's `whereLoopAddBtreeIndex` cost equations), instead of the M5.2-era
+  `(eq_len, covering, order_by_satisfied)` proxy score. The new `codegen::cost` module
+  implements the SQLite `LogEst` arithmetic (`log_est`, `log_est_add`, `est_log` mirroring
+  `sqlite3LogEst`/`sqlite3LogEstAdd`/`estLog`), the default `aiRowLogEst` array
+  (`default_ai_row_log_est` mirroring `sqlite3DefaultRowEst`: `a[0]=200` for the default
+  1M-row table, `a[1..=5]=[33,32,30,28,26]`, `a[6..]=23`), and the per-table/per-index row
+  width estimates (`estimated_table_width_log`/`estimated_index_width_log` mirroring
+  `estimateTableWidth`/`estimateIndexWidth` with `szEst=1` for BLOB/INT/REAL and `szEst=5`
+  for TEXT, plus the appended rowid column). `IndexPlan::plan_cost` computes `rRun`:
+  `rCostIdx = nOut + 1 + (15*szIdxRow)/szTabRow`, `rCostIdx = LogEstAdd(rLogSize,
+  rCostIdx)`, and for a non-covering index `rRun = LogEstAdd(rRun, nOut + 16)` (the table-
+  lookup penalty); `nOut` starts at `a[0]` and is reduced by each equality prefix column
+  (`a[nEq-1] - a[nEq]`) and by the range bounds (`-20` per bound, `-20` extra for a closed
+  range, matching `whereRangeAdjust`'s defaults). The tiebreak is **later-defined wins on
+  an exact `(rRun, nOut)` tie** (mirrors `whereLoopFindLesser`'s strict `>=` comparisons,
+  which make a new equal-cost template replace an existing loop), so the planner now
+  matches the oracle on the cases the M5.2 score couldn't: `SELECT * FROM t WHERE a=1`
+  with `i_a` and `i_ab` picks `i_ab` (the later-defined tiebreak); `SELECT a FROM t WHERE
+  a=1` picks `i_a` (covering beats non-covering); multi-eq composite beats single-eq; and
+  three-way single-eq ties pick the last-defined. The `has_benefit` / `needs_sorter`
+  structural gates are kept on top of the cost comparison (a useless index is still dropped
+  even if its cost is lower than a table scan; an ORDER-BY-mismatched index still needs a
+  sorter when it provides a WHERE seek). Differential-tested vs the C oracle
+  (`cost_based_index_selection_matches_oracle` — 8 queries covering single-eq ties,
+  composite-vs-single, covering-vs-non-covering, and multi-eq prefix; plus the previously-
+  omitted `SELECT a,b,c FROM t WHERE a=1` case in `eqp_index_plan_details_match_oracle`
+  now matches). The cost model uses the default `aiRowLogEst` (no `sqlite_stat1` data) until
+  ANALYZE lands (M22.4 [BLOCKED]); real statistics will thread into `aiRowLogEst` then.
+  **27.6 `INDEXED BY` / `NOT INDEXED` table hints** ✅
   — the parser already captured the hint (M2.54); the planner now consumes it. `pick_index`
   accepts an `Option<&IndexedBy>` hint: `NotIndexed` forces a table scan (returns `None`),
   `Index(name)` forces the named index (raising the oracle-matched `"no such index: <name>"`

@@ -10,6 +10,7 @@
 pub mod alter;
 pub mod builder;
 pub mod compound;
+pub mod cost;
 pub mod create;
 pub mod cte;
 pub mod delete;
