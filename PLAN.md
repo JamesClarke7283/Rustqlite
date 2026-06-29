@@ -517,7 +517,7 @@ list every granular item needed.
 
 - [x] **27.1** Cost estimation: approximate row counts (from ANALYZE or heuristics) for table scans vs index lookups
 - [ ] **27.2** Multi-table join ordering (exhaustive or greedy search over join plans)
-- [ ] **27.3** Index selection for multi-column WHERE clauses (pick best index)
+- [x] **27.3** Index selection for multi-column WHERE clauses (pick best index)
 - [x] **27.4** Index scan for ORDER BY (avoid sorter when index provides ordering)
 - [x] **27.5** Index scan for both WHERE + ORDER BY (prefix of index for WHERE, suffix for ORDER BY)
 - [x] **27.6** `INDEXED BY` / `NOT INDEXED` table hints
